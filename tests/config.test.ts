@@ -445,4 +445,15 @@ describe("generic HTTP MCP policy configuration", () => {
       parseConfiguration(stringify(config)).mcp.servers.context.url,
     ).toContain("api-version=1");
   });
+  for (const parameter of ["key", "x-api-key", "X-Amz-Signature"])
+    for (const target of ["proxy", "mcp"])
+      it(`rejects ${parameter} authentication queries in ${target} endpoints`, () => {
+        const config = fixtureMcp();
+        const endpoint = `https://fixture.invalid/mcp?${parameter}=query-credential-canary`;
+        if (target === "proxy") config.proxy.url = endpoint;
+        else config.mcp.servers.context.url = endpoint;
+        expect(() => parseConfiguration(stringify(config))).toThrow(
+          "schema_invalid",
+        );
+      });
 });

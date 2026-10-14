@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { TextDecoder } from "node:util";
 import {
   immutable,
   loadWorkflowBundles,
@@ -62,7 +63,13 @@ export function createRunSnapshot(
 export type RunSnapshot = ReturnType<typeof createRunSnapshot>;
 
 export async function loadProtectedConfiguration(path = "/config/config.yml") {
-  const source = (await readRegularFile(path, true)).toString("utf8");
+  const bytes = await readRegularFile(path, true);
+  let source: string;
+  try {
+    source = new TextDecoder("utf8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new ConfigurationError("yaml_invalid");
+  }
   const { settings, secrets } = separateSecrets(parseConfiguration(source));
   const bundles = await loadWorkflowBundles(settings, secrets);
   return Object.freeze({

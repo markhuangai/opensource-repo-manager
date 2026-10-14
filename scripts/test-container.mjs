@@ -242,6 +242,8 @@ try {
   validConfig.proxy.key = `${canary}-proxy`;
   validConfig.notifications.webhook.headers.Authorization = `Bearer ${canary}-notification`;
   const validYaml = stringifyYaml(validConfig);
+  const invalidUtf8 = Buffer.from(validYaml);
+  invalidUtf8[invalidUtf8.indexOf(`${canary}-github`)] = 0xff;
   const cases = [
     { name: "config", source: validYaml, expected: 0 },
     { name: "readonly", source: validYaml, mode: "400", expected: 0 },
@@ -264,6 +266,24 @@ try {
       source: `${validYaml}\nmalformed: [${canary}\n`,
       expected: 1,
       code: "yaml_invalid",
+    },
+    {
+      name: "invalid-utf8",
+      source: invalidUtf8,
+      expected: 1,
+      code: "yaml_invalid",
+    },
+    {
+      name: "query-credential",
+      source: stringifyYaml({
+        ...validConfig,
+        proxy: {
+          ...validConfig.proxy,
+          url: `https://fixture.invalid/v1?key=${canary}`,
+        },
+      }),
+      expected: 1,
+      code: "schema_invalid",
     },
     {
       name: "collection-key",
@@ -481,7 +501,7 @@ try {
         ),
       );
   }
-  for (const scenario of ["malformed", "collection-key"]) {
+  for (const scenario of ["malformed", "collection-key", "invalid-utf8"]) {
     const invalidName = `${id}-invalid-startup-${scenario}`;
     register("container", invalidName);
     const invalidStartup = result([

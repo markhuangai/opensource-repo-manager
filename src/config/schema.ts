@@ -33,7 +33,7 @@ const url = text.refine((value) => {
 const endpointUrl = url.refine((value) => {
   try {
     return ![...new URL(value).searchParams.keys()].some((key) =>
-      /^(access[_-]?token|api[_-]?key|authorization|auth|bearer|password|secret|token)$/i.test(
+      /^(access[_-]?token|(?:x[_-]?)?api[_-]?key|authorization|auth|bearer|password|secret|token|key|(?:x[_-]?amz[_-]?)?signature)$/i.test(
         key,
       ),
     );
