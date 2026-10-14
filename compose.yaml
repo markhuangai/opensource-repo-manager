@@ -1,0 +1,30 @@
+services:
+  manager:
+    build: .
+    image: opensource-repo-manager:local
+    ports:
+      - "127.0.0.1:8080:8080"
+    stop_grace_period: 15s
+    volumes:
+      - data:/data
+      - type: bind
+        source: ./operator/config
+        target: /config
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./operator/skills
+        target: /skills
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./operator/prompts
+        target: /prompts
+        read_only: true
+        bind:
+          create_host_path: false
+
+volumes:
+  data:

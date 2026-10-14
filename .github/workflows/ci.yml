@@ -1,0 +1,95 @@
+name: Repository CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm install --global npm@12.0.2
+      - run: npm ci
+      - run: npm run check
+      - run: docker compose config --quiet
+      - name: Validate workflows
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          set -euo pipefail
+          tool_dir="$(mktemp -d "${RUNNER_TEMP}/orm-actionlint.XXXXXX")"
+          trap 'find "$tool_dir" -depth -delete' EXIT
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          curl --fail --silent --show-error --location "$base/$archive" --output "$tool_dir/$archive"
+          curl --fail --silent --show-error --location "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt" --output "$tool_dir/checksums.txt"
+          cd "$tool_dir"
+          awk -v archive="$archive" '$2 == archive { print }' checksums.txt > selected-checksum.txt
+          test -s selected-checksum.txt
+          sha256sum --check selected-checksum.txt
+          tar -xzf "$archive" actionlint
+          cd "$GITHUB_WORKSPACE"
+          "$tool_dir/actionlint"
+
+  containers:
+    name: Container smoke (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm install --global npm@12.0.2
+      - run: npm ci
+      - name: Build and test the native image
+        env:
+          TEST_PLATFORM: ${{ matrix.platform }}
+        run: npm run test:container -- --platform "$TEST_PLATFORM"
+
+  result:
+    name: Repository CI
+    needs: [checks, containers]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all repository checks and architectures
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          CONTAINERS_RESULT: ${{ needs.containers.result }}
+        run: |
+          printf 'Repository checks: %s; container matrix: %s\n' "$CHECKS_RESULT" "$CONTAINERS_RESULT"
+          test "$CHECKS_RESULT" = success
+          test "$CONTAINERS_RESULT" = success

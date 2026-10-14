@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Image version (for example 0.1.0 or 0.1.0-rc.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Validate release source and version
+        id: release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        with:
+          script: |
+            if (context.eventName !== "workflow_dispatch" || context.ref !== "refs/heads/main") {
+              throw new Error("Release requires an explicit dispatch from main.");
+            }
+            const version = process.env.RELEASE_VERSION;
+            if (typeof version !== "string" || version !== version.trim() ||
+                !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$/.test(version)) {
+              throw new Error("Image version must be a numeric semantic version with an optional prerelease suffix.");
+            }
+            if (!/^[0-9a-f]{40}$/.test(context.sha)) {
+              throw new Error("Release source SHA is invalid.");
+            }
+            core.setOutput("version", version);
+            core.setOutput("source_sha", context.sha);
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.release.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify the immutable checkout
+        env:
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish both architectures
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/markhuangai/opensource-repo-manager:${{ steps.release.outputs.version }}
+            ghcr.io/markhuangai/opensource-repo-manager:sha-${{ steps.release.outputs.source_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/markhuangai/opensource-repo-manager
+            org.opencontainers.image.revision=${{ steps.release.outputs.source_sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+      - name: Record publication identity
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        with:
+          script: |
+            if (!/^sha256:[0-9a-f]{64}$/.test(process.env.IMAGE_DIGEST || "")) {
+              throw new Error("Image publication did not return a valid digest.");
+            }
+            const receipt = {
+              repository: "ghcr.io/markhuangai/opensource-repo-manager",
+              version: process.env.VERSION,
+              source_sha: process.env.SOURCE_SHA,
+              digest: process.env.IMAGE_DIGEST,
+              platforms: ["linux/amd64", "linux/arm64"],
+              run_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            };
+            core.info(JSON.stringify(receipt));
+            await core.summary.addHeading("Image publication receipt").addCodeBlock(JSON.stringify(receipt, null, 2), "json").write();
