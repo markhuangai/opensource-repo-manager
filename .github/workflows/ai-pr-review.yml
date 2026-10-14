@@ -303,28 +303,6 @@ jobs:
                 `/actions/runs/${context.runId}`,
             });
 
-      - name: Checkout pull request head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          clean: true
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ needs.resolve.outputs.head_sha }}
-
-      - name: Verify checkout head
-        shell: bash
-        env:
-          EXPECTED_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
-        run: |
-          set -euo pipefail
-
-          actual_head_sha="$(git rev-parse --verify HEAD)"
-          if [[ "${actual_head_sha}" != "${EXPECTED_HEAD_SHA}" ]]; then
-            printf 'checkout HEAD %s does not match expected PR head %s\n' \
-              "${actual_head_sha}" "${EXPECTED_HEAD_SHA}" >&2
-            exit 1
-          fi
-
       - name: Review pull request
         id: reviewer
         continue-on-error: true

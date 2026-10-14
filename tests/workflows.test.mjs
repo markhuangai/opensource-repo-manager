@@ -383,6 +383,19 @@ describe("release and CI boundaries", () => {
     }
   });
 
+  it("delegates checkout to the action's isolated PR workspace", () => {
+    const job = review.jobs.review;
+    expect(
+      job.steps.some((entry) => entry.uses?.startsWith("actions/checkout@")),
+    ).toBe(false);
+    expect(step(job, "Review pull request").with["pull-request-url"]).toContain(
+      "needs.resolve.outputs.pr_number",
+    );
+    expect(step(job, "Publish final review status").env.HEAD_SHA).toBe(
+      "${{ needs.resolve.outputs.head_sha }}",
+    );
+  });
+
   it("keeps AI review separate from builds with only read-only project recall", () => {
     expect(review.on.pull_request).toBeUndefined();
     const reviewer = step(review.jobs.review, "Review pull request");
