@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 const args = process.argv.slice(2);
 assert(
@@ -45,6 +46,7 @@ const resources = [];
 const cleanupErrors = [];
 let failure;
 let receipt;
+let protectedFixtures = false;
 
 let daemon;
 
@@ -222,18 +224,195 @@ try {
 
   for (const directory of ["config", "skills", "prompts"])
     await mkdir(join(fixtures, directory), { recursive: true });
-  await writeFile(join(fixtures, "config", "config.yml"), "{}\n", {
-    mode: 0o600,
-  });
-  await writeFile(
-    join(fixtures, "skills", "fixture.md"),
-    "trusted skill fixture\n",
+  await cp(
+    join(root, "examples", "workflow", "skills"),
+    join(fixtures, "skills"),
+    { recursive: true },
   );
-  await writeFile(
-    join(fixtures, "prompts", "fixture.md"),
-    "trusted prompt fixture\n",
+  await cp(
+    join(root, "examples", "workflow", "prompts"),
+    join(fixtures, "prompts"),
+    { recursive: true },
   );
+  const validConfig = parseYaml(
+    await readFile(join(root, "config.example.yml"), "utf8"),
+  );
+  validConfig.github.token = `${canary}-github`;
+  validConfig.github.webhook_secret = `${canary}-webhook`;
+  validConfig.proxy.key = `${canary}-proxy`;
+  validConfig.notifications.webhook.headers.Authorization = `Bearer ${canary}-notification`;
+  const validYaml = stringifyYaml(validConfig);
+  const cases = [
+    { name: "config", source: validYaml, expected: 0 },
+    { name: "readonly", source: validYaml, mode: "400", expected: 0 },
+    {
+      name: "readable",
+      source: validYaml,
+      mode: "644",
+      expected: 1,
+      code: "config_permissions",
+    },
+    {
+      name: "worker-owned",
+      source: validYaml,
+      owner: "10001:10001",
+      expected: 1,
+      code: "config_permissions",
+    },
+    {
+      name: "malformed",
+      source: `${validYaml}\nmalformed: [${canary}\n`,
+      expected: 1,
+      code: "yaml_invalid",
+    },
+    {
+      name: "collection-key",
+      source: `${validYaml}\n? [parser-secret-canary]\n: true\n`,
+      expected: 1,
+      code: "schema_invalid",
+    },
+    {
+      name: "multiple-documents",
+      source: `${validYaml}\n---\nversion: 1\n`,
+      expected: 1,
+      code: "yaml_invalid",
+    },
+    {
+      name: "unknown",
+      source: `${validYaml}\n${canary}: true\n`,
+      expected: 1,
+      code: "schema_invalid",
+    },
+    {
+      name: "escaping",
+      source: stringifyYaml({
+        ...validConfig,
+        roles: {
+          ...validConfig.roles,
+          audit: {
+            ...validConfig.roles.audit,
+            prompts: { system: "../config/config.yml", user: "user.md" },
+          },
+        },
+      }),
+      expected: 1,
+      code: "schema_invalid",
+    },
+    {
+      name: "missing-prompt",
+      source: stringifyYaml({
+        ...validConfig,
+        roles: {
+          ...validConfig.roles,
+          audit: {
+            ...validConfig.roles.audit,
+            prompts: { system: "missing.md", user: "user.md" },
+          },
+        },
+      }),
+      expected: 1,
+      code: "bundle_invalid",
+    },
+    {
+      name: "linked-prompt",
+      source: stringifyYaml({
+        ...validConfig,
+        roles: {
+          ...validConfig.roles,
+          audit: {
+            ...validConfig.roles.audit,
+            prompts: { system: "linked.md", user: "user.md" },
+          },
+        },
+      }),
+      expected: 1,
+      code: "bundle_invalid",
+    },
+    {
+      name: "secret-prompt",
+      source: stringifyYaml({
+        ...validConfig,
+        roles: {
+          ...validConfig.roles,
+          audit: {
+            ...validConfig.roles.audit,
+            prompts: { system: "secret.md", user: "user.md" },
+          },
+        },
+      }),
+      expected: 1,
+      code: "secret_in_snapshot",
+    },
+  ];
+  const mcpConfig = parseYaml(validYaml);
+  mcpConfig.mcp = {
+    credentials: {
+      service: { headers: { Authorization: `Bearer ${canary}-mcp` } },
+    },
+    servers: {
+      fixture: {
+        transport: "streamable_http",
+        url: "http://fixture.invalid/mcp",
+        allow_plain_http: true,
+        credential_ref: "service",
+        tools: {
+          read_item: { effect: "read" },
+          write_item: {
+            effect: "reviewed_write",
+            idempotency_argument: "operation_key",
+          },
+        },
+      },
+    },
+  };
+  mcpConfig.roles.investigation.mcp = {
+    fixture: { tools: ["read_item", "write_item"] },
+  };
+  cases.push({ name: "mcp", source: stringifyYaml(mcpConfig), expected: 0 });
+  for (const [name, change] of [
+    [
+      "mcp-plain-http",
+      (config) => {
+        config.mcp.servers.fixture.allow_plain_http = false;
+      },
+    ],
+    [
+      "mcp-reviewer",
+      (config) => {
+        config.roles.output_review.mcp = { fixture: { tools: ["read_item"] } };
+      },
+    ],
+    [
+      "mcp-size",
+      (config) => {
+        config.mcp.max_response_bytes = 1048577;
+      },
+    ],
+    [
+      "mcp-timeout",
+      (config) => {
+        config.mcp.call_timeout_seconds = 0;
+      },
+    ],
+  ]) {
+    const changed = parseYaml(stringifyYaml(mcpConfig));
+    change(changed);
+    cases.push({
+      name,
+      source: stringifyYaml(changed),
+      expected: 1,
+      code: "schema_invalid",
+    });
+  }
+  for (const test of cases)
+    await writeFile(join(fixtures, "config", `${test.name}.yml`), test.source, {
+      mode: 0o600,
+    });
+  await writeFile(join(fixtures, "prompts", "secret.md"), `${canary}-github\n`);
+  await symlink("/config/config.yml", join(fixtures, "prompts", "linked.md"));
+  await symlink("config.yml", join(fixtures, "config", "linked.yml"));
   register("container", setup);
+  protectedFixtures = true;
   docker([
     "run",
     "--rm",
@@ -247,7 +426,7 @@ try {
     "/bin/sh",
     image,
     "-c",
-    "chown 0:0 /fixture/config.yml && chmod 600 /fixture/config.yml",
+    "chown 0:0 /fixture && chmod 755 /fixture && chown 0:0 /fixture/*.yml && chmod 600 /fixture/*.yml && chmod 400 /fixture/readonly.yml && chmod 644 /fixture/readable.yml && chown 10001:10001 /fixture/worker-owned.yml",
   ]);
   register("volume", volume);
   docker(["volume", "create", "--label", `${label}=${id}`, volume]);
@@ -256,6 +435,73 @@ try {
     "--mount",
     `type=bind,src=${join(fixtures, directory)},dst=/${directory},readonly`,
   ]);
+  for (const test of [
+    ...cases,
+    { name: "missing", expected: 1, code: "config_unreadable" },
+    { name: "linked", expected: 1, code: "config_unreadable" },
+  ]) {
+    const name = `${id}-validate-${test.name}`;
+    register("container", name);
+    const validation = result([
+      "run",
+      "--rm",
+      "--name",
+      name,
+      "--label",
+      `${label}=${id}`,
+      ...mounts,
+      image,
+      "config",
+      "validate",
+      "--config",
+      `/config/${test.name}.yml`,
+    ]);
+    assert.equal(
+      validation.status,
+      test.expected,
+      `Validation scenario ${test.name} failed: ${validation.stderr}`,
+    );
+    assert(
+      !(validation.stdout + validation.stderr).includes(canary),
+      `Validation scenario ${test.name} disclosed a credential`,
+    );
+    assert(
+      !(validation.stdout + validation.stderr).includes("parser-secret-canary"),
+      `Validation scenario ${test.name} disclosed a collection key`,
+    );
+    if (test.code)
+      assert(
+        validation.stderr.includes(test.code),
+        `Validation scenario ${test.name} did not report its safe error code`,
+      );
+    else
+      assert(
+        validation.stdout.includes(
+          "Configuration and workflow bundles are valid.",
+        ),
+      );
+  }
+  for (const scenario of ["malformed", "collection-key"]) {
+    const invalidName = `${id}-invalid-startup-${scenario}`;
+    register("container", invalidName);
+    const invalidStartup = result([
+      "run",
+      "--rm",
+      "--name",
+      invalidName,
+      "--label",
+      `${label}=${id}`,
+      ...mounts,
+      image,
+      "--config",
+      `/config/${scenario}.yml`,
+    ]);
+    assert.equal(invalidStartup.status, 1);
+    assert(!invalidStartup.stdout.includes("HTTP listening"));
+    assert(invalidStartup.stderr.includes("Configuration rejected"));
+    assert(!invalidStartup.stderr.includes(canary));
+    assert(!invalidStartup.stderr.includes("parser-secret-canary"));
+  }
   docker([
     "run",
     "--detach",
@@ -278,6 +524,33 @@ try {
   assert.equal(binding.HostIp, "127.0.0.1");
   assert(Number(binding.HostPort) > 0);
   await waitForHealth();
+  assert(
+    docker(["exec", runtime, "orm", "config", "validate"]).includes(
+      "Configuration and workflow bundles are valid.",
+    ),
+  );
+  const snapshotProof = JSON.parse(
+    docker([
+      "exec",
+      runtime,
+      "/opt/orm-runtime/bin/node",
+      "--input-type=module",
+      "-e",
+      `
+    import assert from 'node:assert/strict';
+    import { loadProtectedConfiguration } from '/opt/orm/app/dist/config/load.js';
+    const { snapshot, secrets } = await loadProtectedConfiguration('/config/mcp.yml');
+    assert(Object.isFrozen(snapshot.roles.audit.profile));
+    assert.throws(() => { snapshot.roles.audit.profile.model = 'changed'; });
+    assert.throws(() => { snapshot.settings.roles.investigation.mcp.fixture.tools.push('forbidden'); });
+    assert(!secrets.contains(snapshot));
+    console.log(JSON.stringify({ worker: snapshot.roles, digest: snapshot.digest }));
+  `,
+    ]),
+  );
+  assert(!JSON.stringify(snapshotProof).includes(canary));
+  assert(!JSON.stringify(snapshotProof.worker).includes("fixture.invalid"));
+  assert(!JSON.stringify(snapshotProof.worker).includes("cpa:8317"));
 
   const live = request("/healthz", { authorization: `Bearer ${canary}` });
   assert.equal(live.status, 200);
@@ -334,16 +607,30 @@ try {
   assert.equal(new Set(users).size, 3);
   for (const tool of ["git", "cc", "make", "setpriv", "tini"])
     docker(["exec", runtime, "/bin/sh", "-c", `command -v ${tool}`]);
-  const deniedRead = result([
-    "exec",
-    "--user",
-    "coding",
-    runtime,
-    "cat",
-    "/config/config.yml",
-  ]);
-  assert.notEqual(deniedRead.status, 0);
-  assert(deniedRead.stderr.includes("Permission denied"));
+  for (const user of ["coding", "audit", "output-review"]) {
+    const deniedRead = result([
+      "exec",
+      "--user",
+      user,
+      runtime,
+      "cat",
+      "/config/config.yml",
+    ]);
+    assert.notEqual(deniedRead.status, 0);
+    assert(deniedRead.stderr.includes("Permission denied"));
+    const deniedWorkerWrite = result([
+      "exec",
+      "--user",
+      user,
+      runtime,
+      "touch",
+      "/skills/example/worker-write-probe",
+    ]);
+    assert.notEqual(deniedWorkerWrite.status, 0);
+    assert(
+      /Permission denied|Read-only file system/.test(deniedWorkerWrite.stderr),
+    );
+  }
   const deniedWrite = result([
     "exec",
     runtime,
@@ -388,10 +675,35 @@ try {
     users_and_mounts: "passed",
     context_exclusion: "passed",
     shutdown_and_persistence: "passed",
+    protected_configuration_and_cli: "passed",
+    immutable_secret_free_snapshots: "passed",
   };
 } catch (error) {
   failure = error;
 } finally {
+  if (protectedFixtures) {
+    try {
+      const [inspection] = JSON.parse(docker(["image", "inspect", image]));
+      assert.equal(inspection.Config.Labels?.[label], id);
+      docker([
+        "run",
+        "--rm",
+        "--name",
+        setup,
+        "--label",
+        `${label}=${id}`,
+        "--mount",
+        `type=bind,src=${join(fixtures, "config")},dst=/fixture`,
+        "--entrypoint",
+        "/bin/sh",
+        image,
+        "-c",
+        `chown ${process.getuid()}:${process.getgid()} /fixture && chmod 700 /fixture`,
+      ]);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
   for (const { type, name } of resources.reverse()) {
     try {
       const inspection = result([type, "inspect", name]);

@@ -1,0 +1,448 @@
+import { spawnSync } from "node:child_process";
+import { describe, expect, it } from "vitest";
+import { stringify } from "yaml";
+import { parseConfiguration } from "../src/config/schema.ts";
+import { separateSecrets } from "../src/config/secrets.ts";
+import { fixtureConfiguration, fixtureMcp } from "./fixtures.ts";
+
+describe("strict protected configuration contract", () => {
+  it("accepts the documented example with both SDKs and v1 defaults", () => {
+    const config = fixtureConfiguration();
+    expect(config.profiles.coding.sdk).toBe("claude");
+    expect(config.profiles.review.sdk).toBe("codex");
+    expect(config.limits).toEqual({
+      active_slots: 1,
+      active_minutes: 60,
+      model_requests: 200,
+      repair_cycles: 3,
+      infrastructure_retries: 2,
+      wait_hours: 24,
+      reconciliation_minutes: 5,
+    });
+    expect(config.mcp).toEqual({
+      credentials: {},
+      servers: {},
+      initialization_timeout_seconds: 30,
+      call_timeout_seconds: 300,
+      max_request_bytes: 1048576,
+      max_response_bytes: 1048576,
+      max_catalog_bytes: 1048576,
+    });
+  });
+  for (const [sdk, efforts] of [
+    ["claude", ["low", "medium", "high", "xhigh", "max"]],
+    [
+      "codex",
+      [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+        "persistent",
+      ],
+    ],
+  ] as const) {
+    for (const effort of efforts)
+      it(`accepts ${sdk}/${effort} for any phase`, () => {
+        const config = fixtureConfiguration();
+        Object.assign(config.profiles.coding, { sdk, effort });
+        expect(
+          parseConfiguration(stringify(config)).profiles.coding.effort,
+        ).toBe(effort);
+      });
+  }
+  it("accepts all enabled notification channel types and configurable budgets", () => {
+    const config = fixtureConfiguration();
+    config.notifications.discord = {
+      enabled: true,
+      webhook_url:
+        "https://discord.com/api/webhooks/example/notification-secret",
+    };
+    config.notifications.smtp = {
+      enabled: true,
+      host: "smtp.example.invalid",
+      port: 465,
+      secure: true,
+      username: "smtp-user-canary",
+      password: "smtp-password-canary",
+      from: "orm@example.invalid",
+      to: ["maintainer@example.invalid"],
+    };
+    config.limits.active_minutes = 30;
+    config.limits.repair_cycles = 0;
+    expect(parseConfiguration(stringify(config)).limits.active_minutes).toBe(
+      30,
+    );
+    const { settings, secrets } = separateSecrets(config);
+    expect(JSON.stringify(settings)).not.toMatch(
+      /notification-secret|smtp-password-canary|maintainer@example/,
+    );
+    expect(secrets.contains("smtp-password-canary")).toBe(true);
+    expect(secrets.get("notifications.smtp.password")).toBe(
+      "smtp-password-canary",
+    );
+  });
+  const invalid = [
+    [
+      "unsupported version",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c, { version: 2 }),
+    ],
+    [
+      "unknown settings",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c, { unsafe: true }),
+    ],
+    [
+      "unknown role keys",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.roles.audit, { permissions: "root" }),
+    ],
+    [
+      "more than one slot",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.limits, { active_slots: 2 }),
+    ],
+    [
+      "zero active budget",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.limits, { active_minutes: 0 }),
+    ],
+    [
+      "negative retries",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.limits, { infrastructure_retries: -1 }),
+    ],
+    [
+      "missing profile",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.roles.audit, { profile: "missing" }),
+    ],
+    [
+      "unsupported effort",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.profiles.coding, { effort: "ultra" }),
+    ],
+    [
+      "unsupported SDK",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.profiles.coding, { sdk: "other" }),
+    ],
+    [
+      "multiple repositories",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.github, { repository: ["a/b", "c/d"] }),
+    ],
+    [
+      "credential-bearing proxy URL",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.proxy, {
+          url: "https://user:password@example.invalid",
+        }),
+    ],
+    [
+      "all notifications disabled",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.notifications, { webhook: { enabled: false } }),
+    ],
+    [
+      "empty credential",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.github, { token: "" }),
+    ],
+    [
+      "escaping prompt",
+      (c: ReturnType<typeof fixtureConfiguration>) =>
+        Object.assign(c.roles.audit.prompts, {
+          system: "../config/config.yml",
+        }),
+    ],
+  ] as const;
+  for (const [name, change] of invalid)
+    it(`rejects ${name}`, () => {
+      const config = fixtureConfiguration();
+      change(config);
+      expect(() => parseConfiguration(stringify(config))).toThrow(
+        /Configuration rejected/,
+      );
+    });
+  for (const source of [
+    "token: malformed-secret-canary\n[",
+    "version: 1\nversion: 1\n",
+    "version: 1\n---\nversion: 1\n",
+    "!unknown malformed-secret-canary",
+    "a: &a [*a]",
+  ]) {
+    it("rejects unsafe YAML without source lines or arbitrary keys", () => {
+      expect(() => parseConfiguration(source)).toThrow(
+        /Configuration rejected/,
+      );
+      try {
+        parseConfiguration(source);
+      } catch (error) {
+        expect(String(error)).not.toContain("malformed-secret-canary");
+      }
+    });
+  }
+  it("does not echo unknown schema keys containing credentials", () => {
+    const config = Object.assign(fixtureConfiguration(), {
+      "synthetic-secret-canary": true,
+    });
+    expect(() => parseConfiguration(stringify(config))).toThrow(
+      "schema_invalid",
+    );
+    try {
+      parseConfiguration(stringify(config));
+    } catch (error) {
+      expect(String(error)).not.toContain("synthetic-secret-canary");
+    }
+  });
+  it("rejects collection keys without dependency warnings disclosing their contents", () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `
+          import { parseConfiguration } from './src/config/schema.ts';
+          try { parseConfiguration(process.argv[1]); }
+          catch (error) { console.error(error.message); process.exitCode = 1; }
+        `,
+        "? [parser-secret-canary]\n: true\n",
+      ],
+      { cwd: new URL("../", import.meta.url), encoding: "utf8" },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("Configuration rejected");
+    expect(result.stderr).not.toMatch(
+      /parser-secret-canary|Keys with collection values|Warning:/,
+    );
+  });
+  it("rejects missing configuration and bad CLI arguments without echoing paths or input", () => {
+    for (const args of [
+      [
+        "config",
+        "validate",
+        "--config",
+        "/missing-cli-secret-canary/config.yml",
+      ],
+      ["--secret-cli-canary"],
+    ]) {
+      const result = spawnSync(process.execPath, ["src/main.ts", ...args], {
+        cwd: new URL("../", import.meta.url),
+        encoding: "utf8",
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Configuration rejected");
+      expect(result.stderr).not.toMatch(/cli-secret-canary|secret-cli-canary/);
+      expect(result.stdout).not.toContain("HTTP listening");
+    }
+  });
+});
+
+describe("generic HTTP MCP policy configuration", () => {
+  it("accepts generic read/write grants, static headers and binding identity without secrets", () => {
+    const parsed = parseConfiguration(stringify(fixtureMcp()));
+    const { settings, secrets } = separateSecrets(parsed);
+    expect(settings.mcp.servers.context.credential_ref).toBe("service");
+    expect(settings.mcp.servers.context.tools.store_record).toEqual({
+      effect: "reviewed_write",
+      idempotency_argument: "operation_key",
+    });
+    expect(JSON.stringify(settings)).not.toContain("mcp-credential-canary");
+    expect(JSON.stringify(secrets)).not.toContain("mcp-credential-canary");
+    expect(secrets.mcpHeaders("service").Authorization).toBe(
+      "Bearer mcp-credential-canary",
+    );
+    expect(secrets.contains("mcp-credential-canary")).toBe(true);
+  });
+  it("supports an explicitly allowed unauthenticated HTTP server", () => {
+    const config = fixtureMcp();
+    config.mcp.servers.context.url = "http://fixture:8080/mcp";
+    config.mcp.servers.context.allow_plain_http = true;
+    delete config.mcp.servers.context.credential_ref;
+    expect(
+      parseConfiguration(stringify(config)).mcp.servers.context.credential_ref,
+    ).toBeUndefined();
+  });
+  it("accepts the Dense-Mem example without provider-specific policy code", () => {
+    const config = fixtureMcp();
+    config.mcp.servers.context.tools = {
+      recall_memory: { effect: "read" },
+      trace_memory: { effect: "read" },
+      remember: {
+        effect: "reviewed_write",
+        idempotency_argument: "idempotency_key",
+      },
+    };
+    config.roles.investigation.mcp.context.tools = [
+      "recall_memory",
+      "trace_memory",
+      "remember",
+    ];
+    const parsed = parseConfiguration(stringify(config));
+    expect(parsed.mcp.servers.context.tools.remember).toEqual({
+      effect: "reviewed_write",
+      idempotency_argument: "idempotency_key",
+    });
+  });
+  it("freezes credential bindings independently of later source-object mutation", () => {
+    const config = fixtureMcp();
+    const { secrets } = separateSecrets(config);
+    config.mcp.credentials.service.headers.Authorization =
+      "Bearer rotated-secret-canary";
+    expect(secrets.mcpHeaders("service").Authorization).toBe(
+      "Bearer mcp-credential-canary",
+    );
+    expect(() =>
+      Object.assign(secrets.mcpHeaders("service"), {
+        Authorization: "changed",
+      }),
+    ).toThrow();
+  });
+  const changes = [
+    [
+      "plain HTTP without opt-in",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.mcp.servers.context.url = "http://fixture/mcp";
+      },
+    ],
+    [
+      "URL credentials",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.mcp.servers.context.url = "https://user:secret@fixture/mcp";
+      },
+    ],
+    [
+      "missing credential binding",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.mcp.servers.context.credential_ref = "missing";
+      },
+    ],
+    [
+      "missing server grant",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.roles.audit.mcp.missing = { tools: ["read_record"] };
+      },
+    ],
+    [
+      "missing tool grant",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.roles.audit.mcp.context = { tools: ["missing"] };
+      },
+    ],
+    [
+      "wildcard grants",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.roles.audit.mcp.context = { tools: ["*"] };
+      },
+    ],
+    [
+      "reviewer grants",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.roles.output_review.mcp.context = { tools: ["read_record"] };
+      },
+    ],
+    [
+      "duplicate grants",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.roles.audit.mcp.context = { tools: ["read_record", "read_record"] };
+      },
+    ],
+    [
+      "unsupported transport",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        Object.assign(c.mcp.servers.context, {
+          transport: "stdio",
+          command: "sh",
+        });
+      },
+    ],
+    [
+      "OAuth configuration",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        Object.assign(c.mcp.servers.context, { oauth: true });
+      },
+    ],
+    [
+      "inferred tool authority",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        Object.assign(c.mcp.servers.context.tools.read_record, {
+          annotations: { readOnlyHint: true },
+        });
+      },
+    ],
+    [
+      "idempotency on a read",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        Object.assign(c.mcp.servers.context.tools.read_record, {
+          idempotency_argument: "key",
+        });
+      },
+    ],
+    [
+      "unknown effect",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        Object.assign(c.mcp.servers.context.tools.store_record, {
+          effect: "mixed",
+        });
+      },
+    ],
+    [
+      "zero timeout",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.mcp.call_timeout_seconds = 0;
+      },
+    ],
+    [
+      "oversized bound",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.mcp.max_request_bytes = 1048577;
+      },
+    ],
+    [
+      "header injection",
+      (c: ReturnType<typeof fixtureMcp>) => {
+        c.mcp.credentials.service.headers.Authorization =
+          "secret\r\nHost: wrong";
+      },
+    ],
+  ] as const;
+  for (const [name, change] of changes)
+    it(`rejects ${name}`, () => {
+      const config = fixtureMcp();
+      change(config);
+      expect(() => parseConfiguration(stringify(config))).toThrow(
+        /Configuration rejected/,
+      );
+    });
+  it("accepts positive timeout overrides and lower request/response/catalog bounds", () => {
+    const config = fixtureMcp();
+    Object.assign(config.mcp, {
+      initialization_timeout_seconds: 5,
+      call_timeout_seconds: 90,
+      max_request_bytes: 4096,
+      max_response_bytes: 8192,
+      max_catalog_bytes: 16384,
+    });
+    expect(parseConfiguration(stringify(config)).mcp.call_timeout_seconds).toBe(
+      90,
+    );
+  });
+  it("rejects authentication query parameters without treating ordinary URL queries as credentials", () => {
+    const config = fixtureMcp();
+    config.mcp.servers.context.url =
+      "https://fixture/mcp?api_key=embedded-secret-canary";
+    expect(() => parseConfiguration(stringify(config))).toThrow(
+      "schema_invalid",
+    );
+    config.mcp.servers.context.url = "https://fixture/mcp?api-version=1";
+    expect(
+      parseConfiguration(stringify(config)).mcp.servers.context.url,
+    ).toContain("api-version=1");
+  });
+});

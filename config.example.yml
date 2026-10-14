@@ -1,0 +1,47 @@
+version: 1
+github:
+  repository: markhuangai/opensource-repo-manager
+  token: REPLACE_GITHUB_FINE_GRAINED_PAT
+  webhook_secret: REPLACE_GITHUB_WEBHOOK_SECRET
+proxy:
+  url: http://cpa:8317/v1
+  key: REPLACE_CPA_KEY
+profiles:
+  coding:
+    sdk: claude
+    model: your-claude-model-id
+    effort: high
+  review:
+    sdk: codex
+    model: your-codex-model-id
+    effort: high
+roles:
+  bootstrap:
+    profile: coding
+    prompts: { system: system.md, user: user.md }
+    skills: [example]
+  investigation:
+    profile: coding
+    prompts: { system: system.md, user: user.md }
+    skills: [example]
+  implementation:
+    profile: coding
+    prompts: { system: system.md, user: user.md }
+    skills: [example]
+  audit:
+    profile: review
+    prompts: { system: system.md, user: user.md }
+    skills: [example]
+  output_review:
+    profile: review
+    prompts: { system: system.md, user: user.md }
+    skills: [example]
+notifications:
+  webhook:
+    enabled: true
+    url: https://notify.example.invalid/orm
+    headers:
+      Authorization: Bearer REPLACE_NOTIFICATION_TOKEN
+mcp:
+  credentials: {}
+  servers: {}

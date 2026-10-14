@@ -5,11 +5,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 
 function launch() {
-  const child = spawn(process.execPath, ["src/main.ts"], {
-    cwd: new URL("../", import.meta.url),
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, ORM_SECRET_CANARY: "lifecycle-secret-canary" },
-  });
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      "import { startHttpService } from './src/http/server.ts'; await startHttpService();",
+    ],
+    {
+      cwd: new URL("../", import.meta.url),
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ORM_SECRET_CANARY: "lifecycle-secret-canary" },
+    },
+  );
   let output = "";
   child.stdout.on("data", (data: Buffer) => (output += data.toString()));
   child.stderr.on("data", (data: Buffer) => (output += data.toString()));
