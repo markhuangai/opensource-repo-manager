@@ -18,7 +18,12 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
-async function setup(sdk: "claude" | "codex" = "claude", budget = 10) {
+async function setup(
+  sdk: "claude" | "codex" = "claude",
+  budget = 10,
+  credential = "relay-upstream-secret",
+  bytes = 4096,
+) {
   const requests: Array<{
     url: string | undefined;
     authorization: string | undefined;
@@ -47,6 +52,7 @@ async function setup(sdk: "claude" | "codex" = "claude", budget = 10) {
     config = fixtureConfiguration();
   config.proxy.url = `http://127.0.0.1:${port}/v1`;
   config.proxy.key = "relay-upstream-secret";
+  config.github.webhook_secret = credential;
   const loaded = await fixtureSnapshot("model", config),
     root = await mkdtemp(join(tmpdir(), "orm-relay-"));
   const store = new Store(join(root, "state", "db.sqlite"));
@@ -79,7 +85,7 @@ async function setup(sdk: "claude" | "codex" = "claude", budget = 10) {
     profile,
     deadline,
     requests: budget,
-    bytes: 4096,
+    bytes,
     signal: controller.signal,
     current: () => store.runtimeCurrent(lease),
     available: () => available,
@@ -176,6 +182,193 @@ describe("scoped model relay", () => {
     ]);
     expect(f.grant.authorization).not.toBe("relay-upstream-secret");
     expect((await f.post("/messages/count_tokens")).status).toBe(200);
+  });
+  it.each([
+    {
+      sdk: "claude",
+      credential: "relay-upstream-secret",
+      chunks: ["relay-upstream-", "secret"],
+    },
+    {
+      sdk: "codex",
+      credential: "relay-upstream-secret",
+      chunks: ["relay-upstream-", "secret"],
+    },
+    {
+      sdk: "claude",
+      credential: "ababababac",
+      chunks: ["ababa", "baba", "bac"],
+    },
+    {
+      sdk: "codex",
+      credential: "token-😀-credential",
+      chunks: ["token-\ud83d", "\ude00-credential"],
+    },
+    {
+      sdk: "claude",
+      credential: "relay-upstream-secret",
+      chunks: ["relay-upstream-", "secret"],
+      initial: true,
+    },
+    {
+      sdk: "codex",
+      credential: "relay-upstream-secret",
+      chunks: ["relay-upstream-", "secret"],
+      crossBlocks: true,
+    },
+  ] as const)(
+    "withholds fragmented $sdk credentials before forwarding their prefixes ($credential)",
+    async (test) => {
+      const f = await setup(test.sdk, 10, test.credential, 16384);
+      let source: ServerResponse | undefined;
+      const event = (text: string, index = 0) =>
+        test.sdk === "claude"
+          ? {
+              type: "content_block_delta",
+              index,
+              delta: { type: "text_delta", text },
+            }
+          : {
+              type: "response.output_text.delta",
+              output_index: index,
+              content_index: 0,
+              delta: text,
+            };
+      const frame = (value: unknown) =>
+        "data: " + JSON.stringify(value) + "\n\n";
+      const content = (output: string) =>
+        output
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => {
+            const value = JSON.parse(line.slice(5)) as {
+              delta?: string | { text?: string };
+              content_block?: { text?: string };
+            };
+            return typeof value.delta === "string"
+              ? value.delta
+              : (value.delta?.text ?? value.content_block?.text ?? "");
+          })
+          .join("");
+      f.handler((_req, res) => {
+        source = res;
+        res.setHeader("content-type", "text/event-stream");
+        res.write(frame(event("safe first.")));
+      });
+      const response = await f.post(
+          test.sdk === "claude" ? "/messages" : "/responses",
+          undefined,
+          AbortSignal.timeout(2000),
+        ),
+        reader = response.body!.getReader(),
+        first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toContain("safe first.");
+      const initial = "initial" in test && test.initial;
+      source!.write(
+        frame(
+          initial
+            ? {
+                type: "content_block_start",
+                index: 0,
+                content_block: { type: "text", text: test.chunks[0] },
+              }
+            : event(test.chunks[0]),
+        ),
+      );
+      const crossBlocks = "crossBlocks" in test && test.crossBlocks;
+      if (!crossBlocks) source!.write(frame(event("unrelated channel", 1)));
+      for (const text of test.chunks.slice(1))
+        source!.write(frame(event(text, crossBlocks ? 1 : 0)));
+      source!.end();
+      let output = new TextDecoder().decode(first.value);
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        output += new TextDecoder().decode(next.value);
+      }
+      expect(output).toContain("relay_error");
+      expect(content(output)).not.toContain(test.chunks[0]);
+      expect(content(output)).not.toContain(test.credential);
+      expect(f.requests).toHaveLength(1);
+      f.handler((_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        res.write(frame(event("safe first.")));
+        res.write(
+          frame(
+            initial
+              ? {
+                  type: "content_block_start",
+                  index: 0,
+                  content_block: { type: "text", text: test.chunks[0] },
+                }
+              : event(test.chunks[0]),
+          ),
+        );
+        if (!crossBlocks) res.write(frame(event("unrelated channel", 1)));
+        for (const text of test.chunks.slice(1, -1))
+          res.write(frame(event(text, crossBlocks ? 1 : 0)));
+        res.end(frame(event("benign tail.", crossBlocks ? 1 : 0)));
+      });
+      const benign = await f.post(
+          test.sdk === "claude" ? "/messages" : "/responses",
+        ),
+        benignOutput = await benign.text();
+      expect(benign.status).toBe(200);
+      expect(benignOutput).not.toContain("relay_error");
+      expect(content(benignOutput)).toContain(test.chunks[0]);
+      expect(f.requests).toHaveLength(2);
+    },
+  );
+  it.each([["relay-upstream-", " ordinary text"], ["relay-upstream-"]])(
+    "preserves benign prefixes through divergence or EOF: %s",
+    async (...chunks) => {
+      const f = await setup();
+      f.handler((_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        for (const text of chunks)
+          res.write(
+            "data: " +
+              JSON.stringify({
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "text_delta", text },
+              }) +
+              "\n\n",
+          );
+        res.end();
+      });
+      const response = await f.post("/messages"),
+        output = await response.text();
+      expect(response.status).toBe(200);
+      for (const text of chunks) expect(output).toContain(text);
+      expect(output).not.toContain("relay_error");
+    },
+  );
+  it("bounds held SSE data and per-field matcher state", async () => {
+    const f = await setup();
+    f.handler((_req, res) => {
+      res.setHeader("content-type", "text/event-stream");
+      res.write('data: {"delta":"relay-upstream-"}\n\n');
+      for (let index = 0; index < 100; index++)
+        res.write('data: {"message":"' + "x".repeat(100) + '"}\n\n');
+      res.end();
+    });
+    const output = await (await f.post("/messages")).text();
+    expect(output).not.toContain("relay-upstream-");
+    expect(output).toContain("relay_error");
+    f.handler((_req, res) => {
+      res.setHeader("content-type", "text/event-stream");
+      res.end(
+        "data: " +
+          JSON.stringify({
+            content: Array.from({ length: 100 }, () => ({ text: "ordinary" })),
+          }) +
+          "\n\n",
+      );
+    });
+    const response = await f.post("/messages");
+    expect(response.status).toBe(502);
+    expect(await response.text()).toContain("relay_error");
   });
   it.each(["/responses", "/responses/compact"])(
     "supports Codex HTTP route %s and rejects cross-profile requests",

@@ -208,8 +208,8 @@ export class WorkspaceService {
     const timer = setInterval(() => {
       if (!watching)
         watching = (async () => {
-          await treeBytes(stage, limits.storage);
-          await treeBytes(root, limits.storage);
+          const staged = await treeBytes(stage, limits.storage);
+          await treeBytes(root, limits.storage - staged);
         })()
           .then(
             () => {},

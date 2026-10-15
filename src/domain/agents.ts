@@ -7,8 +7,8 @@ import type { SourceMetadata } from "./jobs.ts";
 
 export class RuntimeError extends Error {
   readonly code: string;
-  constructor(code: string) {
-    super(`Worker unavailable (${code}).`);
+  constructor(code: string, options?: ErrorOptions) {
+    super(`Worker unavailable (${code}).`, options);
     this.code = code;
     this.name = "RuntimeError";
   }

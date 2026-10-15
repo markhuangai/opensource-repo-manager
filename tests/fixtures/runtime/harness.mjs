@@ -10,6 +10,7 @@ import {
   lstat,
   mkdir,
   readFile,
+  readlink,
   readdir,
   writeFile,
 } from "node:fs/promises";
@@ -25,6 +26,7 @@ import {
   sourceProcesses,
   userProcesses,
 } from "/opt/orm/app/dist/runtime/process.js";
+import { treeBytes } from "/opt/orm/app/dist/services/workspaces/files.js";
 
 async function collect(iterable) {
   const events = [];
@@ -331,6 +333,47 @@ export async function runRuntimeTests() {
   let tests = 0;
   const errors = [];
   try {
+    const bootstrap = spawn(
+      process.execPath,
+      [
+        "-e",
+        'process.title="runc:[2:INIT]";console.log("ready");setInterval(()=>{},1000)',
+      ],
+      {
+        gid: 1,
+        env: { PATH: "/usr/bin:/bin" },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    bootstrap.stderr.resume();
+    const bootstrapExited = once(bootstrap, "exit");
+    try {
+      await Promise.race([
+        once(bootstrap.stdout, "data", { signal: AbortSignal.timeout(2000) }),
+        bootstrapExited.then(() => {
+          throw new Error("bootstrap fixture exited before its probe");
+        }),
+      ]);
+      assert.match(
+        await readFile(`/proc/${bootstrap.pid}/status`, "utf8"),
+        /^Name:\s+runc:/m,
+      );
+      await assert.rejects(readlink(`/proc/${bootstrap.pid}/cwd`), {
+        code: "EACCES",
+      });
+      assert.deepEqual(
+        await sourceProcesses(
+          "bootstrap-probe",
+          join(root, "private", "sources", "bootstrap-probe"),
+        ),
+        [],
+      );
+    } finally {
+      if (bootstrap.exitCode === null && bootstrap.signalCode === null)
+        bootstrap.kill("SIGKILL");
+      await bootstrapExited;
+    }
+    tests++;
     const fixture = seed();
     const firstRun = await run(fixture, inspect);
     assert.equal(firstRun.outcome, "completed");
@@ -406,12 +449,16 @@ export async function runRuntimeTests() {
     try {
       await until(() => heldSource);
       const preparingRun = store.runs().find((run) => run.finished_at === null),
-        workspace = join(root, "runs", preparingRun.id, "workspace");
+        workspace = join(root, "runs", preparingRun.id, "workspace"),
+        stage = join(root, "private", "sources", preparingRun.id);
       await mkdir(workspace);
       await writeFile(
         join(workspace, "expanded-checkout"),
-        Buffer.alloc(2 * 1024 * 1024),
+        Buffer.alloc(300 * 1024),
       );
+      await writeFile(join(stage, "staging-growth"), Buffer.alloc(300 * 1024));
+      assert((await treeBytes(stage, 512 * 1024)) < 512 * 1024);
+      assert((await treeBytes(workspace, 512 * 1024)) < 512 * 1024);
       assert.equal((await preparation).outcome, "limited");
       assert.equal(store.leases().length, 0);
       assert(!store.runs().some((run) => run.finished_at === null));
@@ -969,7 +1016,10 @@ export async function runRuntimeTests() {
     }
   }
   if (errors.length)
-    throw new AggregateError(errors, "Runtime verification or cleanup failed");
+    throw new AggregateError(
+      errors,
+      `Runtime verification or cleanup failed after ${tests} completed scenario groups`,
+    );
   console.log(
     JSON.stringify({
       runtime: "passed",

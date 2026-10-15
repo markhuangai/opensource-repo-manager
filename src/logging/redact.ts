@@ -21,7 +21,59 @@ export function createKnownSecretChecker(values: readonly string[]) {
     return message;
   }
 
-  return Object.freeze({ contains, redact });
+  type Node = { next: Map<string, number>; fail: number; matched: boolean };
+  let nodes: Node[] | undefined;
+  function createStream() {
+    if (!nodes) {
+      nodes = [{ next: new Map(), fail: 0, matched: false }];
+      for (const secret of secrets) {
+        let state = 0;
+        for (let index = 0; index < secret.length; index++) {
+          const character = secret[index];
+          let next = nodes[state].next.get(character);
+          if (next === undefined) {
+            next = nodes.length;
+            nodes[state].next.set(character, next);
+            nodes.push({ next: new Map(), fail: 0, matched: false });
+          }
+          state = next;
+        }
+        nodes[state].matched = true;
+      }
+      const queue = [...nodes[0].next.values()];
+      for (let cursor = 0; cursor < queue.length; cursor++) {
+        const state = queue[cursor];
+        for (const [character, child] of nodes[state].next) {
+          let fallback = nodes[state].fail;
+          while (fallback && !nodes[fallback].next.has(character))
+            fallback = nodes[fallback].fail;
+          nodes[child].fail = nodes[fallback].next.get(character) ?? 0;
+          nodes[child].matched ||= nodes[nodes[child].fail].matched;
+          queue.push(child);
+        }
+      }
+    }
+    const compiled = nodes;
+    let state = 0;
+    return Object.freeze({
+      get pending() {
+        return state !== 0;
+      },
+      push(text: string) {
+        let matched = false;
+        for (let index = 0; index < text.length; index++) {
+          const character = text[index];
+          while (state && !compiled[state].next.has(character))
+            state = compiled[state].fail;
+          state = compiled[state].next.get(character) ?? 0;
+          matched ||= compiled[state].matched;
+        }
+        return matched;
+      },
+    });
+  }
+
+  return Object.freeze({ contains, redact, createStream });
 }
 
 export type KnownSecretChecker = ReturnType<typeof createKnownSecretChecker>;

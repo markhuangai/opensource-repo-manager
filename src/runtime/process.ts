@@ -90,6 +90,8 @@ export async function sourceProcesses(
     try {
       const status = await readFile(`/proc/${name}/status`, "utf8");
       if (!/^Uid:\s+0\s+0\s+0\s+0$/m.test(status)) continue;
+      // Docker bootstrap helpers have protected /proc entries and cannot belong to the fixed Git launcher chain.
+      if (/^Name:\s+runc(?::|$)/m.test(status)) continue;
       const cwd = await readlink(`/proc/${name}/cwd`),
         environment = await readFile(`/proc/${name}/environ`, "utf8");
       if (

@@ -240,6 +240,94 @@ export class ModelRelay {
       res.setHeader("cache-control", "no-store");
       let bytes = 0,
         pending = "";
+      const matchers = new Map<
+          string,
+          ReturnType<SecretAccessor["createCredentialStream"]>
+        >(),
+        held: string[] = [];
+      let matcherBytes = 0,
+        heldBytes = 0;
+      const flush = async () => {
+        for (const frame of held) {
+          signal.throwIfAborted();
+          if (!res.write(frame + "\n\n")) await once(res, "drain", { signal });
+        }
+        held.length = 0;
+        heldBytes = 0;
+      };
+      const forwardFrame = async (frame: string) => {
+        const length = Buffer.byteLength(frame);
+        if (length > 1024 * 1024) throw new RuntimeError("relay_frame_limit");
+        const value = this.checkFrame(frame),
+          fields =
+            value && typeof value === "object" && !Array.isArray(value)
+              ? (value as Record<string, unknown>)
+              : {},
+          channel = [
+            fields.type,
+            fields.index,
+            fields.output_index,
+            fields.content_index,
+            fields.summary_index,
+            fields.item_id,
+          ];
+        const inspect = (item: unknown, path: string[]) => {
+          if (typeof item === "string") {
+            const leaf = path.at(-1),
+              field = [
+                "text",
+                "delta",
+                "thinking",
+                "partial_json",
+                "arguments",
+              ].includes(leaf ?? "")
+                ? "content"
+                : leaf;
+            if (
+              ![
+                "text",
+                "delta",
+                "thinking",
+                "partial_json",
+                "arguments",
+                "signature",
+                "refusal",
+                "message",
+                "content",
+                "output_text",
+                "input_text",
+              ].includes(leaf ?? "")
+            )
+              return;
+            for (const key of [
+              JSON.stringify([channel, path]),
+              JSON.stringify(["channel", channel.slice(1), field]),
+              JSON.stringify(["field", field]),
+            ]) {
+              let matcher = matchers.get(key);
+              if (!matcher) {
+                matcherBytes += Buffer.byteLength(key) + 64;
+                if (matcherBytes > grant.bytes)
+                  throw new RuntimeError("relay_frame_limit");
+                matcher = this.secrets.createCredentialStream();
+                matchers.set(key, matcher);
+              }
+              if (matcher.push(item))
+                throw new RuntimeError("relay_response_invalid");
+            }
+          } else if (item !== null && typeof item === "object") {
+            for (const [key, child] of Object.entries(item))
+              inspect(child, [...path, key]);
+          }
+        };
+        inspect(value, []);
+        heldBytes += length;
+        if (heldBytes > grant.bytes)
+          throw new RuntimeError("relay_frame_limit");
+        held.push(frame);
+        if (![...matchers.values()].some((matcher) => matcher.pending))
+          await flush();
+      };
       const decoder = new TextDecoder("utf8", { fatal: true });
       for await (const chunk of upstream.body) {
         signal.throwIfAborted();
@@ -252,9 +340,7 @@ export class ModelRelay {
             const frame = pending.slice(0, match.index),
               end = match.index + match[0].length;
             pending = pending.slice(end);
-            this.checkFrame(frame);
-            if (!res.write(frame + "\n\n"))
-              await once(res, "drain", { signal });
+            await forwardFrame(frame);
           }
           if (Buffer.byteLength(pending) > 1024 * 1024)
             throw new RuntimeError("relay_frame_limit");
@@ -262,10 +348,8 @@ export class ModelRelay {
       }
       pending += decoder.decode();
       if (streaming) {
-        if (pending.trim()) {
-          this.checkFrame(pending);
-          res.write(pending + "\n\n");
-        }
+        if (pending.trim()) await forwardFrame(pending);
+        await flush();
       } else {
         const value = JSON.parse(pending) as { error?: unknown };
         if (value?.error || this.secrets.containsCredentials(value))
@@ -299,6 +383,7 @@ export class ModelRelay {
         this.secrets.containsCredentials(value)
       )
         throw new RuntimeError("relay_response_invalid");
+      return value;
     }
   }
 

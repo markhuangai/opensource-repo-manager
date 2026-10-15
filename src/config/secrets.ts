@@ -54,6 +54,7 @@ export function separateSecrets(config: Configuration) {
   const secrets = Object.freeze({
     ...checker,
     containsCredentials: credentialChecker.contains,
+    createCredentialStream: credentialChecker.createStream,
     get(name: string) {
       const value = credentials.get(name);
       if (value === undefined)

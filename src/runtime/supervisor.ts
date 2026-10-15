@@ -355,7 +355,8 @@ export class Supervisor implements AgentRunner {
     let closeProvider: Promise<void> | undefined,
       termination: Promise<void> | undefined,
       watching: Promise<void> | undefined;
-    let cleanupFailure: unknown;
+    let cleanupFailure: unknown,
+      cleanupStep = "connections";
     const revoke = () => {
       relay?.revoke();
       if (mcp && !closeProvider) closeProvider = mcp.close();
@@ -679,11 +680,15 @@ export class Supervisor implements AgentRunner {
       try {
         await closeProvider;
         if (registered) {
+          cleanupStep = "processes";
           termination ??= cleanUser(identity.uid);
           await termination;
+          cleanupStep = "temporary";
           await cleanTemporary(identity.uid);
+          cleanupStep = "workspace";
           await this.workspaces.remove(id);
         }
+        cleanupStep = "receipt";
         if (!cleanupFailure) {
           if (
             terminal?.outcome === "completed" &&
@@ -701,8 +706,20 @@ export class Supervisor implements AgentRunner {
             );
           cleaned = true;
         }
-      } catch {
-        cleanupFailure = new RuntimeError("cleanup_failed");
+      } catch (error) {
+        const code =
+          error instanceof RuntimeError
+            ? error.code
+            : (error as NodeJS.ErrnoException)?.code;
+        const cause =
+          typeof code === "string" &&
+          /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(code) &&
+          !this.secrets.containsCredentials(code)
+            ? new RuntimeError(code)
+            : undefined;
+        cleanupFailure = new RuntimeError(`cleanup_${cleanupStep}_failed`, {
+          cause,
+        });
       }
       signal.removeEventListener("abort", abort);
       if (!parent) {
@@ -711,7 +728,11 @@ export class Supervisor implements AgentRunner {
           cleanupFailure = new RuntimeError("cleanup_failed");
       }
     }
-    if (cleanupFailure) throw new RuntimeError("cleanup_failed");
+    if (cleanupFailure)
+      throw new RuntimeError("cleanup_failed", {
+        cause:
+          cleanupFailure instanceof RuntimeError ? cleanupFailure : undefined,
+      });
     queue.push(terminal!);
     queue.end();
   }
