@@ -32,6 +32,7 @@ import {
   assertRuntimeIdentity,
   cleanEnvironment,
   cleanUser,
+  deletedFileBytes,
   signalUser,
   spawnAsRole,
   suspendUser,
@@ -408,6 +409,7 @@ export class Supervisor implements AgentRunner {
                 throw error;
             }
           }
+          used += await deletedFileBytes(identity.uid, limits.storage - used);
           if (used > limits.storage) throw new RuntimeError("storage_limit");
         }
       })()

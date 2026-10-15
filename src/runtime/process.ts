@@ -1,10 +1,44 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { lstat, readFile, readdir, readlink } from "node:fs/promises";
 import type { Role } from "../config/schema.ts";
 import { checkPath } from "../config/files.ts";
 import { roleUsers, RuntimeError } from "../domain/agents.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { basename, dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execute = promisify(execFile);
+
+export async function deletedFileBytes(uid: number, limit: number) {
+  if (![10001, 10002, 10003].includes(uid))
+    throw new RuntimeError("worker_identity_invalid");
+  const probe = fileURLToPath(new URL("./storage.js", import.meta.url));
+  await trustedExecutable(probe);
+  let output: string;
+  try {
+    const result = await execute(
+      "/opt/orm-runtime/bin/node",
+      [probe, String(uid), String(limit)],
+      {
+        cwd: "/",
+        env: { PATH: "/usr/bin:/bin" },
+        encoding: "utf8",
+        timeout: 2000,
+        killSignal: "SIGKILL",
+        maxBuffer: 256,
+      },
+    );
+    output = result.stdout.trim();
+  } catch {
+    throw new RuntimeError("monitor_failed");
+  }
+  if (output === "storage_limit") throw new RuntimeError("storage_limit");
+  const bytes = Number(output);
+  if (!/^\d+$/.test(output) || !Number.isSafeInteger(bytes) || bytes > limit)
+    throw new RuntimeError("monitor_failed");
+  return bytes;
+}
 
 export async function assertRuntimeIdentity() {
   if (process.platform !== "linux" || process.getuid?.() !== 0)
@@ -38,13 +72,13 @@ export async function userProcesses(
     if (!/^\d+$/.test(name)) continue;
     try {
       const status = await readFile(`/proc/${name}/status`, "utf8");
-      if (
-        status
-          .match(/^Uid:\s+(.+)$/m)?.[1]
-          .trim()
-          .split(/\s+/)
-          .some((value) => Number(value) === uid)
-      )
+      const identities = status
+        .match(/^Uid:\s+(.+)$/m)?.[1]
+        .trim()
+        .split(/\s+/);
+      // Trusted storage probes retain root real/saved identities and must not be suspended or killed with workers.
+      if (identities?.[0] === "0" && identities[2] === "0") continue;
+      if (identities?.some((value) => Number(value) === uid))
         result.push({
           pid: Number(name),
           state: status.match(/^State:\s+(\S)/m)?.[1] ?? "?",

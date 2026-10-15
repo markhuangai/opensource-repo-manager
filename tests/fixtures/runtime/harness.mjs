@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { randomBytes } from "node:crypto";
+import { lstatSync } from "node:fs";
 import { createServer } from "node:http";
 import {
   chmod,
@@ -134,7 +135,9 @@ export async function runRuntimeTests() {
     publicReads = 0,
     requireAuth = true,
     holdSource = false,
-    heldSource = false;
+    heldSource = false,
+    captureObjects = false,
+    sourceObjectInode;
   const sourceServer = createServer((req, res) => {
     const expected = `Basic ${Buffer.from(`x-access-token:${loaded.secrets.get("github.token")}`).toString("base64")}`;
     if (requireAuth && req.headers.authorization !== expected) {
@@ -147,6 +150,15 @@ export async function runRuntimeTests() {
     if (holdSource) {
       heldSource = true;
       return;
+    }
+    if (captureObjects) {
+      const run = store.runs().find((run) => run.finished_at === null);
+      sourceObjectInode = String(
+        lstatSync(
+          join(root, "private", "sources", run.id, "source.git", "objects"),
+          { bigint: true },
+        ).ino,
+      );
     }
     const url = new URL(req.url, "http://fixture");
     const child = spawn("/usr/lib/git-core/git-http-backend", [], {
@@ -373,6 +385,33 @@ export async function runRuntimeTests() {
         bootstrap.kill("SIGKILL");
       await bootstrapExited;
     }
+    const probe = spawn(
+      process.execPath,
+      [
+        "-e",
+        'process.setgroups([]);process.setegid(10001);process.seteuid(10001);console.log("ready");setInterval(()=>{},1000)',
+      ],
+      { env: { PATH: "/usr/bin:/bin" }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const probeExited = once(probe, "exit");
+    probe.stderr.resume();
+    try {
+      await Promise.race([
+        once(probe.stdout, "data", { signal: AbortSignal.timeout(2000) }),
+        probeExited.then(() => {
+          throw new Error("trusted probe exited");
+        }),
+      ]);
+      assert.match(
+        await readFile(`/proc/${probe.pid}/status`, "utf8"),
+        /^Uid:\s+0\s+10001\s+0\s+10001$/m,
+      );
+      assert.deepEqual(await userProcesses(10001), []);
+    } finally {
+      if (probe.exitCode === null && probe.signalCode === null)
+        probe.kill("SIGKILL");
+      await probeExited;
+    }
     tests++;
     const fixture = seed();
     const firstRun = await run(fixture, inspect);
@@ -426,6 +465,50 @@ export async function runRuntimeTests() {
     );
     assert.equal(reviewed.outcome, "completed");
     assert.equal(reviewed.result.uid, 10003);
+    tests++;
+
+    const historyBlob = object("blob", randomBytes(320 * 1024)),
+      historyTree = object(
+        "tree",
+        Buffer.concat([
+          Buffer.from("100644 history.bin\0"),
+          Buffer.from(historyBlob, "hex"),
+        ]),
+      ),
+      historyCommit = object(
+        "commit",
+        `tree ${historyTree}\nparent ${sha}\nauthor ${author}\ncommitter ${author}\n\nlarge history\n`,
+      ),
+      compactCommit = object(
+        "commit",
+        `tree ${tree}\nparent ${historyCommit}\nauthor ${author}\ncommitter ${author}\n\nsmall checkout\n`,
+      );
+    git([
+      "--git-dir",
+      sourceGit,
+      "update-ref",
+      "refs/heads/storage",
+      compactCommit,
+    ]);
+    captureObjects = true;
+    try {
+      const result = await run(
+        seed({
+          limits: { worker_storage_bytes: 512 * 1024 },
+          source: {
+            sha: compactCommit,
+            tree_sha: tree,
+            default_branch: "main",
+          },
+        }),
+        { mode: "object-storage" },
+      );
+      assert.equal(result.outcome, "completed");
+      assert.equal(result.result.history, 4);
+      assert.equal(result.result.inode, sourceObjectInode);
+    } finally {
+      captureObjects = false;
+    }
     tests++;
 
     requireAuth = false;
@@ -499,6 +582,7 @@ export async function runRuntimeTests() {
       ["overflow", { worker_output_bytes: 1024 }],
       ["storage", { worker_storage_bytes: 512 * 1024 }],
       ["shared-temp", { worker_storage_bytes: 512 * 1024 }],
+      ["unlinked-storage", { worker_storage_bytes: 512 * 1024 }],
     ]) {
       const result = await run(seed({ limits }), { mode });
       assert.equal(
@@ -509,6 +593,35 @@ export async function runRuntimeTests() {
       assert.equal(result.artifact, undefined);
       assert.equal((await userProcesses(10001)).length, 0);
     }
+    assert.equal(
+      (
+        await run(seed({ limits: { worker_storage_bytes: 512 * 1024 } }), {
+          mode: "unlinked-small",
+        })
+      ).outcome,
+      "completed",
+    );
+    tests++;
+    const mapped = await collect(
+      supervisor.run(
+        supervisor.request(
+          seed({ limits: { worker_storage_bytes: 512 * 1024 } }).job.id,
+          "implementation",
+          { mode: "mapped-deleted" },
+        ),
+        new globalThis.AbortController().signal,
+      ),
+    );
+    assert(
+      mapped.some(
+        (event) =>
+          event.type === "progress" && event.message === "mapped-ready",
+      ),
+    );
+    assert.equal(terminal(mapped).outcome, "failed");
+    assert.equal((await userProcesses(10001)).length, 0);
+    assert.equal(store.leases().length, 0);
+    tests++;
     assert.equal(
       (
         await run(seed({ limits: { worker_storage_bytes: 1 } }), {

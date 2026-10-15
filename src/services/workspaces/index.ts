@@ -4,7 +4,6 @@ import { constants, createWriteStream } from "node:fs";
 import {
   chmod,
   chown,
-  cp,
   lchown,
   mkdir,
   open,
@@ -204,9 +203,10 @@ export class WorkspaceService {
     await mkdir(stage, { mode: 0o700 });
     const controller = new AbortController(),
       combined = AbortSignal.any([signal, controller.signal]);
-    let watching: Promise<void> | undefined;
+    let watching: Promise<void> | undefined,
+      moving = false;
     const timer = setInterval(() => {
-      if (!watching)
+      if (!watching && !moving)
         watching = (async () => {
           const staged = await treeBytes(stage, limits.storage);
           await treeBytes(root, limits.storage - staged);
@@ -290,9 +290,19 @@ export class WorkspaceService {
         env: publicEnv,
         signal: combined,
       });
-      await cp(join(sourceGit, "objects"), join(workspace, ".git", "objects"), {
-        recursive: true,
-      });
+      moving = true;
+      try {
+        await watching;
+        combined.throwIfAborted();
+        await rm(join(workspace, ".git", "objects"), { recursive: true });
+        await rename(
+          join(sourceGit, "objects"),
+          join(workspace, ".git", "objects"),
+        );
+      } finally {
+        moving = false;
+      }
+      combined.throwIfAborted();
       await writeFile(
         join(workspace, ".git", "config"),
         "[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\nhooksPath = /dev/null\nautocrlf = false\n[credential]\nhelper =\n",

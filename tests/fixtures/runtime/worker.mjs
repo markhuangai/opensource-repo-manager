@@ -3,8 +3,11 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   access,
   appendFile,
+  lstat,
+  open,
   readFile,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -28,6 +31,84 @@ function detached() {
 
 export async function* run(request, signal) {
   const input = request.input ?? {};
+  if (input.mode === "object-storage") {
+    const history = spawnSync("/usr/bin/git", ["rev-list", "--count", "HEAD"], {
+      encoding: "utf8",
+    });
+    assert.equal(history.status, 0);
+    yield {
+      type: "terminal",
+      outcome: "completed",
+      result: {
+        history: Number(history.stdout.trim()),
+        inode: String(
+          (
+            await lstat(join(request.workspace, ".git", "objects"), {
+              bigint: true,
+            })
+          ).ino,
+        ),
+      },
+    };
+    return;
+  }
+  if (["unlinked-storage", "unlinked-small"].includes(input.mode)) {
+    const path = join(request.temporary, "deleted"),
+      file = await open(path, "w+");
+    let duplicate;
+    try {
+      await unlink(path);
+      await file.write(
+        Buffer.alloc(
+          input.mode === "unlinked-small" ? 300 * 1024 : 2 * 1024 * 1024,
+        ),
+      );
+      duplicate = await open(`/proc/self/fd/${file.fd}`, "r");
+      yield { type: "progress", message: "deleted-ready" };
+      await delay(input.mode === "unlinked-small" ? 1800 : 5000, undefined, {
+        signal,
+      });
+      yield { type: "terminal", outcome: "completed" };
+    } finally {
+      await duplicate?.close();
+      await file.close();
+    }
+    return;
+  }
+  if (input.mode === "mapped-deleted") {
+    const source = join(request.temporary, "mapped.c"),
+      binary = join(request.temporary, "mapped");
+    await writeFile(
+      source,
+      '#include <sys/mman.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <string.h>\nint main(int c,char **v){int f=open(v[1],O_CREAT|O_RDWR,0600);if(f<0||ftruncate(f,1048576))return 1;void *m=mmap(0,1048576,PROT_READ|PROT_WRITE,MAP_SHARED,f,0);if(m==MAP_FAILED||unlink(v[1])||close(f))return 2;memset(m,1,1048576);puts("ready");fflush(stdout);pause();}',
+    );
+    const compiled = spawnSync("/usr/bin/cc", [source, "-o", binary], {
+      timeout: 5000,
+    });
+    assert.equal(compiled.status, 0);
+    const child = spawn(binary, [join(request.temporary, "mapped-data")], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const { once } = await import("node:events"),
+      exited = once(child, "exit");
+    child.stderr.resume();
+    try {
+      await Promise.race([
+        once(child.stdout, "data"),
+        exited.then(() => {
+          throw new Error("mapped fixture exited");
+        }),
+      ]);
+      yield { type: "progress", message: "mapped-ready" };
+      await delay(5000, undefined, { signal });
+      yield { type: "terminal", outcome: "completed" };
+    } finally {
+      if (child.exitCode === null && child.signalCode === null)
+        child.kill("SIGKILL");
+      await exited;
+    }
+    return;
+  }
   if (input.mode === "inspect") {
     const status = await readFile("/proc/self/status", "utf8");
     const identity = JSON.parse(
