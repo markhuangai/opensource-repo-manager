@@ -207,7 +207,10 @@ export class WorkspaceService {
     let watching: Promise<void> | undefined;
     const timer = setInterval(() => {
       if (!watching)
-        watching = treeBytes(stage, limits.storage)
+        watching = (async () => {
+          await treeBytes(stage, limits.storage);
+          await treeBytes(root, limits.storage);
+        })()
           .then(
             () => {},
             (error) =>

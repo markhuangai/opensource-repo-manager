@@ -1,4 +1,4 @@
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -74,10 +74,9 @@ export class ModelRelay {
   authorize(options: Omit<Grant, "controller">) {
     if (!this.url) throw new RuntimeError("relay_unavailable");
     const authorization = randomBytes(32).toString("base64url"),
-      key = this.key(authorization),
       controller = new AbortController();
-    this.grants.set(key, { ...options, controller });
-    const revoke = () => this.revoke(key);
+    this.grants.set(authorization, { ...options, controller });
+    const revoke = () => this.revoke(authorization);
     options.signal.addEventListener("abort", revoke, { once: true });
     controller.signal.addEventListener(
       "abort",
@@ -87,9 +86,6 @@ export class ModelRelay {
     return { url: this.url, authorization, revoke };
   }
 
-  private key(token: string) {
-    return createHash("sha256").update(token).digest("hex");
-  }
   private revoke(key: string) {
     const grant = this.grants.get(key);
     if (grant) {
@@ -113,7 +109,7 @@ export class ModelRelay {
       const token = authorization.startsWith("Bearer ")
         ? authorization.slice(7)
         : "";
-      const grant = this.grants.get(this.key(token));
+      const grant = this.grants.get(token);
       if (
         !grant ||
         grant.signal.aborted ||

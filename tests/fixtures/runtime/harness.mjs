@@ -329,6 +329,7 @@ export async function runRuntimeTests() {
       ),
     );
   let tests = 0;
+  const errors = [];
   try {
     const fixture = seed();
     const firstRun = await run(fixture, inspect);
@@ -389,6 +390,34 @@ export async function runRuntimeTests() {
     requireAuth = true;
     assert(authenticated > 0);
     assert(publicReads > 0);
+    tests++;
+
+    const preparing = seed({ limits: { worker_storage_bytes: 512 * 1024 } });
+    heldSource = false;
+    holdSource = true;
+    const preparation = collect(
+      supervisor.run(
+        supervisor.request(preparing.job.id, "implementation", {
+          mode: "relay",
+        }),
+        AbortSignal.timeout(5000),
+      ),
+    ).then(terminal);
+    try {
+      await until(() => heldSource);
+      const preparingRun = store.runs().find((run) => run.finished_at === null),
+        workspace = join(root, "runs", preparingRun.id, "workspace");
+      await mkdir(workspace);
+      await writeFile(
+        join(workspace, "expanded-checkout"),
+        Buffer.alloc(2 * 1024 * 1024),
+      );
+      assert.equal((await preparation).outcome, "limited");
+      assert.equal(store.leases().length, 0);
+      assert(!store.runs().some((run) => run.finished_at === null));
+    } finally {
+      holdSource = false;
+    }
     tests++;
     for (const role of ["implementation", "audit", "output_review"]) {
       const result = await run(seed(), { mode: "relay" }, role);
@@ -672,7 +701,8 @@ export async function runRuntimeTests() {
       options,
     );
     assert.equal(store.leases().length, 0);
-    assert.equal((await userProcesses(10003)).length, 0);
+    assert.equal((await userProcesses(10002)).length, 0);
+    assert(!store.runs().some((run) => run.finished_at === null));
     tests++;
 
     const unavailable = seed({ mcp: true }),
@@ -788,6 +818,7 @@ export async function runRuntimeTests() {
       }),
       { mode: 0o600 },
     );
+    heldSource = false;
     holdSource = true;
     const fetchDriver = spawn(
         process.execPath,
@@ -920,22 +951,34 @@ export async function runRuntimeTests() {
     for (const uid of [10001, 10002, 10003])
       assert.equal((await userProcesses(uid)).length, 0);
     assert.deepEqual(await readdir(join(root, "runs")), []);
-    console.log(
-      JSON.stringify({
-        runtime: "passed",
-        scenario_groups: tests,
-        credentials: "isolated",
-        history: "full",
-        nested_review: "one_lease",
-        crash_recovery: "passed",
-        cleanup: "passed",
-      }),
-    );
+  } catch (error) {
+    errors.push(error);
   } finally {
-    await supervisor.close();
-    store.close();
-    await close(sourceServer);
-    await close(modelServer);
-    await close(mcpServer);
+    for (const cleanup of [
+      () => supervisor.close(),
+      () => store.close(),
+      () => close(sourceServer),
+      () => close(modelServer),
+      () => close(mcpServer),
+    ]) {
+      try {
+        await cleanup();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
   }
+  if (errors.length)
+    throw new AggregateError(errors, "Runtime verification or cleanup failed");
+  console.log(
+    JSON.stringify({
+      runtime: "passed",
+      scenario_groups: tests,
+      credentials: "isolated",
+      history: "full",
+      nested_review: "one_lease",
+      crash_recovery: "passed",
+      cleanup: "passed",
+    }),
+  );
 }
