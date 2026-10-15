@@ -101,6 +101,88 @@ const validate = step(
 ).with.script;
 
 describe("AI review routing and exact-head policy", () => {
+  it("registers edited PR events for CI, CodeQL and the trusted review route", () => {
+    for (const trigger of [
+      ci.on.pull_request,
+      codeql.on.pull_request,
+      review.on.pull_request_target,
+    ]) {
+      expect(trigger.branches).toEqual(["main"]);
+      expect(trigger.types).toEqual([
+        "opened",
+        "synchronize",
+        "reopened",
+        "ready_for_review",
+        "edited",
+      ]);
+    }
+    expect(ci.jobs.checks.if).toBeUndefined();
+    expect(ci.jobs.containers.if).toBeUndefined();
+    expect(codeql.jobs.analyze.if).toBeUndefined();
+  });
+
+  for (const changes of [
+    { base: { ref: { from: "other" }, sha: { from: "b".repeat(40) } } },
+    { title: { from: "Previous title" } },
+    { body: { from: "Previous description" } },
+  ])
+    it("reviews an unchanged trusted head on retarget, title or body edit", async () => {
+      const result = await run(resolve, {
+        context: {
+          payload: { action: "edited", changes, pull_request: pull() },
+        },
+      });
+      expect(result.outputs.should_run).toBe("true");
+      expect(result.outputs.head_sha).toBe(sha);
+    });
+
+  for (const event of [
+    pull({ user: { login: "contributor" } }),
+    pull({ head: { sha, ref: "feature", repo: { id: 2 } } }),
+  ])
+    it("keeps edited other-author and fork PRs on the CodeQL route", async () => {
+      const direct = await run(resolve, {
+        context: {
+          payload: {
+            action: "edited",
+            changes: { base: { ref: { from: "other" } } },
+            pull_request: event,
+          },
+        },
+      });
+      expect(direct.outputs.should_run).toBe("false");
+      const completion = await run(resolve, {
+        current: event,
+        context: {
+          eventName: "workflow_run",
+          payload: {
+            workflow_run: completedRun({ head_repository: event.head.repo }),
+          },
+        },
+      });
+      expect(completion.outputs.should_run).toBe("true");
+      expect(completion.outputs.head_sha).toBe(sha);
+    });
+
+  it("preserves duplicate suppression and head fences on edited events", async () => {
+    const context = { payload: { action: "edited", pull_request: pull() } };
+    const duplicate = await run(resolve, {
+      context,
+      statuses: [{ id: 1, context: "AI PR review / PR #17", state: "success" }],
+    });
+    expect(duplicate.outputs.should_run).toBe("false");
+    for (const current of [
+      pull({ draft: true }),
+      pull({ state: "closed" }),
+      pull({ base: { ref: "other", repo: { id: 1 } } }),
+      pull({ head: { sha: "b".repeat(40), ref: "feature", repo: { id: 1 } } }),
+    ]) {
+      expect(
+        (await run(resolve, { context, current })).outputs.should_run,
+      ).toBe("false");
+    }
+  });
+
   it("resolves a trusted maintainer's same-repository head", async () => {
     const result = await run(resolve);
     expect(result.outputs).toEqual({
@@ -371,11 +453,18 @@ describe("release and CI boundaries", () => {
     ]);
   });
 
-  it("pins action code and never persists checkout credentials", () => {
+  it("uses the reviewer release alias, pins other actions and protects checkout credentials", () => {
+    expect(step(review.jobs.review, "Review pull request").uses).toBe(
+      "markhuangai/ai-pr-reviewer@v1-prerelease",
+    );
     for (const document of [ci, codeql, review, release]) {
       for (const job of Object.values(document.jobs)) {
         for (const entry of job.steps) {
-          if (entry.uses) expect(entry.uses).toMatch(/@[0-9a-f]{40}$/);
+          if (
+            entry.uses &&
+            entry.uses !== "markhuangai/ai-pr-reviewer@v1-prerelease"
+          )
+            expect(entry.uses).toMatch(/@[0-9a-f]{40}$/);
           if (entry.uses?.startsWith("actions/checkout@"))
             expect(entry.with["persist-credentials"]).toBe(false);
         }

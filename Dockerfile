@@ -21,6 +21,8 @@ WORKDIR /opt/orm/app
 COPY --from=build /build/package.json ./
 COPY --from=build /build/node_modules ./node_modules
 COPY --from=build /build/dist ./dist
+RUN chmod 0555 /opt/orm/app/dist/main.js \
+    && ln -s /opt/orm/app/dist/main.js /usr/local/bin/orm
 EXPOSE 8080
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \

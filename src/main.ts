@@ -1,38 +1,41 @@
-import { createApp } from "./http/app.ts";
+#!/opt/orm-runtime/bin/node
+import { parseArgs } from "node:util";
+import { ConfigurationError } from "./config/errors.ts";
+import { loadProtectedConfiguration } from "./config/load.ts";
+import { startHttpService } from "./http/server.ts";
+import {
+  createKnownSecretChecker,
+  createSafeLogger,
+} from "./logging/redact.ts";
 
-const app = createApp();
-let stopping = false;
-
-async function shutdown() {
-  if (stopping) return;
-  stopping = true;
-
-  const deadline = setTimeout(() => {
-    console.error("Shutdown exceeded its 10-second deadline.");
-    process.exit(1);
-  }, 10_000);
-  deadline.unref();
-
-  try {
-    await app.close();
-  } catch {
-    console.error("HTTP shutdown failed.");
-    process.exitCode = 1;
-  } finally {
-    clearTimeout(deadline);
-  }
-}
-
-process.once("SIGINT", () => void shutdown());
-process.once("SIGTERM", () => void shutdown());
-
+let logger = createSafeLogger(createKnownSecretChecker([]));
 try {
-  await app.listen({ host: "0.0.0.0", port: 8080 });
-  console.log(
-    "HTTP listening on port 8080; maintenance automation is unavailable.",
+  let args: ReturnType<typeof parseArgs>;
+  try {
+    args = parseArgs({
+      options: { config: { type: "string", default: "/config/config.yml" } },
+      allowPositionals: true,
+      strict: true,
+    });
+  } catch {
+    throw new ConfigurationError("arguments_invalid");
+  }
+  const command = args.positionals.join(" ");
+  if (
+    !["", "serve", "config validate"].includes(command) ||
+    typeof args.values.config !== "string"
+  )
+    throw new ConfigurationError("arguments_invalid");
+  const loaded = await loadProtectedConfiguration(args.values.config);
+  logger = createSafeLogger(loaded.secrets);
+  if (command === "config validate")
+    logger.info("Configuration and workflow bundles are valid.");
+  else await startHttpService(logger);
+} catch (error) {
+  logger.error(
+    error instanceof ConfigurationError
+      ? error.message
+      : "Configuration loading failed.",
   );
-} catch {
-  console.error("HTTP startup failed.");
   process.exitCode = 1;
-  await app.close();
 }

@@ -2,7 +2,7 @@
 
 A self-hosted GitHub maintenance service for repositories whose maintainers cannot watch every issue. The planned service investigates issues, prepares tested maintenance fixes, follows pull request feedback, and notifies the maintainer when a change is ready for human review.
 
-**Status: service scaffold implemented; maintenance automation planned.** The repository now contains a TypeScript health service, Docker/Compose deployment, checks, and GitHub workflows. The approved implementation program contains 14 issues. Issue investigation, fixes, agents, persistence, and application MCP integration remain planned. No GHCR image has been published by this change.
+**Status: service scaffold and protected configuration implemented; maintenance automation planned.** The repository contains a TypeScript health service, protected YAML loading, immutable workflow snapshots, Docker/Compose deployment, checks, and GitHub workflows. Issue investigation, fixes, agents, persistence, and application MCP transport remain planned. No GHCR image has been published by this change.
 
 ## Run the scaffold
 
@@ -11,21 +11,88 @@ Use Node 24.18.0 and npm 12.0.2:
 ```sh
 npm ci
 npm run check
-npm start
 ```
 
-`npm run dev` runs the source with Node's watch mode. The service listens on port 8080. `GET /healthz` returns HTTP 200 with `{"status":"ok"}`. `GET /readyz` returns HTTP 503 with `{"status":"not_ready","reason":"automation_not_implemented"}`. Docker uses liveness for its healthcheck; a healthy container does not mean maintenance automation is ready.
+`npm run dev` runs the source with Node's watch mode; `npm start` runs the production build. Both require valid protected configuration and bundles before opening HTTP. The default paths are `/config/config.yml`, `/prompts`, and `/skills`; use the container setup below to provide them. The service listens on port 8080. `GET /healthz` returns HTTP 200 with `{"status":"ok"}`. `GET /readyz` returns HTTP 503 with `{"status":"not_ready","reason":"automation_not_implemented"}`. Docker uses liveness for its healthcheck; a healthy container does not mean maintenance automation is ready.
 
-For Compose, create operator-owned mounts and an empty protected configuration file:
+For Compose, install the sample bundles and protected configuration, then replace the placeholder repository, credentials, proxy endpoint, model IDs, and notification settings:
 
 ```sh
 mkdir -p operator/skills operator/prompts
+cp -R examples/workflow/skills/. operator/skills/
+cp -R examples/workflow/prompts/. operator/prompts/
 sudo install -d -o root -g root -m 0700 operator/config
-sudo install -o root -g root -m 0600 /dev/null operator/config/config.yml
+sudo install -o root -g root -m 0600 config.example.yml operator/config/config.yml
+sudoedit operator/config/config.yml
+docker compose run --build --rm manager config validate
 docker compose up --build
 ```
 
-Compose exposes port 8080 on localhost, persists `/data`, and mounts configuration, skills, and prompts read-only. The scaffold does not yet load those files. Protected YAML loading belongs to #2. The container's root supervisor runs the health service; worker execution belongs to later issues. Its fixed `/opt/orm-runtime/bin/node` executable stays separate from future repository toolchains. The image includes Git, certificates, C build tools, process supervision, and distinct `coding`, `audit`, and `output-review` users.
+Compose exposes port 8080 on localhost, persists `/data`, and mounts configuration, skills, and prompts read-only. The root supervisor validates and snapshots those files before starting the health service. Worker execution belongs to later issues. Its fixed `/opt/orm-runtime/bin/node` executable also runs the container's `orm` command and stays separate from future repository toolchains. The image includes Git, certificates, C build tools, process supervision, and distinct `coding`, `audit`, and `output-review` users.
+
+## Protected configuration and workflow bundles
+
+`config.example.yml` is the version 1 contract. Unknown fields and unsupported versions fail; there is no environment-variable interpolation, credential fallback, include processing, or automatic migration. Use a fine-grained GitHub PAT for the single `owner/repository`, a webhook secret, and a mandatory CPA-compatible HTTP(S) URL/key. Validation is offline: GitHub access, model availability, notification delivery, and MCP connections are not probed or implemented here.
+
+The configuration must be a root-owned regular file with owner-read permission and no group/other permissions. Its immediate directory must be root-owned without group/other write permission. Symlinks are rejected, including parent components. Keep the deployment mount read-only; `0400` or `0600` files in a `0700` directory are recommended. Worker users cannot read the configuration. An empty file or the old `{}` scaffold fixture is no longer valid.
+
+Inside the container, `orm config validate [--config PATH]` validates both configuration and selected bundles and exits without opening HTTP. `serve` is the default command. From source, `npm run config:validate -- --config PATH` uses the same checks and requires the same protected file and fixed bundle mounts. Success is exit 0; rejection is exit 1. Diagnostics report fixed codes and safe section/line locations, excluding source lines, arbitrary input names, credentials, and filesystem paths.
+
+Each named profile requires `sdk`, `model`, and `effort`. Every phase selects a profile independently: `bootstrap`, `investigation`, `implementation`, `audit`, and `output_review`. Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`; Codex accepts `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, and `persistent`. These are SDK-level values; a model may support a subset. The future adapters must validate model compatibility without silently changing the selected model or effort. See the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) and [Claude effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort).
+
+`roles.<role>.prompts.system` and `.user` name UTF-8 files relative to `/prompts`. `roles.<role>.skills` lists directories relative to `/skills`, each with a `SKILL.md`. The loader copies all regular files below each selected skill directory, including contained reference files and binary assets. It never follows Markdown links or executes a bundle file while loading. Absolute paths, `..`, symlinks, missing files, writable-by-group/other bundle content, and known credentials in content or metadata are rejected. Files are limited to 1 MiB each, with a 16 MiB aggregate loading limit across roles; configuration YAML is limited to 1 MiB and bounded alias expansion.
+
+The loader exposes a deeply frozen, JSON-safe `RunSnapshot` with a digest, role profiles, prompt text, and skill bytes encoded as base64 with per-file digests. `snapshot.settings` is supervisor metadata and includes non-secret upstream configuration; pass only `snapshot.roles[role]` to a future worker. Role projections exclude upstream endpoints, credentials, notification destinations, and authentication headers. The separate root-only `SecretAccessor` supplies credentials and known-secret checks; it is not part of the snapshot. Known-secret checks detect configured values, not arbitrary unknown secrets.
+
+Configuration and bundle content load once at startup. Restart to load edits; previously captured snapshots remain self-contained and unchanged. Persistence of snapshots and operational pause state belongs to #3; configuration does not own or reset pause state. Sample skills are authoring examples, not implemented maintenance workflows.
+
+At least one notification channel must be enabled in every valid configuration. Supported shapes under `notifications` are `discord: { enabled: true, webhook_url }`, `smtp: { enabled: true, host, port, secure, username, password, from, to }`, and `webhook: { enabled: true, url, headers }`. Disabled channels contain only `enabled: false`. Notification connections and delivery remain planned.
+
+`limits` uses `active_slots: 1`, `active_minutes: 60`, `model_requests: 200`, `repair_cycles: 3`, `infrastructure_retries: 2`, `wait_hours: 24`, and `reconciliation_minutes: 5` by default. The slot count is fixed at one; other budgets are configurable positive integers, with zero permitted for repairs/retries. These are validated settings for future controllers; this scaffold does not execute jobs, impose a daily issue quota, or retry exhausted jobs.
+
+### Optional HTTP MCP configuration
+
+Omitting `mcp`, or leaving its registries empty, preserves the GitHub-only contract. The schema supports fixed Streamable HTTP endpoints with optional protected static headers. Proxy and MCP endpoint URLs cannot contain query strings; keep authentication in the protected key/header fields. HTTPS is required unless a server explicitly sets `allow_plain_http: true`. Credentials in URL userinfo, stdio commands, OAuth settings, unsupported effects, and inferred annotation-based authority are rejected. Header values cannot contain CR/LF or NUL.
+
+Replace the example's `mcp` block with a server registry such as:
+
+```yaml
+mcp:
+  credentials:
+    service:
+      headers:
+        Authorization: Bearer REPLACE_MCP_SERVICE_TOKEN
+  servers:
+    project_context:
+      transport: streamable_http
+      url: https://tools.example.invalid/mcp
+      credential_ref: service
+      tools:
+        read_record:
+          effect: read
+        store_record:
+          effect: reviewed_write
+          idempotency_argument: operation_key
+```
+
+Add `mcp: { project_context: { tools: [read_record, store_record] } }` to an existing role definition to grant those exact tools. An omitted grant denies access; wildcard and unknown names fail. Mixed read/write tools must declare `reviewed_write`. The optional idempotency argument names a top-level string argument whose replay contract the operator has verified; declaring it is not proof that the server actually supports safe retries. `output_review` cannot receive any MCP tool grant.
+
+For Dense-Mem, the same registry can use these declarations with a project-scoped credential and endpoint:
+
+```yaml
+tools:
+  recall_memory:
+    effect: read
+  trace_memory:
+    effect: read
+  remember:
+    effect: reviewed_write
+    idempotency_argument: idempotency_key
+```
+
+Grant only the required exact names to each phase. Runtime behavior does not depend on these example names. Server aliases, grants, effects, and non-secret credential references are captured in supervisor snapshots; protected header values remain separate.
+
+The `mcp` defaults are `initialization_timeout_seconds: 30`, `call_timeout_seconds: 300`, and `max_request_bytes`, `max_response_bytes`, and `max_catalog_bytes` each set to `1048576`. Timeouts must be positive integers; sizes can be lowered but cannot exceed 1 MiB. The future gateway must initialize assigned capabilities before a phase starts, block unavailable capabilities, include write review within the call deadline, and cap it by the remaining job budget. Running-job grants cannot expand through reconfiguration.
 
 ## Development and validation
 
@@ -37,9 +104,9 @@ If the Docker CLI runs in a development container whose `/tmp` differs from the 
 
 ## AI pull request review
 
-After this workflow is merged, trusted maintainer PRs start review through `pull_request_target`; other-author and fork PRs use successful PR CodeQL completion. A manual dispatch accepts an open PR number. The initial PR adding the workflow has an approved activation exception and receives no review from this new workflow. Ordinary CI remains automatic, with no review-first request controller.
+Trusted maintainer PRs start review through `pull_request_target`; other-author and fork PRs use successful PR CodeQL completion. CI, CodeQL, and the direct review route subscribe to `opened`, `synchronize`, `reopened`, `ready_for_review`, and `edited`. Retargeting an unchanged PR to `main` registers validation; title/body edits also rerun CI. Existing current-head review statuses suppress duplicate reviews. Trigger changes in the trusted review workflow take effect after human merge. A manual dispatch accepts an open PR number. The initial workflow bootstrap had a one-time activation exception; later PRs require their own successful review status. Ordinary CI remains automatic, with no review-first request controller.
 
-The pinned AI reviewer uses Claude, model `auto`, effort `xhigh`, six isolated goals, 200 turns per goal, a 50-minute review limit, and no automatic approval. Its goals cover design, security, reliability, public contracts, scope/operations, and test assurance. It first reinspects claimed fixes, then independently sweeps the full change. It runs separately from builds with a pristine checkout and read-only tools. Per-PR concurrency, duplicate suppression, and exact-head status fencing prevent stale success. Incomplete reviews publish a blocking error status; a successful workflow job alone does not prove review completion.
+The AI reviewer follows `v1-prerelease` and uses Claude, model `auto`, effort `xhigh`, six isolated goals, 200 turns per goal, a 50-minute review limit, and no automatic approval. Its goals cover design, security, reliability, public contracts, scope/operations, and test assurance. It first reinspects claimed fixes, then independently sweeps the full change. It runs separately from builds with a pristine checkout and read-only tools. Per-PR concurrency, duplicate suppression, and exact-head status fencing prevent stale success. Incomplete reviews publish a blocking error status; a successful workflow job alone does not prove review completion.
 
 The workflow uses inherited `AI_ENDPOINT`, `LOCAL_AI_SECRET`, and `PR_REVIEW_PAT`, plus `PROJECT_MEMORY_MCP_ENDPOINT` and this repository's `PROJECT_MEMORY_MCP_TOKEN`. Before live activation, supply the missing project token through GitHub Secrets and verify the PAT covers this repository. Interactive review needs Contents and Pull requests read/write, Commit statuses write, and Issues read for linked-issue context. Use a project-scoped read-only memory credential; only `recall_memory` is granted. Do not reuse another project's token. Missing configuration fails visibly. Secrets and repository settings are managed by the maintainer, not this delivery.
 
@@ -79,7 +146,7 @@ Dense-Mem will be a configuration example and integration fixture. The same runt
 
 ## Configuration and security boundaries
 
-The planned root supervisor reads `/config/config.yml` from a read-only, root-owned mount without group or other access. The YAML may contain the GitHub token, webhook secret, model-proxy credentials, and notification credentials. `/skills` and `/prompts` are read-only operator mounts; `/data` holds persistent state.
+The root supervisor reads `/config/config.yml` from a read-only, root-owned mount without group or other access. The YAML contains protected GitHub, webhook, model-proxy, notification, and optional MCP credentials. `/skills` and `/prompts` are read-only operator mounts; `/data` is reserved for persistent state. Worker execution and model/MCP relays remain planned.
 
 Separate coding, audit, and output-review users receive clean environments and credential-free workspaces. A supervisor-owned model relay injects upstream credentials outside SDK processes, and only the supervisor publishes to GitHub. Issue text, comments, repository instructions, command output, and agent results remain untrusted inputs.
 
