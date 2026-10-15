@@ -39,8 +39,10 @@ export function fixtureMcp() {
   return config;
 }
 
-export async function fixtureSnapshot(model = "fixture-model") {
-  const config = fixtureConfiguration();
+export async function fixtureSnapshot(
+  model = "fixture-model",
+  config = fixtureConfiguration(),
+) {
   config.github.repository = "owner/repo";
   config.github.token = "github-fixture-token";
   config.profiles.coding.model = model;
@@ -62,13 +64,20 @@ export async function fixtureGitHub() {
     method: string | undefined;
     url: string | undefined;
     authorization: string | undefined;
+    ifNoneMatch: string | undefined;
+    status?: number;
   }> = [];
   let beforeRequest: ((url: string) => Promise<void>) | undefined;
   const server = createServer(async (request, response) => {
-    requests.push({
+    const captured: (typeof requests)[number] = {
       method: request.method,
       url: request.url,
       authorization: request.headers.authorization,
+      ifNoneMatch: request.headers["if-none-match"],
+    };
+    requests.push(captured);
+    response.on("finish", () => {
+      captured.status = response.statusCode;
     });
     await beforeRequest?.(request.url!);
     await githubFixtureRequest(request, response, state);

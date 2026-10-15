@@ -6,7 +6,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Store } from "../src/repositories/store.ts";
 import { IntakeService } from "../src/services/intake.ts";
 import { createApp } from "../src/http/app.ts";
-import { fixtureGitHub, fixtureSnapshot } from "./fixtures.ts";
+import {
+  fixtureConfiguration,
+  fixtureGitHub,
+  fixtureSnapshot,
+} from "./fixtures.ts";
 import { makeIssue } from "./fixtures/github.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -90,6 +94,125 @@ const issueEvent = (number = 1) => ({
 });
 
 describe("durable GitHub intake", () => {
+  it("revalidates an unchanged backlog and still observes changed comments", async () => {
+    const { github, store, service } = await setup(false);
+    for (let number = 2; number <= 141; number++)
+      github.state.issues[number] = makeIssue(number);
+    await service.reconcile();
+    const firstScan = github.requests.length;
+    await service.reconcile();
+    const repeated = github.requests.slice(firstScan);
+    expect(repeated.length).toBeGreaterThan(0);
+    expect(
+      repeated.every(
+        (request) =>
+          request.status === 304 && typeof request.ifNoneMatch === "string",
+      ),
+    ).toBe(true);
+    expect(store.jobs()).toHaveLength(141);
+    const revision = store.job(1)!.revision;
+    github.state.comments[1] = [
+      {
+        id: 9009,
+        body: "Fresh human comment",
+        updated_at: "2026-10-15T03:00:00Z",
+        user: { id: 7, login: "maintainer" },
+      },
+    ];
+    await service.reconcile();
+    expect(store.job(1)!.revision).toBe(revision + 1);
+    expect(store.job(1)!.input_json).toContain("Fresh human comment");
+  }, 20_000);
+  it("accepts SMTP usernames matching GitHub metadata while blocking authenticating secrets", async () => {
+    const config = fixtureConfiguration();
+    config.notifications.smtp = {
+      enabled: true,
+      host: "smtp.example.invalid",
+      port: 465,
+      secure: true,
+      username: "open",
+      password: "smtp-password-canary",
+      from: "orm@example.invalid",
+      to: ["maintainer@example.invalid"],
+    };
+    const loaded = await fixtureSnapshot("fixture-model", config);
+    const { github, store, services, logger } = await setup(false);
+    const service = new IntakeService(
+      store,
+      github.reader,
+      loaded.snapshot,
+      loaded.secrets,
+      logger,
+    );
+    services.push(service);
+    await service.reconcile();
+    expect(store.job(1)?.status).toBe("pending");
+    expect(loaded.secrets.redact("open")).toBe("[redacted]");
+    github.state.issues[2] = makeIssue(2);
+    github.state.issues[2].body = loaded.secrets.get("github.token");
+    await service.reconcile();
+    expect(store.job(2)).toBeUndefined();
+    expect(service.status()).toMatchObject({
+      reason: "secret_in_input",
+      failed: 1,
+    });
+    github.state.repository.default_branch = loaded.secrets.get("github.token");
+    await service.reconcile();
+    expect(store.job(1)!.input_json).not.toContain(
+      loaded.secrets.get("github.token"),
+    );
+    expect(service.status().failed).toBe(2);
+  });
+  it.each([
+    ["gone", "github_not_found"],
+    ["unavailable", "github_read_failed"],
+    ["invalid", "github_response_invalid"],
+    ["identity", "issue_identity_changed"],
+  ])(
+    "isolates %s input failures from other queued issues",
+    async (mode, code) => {
+      const { github, store, service } = await setup(false);
+      github.state.issues[2] = makeIssue(2);
+      if (mode === "gone" || mode === "unavailable")
+        github.state.failures["/repos/owner/repo/issues/1"] = {
+          status: mode === "gone" ? 410 : 500,
+        };
+      github.beforeRequest(async (url) => {
+        if (url !== "/repos/owner/repo/issues/1") return;
+        if (mode === "invalid")
+          Reflect.deleteProperty(github.state.issues[1], "title");
+        if (mode === "identity") github.state.issues[1].number = 99;
+      });
+      await service.reconcile();
+      expect(store.job(2)?.status).toBe("pending");
+      expect(service.status()).toMatchObject({
+        state: "degraded",
+        reason: code,
+        failed: 1,
+      });
+    },
+  );
+  it.each(["authentication", "storage"])(
+    "keeps %s failures global instead of suppressing them as target deferrals",
+    async (mode) => {
+      const { github, store, service } = await setup(false);
+      github.state.issues[2] = makeIssue(2);
+      if (mode === "authentication")
+        github.state.failures["/repos/owner/repo/issues/1"] = { status: 401 };
+      else
+        store.db.exec(
+          "CREATE TRIGGER fail_jobs BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT,'storage-failure-canary'); END",
+        );
+      await service.reconcile();
+      expect(store.jobs()).toHaveLength(0);
+      expect(service.status()).toMatchObject({
+        state: "degraded",
+        reason:
+          mode === "authentication" ? "github_authentication" : "intake_failed",
+        failed: 0,
+      });
+    },
+  );
   it("verifies signed raw HTTP requests and rejects invalid or excessive input safely", async () => {
     const { send, store, address } = await setup();
     expect((await send(issueEvent())).status).toBe(202);

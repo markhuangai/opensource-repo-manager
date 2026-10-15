@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 
 export function makeIssue(number: number, state = "open") {
   return {
@@ -61,8 +62,18 @@ export async function githubFixtureRequest(
   const url = new URL(request.url!, "https://api.github.com");
   response.setHeader("content-type", "application/json");
   function send(body: unknown, status = 200) {
+    const bytes = JSON.stringify(body);
+    if (status === 200) {
+      const etag = `"${createHash("sha256").update(bytes).digest("hex")}"`;
+      response.setHeader("etag", etag);
+      if (request.headers["if-none-match"] === etag) {
+        response.statusCode = 304;
+        response.end();
+        return;
+      }
+    }
     response.statusCode = status;
-    response.end(JSON.stringify(body));
+    response.end(bytes);
   }
   if (request.method !== "GET") return send({ message: "Reads only" }, 405);
   if (

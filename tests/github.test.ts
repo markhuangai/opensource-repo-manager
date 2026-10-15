@@ -14,6 +14,33 @@ async function fixture() {
 const signal = () => new AbortController().signal;
 
 describe("Octokit read integration against GitHub HTTP", () => {
+  it("revalidates cached responses by route and page while honoring changes and access errors", async () => {
+    const github = await fixture();
+    await github.reader.repository(signal());
+    expect(await github.reader.repository(signal())).toEqual(
+      github.state.repository,
+    );
+    expect(github.requests.at(-1)?.status).toBe(304);
+    github.state.repository.private = false;
+    expect((await github.reader.repository(signal())).private).toBe(false);
+    expect(github.requests.at(-1)?.status).toBe(200);
+    for (let number = 2; number <= 101; number++)
+      github.state.issues[number] = makeIssue(number);
+    await github.reader.issuePage(1, signal());
+    await github.reader.issuePage(2, signal());
+    expect((await github.reader.issuePage(1, signal())).numbers).toHaveLength(
+      100,
+    );
+    expect((await github.reader.issuePage(2, signal())).numbers).toEqual([101]);
+    expect(github.requests.slice(-2).map((request) => request.status)).toEqual([
+      304, 304,
+    ]);
+    github.state.failures["/repos/owner/repo"] = { status: 401 };
+    await expect(github.reader.repository(signal())).rejects.toThrow(
+      "github_authentication",
+    );
+    expect(github.requests.at(-1)?.status).toBe(401);
+  });
   it.each([false, true])(
     "authenticates %s-private repositories and reads bound source metadata",
     async (privateRepository) => {

@@ -72,6 +72,7 @@ export function createGitHubReader(
 export class OctokitReader implements GitHubReader {
   private readonly coordinates: { owner: string; repo: string };
   private readonly client: Octokit;
+  private readonly cache = new Map<string, { etag: string; data: unknown }>();
   constructor(repository: string, client: Octokit) {
     const [owner, repo] = repository.split("/");
     this.coordinates = { owner, repo };
@@ -83,14 +84,20 @@ export class OctokitReader implements GitHubReader {
     parameters: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<unknown> {
+    const key = JSON.stringify([route, parameters]);
+    const cached = this.cache.get(key);
     try {
       const result = await this.client.request(route, {
         ...this.coordinates,
         ...parameters,
+        ...(cached ? { headers: { "if-none-match": cached.etag } } : {}),
         request: {
           signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
         },
       });
+      if (typeof result.headers.etag === "string")
+        this.cache.set(key, { etag: result.headers.etag, data: result.data });
+      else this.cache.delete(key);
       return result.data;
     } catch (error) {
       if (signal.aborted) throw signal.reason;
@@ -103,6 +110,7 @@ export class OctokitReader implements GitHubReader {
         })
         .safeParse(error);
       const code = parsed.success ? parsed.data.status : undefined;
+      if (code === 304 && cached) return cached.data;
       const headers = parsed.success
         ? parsed.data.response?.headers
         : undefined;
@@ -127,7 +135,7 @@ export class OctokitReader implements GitHubReader {
           ? "github_authentication"
           : code === 403
             ? "github_access_denied"
-            : code === 404
+            : code === 404 || code === 410
               ? "github_not_found"
               : "github_read_failed",
       );

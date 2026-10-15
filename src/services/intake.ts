@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { GitHubReader } from "../adapters/github/reader.ts";
 import type { RunSnapshot } from "../config/load.ts";
+import type { SecretAccessor } from "../config/secrets.ts";
 import { githubId, IntakeError, type Target } from "../domain/jobs.ts";
-import type { KnownSecretChecker, SafeLogger } from "../logging/redact.ts";
+import type { SafeLogger } from "../logging/redact.ts";
 import type { Store } from "../repositories/store.ts";
 
 const envelope = z.object({
@@ -41,7 +42,7 @@ export class IntakeService {
   private readonly store: Store;
   private readonly reader: GitHubReader;
   private readonly snapshot: RunSnapshot;
-  private readonly secrets: KnownSecretChecker;
+  private readonly secrets: Pick<SecretAccessor, "containsCredentials">;
   private readonly logger: SafeLogger;
   private readonly controller = new AbortController();
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -57,7 +58,7 @@ export class IntakeService {
     store: Store,
     reader: GitHubReader,
     snapshot: RunSnapshot,
-    secrets: KnownSecretChecker,
+    secrets: Pick<SecretAccessor, "containsCredentials">,
     logger: SafeLogger,
   ) {
     this.store = store;
@@ -245,7 +246,7 @@ export class IntakeService {
           context.comments = context.comments.filter(
             (comment) => !this.store.owns("issue_comment", comment.id),
           );
-          if (this.secrets.contains(context))
+          if (this.secrets.containsCredentials(context))
             throw new IntakeError("secret_in_input");
           this.store.applyIssue(target, context, this.snapshot);
         } else {
@@ -267,26 +268,36 @@ export class IntakeService {
             (review) =>
               !this.store.owns("review", (review as { id: number }).id),
           );
-          if (this.secrets.contains(context))
+          if (this.secrets.containsCredentials(context))
             throw new IntakeError("secret_in_input");
           this.store.applyPull(target, context);
         }
       } catch (error) {
         if (this.controller.signal.aborted) return;
+        const code =
+          error instanceof IntakeError
+            ? error.code
+            : error instanceof z.ZodError
+              ? "github_response_invalid"
+              : undefined;
         if (
-          !(error instanceof IntakeError) ||
+          !code ||
           ![
             "github_not_found",
+            "github_read_failed",
+            "github_response_invalid",
+            "issue_identity_changed",
+            "pull_identity_changed",
             "issue_is_pull_request",
             "secret_in_input",
-          ].includes(error.code)
+          ].includes(code)
         )
           throw error;
-        this.failure = error.code;
-        this.logger.error(`Pending input unavailable (${error.code}).`);
+        this.failure = code;
+        this.logger.error(`Pending input unavailable (${code}).`);
         this.store.defer(
           target,
-          error.code,
+          code,
           Date.now() +
             this.snapshot.settings.limits.reconciliation_minutes * 60_000,
         );
