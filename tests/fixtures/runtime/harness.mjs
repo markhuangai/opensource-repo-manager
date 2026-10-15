@@ -955,6 +955,40 @@ export async function runRuntimeTests() {
     assert(closedSessions >= 4);
     tests++;
 
+    for (const credential of ["relay", "mcp"]) {
+      for (const event of ["progress", "terminal"]) {
+        const fixture = seed({ mcp: true }),
+          events = await collect(
+            supervisor.run(
+              supervisor.request(fixture.job.id, "investigation", {
+                mode: "emit-credential",
+                credential,
+                event,
+              }),
+              new globalThis.AbortController().signal,
+            ),
+          );
+        assert.deepEqual(events, [{ type: "terminal", outcome: "failed" }]);
+        assert.equal(store.leases().length, 0);
+        assert.equal((await userProcesses(10001)).length, 0);
+        const connection = issued.at(-1);
+        assert.equal(
+          (
+            await fetch(connection.url, {
+              headers: { authorization: `Bearer ${connection.authorization}` },
+            })
+          ).status,
+          401,
+        );
+      }
+    }
+    assert.equal(
+      (await run(seed({ mcp: true }), { mode: "mcp" }, "investigation"))
+        .outcome,
+      "completed",
+    );
+    tests++;
+
     const shutdown = seed(),
       shutdownIterator = iterate(
         supervisor.run(

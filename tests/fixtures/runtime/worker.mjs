@@ -31,6 +31,18 @@ function detached() {
 
 export async function* run(request, signal) {
   const input = request.input ?? {};
+  if (input.mode === "emit-credential") {
+    const credential =
+      input.credential === "mcp"
+        ? request.mcp[0].authorization
+        : request.relay.authorization;
+    if (input.event === "progress") {
+      yield { type: "progress", message: credential };
+      await delay(5000, undefined, { signal });
+    }
+    yield { type: "terminal", outcome: "completed", result: { credential } };
+    return;
+  }
   if (input.mode === "object-storage") {
     const history = spawnSync("/usr/bin/git", ["rev-list", "--count", "HEAD"], {
       encoding: "utf8",

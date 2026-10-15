@@ -8,6 +8,7 @@ import type { RunSnapshot } from "../config/load.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
 import { roleNames, type Role } from "../config/schema.ts";
 import { immutable } from "../config/bundles.ts";
+import { createKnownSecretChecker } from "../logging/redact.ts";
 import {
   digest,
   RuntimeError,
@@ -535,7 +536,11 @@ export class Supervisor implements AgentRunner {
           })) ?? [],
         binding,
       };
-      const input = JSON.stringify(workerRequest);
+      const outputCredentials = createKnownSecretChecker([
+          workerRequest.relay.authorization,
+          ...workerRequest.mcp.map((connection) => connection.authorization),
+        ]),
+        input = JSON.stringify(workerRequest);
       if (Buffer.byteLength(input) > 32 * 1024 * 1024)
         throw new RuntimeError("request_limit");
       const child = spawnAsRole(
@@ -589,7 +594,10 @@ export class Supervisor implements AgentRunner {
               terminal
             )
               throw new RuntimeError("protocol_invalid");
-            if (this.secrets.containsCredentials(wire.event))
+            if (
+              this.secrets.containsCredentials(wire.event) ||
+              outputCredentials.contains(wire.event)
+            )
               throw new RuntimeError("secret_in_output");
             if (wire.event.type === "terminal") terminal = wire.event;
             else if (wire.event.type === "session") {
