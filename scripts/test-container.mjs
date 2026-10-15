@@ -6,6 +6,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -15,6 +16,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { githubFixtureState, makeIssue } from "../tests/fixtures/github.ts";
 
 const args = process.argv.slice(2);
 assert(
@@ -41,6 +43,8 @@ const runtime = `${id}-runtime`;
 const probe = `${id}-probe`;
 const setup = `${id}-setup`;
 const volume = `${id}-data`;
+const network = `${id}-network`;
+const github = `${id}-github`;
 const canary = `orm-secret-canary-${randomUUID()}`;
 const resources = [];
 const cleanupErrors = [];
@@ -79,11 +83,17 @@ function register(type, name) {
   resources.push({ type, name });
 }
 
-function request(path, headers = {}) {
+function logs(container) {
+  const output = result(["container", "logs", container]);
+  assert.equal(output.status, 0, "Container logs unavailable");
+  return output.stdout + output.stderr;
+}
+
+function request(path, headers = {}, container = runtime) {
   return JSON.parse(
     docker([
       "exec",
-      runtime,
+      container,
       "/opt/orm-runtime/bin/node",
       "--input-type=module",
       "-e",
@@ -94,12 +104,12 @@ function request(path, headers = {}) {
   );
 }
 
-async function waitForHealth() {
+async function waitForHealth(container = runtime) {
   const deadline = Date.now() + 30_000;
   let lastError;
   while (Date.now() < deadline) {
     try {
-      const response = request("/healthz");
+      const response = request("/healthz", {}, container);
       if (response.status === 200) return;
       lastError = new Error(`Liveness returned HTTP ${response.status}`);
     } catch (error) {
@@ -116,11 +126,69 @@ function inspectRuntime() {
   return JSON.parse(docker(["container", "inspect", runtime]))[0];
 }
 
-function stopCleanly() {
-  docker(["container", "stop", "--timeout", "15", runtime]);
-  const state = inspectRuntime().State;
+function stopCleanly(container = runtime) {
+  docker(["container", "stop", "--timeout", "15", container]);
+  const state = JSON.parse(docker(["container", "inspect", container]))[0]
+    .State;
   assert.equal(state.ExitCode, 0, "Application did not shut down cleanly");
   assert.equal(state.OOMKilled, false);
+}
+
+function databaseState() {
+  return JSON.parse(
+    docker([
+      "exec",
+      runtime,
+      "/opt/orm-runtime/bin/node",
+      "--input-type=module",
+      "-e",
+      `
+    import Database from 'better-sqlite3';
+    const db=new Database('/data/state/manager.sqlite',{readonly:true});
+    console.log(JSON.stringify({jobs:db.prepare('SELECT * FROM jobs ORDER BY id').all(),cursor:db.prepare('SELECT page FROM reconciliation').get(),inbox:db.prepare('SELECT * FROM inbox').all()}));
+    db.close();
+  `,
+    ]),
+  );
+}
+
+function webhook(
+  payload,
+  event = "issues",
+  delivery = randomUUID(),
+  valid = true,
+) {
+  return JSON.parse(
+    docker([
+      "exec",
+      runtime,
+      "/opt/orm-runtime/bin/node",
+      "--input-type=module",
+      "-e",
+      `
+    import {createHmac} from 'node:crypto';
+    import {loadProtectedConfiguration} from './dist/config/load.js';
+    const {secrets}=await loadProtectedConfiguration();
+    const body=process.argv[1];
+    const signature='sha256='+createHmac('sha256',secrets.get('github.webhook_secret')).update(body).digest('hex');
+    const response=await fetch('http://127.0.0.1:8080/webhooks/github',{method:'POST',body,headers:{'content-type':'application/json','x-github-event':process.argv[2],'x-github-delivery':process.argv[3],'x-hub-signature-256':process.argv[4]==='true'?signature:'sha256'+'='+'0'.repeat(64)}});
+    console.log(JSON.stringify({status:response.status,body:await response.json()}));
+  `,
+      JSON.stringify(payload),
+      event,
+      delivery,
+      String(valid),
+    ]),
+  );
+}
+
+async function waitUntil(probe, message) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (probe()) return;
+    await delay(200);
+  }
+  throw new Error(message);
 }
 
 try {
@@ -222,6 +290,91 @@ try {
     { inherit: true, timeout: 1_200_000 },
   );
 
+  const upstream = join(fixtures, "github");
+  await mkdir(upstream, { recursive: true });
+  await cp(
+    join(root, "tests", "fixtures", "github.ts"),
+    join(upstream, "github.mts"),
+  );
+  execFileSync(
+    "openssl",
+    [
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-subj",
+      "/CN=api.github.com",
+      "-addext",
+      "subjectAltName=DNS:api.github.com",
+      "-days",
+      "1",
+      "-keyout",
+      join(upstream, "key.pem"),
+      "-out",
+      join(upstream, "ca.pem"),
+    ],
+    { stdio: "ignore" },
+  );
+  const upstreamState = githubFixtureState();
+  upstreamState.token = `${canary}-github`;
+  for (let number = 2; number <= 101; number++)
+    upstreamState.issues[number] = {
+      ...makeIssue(number),
+      ...(number <= 100 ? { pull_request: { url: "ignored" } } : {}),
+    };
+  upstreamState.hold_page = 2;
+  async function saveUpstream() {
+    await writeFile(
+      join(upstream, "state.next"),
+      JSON.stringify(upstreamState),
+    );
+    await rename(join(upstream, "state.next"), join(upstream, "state.json"));
+  }
+  await saveUpstream();
+  await writeFile(
+    join(upstream, "server.mjs"),
+    `
+    import {createServer} from 'node:https';
+    import {readFileSync,writeFileSync} from 'node:fs';
+    import {setTimeout as delay} from 'node:timers/promises';
+    import {githubFixtureRequest} from './github.mts';
+    createServer({key:readFileSync('/fixture/key.pem'),cert:readFileSync('/fixture/ca.pem')},async(request,response)=>{
+      const url=new URL(request.url,'https://api.github.com');
+      let state=JSON.parse(readFileSync('/fixture/state.json','utf8'));
+      while(state.hold_page && url.pathname==='/repos/owner/repo/issues' && Number(url.searchParams.get('page'))===state.hold_page) {
+        writeFileSync('/fixture/page-received',String(state.hold_page));
+        if(request.destroyed)return;
+        await delay(50);
+        state=JSON.parse(readFileSync('/fixture/state.json','utf8'));
+      }
+      await githubFixtureRequest(request,response,state);
+    }).listen(443,'0.0.0.0');
+  `,
+  );
+  register("network", network);
+  docker(["network", "create", "--label", `${label}=${id}`, network]);
+  register("container", github);
+  docker([
+    "run",
+    "--detach",
+    "--name",
+    github,
+    "--label",
+    `${label}=${id}`,
+    "--network",
+    network,
+    "--network-alias",
+    "api.github.com",
+    "--mount",
+    `type=bind,src=${upstream},dst=/fixture`,
+    "--entrypoint",
+    "/opt/orm-runtime/bin/node",
+    image,
+    "/fixture/server.mjs",
+  ]);
+
   for (const directory of ["config", "skills", "prompts"])
     await mkdir(join(fixtures, directory), { recursive: true });
   await cp(
@@ -237,6 +390,7 @@ try {
   const validConfig = parseYaml(
     await readFile(join(root, "config.example.yml"), "utf8"),
   );
+  validConfig.github.repository = "owner/repo";
   validConfig.github.token = `${canary}-github`;
   validConfig.github.webhook_secret = `${canary}-webhook`;
   validConfig.proxy.key = `${canary}-proxy`;
@@ -436,10 +590,23 @@ try {
       code: "schema_invalid",
     });
   }
-  for (const test of cases)
+  for (const test of cases) {
     await writeFile(join(fixtures, "config", `${test.name}.yml`), test.source, {
       mode: 0o600,
     });
+    await mkdir(join(fixtures, "cases", test.name), { recursive: true });
+    await writeFile(
+      join(fixtures, "cases", test.name, "config.yml"),
+      test.source,
+      { mode: 0o600 },
+    );
+  }
+  await mkdir(join(fixtures, "cases", "missing"));
+  await mkdir(join(fixtures, "cases", "linked"));
+  await writeFile(join(fixtures, "cases", "linked", "real.yml"), validYaml, {
+    mode: 0o600,
+  });
+  await symlink("real.yml", join(fixtures, "cases", "linked", "config.yml"));
   await writeFile(join(fixtures, "prompts", "secret.md"), `${canary}-github\n`);
   await symlink("/config/config.yml", join(fixtures, "prompts", "linked.md"));
   await symlink("config.yml", join(fixtures, "config", "linked.yml"));
@@ -453,12 +620,12 @@ try {
     "--label",
     `${label}=${id}`,
     "--mount",
-    `type=bind,src=${join(fixtures, "config")},dst=/fixture`,
+    `type=bind,src=${fixtures},dst=/fixture`,
     "--entrypoint",
     "/bin/sh",
     image,
     "-c",
-    "chown 0:0 /fixture && chmod 755 /fixture && chown 0:0 /fixture/*.yml && chmod 600 /fixture/*.yml && chmod 400 /fixture/readonly.yml && chmod 644 /fixture/readable.yml && chown 10001:10001 /fixture/worker-owned.yml",
+    "chown 0:0 /fixture/config /fixture/cases /fixture/cases/* && chmod 755 /fixture/config /fixture/cases /fixture/cases/* && find /fixture/config /fixture/cases -type f -exec chown 0:0 {} + -exec chmod 600 {} + && chmod 400 /fixture/config/readonly.yml /fixture/cases/readonly/config.yml && chmod 644 /fixture/config/readable.yml /fixture/cases/readable/config.yml && chown 10001:10001 /fixture/config/worker-owned.yml /fixture/cases/worker-owned/config.yml",
   ]);
   register("volume", volume);
   docker(["volume", "create", "--label", `${label}=${id}`, volume]);
@@ -467,14 +634,70 @@ try {
     "--mount",
     `type=bind,src=${join(fixtures, directory)},dst=/${directory},readonly`,
   ]);
+  const connection = [
+    "--network",
+    network,
+    "--mount",
+    `type=bind,src=${join(upstream, "ca.pem")},dst=/fixture-ca.pem,readonly`,
+    "--env",
+    "NODE_EXTRA_CA_CERTS=/fixture-ca.pem",
+  ];
   for (const test of [
     ...cases,
     { name: "missing", expected: 1, code: "config_unreadable" },
     { name: "linked", expected: 1, code: "config_unreadable" },
   ]) {
-    const name = `${id}-validate-${test.name}`;
+    const name = `${id}-startup-${test.name}`;
     register("container", name);
-    const validation = result([
+    docker([
+      "run",
+      "--detach",
+      "--name",
+      name,
+      "--label",
+      `${label}=${id}`,
+      ...connection,
+      "--mount",
+      `type=bind,src=${join(fixtures, "cases", test.name)},dst=/config,readonly`,
+      ...["skills", "prompts"].flatMap((directory) => [
+        "--mount",
+        `type=bind,src=${join(fixtures, directory)},dst=/${directory},readonly`,
+      ]),
+      image,
+    ]);
+    if (test.expected === 0) {
+      await waitForHealth(name);
+      stopCleanly(name);
+    } else {
+      assert.equal(
+        docker(["container", "wait", name]),
+        "1",
+        `Startup scenario ${test.name} did not reject its configuration`,
+      );
+    }
+    const output = logs(name);
+    assert(
+      !output.includes(canary),
+      `Startup scenario ${test.name} disclosed credentials`,
+    );
+    assert(!output.includes("parser-secret-canary"));
+    if (test.code) {
+      assert(
+        output.includes(test.code),
+        `Startup scenario ${test.name} omitted its safe error code`,
+      );
+      assert(!output.includes("HTTP listening"));
+    }
+  }
+  for (const arguments_ of [
+    ["config", "validate"],
+    ["serve"],
+    ["pause"],
+    ["--config", "/secret-canary/config.yml"],
+  ]) {
+    const name = `${id}-removed-command-${randomUUID()}`;
+    register("container", name);
+    const command = result([
       "run",
       "--rm",
       "--name",
@@ -483,56 +706,11 @@ try {
       `${label}=${id}`,
       ...mounts,
       image,
-      "config",
-      "validate",
-      "--config",
-      `/config/${test.name}.yml`,
+      ...arguments_,
     ]);
-    assert.equal(
-      validation.status,
-      test.expected,
-      `Validation scenario ${test.name} failed: ${validation.stderr}`,
-    );
-    assert(
-      !(validation.stdout + validation.stderr).includes(canary),
-      `Validation scenario ${test.name} disclosed a credential`,
-    );
-    assert(
-      !(validation.stdout + validation.stderr).includes("parser-secret-canary"),
-      `Validation scenario ${test.name} disclosed a collection key`,
-    );
-    if (test.code)
-      assert(
-        validation.stderr.includes(test.code),
-        `Validation scenario ${test.name} did not report its safe error code`,
-      );
-    else
-      assert(
-        validation.stdout.includes(
-          "Configuration and workflow bundles are valid.",
-        ),
-      );
-  }
-  for (const scenario of ["malformed", "collection-key", "invalid-utf8"]) {
-    const invalidName = `${id}-invalid-startup-${scenario}`;
-    register("container", invalidName);
-    const invalidStartup = result([
-      "run",
-      "--rm",
-      "--name",
-      invalidName,
-      "--label",
-      `${label}=${id}`,
-      ...mounts,
-      image,
-      "--config",
-      `/config/${scenario}.yml`,
-    ]);
-    assert.equal(invalidStartup.status, 1);
-    assert(!invalidStartup.stdout.includes("HTTP listening"));
-    assert(invalidStartup.stderr.includes("Configuration rejected"));
-    assert(!invalidStartup.stderr.includes(canary));
-    assert(!invalidStartup.stderr.includes("parser-secret-canary"));
+    assert.equal(command.status, 1);
+    assert(command.stderr.includes("arguments_invalid"));
+    assert(!command.stderr.includes("secret-canary"));
   }
   docker([
     "run",
@@ -543,6 +721,7 @@ try {
     `${label}=${id}`,
     "--platform",
     platform,
+    ...connection,
     "--publish",
     "127.0.0.1::8080",
     "--mount",
@@ -556,11 +735,60 @@ try {
   assert.equal(binding.HostIp, "127.0.0.1");
   assert(Number(binding.HostPort) > 0);
   await waitForHealth();
-  assert(
-    docker(["exec", runtime, "orm", "config", "validate"]).includes(
-      "Configuration and workflow bundles are valid.",
-    ),
+  assert.notEqual(
+    result(["exec", runtime, "orm", "config", "validate"]).status,
+    0,
   );
+  await waitUntil(
+    () =>
+      databaseState().cursor.page === 2 && databaseState().jobs.length === 1,
+    "Backfill did not persist its first page",
+  );
+  const beforeCrash = databaseState();
+  docker(["container", "kill", "--signal", "KILL", runtime]);
+  assert.equal(inspectRuntime().State.Running, false);
+  upstreamState.hold_page = 0;
+  await saveUpstream();
+  docker(["container", "start", runtime]);
+  await waitForHealth();
+  await waitUntil(
+    () => request("/readyz").body.intake.state === "ready",
+    "Backfill did not recover after restart",
+  );
+  const recovered = databaseState();
+  assert.equal(recovered.cursor.page, 1);
+  assert.deepEqual(
+    recovered.jobs.map((job) => job.issue_number),
+    [1, 101],
+  );
+  assert.equal(recovered.jobs[0].id, beforeCrash.jobs[0].id);
+  assert.equal(
+    recovered.jobs[0].snapshot_digest,
+    beforeCrash.jobs[0].snapshot_digest,
+  );
+  assert(recovered.jobs.every((job) => job.status === "pending"));
+  const delivery = randomUUID();
+  const issuePayload = {
+    repository: { id: 42 },
+    issue: { id: 1001, number: 1 },
+  };
+  assert.equal(webhook(issuePayload, "issues", delivery).status, 202);
+  assert.equal(webhook(issuePayload, "issues", delivery).status, 202);
+  assert.equal(
+    webhook({ ...issuePayload, repository: { id: 99 } }).status,
+    403,
+  );
+  assert.equal(
+    webhook(issuePayload, "issues", randomUUID(), false).status,
+    401,
+  );
+  await waitUntil(
+    () =>
+      databaseState().inbox.filter((row) => row.delivery_id === delivery)
+        .length === 1,
+    "Delivery was not persisted",
+  );
+  assert.equal(databaseState().jobs.length, 2);
   const snapshotProof = JSON.parse(
     docker([
       "exec",
@@ -589,12 +817,11 @@ try {
   assert.deepEqual(live.body, { status: "ok" });
   const ready = request("/readyz");
   assert.equal(ready.status, 503);
-  assert.deepEqual(ready.body, {
-    status: "not_ready",
-    reason: "automation_not_implemented",
-  });
+  assert.equal(ready.body.status, "not_ready");
+  assert.equal(ready.body.reason, "automation_not_implemented");
+  assert.equal(ready.body.intake.state, "ready");
   assert(
-    !docker(["container", "logs", runtime]).includes(canary),
+    !logs(runtime).includes(canary),
     "HTTP handling leaked a secret canary",
   );
 
@@ -650,6 +877,16 @@ try {
     ]);
     assert.notEqual(deniedRead.status, 0);
     assert(deniedRead.stderr.includes("Permission denied"));
+    const deniedDatabase = result([
+      "exec",
+      "--user",
+      user,
+      runtime,
+      "cat",
+      "/data/state/manager.sqlite",
+    ]);
+    assert.notEqual(deniedDatabase.status, 0);
+    assert(deniedDatabase.stderr.includes("Permission denied"));
     const deniedWorkerWrite = result([
       "exec",
       "--user",
@@ -707,7 +944,8 @@ try {
     users_and_mounts: "passed",
     context_exclusion: "passed",
     shutdown_and_persistence: "passed",
-    protected_configuration_and_cli: "passed",
+    protected_configuration_and_service_startup: "passed",
+    webhook_intake_and_crash_recovery: "passed",
     immutable_secret_free_snapshots: "passed",
   };
 } catch (error) {
@@ -725,12 +963,12 @@ try {
         "--label",
         `${label}=${id}`,
         "--mount",
-        `type=bind,src=${join(fixtures, "config")},dst=/fixture`,
+        `type=bind,src=${fixtures},dst=/fixture`,
         "--entrypoint",
         "/bin/sh",
         image,
         "-c",
-        `chown ${process.getuid()}:${process.getgid()} /fixture && chmod 700 /fixture`,
+        `find /fixture/config /fixture/cases -exec chown -h ${process.getuid()}:${process.getgid()} {} + && chmod 700 /fixture/config /fixture/cases /fixture/cases/*`,
       ]);
     } catch (error) {
       cleanupErrors.push(error);
@@ -745,7 +983,9 @@ try {
       }
       const [object] = JSON.parse(inspection.stdout);
       assert.equal(
-        (type === "volume" ? object.Labels : object.Config.Labels)?.[label],
+        (["volume", "network"].includes(type)
+          ? object.Labels
+          : object.Config.Labels)?.[label],
         id,
         `Refusing cleanup of unowned ${type} ${name}`,
       );

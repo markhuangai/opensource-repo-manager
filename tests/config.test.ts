@@ -222,7 +222,7 @@ describe("strict protected configuration contract", () => {
       /parser-secret-canary|Keys with collection values|Warning:/,
     );
   });
-  it("rejects missing configuration and bad CLI arguments without echoing paths or input", () => {
+  it("rejects removed command forms without echoing paths or input", () => {
     for (const args of [
       [
         "config",
