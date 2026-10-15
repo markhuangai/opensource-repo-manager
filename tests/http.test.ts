@@ -6,7 +6,7 @@ afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
 });
 
-describe("scaffold HTTP endpoints", () => {
+describe("HTTP construction", () => {
   it("reports liveness without reflecting headers or environment", async () => {
     const app = createApp();
     apps.push(app);
@@ -30,7 +30,7 @@ describe("scaffold HTTP endpoints", () => {
     });
   });
 
-  it("does not expose a webhook integration that is not implemented", async () => {
+  it("leaves webhooks absent when no intake dependencies are composed", async () => {
     const app = createApp();
     apps.push(app);
     const response = await app.inject({

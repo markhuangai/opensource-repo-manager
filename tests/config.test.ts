@@ -81,6 +81,13 @@ describe("strict protected configuration contract", () => {
       /notification-secret|smtp-password-canary|maintainer@example/,
     );
     expect(secrets.contains("smtp-password-canary")).toBe(true);
+    expect(secrets.containsCredentials("smtp-password-canary")).toBe(true);
+    expect(secrets.containsCredentials("smtp-user-canary")).toBe(false);
+    expect(secrets.redact("smtp-user-canary")).toBe("[redacted]");
+    config.notifications.smtp.password = "smtp-user-canary";
+    expect(
+      separateSecrets(config).secrets.containsCredentials("smtp-user-canary"),
+    ).toBe(true);
     expect(secrets.get("notifications.smtp.password")).toBe(
       "smtp-password-canary",
     );
@@ -222,7 +229,7 @@ describe("strict protected configuration contract", () => {
       /parser-secret-canary|Keys with collection values|Warning:/,
     );
   });
-  it("rejects missing configuration and bad CLI arguments without echoing paths or input", () => {
+  it("rejects removed command forms without echoing paths or input", () => {
     for (const args of [
       [
         "config",

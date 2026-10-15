@@ -2,9 +2,9 @@
 
 A self-hosted GitHub maintenance service for repositories whose maintainers cannot watch every issue. The planned service investigates issues, prepares tested maintenance fixes, follows pull request feedback, and notifies the maintainer when a change is ready for human review.
 
-**Status: service scaffold and protected configuration implemented; maintenance automation planned.** The repository contains a TypeScript health service, protected YAML loading, immutable workflow snapshots, Docker/Compose deployment, checks, and GitHub workflows. Issue investigation, fixes, agents, persistence, and application MCP transport remain planned. No GHCR image has been published by this change.
+**Status: protected configuration and durable GitHub intake implemented; maintenance automation planned.** The service verifies one public/private GitHub repository, backfills open issues, receives signed webhooks, and persists deduplicated pending workflows in SQLite. Issue investigation, fixes, agents, GitHub publication, and application MCP transport remain planned. No GHCR image has been published by this change.
 
-## Run the scaffold
+## Run the service
 
 Use Node 24.18.0 and npm 12.0.2:
 
@@ -13,7 +13,7 @@ npm ci
 npm run check
 ```
 
-`npm run dev` runs the source with Node's watch mode; `npm start` runs the production build. Both require valid protected configuration and bundles before opening HTTP. The default paths are `/config/config.yml`, `/prompts`, and `/skills`; use the container setup below to provide them. The service listens on port 8080. `GET /healthz` returns HTTP 200 with `{"status":"ok"}`. `GET /readyz` returns HTTP 503 with `{"status":"not_ready","reason":"automation_not_implemented"}`. Docker uses liveness for its healthcheck; a healthy container does not mean maintenance automation is ready.
+`npm run dev` runs the source with Node's watch mode; `npm start` runs the production build. Both require valid protected configuration and bundles before opening HTTP. The fixed paths are `/config/config.yml`, `/prompts`, and `/skills`; use the container setup below to provide them. The service listens on port 8080. `GET /healthz` returns HTTP 200 with `{"status":"ok"}`. `GET /readyz` returns HTTP 503 with `status: not_ready`, `reason: automation_not_implemented`, and safe intake state and queue counts. Docker uses liveness for its healthcheck; a healthy container does not mean maintenance automation is ready.
 
 For Compose, install the sample bundles and protected configuration, then replace the placeholder repository, credentials, proxy endpoint, model IDs, and notification settings:
 
@@ -24,19 +24,18 @@ cp -R examples/workflow/prompts/. operator/prompts/
 sudo install -d -o root -g root -m 0700 operator/config
 sudo install -o root -g root -m 0600 config.example.yml operator/config/config.yml
 sudoedit operator/config/config.yml
-docker compose run --build --rm manager config validate
 docker compose up --build
 ```
 
-Compose exposes port 8080 on localhost, persists `/data`, and mounts configuration, skills, and prompts read-only. The root supervisor validates and snapshots those files before starting the health service. Worker execution belongs to later issues. Its fixed `/opt/orm-runtime/bin/node` executable also runs the container's `orm` command and stays separate from future repository toolchains. The image includes Git, certificates, C build tools, process supervision, and distinct `coding`, `audit`, and `output-review` users.
+Compose exposes port 8080 on localhost, persists `/data`, and mounts configuration, skills, and prompts read-only. The root supervisor validates and snapshots those files before starting the health service. Worker execution belongs to later issues. Its fixed `/opt/orm-runtime/bin/node` executable stays separate from future repository toolchains. The image includes Git, certificates, C build tools, process supervision, and distinct `coding`, `audit`, and `output-review` users.
 
 ## Protected configuration and workflow bundles
 
-`config.example.yml` is the version 1 contract. Unknown fields and unsupported versions fail; there is no environment-variable interpolation, credential fallback, include processing, or automatic migration. Use a fine-grained GitHub PAT for the single `owner/repository`, a webhook secret, and a mandatory CPA-compatible HTTP(S) URL/key. Validation is offline: GitHub access, model availability, notification delivery, and MCP connections are not probed or implemented here.
+`config.example.yml` is the version 1 contract. Unknown fields and unsupported versions fail; there is no environment-variable interpolation, credential fallback, include processing, or automatic migration. Use a fine-grained GitHub PAT for the single `owner/repository`, a webhook secret, and a mandatory CPA-compatible HTTP(S) URL/key. Configuration validation is offline. After HTTP starts, enrollment verifies GitHub access and reads repository metadata; model availability, notification delivery, and MCP connections remain planned.
 
 The configuration must be a root-owned regular file with owner-read permission and no group/other permissions. Its immediate directory must be root-owned without group/other write permission. Symlinks are rejected, including parent components. Keep the deployment mount read-only; `0400` or `0600` files in a `0700` directory are recommended. Worker users cannot read the configuration. An empty file or the old `{}` scaffold fixture is no longer valid.
 
-Inside the container, `orm config validate [--config PATH]` validates both configuration and selected bundles and exits without opening HTTP. `serve` is the default command. From source, `npm run config:validate -- --config PATH` uses the same checks and requires the same protected file and fixed bundle mounts. Success is exit 0; rejection is exit 1. Diagnostics report fixed codes and safe section/line locations, excluding source lines, arbitrary input names, credentials, and filesystem paths.
+The application runs only as a service. It accepts no commands or arguments and has no `orm` executable, offline validation command, or pause/resume feature. Startup validates protected configuration and all selected bundles before opening HTTP. Rejection exits with code 1. Diagnostics report fixed codes and safe section/line locations, excluding source lines, arbitrary input names, credentials, and filesystem paths.
 
 Each named profile requires `sdk`, `model`, and `effort`. Every phase selects a profile independently: `bootstrap`, `investigation`, `implementation`, `audit`, and `output_review`. Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`; Codex accepts `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, and `persistent`. These are SDK-level values; a model may support a subset. The future adapters must validate model compatibility without silently changing the selected model or effort. See the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) and [Claude effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort).
 
@@ -44,7 +43,7 @@ Each named profile requires `sdk`, `model`, and `effort`. Every phase selects a 
 
 The loader exposes a deeply frozen, JSON-safe `RunSnapshot` with a digest, role profiles, prompt text, and skill bytes encoded as base64 with per-file digests. `snapshot.settings` is supervisor metadata and includes non-secret upstream configuration; pass only `snapshot.roles[role]` to a future worker. Role projections exclude upstream endpoints, credentials, notification destinations, and authentication headers. The separate root-only `SecretAccessor` supplies credentials and known-secret checks; it is not part of the snapshot. Known-secret checks detect configured values, not arbitrary unknown secrets.
 
-Configuration and bundle content load once at startup. Restart to load edits; previously captured snapshots remain self-contained and unchanged. Persistence of snapshots and operational pause state belongs to #3; configuration does not own or reset pause state. Sample skills are authoring examples, not implemented maintenance workflows.
+Configuration and bundle content load once at startup. Restart to load edits; previously captured snapshots remain self-contained and unchanged. Each issue workflow keeps its original persisted snapshot even after restart or later activity; newly discovered workflows capture the current snapshot. Sample skills are authoring examples, not implemented maintenance workflows.
 
 At least one notification channel must be enabled in every valid configuration. Supported shapes under `notifications` are `discord: { enabled: true, webhook_url }`, `smtp: { enabled: true, host, port, secure, username, password, from, to }`, and `webhook: { enabled: true, url, headers }`. Disabled channels contain only `enabled: false`. Notification connections and delivery remain planned.
 
@@ -94,11 +93,27 @@ Grant only the required exact names to each phase. Runtime behavior does not dep
 
 The `mcp` defaults are `initialization_timeout_seconds: 30`, `call_timeout_seconds: 300`, and `max_request_bytes`, `max_response_bytes`, and `max_catalog_bytes` each set to `1048576`. Timeouts must be positive integers; sizes can be lowered but cannot exceed 1 MiB. The future gateway must initialize assigned capabilities before a phase starts, block unavailable capabilities, include write review within the call deadline, and cap it by the remaining job budget. Running-job grants cannot expand through reconfiguration.
 
+## GitHub intake and durable work
+
+Give the fine-grained PAT access to exactly the configured repository, including Metadata, Issues, Contents, Pull requests, and Checks read permissions. The supervisor uses Octokit with fixed GitHub API routes. Repository identity is verified against GitHub's immutable ID; replacing the configured repository while retaining its database blocks enrollment. The default branch is refreshed during reconciliation. Private API access uses the protected PAT without placing it in URLs, persisted inputs, or worker snapshots.
+
+Configure a GitHub webhook with JSON content, your configured webhook secret, and an externally reachable HTTPS URL ending in `/webhooks/github`. Compose binds HTTP to localhost, so arrange HTTPS ingress separately. Select Issues, Issue comments, Pull requests, Pull request reviews, Pull request review comments, Check runs, Check suites, and Statuses. The service does not create or change webhooks itself.
+
+The endpoint verifies the HMAC-SHA256 signature over the exact request bytes and checks repository identity. It accepts at most 1 MiB per request. A successful HTTP 202 means the delivery and its work signals committed to SQLite. Replay is idempotent; reusing a delivery ID for different bytes returns 409. Invalid signatures return 401, foreign repositories return 403, malformed events return 400, and unverified enrollment or unavailable persistence returns 503. Unsupported signed events and unrelated PRs are recorded without creating work.
+
+Enrollment backfills every open issue, filtering PRs from GitHub's mixed issue listing. Persisted page progress survives interruption. Reconciliation repeats every `limits.reconciliation_minutes` (five by default), revisits known workflows for closure, and recovers missed activity. Repeated scans also repair pagination shifts. Events cause authoritative reads rather than trusting stale payload state. Closure and reopening update the same workflow with revision fencing; ordinary activity preserves snapshots and budget usage. Unsupported investigation phases remain pending and consume no coding lease.
+
+Only PRs recorded as instance-owned are processed. Recorded outbound object IDs distinguish this instance's comments from genuine human comments made with the same PAT account. Ownership and publication receipts are persistence contracts for later tickets; this service makes no GitHub writes. A changed PR context advances the associated job revision and persists current-head context without claiming readiness.
+
+State lives in `/data/state/manager.sqlite`, inside a supervisor-owned `0700` directory with `0600` database files. SQLite uses WAL, full synchronous commits, prepared statements, transactions, and additive versioned migrations. Workers cannot access this state. Newer unsupported schemas are rejected. Backups must include committed WAL state; use a consistent SQLite backup or stop the container before copying the complete state directory. Preserve the data volume on rollback. A coding lease survives restart and is released only with its matching token; worker supervision and safe lease recovery belong to the next ticket.
+
+`/healthz` remains process liveness. `/readyz` keeps automation unavailable while reporting intake `starting`, `ready`, or `degraded`, a fixed failure reason, and pending/inbox/failure counts. It exposes no repository names or issue contents. Authentication, rate-limit, and network failures preserve pending work and retry on the reconciliation schedule, respecting provider backoff. Secret-bearing input remains pending with a safe diagnostic. Stop/start the container to stop/restart the service; restarts preserve jobs, receipts, budgets, and snapshots.
+
 ## Development and validation
 
-`npm run check` checks formatting, lint, types, tests, and the production build. `npm run test:container -- --platform linux/amd64` builds and exercises the real image with HTTP, readiness, users, permissions, mounts, persistence, secret-canary exclusion, and graceful shutdown checks. Use `linux/arm64` on an ARM64 host. Container tests require Docker with Buildx and a local Unix-socket daemon. They create an isolated Docker client configuration for public pulls and remove only their labeled test resources, preserving host credentials, other builders, and shared caches.
+`npm run check` checks formatting, lint, types, tests, and the production build. `npm run test:container -- --platform linux/amd64` builds and exercises the real image with HTTP, readiness, users, permissions, mounts, persistence, secret-canary exclusion, signed webhooks, interrupted backfill recovery, and graceful shutdown checks. Use `linux/arm64` on an ARM64 host. Container tests require Docker with Buildx and a local Unix-socket daemon. They create an isolated Docker client configuration for public pulls and remove only their labeled test resources, preserving host credentials, other builders, and shared caches.
 
-PR CI runs automatically and tests both architectures on native runners without application secrets or image publication. CodeQL analyzes Actions and JavaScript/TypeScript. Validate workflow syntax with actionlint 1.7.12 and Compose with `docker compose config --quiet`. Services own decisions, repositories own persistence, and adapters own external I/O; the scaffold currently needs only HTTP construction and process startup, with no empty layers.
+PR CI runs automatically and tests both architectures on native runners without application secrets or image publication. CodeQL analyzes Actions and JavaScript/TypeScript. Validate workflow syntax with actionlint 1.7.12 and Compose with `docker compose config --quiet`. Services own decisions, repositories own persistence, and adapters own external I/O; GitHub reads and SQLite repositories are injected into the intake service at those boundaries.
 
 If the Docker CLI runs in a development container whose `/tmp` differs from the daemon's filesystem, use `TMPDIR="$PWD/node_modules" npm run test:container -- --platform linux/amd64` so bind-mount fixtures reside in the shared workspace. HTTP probes run inside the production container and do not require a shared localhost network namespace.
 
@@ -116,7 +131,7 @@ After human merge, run the **Release** workflow from `main` with a version such 
 
 ## Planned workflow
 
-1. Enroll one public or private GitHub repository, backfill its existing open issues, and receive signed webhooks for subsequent activity.
+1. Enrollment, open-issue backfill, signed webhooks, and durable pending workflows are implemented. The following execution stages remain planned.
 2. Prepare the repository environment and investigate each issue. Maintain one reviewed status comment with findings, evidence, progress, and a later PR link.
 3. For a confirmed maintenance problem, implement an issue-scoped fix, obtain an independent audit, and run real repository checks and regression tests.
 4. Scan and review the exact candidate before committing it to a new branch and opening a non-draft pull request. Monitor feedback and CI, applying bounded corrections.
@@ -172,7 +187,7 @@ V1 preserves human merge authority and other actors' work. Automatic merging, fo
 | CI and review wait               | 24 hours   |
 | Reconciliation interval          | 5 minutes  |
 
-Limits are configurable in YAML. Waiting for CI or reviews releases the execution slot. Backfilled issues remain queued without a daily issue quota. Exhausted budgets require an explicit operator retry. Notifications retain per-channel delivery results; ambiguous delivery can still produce duplicates.
+Limits are configurable in YAML. Waiting for CI or reviews releases the execution slot. Backfilled issues remain queued without a daily issue quota. Exhausted budgets remain blocked; restarting the service does not reset them. This ticket adds no manual retry interface. Notifications retain per-channel delivery results; ambiguous delivery can still produce duplicates.
 
 ## Implementation roadmap
 

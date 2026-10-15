@@ -4,11 +4,24 @@ import {
   type SafeLogger,
 } from "../logging/redact.ts";
 import { createApp } from "./app.ts";
+import type { IntakeService } from "../services/intake.ts";
 
 export async function startHttpService(
   logger: SafeLogger = createSafeLogger(createKnownSecretChecker([])),
+  dependencies?: {
+    intake: IntakeService;
+    webhookSecret: string;
+    close: () => void;
+  },
 ) {
-  const app = createApp();
+  const app = createApp(dependencies?.intake, dependencies?.webhookSecret);
+  app.addHook("onClose", async () => {
+    try {
+      await dependencies?.intake.stop();
+    } finally {
+      dependencies?.close();
+    }
+  });
   let stopping = false;
   async function shutdown() {
     if (stopping) return;
@@ -34,6 +47,7 @@ export async function startHttpService(
     logger.info(
       "HTTP listening on port 8080; maintenance automation is unavailable.",
     );
+    dependencies?.intake.start();
   } catch {
     logger.error("HTTP startup failed.");
     process.exitCode = 1;

@@ -4,6 +4,7 @@ import type { Configuration } from "./schema.ts";
 
 export function separateSecrets(config: Configuration) {
   const credentials = new Map<string, string>();
+  const identifiers: string[] = [];
   const sensitive: string[] = [
     config.github.token,
     config.github.webhook_secret,
@@ -22,10 +23,12 @@ export function separateSecrets(config: Configuration) {
           typeof value === "string" ? value : JSON.stringify(value),
         );
       if (
-        ["webhook_url", "url", "username", "password"].includes(field) &&
+        ["webhook_url", "url", "password"].includes(field) &&
         typeof value === "string"
       )
         sensitive.push(value);
+      if (field === "username" && typeof value === "string")
+        identifiers.push(value);
     }
   }
   for (const [name, credential] of Object.entries(config.mcp.credentials))
@@ -40,7 +43,8 @@ export function separateSecrets(config: Configuration) {
       put(`notifications.webhook.headers.${header}`, value);
       sensitive.push(value);
     }
-  const checker = createKnownSecretChecker(sensitive);
+  const checker = createKnownSecretChecker([...sensitive, ...identifiers]);
+  const credentialChecker = createKnownSecretChecker(sensitive);
   const boundHeaders = new Map(
     Object.entries(config.mcp.credentials).map(([name, credential]) => [
       name,
@@ -49,6 +53,7 @@ export function separateSecrets(config: Configuration) {
   );
   const secrets = Object.freeze({
     ...checker,
+    containsCredentials: credentialChecker.contains,
     get(name: string) {
       const value = credentials.get(name);
       if (value === undefined)

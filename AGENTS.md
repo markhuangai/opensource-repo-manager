@@ -2,7 +2,7 @@
 
 ## Current implementation and scope
 
-- This is a TypeScript/Node 24 service scaffold. Health endpoints, process lifecycle, protected configuration loading, immutable workflow snapshots, Docker/Compose, checks, and CI are implemented. Maintenance automation, storage, agents, and application MCP transport are planned in the published issue graph.
+- This is a TypeScript/Node 24 service scaffold. Health endpoints, process lifecycle, protected configuration loading, immutable workflow snapshots, GitHub enrollment/webhooks/backfill, SQLite persistence, Docker/Compose, checks, and CI are implemented. The application uses service-only startup with no CLI commands or pause/resume feature. Maintenance automation, agents, and application MCP transport are planned in the published issue graph.
 - GitHub issue bodies govern ticket scope; native blocked-by relationships govern dependencies. A closed blocker is insufficient: verify its required PR merged on remote `main`. Implement one approved issue at a time, and preserve the human merge gate.
 - Inspect the actual implementation, callers, instructions, tests, and current branch before changes. Preserve the license and unrelated work. Use constructor injection and interfaces only at real boundaries; do not create empty layers or speculative frameworks.
 
