@@ -31,6 +31,10 @@ function detached() {
 
 export async function* run(request, signal) {
   const input = request.input ?? {};
+  if (input.mode === "terminal-outcome") {
+    yield { type: "terminal", outcome: input.outcome };
+    return;
+  }
   if (input.mode === "emit-credential") {
     const credential =
       input.credential === "mcp"

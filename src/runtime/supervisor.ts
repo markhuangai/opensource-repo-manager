@@ -666,11 +666,12 @@ export class Supervisor implements AgentRunner {
       terminal = {
         type: "terminal",
         outcome:
-          code === "revision_stale"
+          code === "revision_stale" || code === "stale"
             ? "stale"
             : code === "cancelled" || code === "consumer_cancelled"
               ? "cancelled"
               : [
+                    "limited",
                     "output_limit",
                     "storage_limit",
                     "active_budget_exhausted",

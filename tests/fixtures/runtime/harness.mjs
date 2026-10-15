@@ -561,6 +561,24 @@ export async function runRuntimeTests() {
     );
     tests++;
 
+    for (const outcome of ["limited", "stale"]) {
+      const reported = seed(),
+        result = await run(reported, { mode: "terminal-outcome", outcome }),
+        receipt = store.runs().find((run) => run.job_id === reported.job.id);
+      assert.equal(result.outcome, outcome);
+      assert.equal(result.artifact, undefined);
+      assert.equal(receipt.status, outcome);
+      assert.notEqual(receipt.finished_at, null);
+      assert.equal(receipt.artifact_digest, null);
+      assert.equal(
+        store.job(reported.job.issue_number).status,
+        reported.job.status,
+      );
+      assert.equal(store.leases().length, 0);
+      assert.deepEqual(await userProcesses(10001), []);
+    }
+    tests++;
+
     for (const mode of ["escape", "forge"]) {
       const result = await run(seed(), { mode });
       assert.equal(result.outcome, "failed");
