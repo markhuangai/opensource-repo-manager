@@ -982,6 +982,61 @@ export async function runRuntimeTests() {
         );
       }
     }
+    tests++;
+    for (const credential of ["relay", "mcp"]) {
+      const fixture = seed({ mcp: true }),
+        stream = iterate(
+          supervisor.run(
+            supervisor.request(fixture.job.id, "investigation", {
+              mode: "emit-credential",
+              credential,
+              event: "progress",
+              split: true,
+            }),
+            new globalThis.AbortController().signal,
+          ),
+        );
+      try {
+        const first = (await stream.next()).value;
+        assert.equal(first.type, "progress");
+        assert(first.message.length > 0);
+        const connection = issued.at(-1);
+        assert.equal(
+          (
+            await fetch(connection.url, {
+              headers: { authorization: `Bearer ${connection.authorization}` },
+              signal: AbortSignal.timeout(2000),
+            })
+          ).status,
+          200,
+        );
+        const run = store
+          .runs()
+          .find(
+            (run) => run.job_id === fixture.job.id && run.finished_at === null,
+          );
+        assert(run);
+        await writeFile(
+          join(root, "runs", run.id, "tmp", "continue"),
+          "continue",
+        );
+        assert.deepEqual(await remaining(stream), [
+          { type: "terminal", outcome: "failed" },
+        ]);
+        assert.equal(
+          (
+            await fetch(connection.url, {
+              headers: { authorization: `Bearer ${connection.authorization}` },
+            })
+          ).status,
+          401,
+        );
+        assert.equal(store.leases().length, 0);
+        assert.equal((await userProcesses(10001)).length, 0);
+      } finally {
+        await stream.return?.();
+      }
+    }
     assert.equal(
       (await run(seed({ mcp: true }), { mode: "mcp" }, "investigation"))
         .outcome,

@@ -540,6 +540,7 @@ export class Supervisor implements AgentRunner {
           workerRequest.relay.authorization,
           ...workerRequest.mcp.map((connection) => connection.authorization),
         ]),
+        credentialStream = outputCredentials.createStream(),
         input = JSON.stringify(workerRequest);
       if (Buffer.byteLength(input) > 32 * 1024 * 1024)
         throw new RuntimeError("request_limit");
@@ -596,7 +597,9 @@ export class Supervisor implements AgentRunner {
               throw new RuntimeError("protocol_invalid");
             if (
               this.secrets.containsCredentials(wire.event) ||
-              outputCredentials.contains(wire.event)
+              outputCredentials.contains(wire.event) ||
+              (wire.event.type === "progress" &&
+                credentialStream.push(wire.event.message))
             )
               throw new RuntimeError("secret_in_output");
             if (wire.event.type === "terminal") terminal = wire.event;

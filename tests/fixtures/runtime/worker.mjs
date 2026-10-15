@@ -37,7 +37,28 @@ export async function* run(request, signal) {
         ? request.mcp[0].authorization
         : request.relay.authorization;
     if (input.event === "progress") {
-      yield { type: "progress", message: credential };
+      const messages = input.split
+        ? [
+            credential.slice(0, Math.ceil(credential.length / 2)),
+            credential.slice(Math.ceil(credential.length / 2)),
+          ]
+        : [credential];
+      for (const [index, message] of messages.entries()) {
+        yield { type: "progress", message };
+        if (input.split && index === 0) {
+          const deadline = Date.now() + 5000;
+          for (;;) {
+            try {
+              await access(join(request.temporary, "continue"));
+              break;
+            } catch (error) {
+              if (error.code !== "ENOENT") throw error;
+            }
+            assert(Date.now() < deadline, "progress handshake timed out");
+            await delay(10, undefined, { signal });
+          }
+        }
+      }
       await delay(5000, undefined, { signal });
     }
     yield { type: "terminal", outcome: "completed", result: { credential } };
