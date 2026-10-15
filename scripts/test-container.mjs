@@ -279,7 +279,19 @@ try {
         ...validConfig,
         proxy: {
           ...validConfig.proxy,
-          url: `https://fixture.invalid/v1?key=${canary}`,
+          url: `https://fixture.invalid/v1?client_secret=${canary}`,
+        },
+      }),
+      expected: 1,
+      code: "schema_invalid",
+    },
+    {
+      name: "ordinary-query",
+      source: stringifyYaml({
+        ...validConfig,
+        proxy: {
+          ...validConfig.proxy,
+          url: "https://fixture.invalid/v1?api-version=1",
         },
       }),
       expected: 1,

@@ -453,11 +453,18 @@ describe("release and CI boundaries", () => {
     ]);
   });
 
-  it("pins action code and never persists checkout credentials", () => {
+  it("uses the reviewer release alias, pins other actions and protects checkout credentials", () => {
+    expect(step(review.jobs.review, "Review pull request").uses).toBe(
+      "markhuangai/ai-pr-reviewer@v1-prerelease",
+    );
     for (const document of [ci, codeql, review, release]) {
       for (const job of Object.values(document.jobs)) {
         for (const entry of job.steps) {
-          if (entry.uses) expect(entry.uses).toMatch(/@[0-9a-f]{40}$/);
+          if (
+            entry.uses &&
+            entry.uses !== "markhuangai/ai-pr-reviewer@v1-prerelease"
+          )
+            expect(entry.uses).toMatch(/@[0-9a-f]{40}$/);
           if (entry.uses?.startsWith("actions/checkout@"))
             expect(entry.with["persist-credentials"]).toBe(false);
         }

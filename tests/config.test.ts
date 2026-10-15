@@ -433,7 +433,7 @@ describe("generic HTTP MCP policy configuration", () => {
       90,
     );
   });
-  it("rejects authentication query parameters without treating ordinary URL queries as credentials", () => {
+  it("rejects credential-bearing and ordinary endpoint URL queries", () => {
     const config = fixtureMcp();
     config.mcp.servers.context.url =
       "https://fixture/mcp?api_key=embedded-secret-canary";
@@ -441,11 +441,17 @@ describe("generic HTTP MCP policy configuration", () => {
       "schema_invalid",
     );
     config.mcp.servers.context.url = "https://fixture/mcp?api-version=1";
-    expect(
-      parseConfiguration(stringify(config)).mcp.servers.context.url,
-    ).toContain("api-version=1");
+    expect(() => parseConfiguration(stringify(config))).toThrow(
+      "schema_invalid",
+    );
   });
-  for (const parameter of ["key", "x-api-key", "X-Amz-Signature"])
+  for (const parameter of [
+    "key",
+    "x-api-key",
+    "X-Amz-Signature",
+    "client_secret",
+    "refresh_token",
+  ])
     for (const target of ["proxy", "mcp"])
       it(`rejects ${parameter} authentication queries in ${target} endpoints`, () => {
         const config = fixtureMcp();

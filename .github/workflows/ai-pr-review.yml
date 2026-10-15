@@ -307,7 +307,7 @@ jobs:
         id: reviewer
         continue-on-error: true
         timeout-minutes: 50
-        uses: markhuangai/ai-pr-reviewer@39a3843bd925258b1cc9f03bdb5f4126b7f62549 # v1-prerelease
+        uses: markhuangai/ai-pr-reviewer@v1-prerelease
         with:
           executor: claude
           pull-request-url: ${{ format('{0}/{1}/pull/{2}', github.server_url, github.repository, needs.resolve.outputs.pr_number) }}
