@@ -42,6 +42,10 @@ notifications:
     url: https://notify.example.invalid/orm
     headers:
       Authorization: Bearer REPLACE_NOTIFICATION_TOKEN
+limits:
+  worker_processes: 128
+  worker_output_bytes: 16777216
+  worker_storage_bytes: 4294967296
 mcp:
   credentials: {}
   servers: {}

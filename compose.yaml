@@ -6,6 +6,7 @@ services:
       - "127.0.0.1:8080:8080"
     stop_grace_period: 15s
     volumes:
+      # Worker scratch shares this disk-backed volume and has monitored, rather than filesystem-enforced, size limits.
       - data:/data
       - type: bind
         source: ./operator/config

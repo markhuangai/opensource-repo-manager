@@ -634,6 +634,10 @@ try {
     "--mount",
     `type=bind,src=${join(fixtures, directory)},dst=/${directory},readonly`,
   ]);
+  mounts.push(
+    "--mount",
+    `type=bind,src=${join(root, "tests", "fixtures", "runtime")},dst=/runtime-fixtures,readonly`,
+  );
   const connection = [
     "--network",
     network,
@@ -909,6 +913,22 @@ try {
   assert.notEqual(deniedWrite.status, 0);
   assert(deniedWrite.stderr.includes("Read-only file system"));
 
+  const runtimeProof = JSON.parse(
+    docker(
+      [
+        "exec",
+        runtime,
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        "import {runRuntimeTests} from '/runtime-fixtures/harness.mjs'; await runRuntimeTests();",
+      ],
+      { timeout: 180_000 },
+    ),
+  );
+  assert.equal(runtimeProof.runtime, "passed");
+  assert.equal(runtimeProof.cleanup, "passed");
+
   const healthyDeadline = Date.now() + 30_000;
   while (
     inspectRuntime().State.Health.Status === "starting" &&
@@ -947,6 +967,7 @@ try {
     protected_configuration_and_service_startup: "passed",
     webhook_intake_and_crash_recovery: "passed",
     immutable_secret_free_snapshots: "passed",
+    supervised_workers: runtimeProof,
   };
 } catch (error) {
   failure = error;

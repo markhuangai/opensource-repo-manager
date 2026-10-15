@@ -11,7 +11,7 @@ export async function startHttpService(
   dependencies?: {
     intake: IntakeService;
     webhookSecret: string;
-    close: () => void;
+    close: () => void | Promise<void>;
   },
 ) {
   const app = createApp(dependencies?.intake, dependencies?.webhookSecret);
@@ -19,7 +19,7 @@ export async function startHttpService(
     try {
       await dependencies?.intake.stop();
     } finally {
-      dependencies?.close();
+      await dependencies?.close();
     }
   });
   let stopping = false;
