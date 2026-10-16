@@ -474,6 +474,7 @@ export class Supervisor implements AgentRunner {
           grants: grantFor(snapshot, request.role),
           deadline: context.deadline,
           signal,
+          available: () => !context.suspended,
         });
         this.validateMcp(mcp, context);
       }

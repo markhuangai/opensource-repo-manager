@@ -28,6 +28,7 @@ import {
   userProcesses,
 } from "/opt/orm/app/dist/runtime/process.js";
 import { treeBytes } from "/opt/orm/app/dist/services/workspaces/files.js";
+import { verifyMcp } from "./mcp.mjs";
 
 async function collect(iterable) {
   const events = [];
@@ -342,7 +343,8 @@ export async function runRuntimeTests() {
         ),
       ),
     );
-  let tests = 0;
+  let tests = 0,
+    mcpProof;
   const errors = [];
   try {
     const bootstrap = spawn(
@@ -701,10 +703,17 @@ export async function runRuntimeTests() {
     const timed = seed({ limits: { active_minutes: 1 } });
     store.db
       .prepare(
-        "UPDATE jobs SET budget_json=json_set(budget_json,'$.active_ms',59000) WHERE id=?",
+        "UPDATE jobs SET budget_json=json_set(budget_json,'$.active_ms',55000) WHERE id=?",
       )
       .run(timed.job.id);
-    assert.equal((await run(timed, { mode: "hang" })).outcome, "limited");
+    const timedIterator = iterate(
+      supervisor.run(
+        supervisor.request(timed.job.id, "implementation", { mode: "hang" }),
+        new globalThis.AbortController().signal,
+      ),
+    );
+    assert.equal((await timedIterator.next()).value.message, "ready");
+    assert.equal(terminal(await remaining(timedIterator)).outcome, "limited");
     assert.equal(
       JSON.parse(store.jobById(timed.job.id).budget_json).active_ms,
       60000,
@@ -1140,6 +1149,15 @@ export async function runRuntimeTests() {
       }
     }
     await supervisor.close();
+    mcpProof = await verifyMcp({
+      store,
+      worker,
+      root,
+      sourceUrl,
+      source: { sha, tree_sha: tree, default_branch: "main" },
+      proxy,
+      bundles,
+    });
     assert.equal(
       terminal(await remaining(shutdownIterator)).outcome,
       "cancelled",
@@ -1248,6 +1266,7 @@ export async function runRuntimeTests() {
       history: "full",
       nested_review: "one_lease",
       crash_recovery: "passed",
+      mcp_gateway: mcpProof,
       cleanup: "passed",
     }),
   );

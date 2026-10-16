@@ -31,6 +31,68 @@ function detached() {
 
 export async function* run(request, signal) {
   const input = request.input ?? {};
+  if (input.mode === "mcp-real") {
+    const { Client } =
+      await import("/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js");
+    const { StreamableHTTPClientTransport } =
+      await import("/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js");
+    const serialized = JSON.stringify({ environment: process.env, request });
+    assert(!serialized.includes("mcp-upstream-container-"));
+    assert(await denied(readFile("/config/config.yml")));
+    const name = request.role === "audit" ? "hidden" : "read",
+      values = [];
+    for (const connection of request.mcp) {
+      assert.deepEqual(connection.tools, [name]);
+      assert.equal(new URL(connection.url).hostname, "127.0.0.1");
+      const client = new Client(
+        { name: "unprivileged-fixture", version: "1" },
+        { capabilities: {} },
+      );
+      try {
+        await client.connect(
+          new StreamableHTTPClientTransport(new URL(connection.url), {
+            requestInit: {
+              headers: { Authorization: `Bearer ${connection.authorization}` },
+            },
+          }),
+        );
+        assert.deepEqual(
+          (await client.listTools()).tools.map((tool) => tool.name),
+          [name],
+        );
+        await assert.rejects(
+          client.callTool({ name: name === "read" ? "hidden" : "read" }),
+          /mcp_tool_denied/,
+        );
+        assert.equal(
+          (
+            await fetch(connection.url, {
+              method: "POST",
+              headers: { Authorization: "Bearer forged" },
+              body: "{}",
+              signal,
+            })
+          ).status,
+          401,
+        );
+        const result = await client.callTool(
+          { name, arguments: { text: "safe" } },
+          undefined,
+          { signal },
+        );
+        values.push(result.content[0].text);
+      } finally {
+        await client.close();
+      }
+    }
+    yield { type: "session", id: "real-mcp-session" };
+    yield {
+      type: "terminal",
+      outcome: "completed",
+      result: { binding: request.binding, uid: process.getuid(), values },
+    };
+    return;
+  }
   if (input.mode === "terminal-outcome") {
     yield { type: "terminal", outcome: input.outcome };
     return;

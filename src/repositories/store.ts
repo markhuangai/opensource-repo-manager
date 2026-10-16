@@ -16,6 +16,7 @@ import {
   RuntimeError,
   type AgentRunRecord,
   type ArtifactManifest,
+  type McpCallReceipt,
 } from "../domain/agents.ts";
 import {
   budgetUsage,
@@ -79,7 +80,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (version !== 0 && version !== 1 && version !== 2)
+      if (version !== 0 && version !== 1 && version !== 2 && version !== 3)
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -159,6 +160,23 @@ export class Store {
             manifest_json TEXT NOT NULL
           );
           PRAGMA user_version = 2;
+        `),
+          )
+          .immediate();
+      if (version === 0 || version === 1 || version === 2)
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE mcp_calls (
+            id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES agent_runs(id),
+            job_id INTEGER NOT NULL REFERENCES jobs(id), revision INTEGER NOT NULL,
+            role TEXT NOT NULL, alias TEXT NOT NULL, tool TEXT NOT NULL,
+            credential_binding TEXT NOT NULL, policy_identity TEXT NOT NULL,
+            catalog_identity TEXT NOT NULL, request_digest TEXT NOT NULL,
+            result_digest TEXT, started_at INTEGER NOT NULL, finished_at INTEGER,
+            outcome TEXT NOT NULL CHECK(outcome IN ('running','completed','tool_error','failed','cancelled','interrupted'))
+          );
+          PRAGMA user_version = 3;
         `),
           )
           .immediate();
@@ -574,6 +592,66 @@ export class Store {
     return this.db
       .prepare("SELECT * FROM agent_runs ORDER BY started_at,rowid")
       .all() as AgentRunRecord[];
+  }
+
+  run(id: string): AgentRunRecord | undefined {
+    return this.db.prepare("SELECT * FROM agent_runs WHERE id=?").get(id) as
+      AgentRunRecord | undefined;
+  }
+
+  startMcpCall(
+    receipt: Omit<McpCallReceipt, "result_digest" | "finished_at" | "outcome">,
+  ) {
+    this.db
+      .transaction(() => {
+        const run = this.run(receipt.run_id);
+        if (
+          !run ||
+          run.finished_at !== null ||
+          run.job_id !== receipt.job_id ||
+          run.revision !== receipt.revision ||
+          run.role !== receipt.role ||
+          !this.runtimeCurrent(run.lease_token)
+        )
+          throw new RuntimeError("revision_stale");
+        this.db
+          .prepare(
+            `INSERT INTO mcp_calls
+        (id,run_id,job_id,revision,role,alias,tool,credential_binding,policy_identity,catalog_identity,request_digest,started_at,outcome)
+        VALUES(@id,@run_id,@job_id,@revision,@role,@alias,@tool,@credential_binding,@policy_identity,@catalog_identity,@request_digest,@started_at,'running')`,
+          )
+          .run(receipt);
+      })
+      .immediate();
+  }
+
+  finishMcpCall(
+    id: string,
+    outcome: Exclude<McpCallReceipt["outcome"], "running">,
+    result: string | null,
+  ) {
+    if (
+      this.db
+        .prepare(
+          "UPDATE mcp_calls SET outcome=?,result_digest=?,finished_at=? WHERE id=? AND outcome='running'",
+        )
+        .run(outcome, result, Date.now(), id).changes !== 1
+    )
+      throw new RuntimeError("mcp_receipt_not_active");
+  }
+
+  interruptMcpCalls() {
+    this.db
+      .prepare(
+        "UPDATE mcp_calls SET outcome='interrupted',finished_at=? WHERE outcome='running'",
+      )
+      .run(Date.now());
+  }
+
+  mcpCalls(): McpCallReceipt[] {
+    return this.db
+      .prepare("SELECT * FROM mcp_calls ORDER BY started_at,rowid")
+      .all() as McpCallReceipt[];
   }
 
   bindRun(id: string, binding: string) {

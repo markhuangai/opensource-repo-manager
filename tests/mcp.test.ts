@@ -1,0 +1,1923 @@
+import { createServer } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { afterEach, describe, expect, it } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  CallToolRequestSchema,
+  CallToolResultSchema,
+  ListToolsRequestSchema,
+  ListToolsResultSchema,
+  McpError,
+  type CallToolResult,
+  type Tool,
+} from "@modelcontextprotocol/sdk/types.js";
+import { McpGateway } from "../src/services/mcp/index.ts";
+import { budget } from "../src/services/mcp/http.ts";
+import { Store } from "../src/repositories/store.ts";
+import { fixtureConfiguration, fixtureSnapshot } from "./fixtures.ts";
+import { makeIssue } from "./fixtures/github.ts";
+import { roleUsers, type McpConnection } from "../src/domain/agents.ts";
+import type { Configuration, Role } from "../src/config/schema.ts";
+
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => {
+  const results = await Promise.allSettled(
+    cleanups
+      .splice(0)
+      .reverse()
+      .map((cleanup) => cleanup()),
+  );
+  const failed = results.filter((result) => result.status === "rejected");
+  if (failed.length)
+    throw new AggregateError(
+      failed.map((result) => result.reason),
+      "MCP fixture cleanup failed",
+    );
+});
+
+const tool = (name: string, description = name): Tool => ({
+  name,
+  description,
+  inputSchema: {
+    type: "object",
+    properties: { text: { type: "string" } },
+    additionalProperties: false,
+  },
+});
+
+async function setup(configure?: (config: Configuration) => void) {
+  const transports = new Map<
+    string,
+    { server: Server; transport: StreamableHTTPServerTransport }
+  >();
+  const servers = new Set<Server>();
+  const state = {
+    catalog: [tool("read"), tool("hidden"), tool("write")],
+    catalogs: new Map<string, Tool[]>(),
+    pageSize: 1,
+    pageDelay: 0,
+    hang: "",
+    stateless: false,
+    progressOnGet: false,
+    progressMetadata: undefined as { text: string } | undefined,
+    sseEnding: "\n",
+    sseCommentLines: 0,
+    redirect: new Set<string>(),
+    requests: [] as Array<{
+      method: string;
+      path: string;
+      authorization?: string;
+      session?: string;
+      body?: {
+        method?: string;
+        params?: { name?: string; arguments?: Record<string, unknown> };
+      };
+    }>,
+    calls: [] as Array<{
+      name: string;
+      args: Record<string, unknown>;
+      authorization?: string;
+    }>,
+    execute: async (
+      args: Record<string, unknown>,
+      _progress: (message: string) => Promise<void>,
+      _signal: AbortSignal,
+      authorization?: string,
+    ): Promise<CallToolResult> => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            args,
+            authorization:
+              authorization === "Bearer mcp-upstream-canary"
+                ? "first"
+                : "second",
+          }),
+        },
+      ],
+    }),
+  };
+  const upstream = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = chunks.length
+      ? JSON.parse(Buffer.concat(chunks).toString())
+      : undefined;
+    state.requests.push({
+      method: req.method!,
+      path: req.url!,
+      authorization: req.headers.authorization,
+      session: req.headers["mcp-session-id"] as string | undefined,
+      body,
+    });
+    if (state.redirect.has(req.method!)) {
+      res.writeHead(307, { location: endpoint + "/redirected" });
+      res.end();
+      return;
+    }
+    if (state.hang === body?.method) return;
+    let session = transports.get(req.headers["mcp-session-id"] as string);
+    if (!session) {
+      if (!state.stateless && body?.method !== "initialize") {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      if (state.stateless && req.method === "GET") {
+        res.writeHead(405);
+        res.end();
+        return;
+      }
+      const server = new Server(
+        { name: "fixture", version: "1" },
+        { capabilities: { tools: { listChanged: true } } },
+      );
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: state.stateless ? undefined : randomUUID,
+        onsessioninitialized: (id) => {
+          transports.set(id, { server, transport });
+        },
+        keepAliveMs: 0,
+      });
+      servers.add(server);
+      server.setRequestHandler(ListToolsRequestSchema, async (message) => {
+        if (state.pageDelay) await delay(state.pageDelay);
+        const index = Number(message.params?.cursor ?? 0);
+        const catalog =
+          state.catalogs.get(req.headers.authorization ?? "") ?? state.catalog;
+        return {
+          tools: catalog.slice(index, index + state.pageSize),
+          ...(index + state.pageSize < catalog.length
+            ? { nextCursor: String(index + state.pageSize) }
+            : {}),
+        };
+      });
+      const authorization = req.headers.authorization;
+      server.setRequestHandler(
+        CallToolRequestSchema,
+        async (message, extra) => {
+          const args = message.params.arguments ?? {};
+          state.calls.push({ name: message.params.name, args, authorization });
+          return state.execute(
+            args,
+            async (text) => {
+              if (extra._meta?.progressToken !== undefined) {
+                const notification = {
+                  method: "notifications/progress" as const,
+                  params: {
+                    progressToken: extra._meta.progressToken,
+                    progress: 1,
+                    total: 2,
+                    message: text,
+                    ...(state.progressMetadata
+                      ? { _meta: state.progressMetadata }
+                      : {}),
+                  },
+                };
+                if (state.progressOnGet)
+                  await server.notification(notification);
+                else await extra.sendNotification(notification);
+              }
+            },
+            extra.signal,
+            authorization,
+          );
+        },
+      );
+      await server.connect(transport);
+      session = { server, transport };
+    }
+    if (req.method === "GET" && state.sseEnding !== "\n") {
+      const write = res.write.bind(res);
+      let firstWrite = true;
+      res.write = (chunk: string | Uint8Array) => {
+        const text =
+          typeof chunk === "string"
+            ? chunk
+            : Buffer.from(chunk).toString("utf8");
+        const prefix = firstWrite
+          ? (":comment" + state.sseEnding).repeat(state.sseCommentLines)
+          : "";
+        firstWrite = false;
+        // The SDK parser waits for the next character before consuming a trailing CR.
+        return write(
+          prefix +
+            text.replaceAll("\n", state.sseEnding) +
+            (state.sseEnding === "\r" ? ":flush\r" : ""),
+        );
+      };
+    }
+    await session.transport.handleRequest(req, res, body);
+  });
+  await new Promise<void>((resolve) =>
+    upstream.listen(0, "127.0.0.1", resolve),
+  );
+  const endpoint = `http://127.0.0.1:${(upstream.address() as { port: number }).port}/mcp`;
+  const config = fixtureConfiguration();
+  config.mcp.credentials.first = {
+    headers: { Authorization: "Bearer mcp-upstream-canary" },
+  };
+  config.mcp.credentials.second = {
+    headers: { Authorization: "Bearer other-upstream-canary" },
+  };
+  config.mcp.servers.context = {
+    transport: "streamable_http",
+    url: endpoint,
+    allow_plain_http: true,
+    credential_ref: "first",
+    tools: {
+      read: { effect: "read" },
+      hidden: { effect: "read" },
+      write: { effect: "reviewed_write" },
+    },
+  };
+  config.roles.investigation.mcp = { context: { tools: ["read"] } };
+  config.roles.audit.mcp = { context: { tools: ["hidden"] } };
+  configure?.(config);
+  const loaded = await fixtureSnapshot("model", config);
+  const root = await mkdtemp(join(tmpdir(), "orm-mcp-")),
+    path = join(root, "state", "db.sqlite"),
+    store = new Store(path);
+  store.saveSnapshot(loaded.snapshot);
+  store.discover([1], 1, true);
+  const context = {
+    ...makeIssue(1),
+    state: "open" as const,
+    comments: [],
+    source: {
+      sha: "a".repeat(40),
+      tree_sha: "b".repeat(40),
+      default_branch: "main",
+    },
+  };
+  store.applyIssue(store.nextDirty()!, context, loaded.snapshot);
+  const job = store.job(1)!,
+    lease = store.acquireLease(job.id, job.revision)!;
+  const deadline = store.startRuntimeLease(lease, 30_000),
+    gateway = new McpGateway(store, loaded.snapshot, loaded.secrets);
+  await gateway.start();
+  const runs = new Map<Role, string>(),
+    controller = new AbortController();
+  let available = true,
+    expectedCleanupFailure = false;
+  const clients: Client[] = [];
+  const request = (role: Role = "investigation", until = deadline) => {
+    if (!runs.has(role)) {
+      const id = randomUUID();
+      store.startRun({
+        id,
+        job_id: job.id,
+        revision: job.revision,
+        role,
+        uid: roleUsers[role].uid,
+        parent_id: null,
+        lease_token: lease,
+        binding_json: "{}",
+      });
+      runs.set(role, id);
+    }
+    return {
+      run_id: runs.get(role)!,
+      job_id: job.id,
+      revision: job.revision,
+      role,
+      grants: loaded.snapshot.roles[role].mcp,
+      deadline: until,
+      signal: controller.signal,
+      available: () => available,
+    };
+  };
+  const open = (role: Role = "investigation", until = deadline) =>
+    gateway.open(request(role, until));
+  const connect = async (connection: McpConnection) => {
+    const client = new Client(
+      { name: "worker", version: "1" },
+      { capabilities: {} },
+    );
+    clients.push(client);
+    const transport = new StreamableHTTPClientTransport(
+      new URL(connection.url),
+      {
+        requestInit: {
+          headers: { Authorization: `Bearer ${connection.authorization}` },
+        },
+        reconnectionOptions: {
+          maxRetries: 0,
+          initialReconnectionDelay: 100,
+          maxReconnectionDelay: 100,
+          reconnectionDelayGrowFactor: 1,
+        },
+      },
+    );
+    await client.connect(transport, { timeout: 3000 });
+    return { client, transport };
+  };
+  const raw = (
+    connection: McpConnection,
+    method = "POST",
+    body?: unknown,
+    authorization = connection.authorization,
+    session?: string,
+  ) =>
+    fetch(connection.url, {
+      method,
+      headers: {
+        authorization: `Bearer ${authorization}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        ...(session ? { "mcp-session-id": session } : {}),
+      },
+      ...(method === "POST"
+        ? {
+            body: JSON.stringify(
+              body ?? {
+                jsonrpc: "2.0",
+                id: 7,
+                method: "tools/call",
+                params: { name: "read", arguments: {} },
+              },
+            ),
+          }
+        : {}),
+      signal: AbortSignal.timeout(3000),
+    });
+  cleanups.push(async () => {
+    try {
+      if (expectedCleanupFailure)
+        await expect(gateway.close()).rejects.toThrow("mcp_cleanup_failed");
+      else await gateway.close();
+    } finally {
+      await Promise.all(clients.map((client) => client.close()));
+      await Promise.all([...servers].map((server) => server.close()));
+      upstream.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        upstream.close((error) => (error ? reject(error) : resolve())),
+      );
+      store.close();
+      await rm(root, { recursive: true });
+    }
+  });
+  return {
+    state,
+    config,
+    loaded,
+    store,
+    root,
+    path,
+    job,
+    lease,
+    deadline,
+    gateway,
+    request,
+    open,
+    connect,
+    raw,
+    controller,
+    context,
+    available: (value: boolean) => {
+      available = value;
+    },
+    expectCleanupFailure: () => {
+      expectedCleanupFailure = true;
+    },
+    changed: () =>
+      Promise.all(
+        [...servers].map((server) =>
+          server.notification({ method: "notifications/tools/list_changed" }),
+        ),
+      ),
+  };
+}
+
+describe("scoped HTTP MCP gateway", () => {
+  it("initializes a complete paginated catalog and exposes only granted reads with durable digests", async () => {
+    const f = await setup(),
+      session = await f.open();
+    const { client } = await f.connect(session.connections[0]);
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
+      "read",
+    ]);
+    const result = await client.callTool({
+      name: "read",
+      arguments: { text: "hello" },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(
+      f.state.requests.filter(
+        (request) => request.body?.method === "tools/list",
+      ),
+    ).toHaveLength(3);
+    expect(f.state.calls).toEqual([
+      {
+        name: "read",
+        args: { text: "hello" },
+        authorization: "Bearer mcp-upstream-canary",
+      },
+    ]);
+    expect(f.store.mcpCalls()).toMatchObject([
+      {
+        outcome: "completed",
+        role: "investigation",
+        alias: "context",
+        tool: "read",
+      },
+    ]);
+    expect(f.store.mcpCalls()[0].request_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(f.store.mcpCalls()[0].result_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(f.store.mcpCalls())).not.toMatch(
+      /hello|canary|Bearer/,
+    );
+    expect(JSON.stringify(session)).not.toContain("upstream-canary");
+    await session.close();
+    expect((await f.raw(session.connections[0])).status).toBe(401);
+  });
+
+  it("supports a real stateless Streamable HTTP server", async () => {
+    const f = await setup();
+    f.state.stateless = true;
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    expect((await client.callTool({ name: "read" })).isError).not.toBe(true);
+  });
+
+  it("allows empty grants without contacting any server and blocks every assigned write", async () => {
+    const f = await setup((config) => {
+      config.roles.investigation.mcp = {};
+    });
+    expect((await f.open()).connections).toEqual([]);
+    expect(f.state.requests).toEqual([]);
+    const write = await setup((config) => {
+      config.roles.investigation.mcp.context.tools.push("write");
+    });
+    await expect(write.open()).rejects.toThrow(
+      "mcp_reviewed_write_unavailable",
+    );
+    expect(write.state.requests).toEqual([]);
+  });
+
+  it("denies forged raw requests, cross-role session IDs, ungranted tools and unsupported capabilities", async () => {
+    const f = await setup(),
+      session = await f.open(),
+      audit = await f.open("audit");
+    const { client, transport } = await f.connect(session.connections[0]);
+    const other = await f.connect(audit.connections[0]);
+    expect(
+      (await other.client.listTools()).tools.map((tool) => tool.name),
+    ).toEqual(["hidden"]);
+    expect(
+      (
+        await f.raw(
+          session.connections[0],
+          "POST",
+          undefined,
+          "wrong",
+          transport.sessionId,
+        )
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await f.raw(
+          session.connections[0],
+          "POST",
+          undefined,
+          audit.connections[0].authorization,
+          transport.sessionId,
+        )
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await f.raw(
+          session.connections[0],
+          "POST",
+          undefined,
+          session.connections[0].authorization,
+          other.transport.sessionId,
+        )
+      ).status,
+    ).toBe(404);
+    expect((await f.raw(session.connections[0], "PUT")).status).toBe(405);
+    await expect(client.callTool({ name: "hidden" })).rejects.toThrow(
+      "mcp_tool_denied",
+    );
+    await expect(
+      client.request({ method: "resources/list" }, ListToolsResultSchema),
+    ).rejects.toThrow("Method not found");
+    await expect(
+      client.request(
+        { method: "tools/call", params: { name: "read", task: {} } },
+        CallToolResultSchema,
+      ),
+    ).rejects.toThrow("Server does not support task creation");
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it("isolates aliases sharing one URL and distinct credentials", async () => {
+    const f = await setup((config) => {
+      config.mcp.servers.second = {
+        ...config.mcp.servers.context,
+        credential_ref: "second",
+      };
+      config.roles.investigation.mcp.second = { tools: ["read"] };
+    });
+    const session = await f.open();
+    expect(session.connections).toHaveLength(2);
+    expect(
+      new Set(session.connections.map((connection) => connection.authorization))
+        .size,
+    ).toBe(2);
+    const first = await f.connect(session.connections[0]),
+      second = await f.connect(session.connections[1]);
+    await first.client.callTool({ name: "read" });
+    await second.client.callTool({ name: "read" });
+    expect(f.state.calls.map((call) => call.authorization)).toEqual([
+      "Bearer mcp-upstream-canary",
+      "Bearer other-upstream-canary",
+    ]);
+    const initializations = f.state.requests.filter(
+      (request) => request.body?.method === "initialize",
+    );
+    expect(initializations).toHaveLength(2);
+    expect(
+      new Set(f.store.mcpCalls().map((call) => call.credential_binding)).size,
+    ).toBe(2);
+    expect(
+      (
+        await f.raw(
+          session.connections[0],
+          "POST",
+          undefined,
+          session.connections[1].authorization,
+          first.transport.sessionId,
+        )
+      ).status,
+    ).toBe(401);
+  });
+
+  it("validates real schemas without coercion, mutation, external loading or shared schema IDs", async () => {
+    const f = await setup();
+    f.state.catalog[0].inputSchema = {
+      type: "object",
+      $defs: { value: { type: "integer" } },
+      properties: { value: { $ref: "#/$defs/value" } },
+      required: ["value"],
+      additionalProperties: false,
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    await expect(
+      client.callTool({ name: "read", arguments: { value: "3" } }),
+    ).rejects.toThrow("mcp_arguments_invalid");
+    await client.callTool({ name: "read", arguments: { value: 3 } });
+    expect(f.state.calls.map((call) => call.args)).toEqual([{ value: 3 }]);
+    const external = await setup();
+    external.state.catalog[0].inputSchema = {
+      type: "object",
+      properties: {
+        value: { $ref: external.config.mcp.servers.context.url + "/schema" },
+      },
+    };
+    await expect(external.open()).rejects.toThrow("mcp_schema_invalid");
+    expect(
+      external.state.requests.some((request) =>
+        request.path.includes("schema"),
+      ),
+    ).toBe(false);
+  });
+
+  it.each([
+    ["input", "pattern"],
+    ["output", "pattern"],
+    ["input", "patternProperties"],
+    ["output", "patternProperties"],
+  ])("bounds untrusted %s schema %s evaluation", async (kind, keyword) => {
+    const f = await setup();
+    const schema = {
+      type: "object" as const,
+      additionalProperties: false,
+      ...(keyword === "pattern"
+        ? {
+            properties: { text: { type: "string", pattern: "^(a+)+$" } },
+            required: ["text"],
+          }
+        : { patternProperties: { "^(a+)+$": { type: "string" } } }),
+    };
+    if (kind === "input") f.state.catalog[0].inputSchema = schema;
+    else f.state.catalog[0].outputSchema = schema;
+    const invalid =
+      keyword === "pattern"
+        ? { text: "a".repeat(20_000) + "!" }
+        : { ["a".repeat(20_000) + "!"]: "value" };
+    const valid = keyword === "pattern" ? { text: "aaaa" } : { aaaa: "value" };
+    let output: Record<string, unknown> = invalid;
+    f.state.execute = async () => ({ content: [], structuredContent: output });
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    await expect(
+      client.callTool({
+        name: "read",
+        arguments: kind === "input" ? invalid : {},
+      }),
+    ).rejects.toThrow(
+      kind === "input" ? "mcp_arguments_invalid" : "mcp_result_invalid",
+    );
+    if (kind === "input") expect(f.state.calls).toEqual([]);
+    else expect(f.store.mcpCalls().at(-1)?.outcome).toBe("failed");
+    output = valid;
+    await client.callTool({
+      name: "read",
+      arguments: kind === "input" ? valid : {},
+    });
+    expect(f.store.mcpCalls().at(-1)?.outcome).toBe("completed");
+  });
+
+  it("preserves Unicode, unanchored matching and distinct schema patterns", async () => {
+    const f = await setup();
+    f.state.catalog[0].inputSchema = {
+      type: "object",
+      properties: {
+        number: { type: "string", pattern: "^[0-9]+$" },
+        name: { type: "string", pattern: "^[a-z]+$" },
+        text: { type: "string", pattern: "needle" },
+        emoji: { type: "string", pattern: "^\\u{1F600}$" },
+      },
+      required: ["number", "name", "text", "emoji"],
+      additionalProperties: false,
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const args = {
+      number: "123",
+      name: "abc",
+      text: "a needle here",
+      emoji: "😀",
+    };
+    await client.callTool({ name: "read", arguments: args });
+    for (const invalid of [
+      { ...args, number: "abc" },
+      { ...args, name: "123" },
+      { ...args, text: "absent" },
+      { ...args, emoji: "😃" },
+    ])
+      await expect(
+        client.callTool({ name: "read", arguments: invalid }),
+      ).rejects.toThrow("mcp_arguments_invalid");
+    expect(f.state.calls.map((call) => call.args)).toEqual([args]);
+  });
+
+  it.each(["input", "output"])(
+    "rejects unsupported %s regex syntax explicitly",
+    async (kind) => {
+      const f = await setup();
+      const schema = {
+        type: "object" as const,
+        properties: { text: { type: "string", pattern: "(?=a)a" } },
+      };
+      if (kind === "input") f.state.catalog[0].inputSchema = schema;
+      else f.state.catalog[0].outputSchema = schema;
+      await expect(f.open()).rejects.toThrow("mcp_schema_invalid");
+      expect(f.state.calls).toEqual([]);
+    },
+  );
+
+  it("keeps identically named schema IDs isolated across credential-bound catalogs", async () => {
+    const f = await setup((config) => {
+      config.mcp.servers.second = {
+        ...config.mcp.servers.context,
+        credential_ref: "second",
+      };
+      config.roles.investigation.mcp.second = { tools: ["read"] };
+    });
+    const schema = (type: string): Tool => ({
+      name: "read",
+      inputSchema: {
+        type: "object",
+        $id: "urn:fixture:same-id",
+        properties: { value: { type } },
+        required: ["value"],
+      },
+    });
+    f.state.catalogs.set("Bearer mcp-upstream-canary", [schema("integer")]);
+    f.state.catalogs.set("Bearer other-upstream-canary", [schema("string")]);
+    const session = await f.open(),
+      first = await f.connect(session.connections[0]),
+      second = await f.connect(session.connections[1]);
+    await first.client.callTool({ name: "read", arguments: { value: 1 } });
+    await second.client.callTool({ name: "read", arguments: { value: "one" } });
+    await expect(
+      first.client.callTool({ name: "read", arguments: { value: "one" } }),
+    ).rejects.toThrow("mcp_arguments_invalid");
+    await expect(
+      second.client.callTool({ name: "read", arguments: { value: 1 } }),
+    ).rejects.toThrow("mcp_arguments_invalid");
+  });
+
+  it.each([
+    "missing",
+    "duplicate",
+    "invalid-schema",
+    "ungranted-invalid-schema",
+  ])("rejects an invalid complete catalog: %s", async (mode) => {
+    const f = await setup();
+    if (mode === "missing") f.state.catalog = [tool("hidden")];
+    if (mode === "duplicate") f.state.catalog.push(tool("read"));
+    if (mode === "invalid-schema")
+      f.state.catalog[0].inputSchema = {
+        type: "object",
+        properties: { invalid: { type: "invented" } },
+      };
+    if (mode === "ungranted-invalid-schema")
+      f.state.catalog[1].inputSchema = {
+        type: "object",
+        properties: { invalid: { type: "invented" } },
+      };
+    await expect(f.open()).rejects.toThrow(
+      mode === "missing"
+        ? "mcp_tool_unavailable"
+        : mode === "duplicate"
+          ? "mcp_catalog_invalid"
+          : "mcp_schema_invalid",
+    );
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it.each(["input", "output"])(
+    "rejects asynchronous %s schemas before they can bypass validation",
+    async (kind) => {
+      const f = await setup();
+      const schema = {
+        type: "object" as const,
+        $async: true,
+        properties: { value: { type: "integer" } },
+        required: ["value"],
+      };
+      if (kind === "input") f.state.catalog[0].inputSchema = schema;
+      else f.state.catalog[0].outputSchema = schema;
+      f.state.execute = async () => ({
+        content: [],
+        structuredContent: { value: "invalid" },
+      });
+      await expect(f.open()).rejects.toThrow("mcp_schema_invalid");
+      expect(f.state.calls).toEqual([]);
+    },
+  );
+
+  it("rejects assigned task-required reads and closes aliases already initialized", async () => {
+    const f = await setup((config) => {
+      config.mcp.servers.second = {
+        ...config.mcp.servers.context,
+        credential_ref: "second",
+      };
+      config.roles.investigation.mcp.second = { tools: ["read"] };
+    });
+    f.state.catalogs.set("Bearer other-upstream-canary", [
+      { ...tool("read"), execution: { taskSupport: "required" } },
+    ]);
+    await expect(f.open()).rejects.toThrow("mcp_tool_unavailable");
+    expect(f.state.calls).toEqual([]);
+    expect(
+      f.state.requests.filter((request) => request.method === "DELETE"),
+    ).toHaveLength(2);
+  });
+
+  it.each([
+    "description",
+    "schema",
+    "result",
+    "error",
+    "progress",
+    "arguments",
+    "authorization",
+  ])("blocks secret canaries in %s", async (mode) => {
+    const f = await setup();
+    if (mode === "description")
+      f.state.catalog[0].description = "mcp-upstream-canary";
+    if (mode === "schema")
+      f.state.catalog[0].inputSchema.description = "mcp-upstream-canary";
+    if (mode === "description" || mode === "schema") {
+      await expect(f.open()).rejects.toThrow("mcp_secret_in_response");
+      return;
+    }
+    const session = await f.open(),
+      connection = session.connections[0],
+      { client } = await f.connect(connection);
+    f.state.execute = async (_args, progress) => {
+      if (mode === "error") throw new McpError(-32004, "mcp-upstream-canary");
+      if (mode === "progress") {
+        await progress("mcp-upstream-canary");
+        await delay(30);
+      }
+      return { content: [{ type: "text", text: "mcp-upstream-canary" }] };
+    };
+    let failure: unknown;
+    try {
+      await client.callTool(
+        {
+          name: "read",
+          arguments: {
+            text:
+              mode === "authorization"
+                ? connection.authorization
+                : mode === "arguments"
+                  ? "mcp-upstream-canary"
+                  : "safe",
+          },
+        },
+        undefined,
+        {
+          timeout: 2000,
+          onprogress: () => {
+            throw new Error("secret progress escaped");
+          },
+        },
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeDefined();
+    expect(String(failure)).not.toContain("mcp-upstream-canary");
+    expect(String(failure)).not.toContain(connection.authorization);
+    if (mode === "arguments" || mode === "authorization")
+      expect(f.state.calls).toEqual([]);
+    expect(JSON.stringify(f.store.mcpCalls())).not.toContain("canary");
+  });
+
+  it.each(["fields", "schema-keys"])(
+    "rejects split credentials in catalog %s",
+    async (mode) => {
+      const f = await setup();
+      if (mode === "fields") {
+        f.state.catalog[0].title = "mcp-upstream-";
+        f.state.catalog[0].description = "canary";
+      } else {
+        f.state.catalog[0].inputSchema.properties = {
+          "mcp-upstream-": { type: "string" },
+          canary: { type: "string" },
+        };
+      }
+      await expect(f.open()).rejects.toThrow("mcp_secret_in_response");
+      expect(f.state.calls).toEqual([]);
+    },
+  );
+
+  it.each(["credential", "authorization"])(
+    "suppresses split %s text in upstream error fields",
+    async (secret) => {
+      const f = await setup();
+      const session = await f.open(),
+        connection = session.connections[0],
+        { client } = await f.connect(connection);
+      const value =
+        secret === "credential"
+          ? "mcp-upstream-canary"
+          : connection.authorization;
+      const first = value.slice(0, Math.floor(value.length / 2));
+      f.state.execute = async () => {
+        throw new McpError(-32004, first, {
+          suffix: value.slice(first.length),
+        });
+      };
+      await expect(client.callTool({ name: "read" })).rejects.toMatchObject({
+        code: -32603,
+        data: undefined,
+      });
+      expect(f.store.mcpCalls()).toMatchObject([
+        { outcome: "failed", result_digest: null },
+      ]);
+      expect(
+        (await client.listTools()).tools.map((entry) => entry.name),
+      ).toEqual(["read"]);
+      expect(JSON.stringify(f.store.mcpCalls())).not.toContain(value);
+    },
+  );
+
+  it.each([" ", "\t"])(
+    "blocks HTTP-normalized credentials configured with %j padding",
+    async (padding) => {
+      const f = await setup((config) => {
+        config.mcp.credentials.first.headers.Authorization = `${padding}Bearer mcp-upstream-canary${padding}`;
+      });
+      const session = await f.open(),
+        connection = session.connections[0],
+        { client } = await f.connect(connection);
+      f.state.execute = async () => ({
+        content: [{ type: "text", text: "mcp-upstream-canary" }],
+      });
+      const settled = client
+        .callTool({ name: "read" }, undefined, { timeout: 2000 })
+        .catch((error: unknown) => error);
+      const until = performance.now() + 1000;
+      while (
+        f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+        performance.now() < until
+      )
+        await delay(5);
+      expect(f.state.calls).toMatchObject([
+        { authorization: "Bearer mcp-upstream-canary" },
+      ]);
+      expect(f.store.mcpCalls()).toMatchObject([
+        { outcome: "cancelled", result_digest: null },
+      ]);
+      expect((await f.raw(connection)).status).toBe(401);
+      const failure = await settled;
+      expect(failure).toBeInstanceOf(Error);
+      expect(String(failure)).not.toContain("mcp-upstream-canary");
+      expect(JSON.stringify(f.store.mcpCalls())).not.toContain("canary");
+    },
+  );
+
+  it.each([
+    ["credential", "progress"],
+    ["authorization", "progress"],
+    ["credential", "result"],
+    ["authorization", "result"],
+    ["credential", "resource"],
+    ["credential", "progress-result"],
+    ["authorization", "progress-result"],
+    ["credential", "progress-structured"],
+    ["authorization", "progress-structured"],
+    ["credential", "progress-structured-parts"],
+    ["credential", "progress-meta"],
+    ["credential", "progress-extension"],
+    ["credential", "structured"],
+    ["authorization", "structured"],
+    ["credential", "keys"],
+    ["authorization", "keys"],
+    ["credential", "key-value"],
+    ["credential", "root-keys"],
+    ["credential", "progress-keys-parts"],
+    ["credential", "nested-keys"],
+    ["authorization", "nested-keys"],
+    ["credential", "key-array-value"],
+    ["authorization", "key-array-value"],
+    ["credential", "value-nested-key"],
+    ["authorization", "value-nested-key"],
+  ])("blocks split %s text across %s", async (secret, channel) => {
+    const f = await setup();
+    const session = await f.open(),
+      connection = session.connections[0],
+      { client } = await f.connect(connection);
+    const value =
+        secret === "credential"
+          ? "mcp-upstream-canary"
+          : connection.authorization,
+      first = value.slice(0, Math.floor(value.length / 2)),
+      second = value.slice(first.length);
+    f.state.execute = async (_args, progress) => {
+      if (channel.startsWith("progress")) await progress(first);
+      if (channel === "progress") {
+        await progress(second);
+        return { content: [] };
+      }
+      if (channel === "resource")
+        return {
+          content: [
+            { type: "text", text: first },
+            { type: "resource", resource: { uri: "urn:text", text: second } },
+          ],
+        };
+      if (channel === "progress-structured")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          structuredContent: { metadata: "ordinary", nested: { text: second } },
+        };
+      if (channel === "progress-structured-parts")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          structuredContent: {
+            nested: { first: second.slice(0, 2), second: second.slice(2) },
+          },
+        };
+      if (channel === "progress-meta")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          _meta: { nested: { suffix: second } },
+        };
+      if (channel === "progress-extension")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          detail: { suffix: second },
+        };
+      if (channel === "structured")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          structuredContent: { first, second },
+        };
+      if (channel === "keys")
+        return {
+          content: [],
+          structuredContent: { [first]: 0, [second]: 0 },
+        };
+      if (channel === "key-value")
+        return { content: [], structuredContent: { [first]: second } };
+      if (channel === "root-keys")
+        return { content: [], [first]: 0, [second]: 0 };
+      if (channel === "nested-keys")
+        return {
+          content: [],
+          structuredContent: { [first]: { [second]: 0 } },
+        };
+      if (channel === "key-array-value")
+        return { content: [], structuredContent: { [first]: [second] } };
+      if (channel === "value-nested-key")
+        return {
+          content: [],
+          structuredContent: { first, nested: { [second]: 0 } },
+        };
+      if (channel === "progress-keys-parts")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          structuredContent: {
+            nested: { [second.slice(0, 2)]: 0, [second.slice(2)]: 0 },
+          },
+        };
+      return {
+        content: [
+          ...(channel === "result"
+            ? [{ type: "text" as const, text: first }]
+            : []),
+          { type: "text", text: second },
+        ],
+      };
+    };
+    const messages: string[] = [];
+    const settled = client
+      .callTool({ name: "read" }, undefined, {
+        timeout: 2000,
+        onprogress: (progress) => messages.push(progress.message ?? ""),
+      })
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+    const until = performance.now() + 1000;
+    while (
+      f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+      performance.now() < until
+    )
+      await delay(5);
+    expect(f.store.mcpCalls()).toMatchObject([
+      { outcome: "cancelled", result_digest: null },
+    ]);
+    expect(messages).toEqual([]);
+    expect((await f.raw(connection)).status).toBe(401);
+    expect(await settled).toMatchObject({ error: expect.any(Error) });
+    expect(JSON.stringify(f.store.mcpCalls())).not.toContain(value);
+  });
+
+  it("does not treat implicit array indices as worker-visible text", async () => {
+    const f = await setup((config) => {
+      config.mcp.credentials.first.headers.Authorization =
+        "Bearer mcp-upstream-1";
+    });
+    const content = [
+      { type: "text" as const, text: "safe!" },
+      { type: "text" as const, text: "safe!" },
+    ];
+    f.state.execute = async (_args, progress) => {
+      await progress("mcp-upstream-");
+      return { content };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]),
+      messages: string[] = [];
+    expect(
+      await client.callTool({ name: "read" }, undefined, {
+        timeout: 2000,
+        onprogress: (progress) => messages.push(progress.message ?? ""),
+      }),
+    ).toMatchObject({ content });
+    expect(messages).toEqual(["mcp-upstream-"]);
+    expect(f.store.mcpCalls()).toMatchObject([{ outcome: "completed" }]);
+    expect((await client.listTools()).tools.map((entry) => entry.name)).toEqual(
+      ["read"],
+    );
+  });
+
+  it("preserves progress order and flushes benign secret prefixes at completion", async () => {
+    const f = await setup();
+    f.state.execute = async (_args, progress) => {
+      await Promise.all(
+        Array.from({ length: 20 }, (_, i) => progress(`${i}!`)),
+      );
+      await progress("mcp-up");
+      await progress("stream-");
+      return { content: [] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]),
+      messages: string[] = [];
+    expect(
+      await client.callTool({ name: "read" }, undefined, {
+        onprogress: (progress) => messages.push(progress.message ?? ""),
+      }),
+    ).toMatchObject({ content: [] });
+    expect(messages).toEqual([
+      ...Array.from({ length: 20 }, (_, i) => `${i}!`),
+      "mcp-up",
+      "stream-",
+    ]);
+    expect(f.store.mcpCalls()).toMatchObject([{ outcome: "completed" }]);
+  });
+
+  it.each(["POST", "GET", "DELETE"])(
+    "rejects upstream redirects on %s without following them",
+    async (method) => {
+      const f = await setup();
+      if (method !== "DELETE") {
+        f.state.redirect.add(method);
+        await expect(f.open()).rejects.toThrow();
+      } else {
+        const session = await f.open();
+        f.state.redirect.add(method);
+        f.expectCleanupFailure();
+        await expect(session.close()).rejects.toThrow("mcp_cleanup_failed");
+      }
+      expect(
+        f.state.requests.some((request) => request.path.includes("redirected")),
+      ).toBe(false);
+    },
+  );
+
+  it("bounds requests, streamed responses and the aggregate paginated catalog", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_request_bytes = 1024;
+      config.mcp.max_response_bytes = 4096;
+    });
+    const session = await f.open(),
+      { client, transport } = await f.connect(session.connections[0]);
+    expect(
+      (
+        await f.raw(
+          session.connections[0],
+          "POST",
+          { padding: "x".repeat(2000) },
+          session.connections[0].authorization,
+          transport.sessionId,
+        )
+      ).status,
+    ).toBe(413);
+    expect(f.state.calls).toEqual([]);
+    f.state.execute = async () => ({
+      content: [{ type: "text", text: "x".repeat(8192) }],
+    });
+    await expect(
+      client.callTool({ name: "read" }, undefined, { timeout: 2000 }),
+    ).rejects.toThrow();
+    const catalog = await setup((config) => {
+      config.mcp.max_catalog_bytes = 500;
+    });
+    catalog.state.catalog = [
+      tool("read", "x".repeat(150)),
+      tool("hidden", "x".repeat(150)),
+      tool("write", "x".repeat(150)),
+    ];
+    await expect(catalog.open()).rejects.toThrow("mcp_catalog_limit");
+  });
+
+  it("records oversized outgoing result envelopes as failures before sending", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 1000;
+    });
+    f.state.execute = async () => ({
+      content: [{ type: "text", text: "x".repeat(850) }],
+    });
+    const session = await f.open(),
+      { transport } = await f.connect(session.connections[0]);
+    const response = await f.raw(
+      session.connections[0],
+      "POST",
+      {
+        jsonrpc: "2.0",
+        id: "r".repeat(200),
+        method: "tools/call",
+        params: { name: "read" },
+      },
+      session.connections[0].authorization,
+      transport.sessionId,
+    );
+    expect(await response.text()).toContain("mcp_response_limit");
+    expect(f.state.calls).toHaveLength(1);
+    expect(f.store.mcpCalls()).toMatchObject([
+      { outcome: "failed", result_digest: null },
+    ]);
+  });
+
+  it("revokes a session when its required error envelope cannot fit the response bound", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 1000;
+    });
+    const session = await f.open(),
+      { transport } = await f.connect(session.connections[0]);
+    let body = "";
+    try {
+      const response = await f.raw(
+        session.connections[0],
+        "POST",
+        {
+          jsonrpc: "2.0",
+          id: "r".repeat(2000),
+          method: "tools/call",
+          params: { name: "read" },
+        },
+        session.connections[0].authorization,
+        transport.sessionId,
+      );
+      body = await response.text();
+    } catch (error) {
+      expect(error).toBeInstanceOf(TypeError);
+    }
+    expect(Buffer.byteLength(body)).toBeLessThanOrEqual(1000);
+    expect((await f.raw(session.connections[0])).status).toBe(401);
+    expect(f.store.mcpCalls()).toMatchObject([
+      { outcome: "failed", result_digest: null },
+    ]);
+  });
+
+  it("bounds concurrent upstream calls and admits work after capacity is released", async () => {
+    const f = await setup(),
+      release: Array<() => void> = [];
+    f.state.execute = (_args, _progress, signal) =>
+      new Promise((resolve) => {
+        const finish = () => resolve({ content: [] });
+        release.push(finish);
+        signal.addEventListener("abort", finish, { once: true });
+      });
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const calls = Array.from({ length: 16 }, () =>
+      client.callTool({ name: "read" }).catch((error: unknown) => error),
+    );
+    let until = performance.now() + 2000;
+    while (f.state.calls.length < 16 && performance.now() < until)
+      await delay(5);
+    expect(f.state.calls).toHaveLength(16);
+    await expect(client.callTool({ name: "read" })).rejects.toThrow(
+      "mcp_concurrency_limit",
+    );
+    expect(f.store.mcpCalls()).toHaveLength(16);
+    release[0]();
+    await calls[0];
+    calls.push(
+      client.callTool({ name: "read" }).catch((error: unknown) => error),
+    );
+    until = performance.now() + 2000;
+    while (f.state.calls.length < 17 && performance.now() < until)
+      await delay(5);
+    expect(f.state.calls).toHaveLength(17);
+    release.forEach((finish) => finish());
+    expect(await Promise.all(calls)).toMatchObject(
+      Array.from({ length: 17 }, () => ({ content: [] })),
+    );
+    expect(
+      f.store.mcpCalls().every((call) => call.outcome === "completed"),
+    ).toBe(true);
+  });
+
+  it("forwards standard progress fields without upstream metadata", async () => {
+    const f = await setup();
+    f.state.execute = async (_args, progress) => {
+      f.state.progressMetadata = { text: "mcp-upstream-" };
+      await progress("safe!");
+      f.state.progressMetadata = { text: "canary" };
+      await progress("safe!");
+      return { content: [] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]),
+      seen: unknown[] = [];
+    expect(
+      await client.callTool({ name: "read" }, undefined, {
+        onprogress: (progress) => seen.push(progress),
+      }),
+    ).toMatchObject({ content: [] });
+    expect(seen).toEqual([
+      { progress: 1, total: 2, message: "safe!" },
+      { progress: 1, total: 2, message: "safe!" },
+    ]);
+    expect(f.store.mcpCalls()).toMatchObject([{ outcome: "completed" }]);
+  });
+
+  it("charges upstream progress metadata to the response budget before filtering it", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 4096;
+    });
+    f.state.progressMetadata = { text: "x".repeat(300) + "!" };
+    f.state.progressOnGet = true;
+    let observed = 0;
+    f.state.execute = async (_args, progress, signal) => {
+      for (let i = 0; i < 20 && !signal.aborted; i++) await progress("safe!");
+      const until = performance.now() + 2000;
+      while (observed < 20 && !signal.aborted && performance.now() < until)
+        await delay(5);
+      return { content: [] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const settled = client
+      .callTool({ name: "read" }, undefined, {
+        timeout: 2000,
+        onprogress: () => {
+          observed++;
+        },
+      })
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+    const until = performance.now() + 1000;
+    while (
+      f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+      performance.now() < until
+    )
+      await delay(5);
+    expect(f.store.mcpCalls().at(-1)?.outcome).toBe("cancelled");
+    expect(observed).toBeLessThan(20);
+    expect((await f.raw(session.connections[0])).status).toBe(401);
+    expect(await settled).toMatchObject({ error: expect.any(Error) });
+  });
+
+  it("does not request upstream progress when the worker omitted its progress token", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 4096;
+    });
+    f.state.progressOnGet = true;
+    f.state.execute = async (_args, progress) => {
+      for (let i = 0; i < 100; i++) await progress("x".repeat(100) + "!");
+      return { content: [{ type: "text", text: "done" }] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    expect(
+      await client.callTool({ name: "read" }, undefined, { timeout: 2000 }),
+    ).toMatchObject({ content: [{ type: "text", text: "done" }] });
+    const request = f.state.requests.find(
+      (entry) => entry.body?.method === "tools/call",
+    );
+    expect(request).toBeDefined();
+    expect(request?.body?.params).not.toHaveProperty("_meta.progressToken");
+    expect(f.state.calls).toHaveLength(1);
+    expect(f.store.mcpCalls()).toMatchObject([{ outcome: "completed" }]);
+    expect((await client.listTools()).tools.map((entry) => entry.name)).toEqual(
+      ["read"],
+    );
+  });
+
+  it.each(["preserved", "sanitized", "invalid-result", "revoked"])(
+    "bounds progress and the complete error envelope when %s",
+    async (mode) => {
+      const maximum = 4096;
+      const f = await setup((config) => {
+        config.mcp.max_response_bytes = maximum;
+      });
+      if (mode === "invalid-result")
+        f.state.catalog[0].outputSchema = {
+          type: "object",
+          properties: { ok: { type: "boolean" } },
+          required: ["ok"],
+        };
+      f.state.progressOnGet = true;
+      const message = "p".repeat(
+        mode === "revoked" ? 500 : mode === "invalid-result" ? 3850 : 2800,
+      );
+      const errorText = "e".repeat(mode === "sanitized" ? 1800 : 500);
+      let delivered = false;
+      f.state.execute = async (_args, progress, signal) => {
+        await progress(message);
+        const until = performance.now() + 1000;
+        while (!delivered && !signal.aborted && performance.now() < until)
+          await delay(5);
+        if (mode === "invalid-result") return { content: [] };
+        throw new McpError(-32004, "upstream failure", { text: errorText });
+      };
+      const session = await f.open(),
+        connection = session.connections[0],
+        { client, transport } = await f.connect(connection);
+      const readyUntil = performance.now() + 1000;
+      while (
+        !f.state.requests.some((request) => request.method === "GET") &&
+        performance.now() < readyUntil
+      )
+        await delay(5);
+      expect(f.state.requests.some((request) => request.method === "GET")).toBe(
+        true,
+      );
+      const response = await f.raw(
+        connection,
+        "POST",
+        {
+          jsonrpc: "2.0",
+          id: mode === "revoked" ? "r".repeat(3500) : "budget",
+          method: "tools/call",
+          params: { name: "read", _meta: { progressToken: "budget" } },
+        },
+        connection.authorization,
+        transport.sessionId,
+      );
+      let body = "";
+      const reader = response.body!.getReader();
+      try {
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          body += Buffer.from(chunk.value).toString("utf8");
+          delivered ||= body.includes("\n\n");
+        }
+      } catch (error) {
+        expect(mode).toBe("revoked");
+        expect(error).toBeInstanceOf(TypeError);
+      }
+      const messages = body
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => JSON.parse(line.slice(5)));
+      const progress = messages.find(
+        (item) => item.method === "notifications/progress",
+      );
+      expect(
+        progress?.params.message?.length,
+        JSON.stringify({
+          status: response.status,
+          getRequests: f.state.requests.filter(
+            (request) => request.method === "GET",
+          ).length,
+          outcomes: f.store.mcpCalls().map((call) => call.outcome),
+          frames: messages.map((item) => ({
+            method: item.method,
+            error: item.error?.message,
+          })),
+        }),
+      ).toBe(message.length);
+      expect(progress.params.message).toBe(message);
+      expect(
+        messages.reduce(
+          (bytes, item) => bytes + Buffer.byteLength(JSON.stringify(item)),
+          0,
+        ),
+      ).toBeLessThanOrEqual(maximum);
+      const failure = messages.find((item) => item.error)?.error;
+      if (mode === "revoked") {
+        expect(failure).toBeUndefined();
+        expect((await f.raw(connection)).status).toBe(401);
+      } else {
+        expect(failure).toMatchObject({
+          code: mode === "preserved" ? -32004 : -32603,
+        });
+        expect(failure.data).toEqual(
+          mode === "preserved" ? { text: errorText } : undefined,
+        );
+        if (mode === "invalid-result")
+          expect(failure.message).toContain("mcp_result_invalid");
+        expect((await client.listTools()).tools).toHaveLength(1);
+      }
+      expect(f.store.mcpCalls()).toMatchObject([
+        { outcome: "failed", result_digest: null },
+      ]);
+    },
+  );
+
+  it.each(["within", "exceeded"])(
+    "enforces the %s call response budget for progress on the upstream GET stream",
+    async (mode) => {
+      const f = await setup((config) => {
+        config.mcp.max_response_bytes = 4096;
+      });
+      f.state.progressOnGet = true;
+      let observed = 0;
+      const count = mode === "within" ? 12 : 100;
+      f.state.execute = async (_args, progress, signal) => {
+        for (let i = 0; i < count && !signal.aborted; i++)
+          await progress("x".repeat(100) + "!");
+        const until = Date.now() + 2000;
+        while (observed < count && !signal.aborted && Date.now() < until)
+          await delay(5);
+        return { content: [] };
+      };
+      const session = await f.open(),
+        { client } = await f.connect(session.connections[0]);
+      const call = client.callTool({ name: "read" }, undefined, {
+        timeout: 2000,
+        onprogress: () => {
+          observed++;
+        },
+      });
+      const settled = call.then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+      if (mode === "within") {
+        expect(await settled).toMatchObject({ value: { content: [] } });
+        expect(observed).toBe(count);
+        expect(f.store.mcpCalls().at(-1)?.outcome).toBe("completed");
+      } else {
+        const until = performance.now() + 1000;
+        while (
+          f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+          performance.now() < until
+        )
+          await delay(5);
+        expect(f.store.mcpCalls().at(-1)?.outcome).toBe("cancelled");
+        expect(observed).toBeLessThan(count);
+        expect((await f.raw(session.connections[0])).status).toBe(401);
+        expect(await settled).toMatchObject({ error: expect.any(Error) });
+      }
+    },
+  );
+
+  it.each(["\r", "\r\n"])(
+    "bounds individual GET events with %j line endings across repeated calls",
+    async (ending) => {
+      const f = await setup((config) => {
+        config.mcp.max_response_bytes = 4096;
+      });
+      f.state.sseEnding = ending;
+      f.state.progressOnGet = true;
+      let observed = 0;
+      f.state.execute = async (_args, progress, signal) => {
+        const expected = observed + 12;
+        for (let i = 0; i < 12; i++) await progress("x".repeat(100) + "!");
+        const until = performance.now() + 1000;
+        while (
+          observed < expected &&
+          !signal.aborted &&
+          performance.now() < until
+        )
+          await delay(5);
+        return { content: [] };
+      };
+      const session = await f.open(),
+        { client } = await f.connect(session.connections[0]);
+      for (let i = 0; i < 4; i++)
+        expect(
+          await client.callTool({ name: "read" }, undefined, {
+            timeout: 2000,
+            onprogress: () => {
+              observed++;
+            },
+          }),
+        ).toMatchObject({ content: [] });
+      expect(observed).toBe(48);
+      expect(f.store.mcpCalls().map((call) => call.outcome)).toEqual(
+        Array(4).fill("completed"),
+      );
+    },
+  );
+
+  it.each(["\r", "\r\n"])(
+    "rejects one oversized multiline GET event with %j line endings",
+    async (ending) => {
+      const f = await setup((config) => {
+        config.mcp.max_response_bytes = 4096;
+      });
+      f.state.sseEnding = ending;
+      f.state.sseCommentLines = 600;
+      f.state.progressOnGet = true;
+      f.state.execute = async (_args, progress, signal) => {
+        await progress("safe!");
+        await delay(2000, undefined, { signal });
+        return { content: [] };
+      };
+      const session = await f.open(),
+        { client } = await f.connect(session.connections[0]);
+      let observed = 0;
+      const settled = client
+        .callTool({ name: "read" }, undefined, {
+          timeout: 2000,
+          onprogress: () => {
+            observed++;
+          },
+        })
+        .then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+      const until = performance.now() + 1000;
+      while (
+        f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+        performance.now() < until
+      )
+        await delay(5);
+      expect(f.store.mcpCalls().at(-1)?.outcome).toBe("cancelled");
+      expect(observed).toBe(0);
+      expect((await f.raw(session.connections[0])).status).toBe(401);
+      expect(await settled).toMatchObject({ error: expect.any(Error) });
+    },
+  );
+
+  it("paginates the downstream snapshot within its response bound", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 1000;
+      config.mcp.servers.context.tools.extra = { effect: "read" };
+      config.roles.investigation.mcp.context.tools.push("extra");
+    });
+    f.state.catalog.push(tool("extra", "x".repeat(500)));
+    f.state.catalog[0].description = "x".repeat(500);
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const first = await client.listTools();
+    expect(first.tools).toHaveLength(1);
+    expect(first.nextCursor).toBeDefined();
+    for (let i = 0; i < 8; i++)
+      expect((await client.listTools()).nextCursor).toBe(first.nextCursor);
+    const second = await client.listTools({ cursor: first.nextCursor });
+    expect(second.tools).toHaveLength(1);
+    expect(second.nextCursor).toBeUndefined();
+    await expect(client.listTools({ cursor: "forged" })).rejects.toThrow(
+      "mcp_cursor_invalid",
+    );
+    const other = await f.open(),
+      connected = await f.connect(other.connections[0]);
+    await expect(
+      connected.client.listTools({ cursor: first.nextCursor }),
+    ).rejects.toThrow("mcp_cursor_invalid");
+  });
+
+  it("forwards safe progress, preserves tool errors and validates structured results", async () => {
+    const f = await setup();
+    f.state.catalog[0].outputSchema = {
+      type: "object",
+      properties: { ok: { type: "boolean" } },
+      required: ["ok"],
+    };
+    f.state.execute = async (_args, progress) => {
+      await progress("working");
+      return { content: [], structuredContent: { ok: true } };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const messages: string[] = [];
+    expect(
+      (
+        await client.callTool({ name: "read" }, undefined, {
+          onprogress: (progress) => {
+            if (progress.message) messages.push(progress.message);
+          },
+        })
+      ).structuredContent,
+    ).toEqual({ ok: true });
+    expect(messages).toEqual(["working"]);
+    f.state.execute = async () => ({
+      isError: true,
+      content: [{ type: "text", text: "provider rejected" }],
+    });
+    expect((await client.callTool({ name: "read" })).isError).toBe(true);
+    expect(f.store.mcpCalls().at(-1)?.outcome).toBe("tool_error");
+    f.state.execute = async () => ({
+      content: [],
+      structuredContent: { ok: "wrong" },
+    });
+    await expect(client.callTool({ name: "read" })).rejects.toThrow(
+      "mcp_result_invalid",
+    );
+    f.state.execute = async () => {
+      throw new McpError(-32004, "provider failure", { kind: "safe" });
+    };
+    await expect(client.callTool({ name: "read" })).rejects.toMatchObject({
+      code: -32004,
+      data: { kind: "safe" },
+    });
+  });
+
+  it("checks elapsed deadlines even when the timer cannot run and preserves cancellation", () => {
+    const parent = new AbortController(),
+      deadline = Date.now() + 20,
+      elapsed = budget(deadline, parent.signal);
+    try {
+      while (Date.now() < deadline) Math.sqrt(Date.now());
+      expect(elapsed.signal.aborted).toBe(false);
+      expect(() => elapsed.assertActive()).toThrow("mcp_timeout");
+    } finally {
+      elapsed.dispose();
+    }
+    const cancelled = budget(Date.now() + 1000, parent.signal);
+    try {
+      parent.abort();
+      expect(() => cancelled.assertActive()).toThrow("mcp_cancelled");
+    } finally {
+      cancelled.dispose();
+    }
+  });
+
+  it("rejects a single-page catalog whose schema compilation exceeds initialization time", async () => {
+    const f = await setup((config) => {
+      config.mcp.initialization_timeout_seconds = 1;
+    });
+    f.state.catalog = [
+      tool("read"),
+      ...Array.from({ length: 2048 }, (_, i) => tool(`other_${i}`)),
+    ];
+    f.state.pageSize = f.state.catalog.length;
+    expect(
+      Buffer.byteLength(JSON.stringify({ tools: f.state.catalog })),
+    ).toBeLessThan(f.loaded.snapshot.settings.mcp.max_catalog_bytes);
+    await expect(f.open()).rejects.toThrow("mcp_timeout");
+    expect(
+      f.state.requests.filter(
+        (request) => request.body?.method === "tools/list",
+      ),
+    ).toHaveLength(1);
+    expect(
+      f.state.requests.some((request) => request.method === "DELETE"),
+    ).toBe(true);
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it("applies one initialization deadline across pages and independent call deadlines after idle time", async () => {
+    const slow = await setup((config) => {
+      config.mcp.initialization_timeout_seconds = 1;
+    });
+    slow.state.pageDelay = 400;
+    await expect(slow.open()).rejects.toThrow();
+    const f = await setup((config) => {
+      config.mcp.call_timeout_seconds = 1;
+    });
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    await delay(1100);
+    await client.callTool({ name: "read" });
+    f.state.execute = async (_args, progress, signal) => {
+      for (let index = 0; index < 20; index++) {
+        await progress("still working");
+        await delay(100, undefined, { signal });
+      }
+      return { content: [] };
+    };
+    const started = performance.now();
+    const settled = client
+      .callTool({ name: "read" }, undefined, {
+        timeout: 5000,
+        onprogress: () => {},
+      })
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+    const deadline = started + 2000;
+    while (
+      f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+      performance.now() < deadline
+    )
+      await delay(20);
+    const receipt = f.store.mcpCalls().at(-1)!;
+    expect(receipt.outcome).toBe("cancelled");
+    expect(receipt.finished_at).not.toBeNull();
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(await settled).toMatchObject({ error: expect.any(Error) });
+  }, 10_000);
+
+  it("cancels a real in-flight call and respects the remaining parent budget", async () => {
+    const f = await setup();
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    f.state.execute = async (_args, _progress, signal) => {
+      started();
+      await delay(10_000, undefined, { signal });
+      return { content: [] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const controller = new AbortController(),
+      call = client.callTool({ name: "read" }, undefined, {
+        signal: controller.signal,
+      });
+    await running;
+    controller.abort();
+    await expect(call).rejects.toThrow();
+    await delay(100);
+    expect(f.store.mcpCalls().at(-1)?.outcome).toBe("cancelled");
+    const bounded = await setup(),
+      parent = await bounded.open("investigation", Date.now() + 600),
+      connection = await bounded.connect(parent.connections[0]);
+    bounded.state.execute = async (_args, _progress, signal) => {
+      await delay(10_000, undefined, { signal });
+      return { content: [] };
+    };
+    await expect(
+      connection.client.callTool({ name: "read" }, undefined, {
+        timeout: 2500,
+      }),
+    ).rejects.toThrow();
+    expect((await bounded.raw(parent.connections[0])).status).toBe(401);
+  });
+
+  it.each(["abort", "revision", "phase", "finished", "catalog", "delete"])(
+    "revokes on %s and never expands a running catalog",
+    async (mode) => {
+      const f = await setup(),
+        session = await f.open(),
+        connection = session.connections[0],
+        { client, transport } = await f.connect(connection);
+      if (mode === "abort") f.controller.abort();
+      if (mode === "revision")
+        f.store.db
+          .prepare("UPDATE jobs SET revision=revision+1 WHERE id=?")
+          .run(f.job.id);
+      if (mode === "phase")
+        f.store.db
+          .prepare("UPDATE jobs SET phase='implementation' WHERE id=?")
+          .run(f.job.id);
+      if (mode === "finished")
+        f.store.finishRun(f.request().run_id, "completed", null, null);
+      if (mode === "catalog") {
+        f.state.catalog.push(tool("new"));
+        await f.changed();
+        await delay(100);
+      }
+      if (mode === "delete") await transport.terminateSession();
+      expect(
+        (
+          await f.raw(
+            connection,
+            "POST",
+            undefined,
+            connection.authorization,
+            transport.sessionId,
+          )
+        ).status,
+      ).toBe(401);
+      await expect(
+        client.callTool({ name: "read" }, undefined, { timeout: 1000 }),
+      ).rejects.toThrow();
+      expect(f.state.calls).toEqual([]);
+    },
+  );
+
+  it("blocks suspended turns without revoking them and freezes grants against caller mutation", async () => {
+    const f = await setup(),
+      request = f.request();
+    const mutable = { ...request, grants: structuredClone(request.grants) },
+      session = await f.gateway.open(mutable);
+    const { client } = await f.connect(session.connections[0]);
+    mutable.grants.context.tools.hidden = { effect: "read" };
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
+      "read",
+    ]);
+    f.available(false);
+    expect((await f.raw(session.connections[0])).status).toBe(409);
+    f.available(true);
+    await client.callTool({ name: "read" });
+  });
+
+  it("changes identities after fresh catalog or credential binding changes and rejects mismatched policies", async () => {
+    const f = await setup(),
+      first = await f.open();
+    await first.close();
+    f.state.catalog[0].description = "new description";
+    const second = await f.open();
+    expect(second.catalog_identity).not.toBe(first.catalog_identity);
+    expect(second.policy_identity).toBe(first.policy_identity);
+    await second.close();
+    const rotatedConfig = structuredClone(f.config);
+    rotatedConfig.mcp.credentials.first.headers.Authorization =
+      "Bearer rotated-upstream-canary";
+    const rotated = await fixtureSnapshot("model", rotatedConfig),
+      replacement = new McpGateway(f.store, rotated.snapshot, rotated.secrets);
+    await replacement.start();
+    try {
+      const changed = await replacement.open(f.request());
+      expect(changed.policy_identity).not.toBe(second.policy_identity);
+      expect(changed.catalog_identity).toBe(second.catalog_identity);
+      await changed.close();
+    } finally {
+      await replacement.close();
+    }
+    const altered = structuredClone(f.loaded.snapshot);
+    altered.settings.mcp.servers.context.credential_ref = "second";
+    const different = new McpGateway(f.store, altered, f.loaded.secrets);
+    await different.start();
+    try {
+      await expect(different.open(f.request())).rejects.toThrow(
+        "mcp_policy_mismatch",
+      );
+    } finally {
+      await different.close();
+    }
+  });
+
+  it("cleans up already initialized aliases when a later catalog is unavailable", async () => {
+    const f = await setup((config) => {
+      config.mcp.servers.second = {
+        ...config.mcp.servers.context,
+        credential_ref: "second",
+        tools: { absent: { effect: "read" } },
+      };
+      config.roles.investigation.mcp.second = { tools: ["absent"] };
+    });
+    await expect(f.open()).rejects.toThrow("mcp_tool_unavailable");
+    expect(
+      f.state.requests.filter((request) => request.method === "DELETE"),
+    ).toHaveLength(2);
+    expect(f.state.calls).toEqual([]);
+  });
+});

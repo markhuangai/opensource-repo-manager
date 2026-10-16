@@ -15,6 +15,22 @@ describe("known-secret checks and actual logging", () => {
       "[redacted] [redacted]",
     );
   });
+  it("forks a pending secret prefix without changing the original or another fork", () => {
+    const stream = createKnownSecretChecker([
+      "prefix-canary",
+      "prefix-candy",
+    ]).createStream();
+    expect(stream.push("prefix-ca")).toBe(false);
+    expect(stream.pending).toBe(true);
+    const matching = stream.fork(),
+      benign = stream.fork();
+    expect(benign.push("t!")).toBe(false);
+    expect(benign.pending).toBe(false);
+    expect(matching.push("nary")).toBe(true);
+    expect(stream.pending).toBe(true);
+    expect(stream.push("ndy")).toBe(true);
+  });
+
   it("redacts actual stdout/stderr before bounding output", () => {
     const result = spawnSync(
       process.execPath,

@@ -7,6 +7,7 @@ import { Store } from "./repositories/store.ts";
 import { IntakeService } from "./services/intake.ts";
 import { RuntimeError } from "./domain/agents.ts";
 import { Supervisor } from "./runtime/supervisor.ts";
+import { McpGateway } from "./services/mcp/index.ts";
 import {
   createKnownSecretChecker,
   createSafeLogger,
@@ -21,13 +22,16 @@ try {
   if (process.getuid?.() !== 0)
     throw new IntakeError("supervisor_requires_root");
   const store = new Store("/data/state/manager.sqlite");
+  const mcp = new McpGateway(store, loaded.snapshot, loaded.secrets);
   let supervisor: Supervisor | undefined;
   try {
     supervisor = await Supervisor.create(
       store,
       loaded.snapshot,
       loaded.secrets,
+      { mcp },
     );
+    await mcp.start();
     const reader = createGitHubReader(
       loaded.snapshot.settings.github.repository,
       loaded.secrets.get("github.token"),
@@ -46,13 +50,24 @@ try {
         try {
           await supervisor!.close();
         } finally {
-          store.close();
+          try {
+            await mcp.close();
+          } finally {
+            store.close();
+          }
         }
       },
     });
   } catch (error) {
-    await supervisor?.close();
-    if (store.db.open) store.close();
+    try {
+      await supervisor?.close();
+    } finally {
+      try {
+        await mcp.close();
+      } finally {
+        if (store.db.open) store.close();
+      }
+    }
     throw error;
   }
 } catch (error) {
