@@ -420,6 +420,7 @@ export class McpGateway implements McpSessionProvider {
             let progressFailure: unknown;
             let progressBytes = 0;
             const progressTasks = new Set<Promise<void>>();
+            const progressToken = extra._meta?.progressToken;
             try {
               this.authorize(session);
               const result = await http.within(call.signal, () =>
@@ -431,29 +432,31 @@ export class McpGateway implements McpSessionProvider {
                   CallToolResultSchema,
                   {
                     ...this.options(call.signal, request.deadline),
-                    onprogress: (progress) => {
-                      const task = (async () => {
-                        this.authorize(session);
-                        const notification = {
-                          method: "notifications/progress" as const,
-                          params: {
-                            ...progress,
-                            progressToken: extra._meta?.progressToken ?? 0,
+                    onprogress:
+                      progressToken === undefined
+                        ? undefined
+                        : (progress) => {
+                            const task = (async () => {
+                              this.authorize(session);
+                              const notification = {
+                                method: "notifications/progress" as const,
+                                params: {
+                                  ...progress,
+                                  progressToken,
+                                },
+                              };
+                              progressBytes += this.checkVisible(
+                                { jsonrpc: "2.0", ...notification },
+                                limits.max_response_bytes - progressBytes,
+                              );
+                              await extra.sendNotification(notification);
+                            })().catch((error) => {
+                              progressFailure = error;
+                              this.revoke(session);
+                            });
+                            progressTasks.add(task);
+                            void task.then(() => progressTasks.delete(task));
                           },
-                        };
-                        progressBytes += this.checkVisible(
-                          { jsonrpc: "2.0", ...notification },
-                          limits.max_response_bytes - progressBytes,
-                        );
-                        if (extra._meta?.progressToken !== undefined)
-                          await extra.sendNotification(notification);
-                      })().catch((error) => {
-                        progressFailure = error;
-                        this.revoke(session);
-                      });
-                      progressTasks.add(task);
-                      void task.then(() => progressTasks.delete(task));
-                    },
                   },
                 ),
               );

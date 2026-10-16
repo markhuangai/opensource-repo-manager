@@ -173,7 +173,7 @@ Operators can configure generic remote Streamable HTTP MCP servers and grant exa
 
 Tool schemas support JSON Schema 2020-12 (the default) and draft-07. Other dialects fail explicitly. Schema patterns use RE2 to keep untrusted validation from blocking the supervisor; unsupported regex features such as lookaround and backreferences fail schema compilation. External schema references are never fetched.
 
-Each session admits at most 16 concurrent tool calls; callers receive an explicit concurrency error until capacity is available. Progress notifications and the final result share the configured response byte budget. If even a required error envelope cannot fit that bound, the gateway revokes the session.
+Each session admits at most 16 concurrent tool calls; callers receive an explicit concurrency error until capacity is available. Requested progress notifications and the final result share the configured response byte budget. If even a required error envelope cannot fit that bound, the gateway revokes the session.
 
 Each configured tool declares a read or reviewed-write effect. Reviewed writes remain unavailable until issue #14 implements scans, independent review, durable dispatch, and recovery. Its reviewer will run within the requesting job's lease with no MCP access, and uncertain unkeyed effects will require inspection.
 

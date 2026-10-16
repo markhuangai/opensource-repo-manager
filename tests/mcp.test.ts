@@ -977,6 +977,32 @@ describe("scoped HTTP MCP gateway", () => {
     ).toBe(true);
   });
 
+  it("does not request upstream progress when the worker omitted its progress token", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 4096;
+    });
+    f.state.progressOnGet = true;
+    f.state.execute = async (_args, progress) => {
+      for (let i = 0; i < 100; i++) await progress("x".repeat(100));
+      return { content: [{ type: "text", text: "done" }] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    expect(
+      await client.callTool({ name: "read" }, undefined, { timeout: 2000 }),
+    ).toMatchObject({ content: [{ type: "text", text: "done" }] });
+    const request = f.state.requests.find(
+      (entry) => entry.body?.method === "tools/call",
+    );
+    expect(request).toBeDefined();
+    expect(request?.body?.params).not.toHaveProperty("_meta.progressToken");
+    expect(f.state.calls).toHaveLength(1);
+    expect(f.store.mcpCalls()).toMatchObject([{ outcome: "completed" }]);
+    expect((await client.listTools()).tools.map((entry) => entry.name)).toEqual(
+      ["read"],
+    );
+  });
+
   it.each(["within", "exceeded"])(
     "enforces the %s call response budget for progress on the upstream GET stream",
     async (mode) => {
