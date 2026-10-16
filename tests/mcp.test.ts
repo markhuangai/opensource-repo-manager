@@ -851,6 +851,55 @@ describe("scoped HTTP MCP gateway", () => {
     expect(JSON.stringify(f.store.mcpCalls())).not.toContain("canary");
   });
 
+  it.each(["fields", "schema-keys"])(
+    "rejects split credentials in catalog %s",
+    async (mode) => {
+      const f = await setup();
+      if (mode === "fields") {
+        f.state.catalog[0].title = "mcp-upstream-";
+        f.state.catalog[0].description = "canary";
+      } else {
+        f.state.catalog[0].inputSchema.properties = {
+          "mcp-upstream-": { type: "string" },
+          canary: { type: "string" },
+        };
+      }
+      await expect(f.open()).rejects.toThrow("mcp_secret_in_response");
+      expect(f.state.calls).toEqual([]);
+    },
+  );
+
+  it.each(["credential", "authorization"])(
+    "suppresses split %s text in upstream error fields",
+    async (secret) => {
+      const f = await setup();
+      const session = await f.open(),
+        connection = session.connections[0],
+        { client } = await f.connect(connection);
+      const value =
+        secret === "credential"
+          ? "mcp-upstream-canary"
+          : connection.authorization;
+      const first = value.slice(0, Math.floor(value.length / 2));
+      f.state.execute = async () => {
+        throw new McpError(-32004, first, {
+          suffix: value.slice(first.length),
+        });
+      };
+      await expect(client.callTool({ name: "read" })).rejects.toMatchObject({
+        code: -32603,
+        data: undefined,
+      });
+      expect(f.store.mcpCalls()).toMatchObject([
+        { outcome: "failed", result_digest: null },
+      ]);
+      expect(
+        (await client.listTools()).tools.map((entry) => entry.name),
+      ).toEqual(["read"]);
+      expect(JSON.stringify(f.store.mcpCalls())).not.toContain(value);
+    },
+  );
+
   it.each([" ", "\t"])(
     "blocks HTTP-normalized credentials configured with %j padding",
     async (padding) => {
@@ -858,19 +907,30 @@ describe("scoped HTTP MCP gateway", () => {
         config.mcp.credentials.first.headers.Authorization = `${padding}Bearer mcp-upstream-canary${padding}`;
       });
       const session = await f.open(),
-        { client } = await f.connect(session.connections[0]);
+        connection = session.connections[0],
+        { client } = await f.connect(connection);
       f.state.execute = async () => ({
         content: [{ type: "text", text: "mcp-upstream-canary" }],
       });
-      await expect(client.callTool({ name: "read" })).rejects.toThrow(
-        "mcp_secret_in_response",
-      );
+      const settled = client
+        .callTool({ name: "read" }, undefined, { timeout: 2000 })
+        .catch((error: unknown) => error);
+      const until = performance.now() + 1000;
+      while (
+        f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+        performance.now() < until
+      )
+        await delay(5);
       expect(f.state.calls).toMatchObject([
         { authorization: "Bearer mcp-upstream-canary" },
       ]);
       expect(f.store.mcpCalls()).toMatchObject([
-        { outcome: "failed", result_digest: null },
+        { outcome: "cancelled", result_digest: null },
       ]);
+      expect((await f.raw(connection)).status).toBe(401);
+      const failure = await settled;
+      expect(failure).toBeInstanceOf(Error);
+      expect(String(failure)).not.toContain("mcp-upstream-canary");
       expect(JSON.stringify(f.store.mcpCalls())).not.toContain("canary");
     },
   );

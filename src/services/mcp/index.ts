@@ -509,37 +509,19 @@ export class McpGateway implements McpSessionProvider {
               if (progressFailure) throw progressFailure;
               call.assertActive();
               this.authorize(session);
+              if (
+                this.containsVisibleSecret(result, [
+                  secretStream,
+                  authorizationStream,
+                ])
+              ) {
+                this.revoke(session);
+                throw new RuntimeError("mcp_secret_in_response");
+              }
               this.checkVisible(
                 { jsonrpc: "2.0", id: extra.requestId, result },
                 limits.max_response_bytes - progressBytes,
               );
-              const progressForks = () => [
-                secretStream.fork(),
-                authorizationStream.fork(),
-              ];
-              const inspectResult = (
-                value: unknown,
-                streams?: ReturnType<typeof progressForks>,
-              ) => {
-                if (typeof value === "string") {
-                  inspectText(value, progressForks());
-                  inspectText(value, streams ?? progressForks());
-                } else if (Array.isArray(value)) {
-                  for (const item of value) inspectResult(item, streams);
-                } else if (value !== null && typeof value === "object") {
-                  const keyStreams = progressForks(),
-                    mixedStreams = progressForks();
-                  for (const [key, item] of Object.entries(value)) {
-                    inspectText(key, progressForks());
-                    inspectText(key, keyStreams);
-                    inspectText(key, mixedStreams);
-                    if (typeof item === "string")
-                      inspectText(item, mixedStreams);
-                    inspectResult(item, streams ?? progressForks());
-                  }
-                }
-              };
-              inspectResult(result);
               for (const content of result.content) {
                 if (content.type === "text") inspectText(content.text);
                 else if (
@@ -581,8 +563,7 @@ export class McpGateway implements McpSessionProvider {
         const send = transport.send.bind(transport);
         transport.send = async (message, options) => {
           if (
-            this.secrets.contains(message) ||
-            this.containsAuthorization(message) ||
+            this.containsVisibleSecret(message) ||
             Buffer.byteLength(JSON.stringify(message)) >
               limits.max_response_bytes
           ) {
@@ -703,10 +684,53 @@ export class McpGateway implements McpSessionProvider {
     ).contains(value);
   }
 
+  private containsVisibleSecret(
+    value: unknown,
+    previous: ReturnType<SecretAccessor["createStream"]>[] = [],
+  ) {
+    const sources = [
+      this.secrets.createStream(),
+      createKnownSecretChecker(
+        [...this.sessions.values()].map((session) => session.token),
+      ).createStream(),
+      ...previous,
+    ];
+    const forks = () => sources.map((stream) => stream.fork());
+    const values = forks();
+    const inspect = (text: string, streams: typeof values) =>
+      streams.some((stream) => stream.push(text));
+    const visit = (value: unknown, streams?: typeof values): boolean => {
+      if (typeof value === "string")
+        return (
+          inspect(value, forks()) ||
+          inspect(value, streams ?? forks()) ||
+          inspect(value, values)
+        );
+      if (Array.isArray(value))
+        return value.some((item) => visit(item, streams));
+      if (value !== null && typeof value === "object") {
+        const keys = forks(),
+          mixed = forks();
+        for (const [key, item] of Object.entries(value)) {
+          if (
+            inspect(key, forks()) ||
+            inspect(key, keys) ||
+            inspect(key, mixed) ||
+            (typeof item === "string" && inspect(item, mixed)) ||
+            visit(item, streams ?? forks())
+          )
+            return true;
+        }
+      }
+      return false;
+    };
+    return visit(value);
+  }
+
   private checkVisible(value: unknown, maximum: number) {
     const bytes = Buffer.byteLength(JSON.stringify(value));
     if (bytes > maximum) throw new RuntimeError("mcp_response_limit");
-    if (this.secrets.contains(value) || this.containsAuthorization(value))
+    if (this.containsVisibleSecret(value))
       throw new RuntimeError("mcp_secret_in_response");
     return bytes;
   }
@@ -722,8 +746,7 @@ export class McpGateway implements McpSessionProvider {
       };
       if (
         Buffer.byteLength(JSON.stringify(exposed)) <= maximum &&
-        !this.secrets.contains(exposed) &&
-        !this.containsAuthorization(exposed)
+        !this.containsVisibleSecret(exposed)
       )
         return new McpError(error.code, error.message, error.data);
     }
