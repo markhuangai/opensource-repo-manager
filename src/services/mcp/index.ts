@@ -546,7 +546,23 @@ export class McpGateway implements McpSessionProvider {
               return result;
             } catch (error) {
               if (call.signal.aborted) outcome = "cancelled";
-              throw this.safeError(error, limits.max_response_bytes);
+              const remaining = limits.max_response_bytes - progressBytes;
+              const failure = this.safeError(error, remaining);
+              if (
+                Buffer.byteLength(
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: extra.requestId,
+                    error: {
+                      code: failure.code,
+                      message: failure.message,
+                      data: failure.data,
+                    },
+                  }),
+                ) > remaining
+              )
+                this.revoke(session);
+              throw failure;
             } finally {
               await Promise.all(progressTasks);
               call.dispose();
@@ -695,8 +711,10 @@ export class McpGateway implements McpSessionProvider {
       ).createStream(),
       ...previous,
     ];
-    const forks = () => sources.map((stream) => stream.fork());
-    const values = forks();
+    const forks = (streams = sources) => streams.map((stream) => stream.fork());
+    const values = forks(),
+      keys = forks(),
+      mixed = forks();
     const inspect = (text: string, streams: typeof values) =>
       streams.some((stream) => stream.push(text));
     const visit = (value: unknown, streams?: typeof values): boolean => {
@@ -704,19 +722,23 @@ export class McpGateway implements McpSessionProvider {
         return (
           inspect(value, forks()) ||
           inspect(value, streams ?? forks()) ||
-          inspect(value, values)
+          inspect(value, values) ||
+          inspect(value, mixed)
         );
       if (Array.isArray(value))
         return value.some((item) => visit(item, streams));
       if (value !== null && typeof value === "object") {
-        const keys = forks(),
-          mixed = forks();
+        const objectKeys = forks(),
+          objectMixed = forks();
         for (const [key, item] of Object.entries(value)) {
           if (
             inspect(key, forks()) ||
             inspect(key, keys) ||
             inspect(key, mixed) ||
-            (typeof item === "string" && inspect(item, mixed)) ||
+            inspect(key, forks(values)) ||
+            inspect(key, objectKeys) ||
+            inspect(key, objectMixed) ||
+            (typeof item === "string" && inspect(item, objectMixed)) ||
             visit(item, streams ?? forks())
           )
             return true;

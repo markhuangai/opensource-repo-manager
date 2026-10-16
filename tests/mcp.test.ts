@@ -955,6 +955,12 @@ describe("scoped HTTP MCP gateway", () => {
     ["credential", "key-value"],
     ["credential", "root-keys"],
     ["credential", "progress-keys-parts"],
+    ["credential", "nested-keys"],
+    ["authorization", "nested-keys"],
+    ["credential", "key-array-value"],
+    ["authorization", "key-array-value"],
+    ["credential", "value-nested-key"],
+    ["authorization", "value-nested-key"],
   ])("blocks split %s text across %s", async (secret, channel) => {
     const f = await setup();
     const session = await f.open(),
@@ -1015,6 +1021,18 @@ describe("scoped HTTP MCP gateway", () => {
         return { content: [], structuredContent: { [first]: second } };
       if (channel === "root-keys")
         return { content: [], [first]: 0, [second]: 0 };
+      if (channel === "nested-keys")
+        return {
+          content: [],
+          structuredContent: { [first]: { [second]: 0 } },
+        };
+      if (channel === "key-array-value")
+        return { content: [], structuredContent: { [first]: [second] } };
+      if (channel === "value-nested-key")
+        return {
+          content: [],
+          structuredContent: { first, nested: { [second]: 0 } },
+        };
       if (channel === "progress-keys-parts")
         return {
           content: [{ type: "text", text: "safe!" }],
@@ -1353,6 +1371,119 @@ describe("scoped HTTP MCP gateway", () => {
       ["read"],
     );
   });
+
+  it.each(["preserved", "sanitized", "invalid-result", "revoked"])(
+    "bounds progress and the complete error envelope when %s",
+    async (mode) => {
+      const maximum = 4096;
+      const f = await setup((config) => {
+        config.mcp.max_response_bytes = maximum;
+      });
+      if (mode === "invalid-result")
+        f.state.catalog[0].outputSchema = {
+          type: "object",
+          properties: { ok: { type: "boolean" } },
+          required: ["ok"],
+        };
+      f.state.progressOnGet = true;
+      const message = "p".repeat(
+        mode === "revoked" ? 500 : mode === "invalid-result" ? 3850 : 2800,
+      );
+      const errorText = "e".repeat(mode === "sanitized" ? 1800 : 500);
+      let delivered = false;
+      f.state.execute = async (_args, progress, signal) => {
+        await progress(message);
+        const until = performance.now() + 1000;
+        while (!delivered && !signal.aborted && performance.now() < until)
+          await delay(5);
+        if (mode === "invalid-result") return { content: [] };
+        throw new McpError(-32004, "upstream failure", { text: errorText });
+      };
+      const session = await f.open(),
+        connection = session.connections[0],
+        { client, transport } = await f.connect(connection);
+      const readyUntil = performance.now() + 1000;
+      while (
+        !f.state.requests.some((request) => request.method === "GET") &&
+        performance.now() < readyUntil
+      )
+        await delay(5);
+      expect(f.state.requests.some((request) => request.method === "GET")).toBe(
+        true,
+      );
+      const response = await f.raw(
+        connection,
+        "POST",
+        {
+          jsonrpc: "2.0",
+          id: mode === "revoked" ? "r".repeat(3500) : "budget",
+          method: "tools/call",
+          params: { name: "read", _meta: { progressToken: "budget" } },
+        },
+        connection.authorization,
+        transport.sessionId,
+      );
+      let body = "";
+      const reader = response.body!.getReader();
+      try {
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          body += Buffer.from(chunk.value).toString("utf8");
+          delivered ||= body.includes("\n\n");
+        }
+      } catch (error) {
+        expect(mode).toBe("revoked");
+        expect(error).toBeInstanceOf(TypeError);
+      }
+      const messages = body
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => JSON.parse(line.slice(5)));
+      const progress = messages.find(
+        (item) => item.method === "notifications/progress",
+      );
+      expect(
+        progress?.params.message?.length,
+        JSON.stringify({
+          status: response.status,
+          getRequests: f.state.requests.filter(
+            (request) => request.method === "GET",
+          ).length,
+          outcomes: f.store.mcpCalls().map((call) => call.outcome),
+          frames: messages.map((item) => ({
+            method: item.method,
+            error: item.error?.message,
+          })),
+        }),
+      ).toBe(message.length);
+      expect(progress.params.message).toBe(message);
+      expect(
+        messages.reduce(
+          (bytes, item) => bytes + Buffer.byteLength(JSON.stringify(item)),
+          0,
+        ),
+      ).toBeLessThanOrEqual(maximum);
+      const failure = messages.find((item) => item.error)?.error;
+      if (mode === "revoked") {
+        expect(failure).toBeUndefined();
+        expect((await f.raw(connection)).status).toBe(401);
+      } else {
+        expect(failure).toMatchObject({
+          code: mode === "preserved" ? -32004 : -32603,
+        });
+        expect(failure.data).toEqual(
+          mode === "preserved" ? { text: errorText } : undefined,
+        );
+        if (mode === "invalid-result")
+          expect(failure.message).toContain("mcp_result_invalid");
+        expect((await client.listTools()).tools).toHaveLength(1);
+      }
+      expect(f.store.mcpCalls()).toMatchObject([
+        { outcome: "failed", result_digest: null },
+      ]);
+    },
+  );
 
   it.each(["within", "exceeded"])(
     "enforces the %s call response budget for progress on the upstream GET stream",
