@@ -17,6 +17,11 @@ export function budget(deadline: number, parent: AbortSignal) {
   expire();
   return {
     signal: controller.signal,
+    assertActive() {
+      if (Date.now() >= deadline)
+        controller.abort(new RuntimeError("mcp_timeout"));
+      controller.signal.throwIfAborted();
+    },
     dispose() {
       clearTimeout(timer);
       parent.removeEventListener("abort", abort);
@@ -97,7 +102,9 @@ export class UpstreamHttp {
         if (!response.body) return response;
         const reader = response.body.getReader();
         let used = 0,
-          previous = "";
+          lineEmpty = true,
+          afterCR = false,
+          boundaryAfterCR = false;
         const body = new ReadableStream<Uint8Array>({
           async pull(controller) {
             try {
@@ -108,11 +115,28 @@ export class UpstreamHttp {
               }
               if (method === "GET") {
                 for (const byte of next.value) {
+                  if (afterCR) {
+                    afterCR = false;
+                    if (byte === 10) {
+                      if (++used > limits.max_response_bytes)
+                        throw new RuntimeError("mcp_response_limit");
+                      if (boundaryAfterCR) used = 0;
+                      boundaryAfterCR = false;
+                      continue;
+                    }
+                    if (boundaryAfterCR) used = 0;
+                    boundaryAfterCR = false;
+                  }
                   if (++used > limits.max_response_bytes)
                     throw new RuntimeError("mcp_response_limit");
-                  previous = (previous + String.fromCharCode(byte)).slice(-4);
-                  if (previous.endsWith("\n\n") || previous === "\r\n\r\n")
-                    used = 0;
+                  if (byte === 13) {
+                    boundaryAfterCR = lineEmpty;
+                    afterCR = true;
+                    lineEmpty = true;
+                  } else if (byte === 10) {
+                    if (lineEmpty) used = 0;
+                    lineEmpty = true;
+                  } else lineEmpty = false;
                 }
               } else if (
                 (used += next.value.byteLength) > limits.max_response_bytes

@@ -19,6 +19,7 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpGateway } from "../src/services/mcp/index.ts";
+import { budget } from "../src/services/mcp/http.ts";
 import { Store } from "../src/repositories/store.ts";
 import { fixtureConfiguration, fixtureSnapshot } from "./fixtures.ts";
 import { makeIssue } from "./fixtures/github.ts";
@@ -65,6 +66,8 @@ async function setup(configure?: (config: Configuration) => void) {
     hang: "",
     stateless: false,
     progressOnGet: false,
+    sseEnding: "\n",
+    sseCommentLines: 0,
     redirect: new Set<string>(),
     requests: [] as Array<{
       method: string;
@@ -186,6 +189,26 @@ async function setup(configure?: (config: Configuration) => void) {
       );
       await server.connect(transport);
       session = { server, transport };
+    }
+    if (req.method === "GET" && state.sseEnding !== "\n") {
+      const write = res.write.bind(res);
+      let firstWrite = true;
+      res.write = (chunk: string | Uint8Array) => {
+        const text =
+          typeof chunk === "string"
+            ? chunk
+            : Buffer.from(chunk).toString("utf8");
+        const prefix = firstWrite
+          ? (":comment" + state.sseEnding).repeat(state.sseCommentLines)
+          : "";
+        firstWrite = false;
+        // The SDK parser waits for the next character before consuming a trailing CR.
+        return write(
+          prefix +
+            text.replaceAll("\n", state.sseEnding) +
+            (state.sseEnding === "\r" ? ":flush\r" : ""),
+        );
+      };
     }
     await session.transport.handleRequest(req, res, body);
   });
@@ -823,6 +846,98 @@ describe("scoped HTTP MCP gateway", () => {
     expect(JSON.stringify(f.store.mcpCalls())).not.toContain("canary");
   });
 
+  it.each([
+    ["credential", "progress"],
+    ["authorization", "progress"],
+    ["credential", "result"],
+    ["authorization", "result"],
+    ["credential", "resource"],
+    ["credential", "progress-result"],
+    ["authorization", "progress-result"],
+  ])("blocks split %s text across %s", async (secret, channel) => {
+    const f = await setup();
+    const session = await f.open(),
+      connection = session.connections[0],
+      { client } = await f.connect(connection);
+    const value =
+        secret === "credential"
+          ? "mcp-upstream-canary"
+          : connection.authorization,
+      first = value.slice(0, Math.floor(value.length / 2)),
+      second = value.slice(first.length);
+    f.state.execute = async (_args, progress) => {
+      if (channel.startsWith("progress")) await progress(first);
+      if (channel === "progress") {
+        await progress(second);
+        return { content: [] };
+      }
+      if (channel === "resource")
+        return {
+          content: [
+            { type: "text", text: first },
+            { type: "resource", resource: { uri: "urn:text", text: second } },
+          ],
+        };
+      return {
+        content: [
+          ...(channel === "result"
+            ? [{ type: "text" as const, text: first }]
+            : []),
+          { type: "text", text: second },
+        ],
+      };
+    };
+    const messages: string[] = [];
+    const settled = client
+      .callTool({ name: "read" }, undefined, {
+        timeout: 2000,
+        onprogress: (progress) => messages.push(progress.message ?? ""),
+      })
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+    const until = performance.now() + 1000;
+    while (
+      f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+      performance.now() < until
+    )
+      await delay(5);
+    expect(f.store.mcpCalls()).toMatchObject([
+      { outcome: "cancelled", result_digest: null },
+    ]);
+    expect(messages).toEqual([]);
+    expect((await f.raw(connection)).status).toBe(401);
+    expect(await settled).toMatchObject({ error: expect.any(Error) });
+    expect(JSON.stringify(f.store.mcpCalls())).not.toContain(value);
+  });
+
+  it("preserves progress order and flushes benign secret prefixes at completion", async () => {
+    const f = await setup();
+    f.state.execute = async (_args, progress) => {
+      await Promise.all(
+        Array.from({ length: 20 }, (_, i) => progress(`${i}!`)),
+      );
+      await progress("mcp-up");
+      await progress("stream-");
+      return { content: [] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]),
+      messages: string[] = [];
+    expect(
+      await client.callTool({ name: "read" }, undefined, {
+        onprogress: (progress) => messages.push(progress.message ?? ""),
+      }),
+    ).toMatchObject({ content: [] });
+    expect(messages).toEqual([
+      ...Array.from({ length: 20 }, (_, i) => `${i}!`),
+      "mcp-up",
+      "stream-",
+    ]);
+    expect(f.store.mcpCalls()).toMatchObject([{ outcome: "completed" }]);
+  });
+
   it.each(["POST", "GET", "DELETE"])(
     "rejects upstream redirects on %s without following them",
     async (method) => {
@@ -983,7 +1098,7 @@ describe("scoped HTTP MCP gateway", () => {
     });
     f.state.progressOnGet = true;
     f.state.execute = async (_args, progress) => {
-      for (let i = 0; i < 100; i++) await progress("x".repeat(100));
+      for (let i = 0; i < 100; i++) await progress("x".repeat(100) + "!");
       return { content: [{ type: "text", text: "done" }] };
     };
     const session = await f.open(),
@@ -1014,7 +1129,7 @@ describe("scoped HTTP MCP gateway", () => {
       const count = mode === "within" ? 12 : 100;
       f.state.execute = async (_args, progress, signal) => {
         for (let i = 0; i < count && !signal.aborted; i++)
-          await progress("x".repeat(100));
+          await progress("x".repeat(100) + "!");
         const until = Date.now() + 2000;
         while (observed < count && !signal.aborted && Date.now() < until)
           await delay(5);
@@ -1048,6 +1163,86 @@ describe("scoped HTTP MCP gateway", () => {
         expect((await f.raw(session.connections[0])).status).toBe(401);
         expect(await settled).toMatchObject({ error: expect.any(Error) });
       }
+    },
+  );
+
+  it.each(["\r", "\r\n"])(
+    "bounds individual GET events with %j line endings across repeated calls",
+    async (ending) => {
+      const f = await setup((config) => {
+        config.mcp.max_response_bytes = 4096;
+      });
+      f.state.sseEnding = ending;
+      f.state.progressOnGet = true;
+      let observed = 0;
+      f.state.execute = async (_args, progress, signal) => {
+        const expected = observed + 12;
+        for (let i = 0; i < 12; i++) await progress("x".repeat(100) + "!");
+        const until = performance.now() + 1000;
+        while (
+          observed < expected &&
+          !signal.aborted &&
+          performance.now() < until
+        )
+          await delay(5);
+        return { content: [] };
+      };
+      const session = await f.open(),
+        { client } = await f.connect(session.connections[0]);
+      for (let i = 0; i < 4; i++)
+        expect(
+          await client.callTool({ name: "read" }, undefined, {
+            timeout: 2000,
+            onprogress: () => {
+              observed++;
+            },
+          }),
+        ).toMatchObject({ content: [] });
+      expect(observed).toBe(48);
+      expect(f.store.mcpCalls().map((call) => call.outcome)).toEqual(
+        Array(4).fill("completed"),
+      );
+    },
+  );
+
+  it.each(["\r", "\r\n"])(
+    "rejects one oversized multiline GET event with %j line endings",
+    async (ending) => {
+      const f = await setup((config) => {
+        config.mcp.max_response_bytes = 4096;
+      });
+      f.state.sseEnding = ending;
+      f.state.sseCommentLines = 600;
+      f.state.progressOnGet = true;
+      f.state.execute = async (_args, progress, signal) => {
+        await progress("safe!");
+        await delay(2000, undefined, { signal });
+        return { content: [] };
+      };
+      const session = await f.open(),
+        { client } = await f.connect(session.connections[0]);
+      let observed = 0;
+      const settled = client
+        .callTool({ name: "read" }, undefined, {
+          timeout: 2000,
+          onprogress: () => {
+            observed++;
+          },
+        })
+        .then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+      const until = performance.now() + 1000;
+      while (
+        f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+        performance.now() < until
+      )
+        await delay(5);
+      expect(f.store.mcpCalls().at(-1)?.outcome).toBe("cancelled");
+      expect(observed).toBe(0);
+      expect((await f.raw(session.connections[0])).status).toBe(401);
+      expect(await settled).toMatchObject({ error: expect.any(Error) });
     },
   );
 
@@ -1123,6 +1318,50 @@ describe("scoped HTTP MCP gateway", () => {
       code: -32004,
       data: { kind: "safe" },
     });
+  });
+
+  it("checks elapsed deadlines even when the timer cannot run and preserves cancellation", () => {
+    const parent = new AbortController(),
+      deadline = Date.now() + 20,
+      elapsed = budget(deadline, parent.signal);
+    try {
+      while (Date.now() < deadline) Math.sqrt(Date.now());
+      expect(elapsed.signal.aborted).toBe(false);
+      expect(() => elapsed.assertActive()).toThrow("mcp_timeout");
+    } finally {
+      elapsed.dispose();
+    }
+    const cancelled = budget(Date.now() + 1000, parent.signal);
+    try {
+      parent.abort();
+      expect(() => cancelled.assertActive()).toThrow("mcp_cancelled");
+    } finally {
+      cancelled.dispose();
+    }
+  });
+
+  it("rejects a single-page catalog whose schema compilation exceeds initialization time", async () => {
+    const f = await setup((config) => {
+      config.mcp.initialization_timeout_seconds = 1;
+    });
+    f.state.catalog = [
+      tool("read"),
+      ...Array.from({ length: 2048 }, (_, i) => tool(`other_${i}`)),
+    ];
+    f.state.pageSize = f.state.catalog.length;
+    expect(
+      Buffer.byteLength(JSON.stringify({ tools: f.state.catalog })),
+    ).toBeLessThan(f.loaded.snapshot.settings.mcp.max_catalog_bytes);
+    await expect(f.open()).rejects.toThrow("mcp_timeout");
+    expect(
+      f.state.requests.filter(
+        (request) => request.body?.method === "tools/list",
+      ),
+    ).toHaveLength(1);
+    expect(
+      f.state.requests.some((request) => request.method === "DELETE"),
+    ).toBe(true);
+    expect(f.state.calls).toEqual([]);
   });
 
   it("applies one initialization deadline across pages and independent call deadlines after idle time", async () => {

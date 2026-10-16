@@ -16,6 +16,7 @@ import {
   McpError,
   ErrorCode,
   type CallToolResult,
+  type ProgressNotification,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { RunSnapshot } from "../../config/load.ts";
 import type { SecretAccessor } from "../../config/secrets.ts";
@@ -190,7 +191,7 @@ export class McpGateway implements McpSessionProvider {
     );
     try {
       for (const [alias, grant] of aliases) {
-        initialization.signal.throwIfAborted();
+        initialization.assertActive();
         const configured = limits.servers[alias],
           authentication = configured.credential_ref
             ? this.secrets.mcpHeaders(configured.credential_ref)
@@ -290,14 +291,17 @@ export class McpGateway implements McpSessionProvider {
               this.options(initialization.signal, request.deadline),
             ),
           );
+          initialization.assertActive();
           bytes += Buffer.byteLength(JSON.stringify(page));
           if (bytes > limits.max_catalog_bytes)
             throw new RuntimeError("mcp_catalog_limit");
           for (const tool of page.tools) {
+            initialization.assertActive();
             if (seen.has(tool.name))
               throw new RuntimeError("mcp_catalog_invalid");
             seen.add(tool.name);
             const entry = snapshotTool(tool);
+            initialization.assertActive();
             if (Object.hasOwn(grant.tools, tool.name)) {
               if (tool.execution?.taskSupport === "required")
                 throw new RuntimeError("mcp_tool_unavailable");
@@ -421,7 +425,31 @@ export class McpGateway implements McpSessionProvider {
             let progressBytes = 0;
             const progressTasks = new Set<Promise<void>>();
             const progressToken = extra._meta?.progressToken;
+            const secretStream = this.secrets.createStream();
+            const authorizationStream = createKnownSecretChecker(
+              [...this.sessions.values()].map((session) => session.token),
+            ).createStream();
+            const held: ProgressNotification[] = [];
+            let delivery = Promise.resolve();
+            const inspectText = (text: string) => {
+              if (secretStream.push(text) || authorizationStream.push(text)) {
+                this.revoke(session);
+                throw new RuntimeError("mcp_secret_in_response");
+              }
+            };
+            const drain = () => {
+              const notifications = held.splice(0);
+              delivery = delivery.then(async () => {
+                for (const notification of notifications) {
+                  call.assertActive();
+                  this.authorize(session);
+                  await extra.sendNotification(notification);
+                }
+              });
+              return delivery;
+            };
             try {
+              call.assertActive();
               this.authorize(session);
               const result = await http.within(call.signal, () =>
                 client.request(
@@ -449,7 +477,14 @@ export class McpGateway implements McpSessionProvider {
                                 { jsonrpc: "2.0", ...notification },
                                 limits.max_response_bytes - progressBytes,
                               );
-                              await extra.sendNotification(notification);
+                              held.push(notification);
+                              if (progress.message !== undefined)
+                                inspectText(progress.message);
+                              if (
+                                !secretStream.pending &&
+                                !authorizationStream.pending
+                              )
+                                await drain();
                             })().catch((error) => {
                               progressFailure = error;
                               this.revoke(session);
@@ -462,12 +497,20 @@ export class McpGateway implements McpSessionProvider {
               );
               await Promise.all(progressTasks);
               if (progressFailure) throw progressFailure;
-              call.signal.throwIfAborted();
+              call.assertActive();
               this.authorize(session);
               this.checkVisible(
                 { jsonrpc: "2.0", id: extra.requestId, result },
                 limits.max_response_bytes - progressBytes,
               );
+              for (const content of result.content) {
+                if (content.type === "text") inspectText(content.text);
+                else if (
+                  content.type === "resource" &&
+                  "text" in content.resource
+                )
+                  inspectText(content.resource.text);
+              }
               if (
                 entry.output &&
                 !result.isError &&
@@ -475,7 +518,11 @@ export class McpGateway implements McpSessionProvider {
                   !entry.output(result.structuredContent))
               )
                 throw new RuntimeError("mcp_result_invalid");
-              resultDigest = digest(result);
+              await drain();
+              const completedDigest = digest(result);
+              call.assertActive();
+              this.authorize(session);
+              resultDigest = completedDigest;
               outcome = result.isError ? "tool_error" : "completed";
               return result;
             } catch (error) {
@@ -527,7 +574,7 @@ export class McpGateway implements McpSessionProvider {
         await server.connect(transport);
         if (!this.current(session)) throw new RuntimeError("mcp_scope_stale");
       }
-      initialization.signal.throwIfAborted();
+      initialization.assertActive();
       for (const session of opened) {
         if (!this.current(session)) throw new RuntimeError("mcp_scope_stale");
         session.ready = true;
@@ -714,9 +761,11 @@ export class McpGateway implements McpSessionProvider {
         this.reject(res, 400);
         return;
       }
+      incoming.assertActive();
       this.authorize(session);
       await session.transport.handleRequest(req, res, parsed);
     } else {
+      incoming.assertActive();
       await session.transport.handleRequest(req, res);
       if (req.method === "DELETE" && res.statusCode < 400)
         await this.revoke(session);
