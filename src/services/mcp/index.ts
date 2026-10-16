@@ -12,6 +12,7 @@ import {
   CallToolResultSchema,
   ListToolsRequestSchema,
   ListToolsResultSchema,
+  ProgressSchema,
   ToolListChangedNotificationSchema,
   McpError,
   ErrorCode,
@@ -431,8 +432,11 @@ export class McpGateway implements McpSessionProvider {
             ).createStream();
             const held: ProgressNotification[] = [];
             let delivery = Promise.resolve();
-            const inspectText = (text: string) => {
-              if (secretStream.push(text) || authorizationStream.push(text)) {
+            const inspectText = (
+              text: string,
+              streams = [secretStream, authorizationStream],
+            ) => {
+              if (streams.some((stream) => stream.push(text))) {
                 this.revoke(session);
                 throw new RuntimeError("mcp_secret_in_response");
               }
@@ -443,7 +447,13 @@ export class McpGateway implements McpSessionProvider {
                 for (const notification of notifications) {
                   call.assertActive();
                   this.authorize(session);
-                  await extra.sendNotification(notification);
+                  await extra.sendNotification({
+                    ...notification,
+                    params: {
+                      ...ProgressSchema.parse(notification.params),
+                      progressToken: notification.params.progressToken,
+                    },
+                  });
                 }
               });
               return delivery;
@@ -503,6 +513,28 @@ export class McpGateway implements McpSessionProvider {
                 { jsonrpc: "2.0", id: extra.requestId, result },
                 limits.max_response_bytes - progressBytes,
               );
+              const progressForks = () => [
+                secretStream.fork(),
+                authorizationStream.fork(),
+              ];
+              const inspectResult = (
+                value: unknown,
+                streams: ReturnType<typeof progressForks>,
+              ) => {
+                if (typeof value === "string") {
+                  inspectText(value, progressForks());
+                  inspectText(value, streams);
+                } else if (value !== null && typeof value === "object") {
+                  for (const [key, item] of Object.entries(value)) {
+                    inspectText(key, progressForks());
+                    inspectResult(item, streams);
+                  }
+                }
+              };
+              for (const [key, value] of Object.entries(result)) {
+                inspectText(key, progressForks());
+                inspectResult(value, progressForks());
+              }
               for (const content of result.content) {
                 if (content.type === "text") inspectText(content.text);
                 else if (

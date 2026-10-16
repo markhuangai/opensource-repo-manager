@@ -66,6 +66,7 @@ async function setup(configure?: (config: Configuration) => void) {
     hang: "",
     stateless: false,
     progressOnGet: false,
+    progressMetadata: undefined as { text: string } | undefined,
     sseEnding: "\n",
     sseCommentLines: 0,
     redirect: new Set<string>(),
@@ -174,7 +175,11 @@ async function setup(configure?: (config: Configuration) => void) {
                   params: {
                     progressToken: extra._meta.progressToken,
                     progress: 1,
+                    total: 2,
                     message: text,
+                    ...(state.progressMetadata
+                      ? { _meta: state.progressMetadata }
+                      : {}),
                   },
                 };
                 if (state.progressOnGet)
@@ -846,6 +851,30 @@ describe("scoped HTTP MCP gateway", () => {
     expect(JSON.stringify(f.store.mcpCalls())).not.toContain("canary");
   });
 
+  it.each([" ", "\t"])(
+    "blocks HTTP-normalized credentials configured with %j padding",
+    async (padding) => {
+      const f = await setup((config) => {
+        config.mcp.credentials.first.headers.Authorization = `${padding}Bearer mcp-upstream-canary${padding}`;
+      });
+      const session = await f.open(),
+        { client } = await f.connect(session.connections[0]);
+      f.state.execute = async () => ({
+        content: [{ type: "text", text: "mcp-upstream-canary" }],
+      });
+      await expect(client.callTool({ name: "read" })).rejects.toThrow(
+        "mcp_secret_in_response",
+      );
+      expect(f.state.calls).toMatchObject([
+        { authorization: "Bearer mcp-upstream-canary" },
+      ]);
+      expect(f.store.mcpCalls()).toMatchObject([
+        { outcome: "failed", result_digest: null },
+      ]);
+      expect(JSON.stringify(f.store.mcpCalls())).not.toContain("canary");
+    },
+  );
+
   it.each([
     ["credential", "progress"],
     ["authorization", "progress"],
@@ -854,6 +883,13 @@ describe("scoped HTTP MCP gateway", () => {
     ["credential", "resource"],
     ["credential", "progress-result"],
     ["authorization", "progress-result"],
+    ["credential", "progress-structured"],
+    ["authorization", "progress-structured"],
+    ["credential", "progress-structured-parts"],
+    ["credential", "progress-meta"],
+    ["credential", "progress-extension"],
+    ["credential", "structured"],
+    ["authorization", "structured"],
   ])("blocks split %s text across %s", async (secret, channel) => {
     const f = await setup();
     const session = await f.open(),
@@ -877,6 +913,33 @@ describe("scoped HTTP MCP gateway", () => {
             { type: "text", text: first },
             { type: "resource", resource: { uri: "urn:text", text: second } },
           ],
+        };
+      if (channel === "progress-structured")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          structuredContent: { metadata: "ordinary", nested: { text: second } },
+        };
+      if (channel === "progress-structured-parts")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          structuredContent: {
+            nested: { first: second.slice(0, 2), second: second.slice(2) },
+          },
+        };
+      if (channel === "progress-meta")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          _meta: { nested: { suffix: second } },
+        };
+      if (channel === "progress-extension")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          detail: { suffix: second },
+        };
+      if (channel === "structured")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          structuredContent: { first, second },
         };
       return {
         content: [
@@ -1090,6 +1153,69 @@ describe("scoped HTTP MCP gateway", () => {
     expect(
       f.store.mcpCalls().every((call) => call.outcome === "completed"),
     ).toBe(true);
+  });
+
+  it("forwards standard progress fields without upstream metadata", async () => {
+    const f = await setup();
+    f.state.execute = async (_args, progress) => {
+      f.state.progressMetadata = { text: "mcp-upstream-" };
+      await progress("safe!");
+      f.state.progressMetadata = { text: "canary" };
+      await progress("safe!");
+      return { content: [] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]),
+      seen: unknown[] = [];
+    expect(
+      await client.callTool({ name: "read" }, undefined, {
+        onprogress: (progress) => seen.push(progress),
+      }),
+    ).toMatchObject({ content: [] });
+    expect(seen).toEqual([
+      { progress: 1, total: 2, message: "safe!" },
+      { progress: 1, total: 2, message: "safe!" },
+    ]);
+    expect(f.store.mcpCalls()).toMatchObject([{ outcome: "completed" }]);
+  });
+
+  it("charges upstream progress metadata to the response budget before filtering it", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 4096;
+    });
+    f.state.progressMetadata = { text: "x".repeat(300) + "!" };
+    f.state.progressOnGet = true;
+    let observed = 0;
+    f.state.execute = async (_args, progress, signal) => {
+      for (let i = 0; i < 20 && !signal.aborted; i++) await progress("safe!");
+      const until = performance.now() + 2000;
+      while (observed < 20 && !signal.aborted && performance.now() < until)
+        await delay(5);
+      return { content: [] };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const settled = client
+      .callTool({ name: "read" }, undefined, {
+        timeout: 2000,
+        onprogress: () => {
+          observed++;
+        },
+      })
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+    const until = performance.now() + 1000;
+    while (
+      f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+      performance.now() < until
+    )
+      await delay(5);
+    expect(f.store.mcpCalls().at(-1)?.outcome).toBe("cancelled");
+    expect(observed).toBeLessThan(20);
+    expect((await f.raw(session.connections[0])).status).toBe(401);
+    expect(await settled).toMatchObject({ error: expect.any(Error) });
   });
 
   it("does not request upstream progress when the worker omitted its progress token", async () => {
@@ -1384,21 +1510,27 @@ describe("scoped HTTP MCP gateway", () => {
       }
       return { content: [] };
     };
-    await expect(
-      client.callTool({ name: "read" }, undefined, {
+    const started = performance.now();
+    const settled = client
+      .callTool({ name: "read" }, undefined, {
         timeout: 5000,
         onprogress: () => {},
-      }),
-    ).rejects.toThrow();
-    const deadline = Date.now() + 2000;
+      })
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+    const deadline = started + 2000;
     while (
-      f.store.mcpCalls().at(-1)?.finished_at === null &&
-      Date.now() < deadline
+      f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+      performance.now() < deadline
     )
       await delay(20);
     const receipt = f.store.mcpCalls().at(-1)!;
     expect(receipt.outcome).toBe("cancelled");
-    expect(receipt.finished_at! - receipt.started_at).toBeLessThan(2000);
+    expect(receipt.finished_at).not.toBeNull();
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(await settled).toMatchObject({ error: expect.any(Error) });
   }, 10_000);
 
   it("cancels a real in-flight call and respects the remaining parent budget", async () => {

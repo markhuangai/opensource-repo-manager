@@ -22,8 +22,13 @@ export function createKnownSecretChecker(values: readonly string[]) {
   }
 
   type Node = { next: Map<string, number>; fail: number; matched: boolean };
+  type Stream = Readonly<{
+    pending: boolean;
+    push(text: string): boolean;
+    fork(): Stream;
+  }>;
   let nodes: Node[] | undefined;
-  function createStream() {
+  function createStream(): Stream {
     if (!nodes) {
       nodes = [{ next: new Map(), fail: 0, matched: false }];
       for (const secret of secrets) {
@@ -54,23 +59,25 @@ export function createKnownSecretChecker(values: readonly string[]) {
       }
     }
     const compiled = nodes;
-    let state = 0;
-    return Object.freeze({
-      get pending() {
-        return state !== 0;
-      },
-      push(text: string) {
-        let matched = false;
-        for (let index = 0; index < text.length; index++) {
-          const character = text[index];
-          while (state && !compiled[state].next.has(character))
-            state = compiled[state].fail;
-          state = compiled[state].next.get(character) ?? 0;
-          matched ||= compiled[state].matched;
-        }
-        return matched;
-      },
-    });
+    const stream = (state: number): Stream =>
+      Object.freeze({
+        get pending() {
+          return state !== 0;
+        },
+        push(text: string) {
+          let matched = false;
+          for (let index = 0; index < text.length; index++) {
+            const character = text[index];
+            while (state && !compiled[state].next.has(character))
+              state = compiled[state].fail;
+            state = compiled[state].next.get(character) ?? 0;
+            matched ||= compiled[state].matched;
+          }
+          return matched;
+        },
+        fork: () => stream(state),
+      });
+    return stream(0);
   }
 
   return Object.freeze({ contains, redact, createStream });

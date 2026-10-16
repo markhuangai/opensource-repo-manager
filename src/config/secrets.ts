@@ -34,7 +34,7 @@ export function separateSecrets(config: Configuration) {
   for (const [name, credential] of Object.entries(config.mcp.credentials))
     for (const [header, value] of Object.entries(credential.headers)) {
       put(`mcp.${name}.${header}`, value);
-      sensitive.push(value);
+      sensitive.push(value, value.trim());
     }
   if (config.notifications.webhook.enabled)
     for (const [header, value] of Object.entries(
