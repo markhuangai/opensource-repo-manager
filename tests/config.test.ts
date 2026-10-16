@@ -18,6 +18,9 @@ describe("strict protected configuration contract", () => {
       infrastructure_retries: 2,
       wait_hours: 24,
       reconciliation_minutes: 5,
+      worker_processes: 128,
+      worker_output_bytes: 16 * 1024 * 1024,
+      worker_storage_bytes: 4 * 1024 ** 3,
     });
     expect(config.mcp).toEqual({
       credentials: {},

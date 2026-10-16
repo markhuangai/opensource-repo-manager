@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { setTimeout as delay } from "node:timers/promises";
 import { Store } from "../src/repositories/store.ts";
 import { IntakeService } from "../src/services/intake.ts";
 import { createApp } from "../src/http/app.ts";
@@ -538,4 +539,81 @@ describe("durable GitHub intake", () => {
     );
     expect(store.job(1)!.status).toBe("pending");
   });
+
+  it("processes a fresh signed signal before the obsolete secret-input retry deadline", async () => {
+    const { github, send, service, store, loaded, path, stores } =
+      await setup();
+    github.state.issues[2] = {
+      ...makeIssue(2),
+      body: loaded.secrets.get("github.token"),
+    };
+    const event = issueEvent(2),
+      delivery = randomUUID();
+    expect((await send(event, "issues", delivery)).status).toBe(202);
+    await service.reconcile();
+    const obsolete = store.nextRetry()!;
+    expect(obsolete).toBeGreaterThan(Date.now() + 250_000);
+    expect((await send(event, "issues", delivery)).status).toBe(202);
+    expect(store.nextRetry()).toBe(obsolete);
+    github.state.issues[2].body = "credential removed";
+    service.start();
+    expect((await send({ ...event, action: "edited" })).status).toBe(202);
+    const deadline = Date.now() + 3000;
+    while ((!store.job(2) || store.counts().inbox) && Date.now() < deadline)
+      await delay(10);
+    expect(Date.now()).toBeLessThan(obsolete);
+    expect(store.job(2)?.input_json).toContain("credential removed");
+    expect(store.counts()).toMatchObject({ inbox: 0, failed: 0 });
+    const reopened = new Store(path);
+    stores.push(reopened);
+    expect(reopened.counts().inbox).toBe(0);
+    expect(reopened.job(2)?.input_json).toContain("credential removed");
+    expect(
+      store.db
+        .prepare("SELECT processed FROM inbox")
+        .all()
+        .every((row) => (row as { processed: number }).processed === 1),
+    ).toBe(true);
+  });
+
+  it("fences an authoritative read interrupted by another signed generation", async () => {
+    const { github, send, service, store } = await setup();
+    await send({ ...issueEvent(), action: "edited" });
+    let interrupted = false;
+    github.beforeRequest(async (url) => {
+      if (url !== "/repos/owner/repo/issues/1" || interrupted) return;
+      interrupted = true;
+      github.state.issues[1].body = "new authoritative input";
+      expect((await send({ ...issueEvent(), action: "edited" })).status).toBe(
+        202,
+      );
+    });
+    await service.reconcile();
+    expect(interrupted).toBe(true);
+    expect(store.job(1)?.revision).toBe(2);
+    expect(store.job(1)?.input_json).toContain("new authoritative input");
+    expect(store.counts().inbox).toBe(0);
+  });
+
+  it.each([401, 429])(
+    "retains repository-wide %s backoff after a fresh signed webhook",
+    async (status) => {
+      const { github, send, service, store } = await setup();
+      github.state.failures["/repos/owner/repo/issues/1"] = { status };
+      await send({ ...issueEvent(), action: "edited" });
+      await service.reconcile();
+      expect(service.status().reason).toBe(
+        status === 401 ? "github_authentication" : "github_rate_limited",
+      );
+      github.state.failures = {};
+      expect((await send({ ...issueEvent(), action: "edited" })).status).toBe(
+        202,
+      );
+      const count = github.requests.length;
+      await service.reconcile();
+      expect(github.requests).toHaveLength(count);
+      expect(store.nextDirty()).toBeDefined();
+      expect(store.counts().inbox).toBeGreaterThan(0);
+    },
+  );
 });

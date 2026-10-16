@@ -5,6 +5,8 @@ import { startHttpService } from "./http/server.ts";
 import { IntakeError } from "./domain/jobs.ts";
 import { Store } from "./repositories/store.ts";
 import { IntakeService } from "./services/intake.ts";
+import { RuntimeError } from "./domain/agents.ts";
+import { Supervisor } from "./runtime/supervisor.ts";
 import {
   createKnownSecretChecker,
   createSafeLogger,
@@ -19,7 +21,13 @@ try {
   if (process.getuid?.() !== 0)
     throw new IntakeError("supervisor_requires_root");
   const store = new Store("/data/state/manager.sqlite");
+  let supervisor: Supervisor | undefined;
   try {
+    supervisor = await Supervisor.create(
+      store,
+      loaded.snapshot,
+      loaded.secrets,
+    );
     const reader = createGitHubReader(
       loaded.snapshot.settings.github.repository,
       loaded.secrets.get("github.token"),
@@ -34,15 +42,24 @@ try {
     await startHttpService(logger, {
       intake,
       webhookSecret: loaded.secrets.get("github.webhook_secret"),
-      close: () => store.close(),
+      close: async () => {
+        try {
+          await supervisor!.close();
+        } finally {
+          store.close();
+        }
+      },
     });
   } catch (error) {
+    await supervisor?.close();
     if (store.db.open) store.close();
     throw error;
   }
 } catch (error) {
   logger.error(
-    error instanceof ConfigurationError || error instanceof IntakeError
+    error instanceof ConfigurationError ||
+      error instanceof IntakeError ||
+      error instanceof RuntimeError
       ? error.message
       : "Service startup failed.",
   );

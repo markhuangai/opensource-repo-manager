@@ -16,7 +16,9 @@ RUN apt-get update \
     && chmod 0555 /opt/orm-runtime /opt/orm-runtime/bin \
     && useradd --create-home --uid 10001 --user-group --shell /usr/sbin/nologin coding \
     && useradd --create-home --uid 10002 --user-group --shell /usr/sbin/nologin audit \
-    && useradd --create-home --uid 10003 --user-group --shell /usr/sbin/nologin output-review
+    && useradd --create-home --uid 10003 --user-group --shell /usr/sbin/nologin output-review \
+    && chown root:root /home/coding /home/audit /home/output-review \
+    && chmod 0555 /home/coding /home/audit /home/output-review
 WORKDIR /opt/orm/app
 COPY --from=build /build/package.json ./
 COPY --from=build /build/node_modules ./node_modules

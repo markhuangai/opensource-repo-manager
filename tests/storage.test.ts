@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import type { IssueContext } from "../src/domain/jobs.ts";
 import { fixtureSnapshot } from "./fixtures.ts";
 import { makeIssue } from "./fixtures/github.ts";
+import { digest } from "../src/domain/agents.ts";
 
 const roots: string[] = [];
 const stores: Store[] = [];
@@ -89,7 +90,7 @@ describe("durable SQLite repositories", () => {
         private: false,
       }),
     ).toThrow("repository_changed");
-    store.db.pragma("user_version = 2");
+    store.db.pragma("user_version = 3");
     store.close();
     expect(() => new Store(path)).toThrow("schema_unsupported");
   });
@@ -238,5 +239,160 @@ describe("durable SQLite repositories", () => {
     expect(reopened.acquireLease(secondJob.id, secondJob.revision)).toBeTypeOf(
       "string",
     );
+  });
+
+  it("clears only fresh webhook deferrals and fences stale completion and failure", async () => {
+    const { store, snapshot } = await database();
+    seed(store, snapshot);
+    const target = { kind: "issue" as const, number: 1 };
+    store.accept("first", "digest", "issues", [target]);
+    const stale = store.nextDirty()!;
+    const retry = Date.now() + 300_000;
+    store.defer(stale, "secret_in_input", retry);
+    store.discover([1], 1, true);
+    store.reconcileKnown();
+    expect(store.nextDirty()).toBeUndefined();
+    expect(store.nextRetry()).toBe(retry);
+    expect(store.accept("first", "digest", "issues", [target])).toBe(false);
+    expect(store.nextRetry()).toBe(retry);
+    store.accept("fresh", "new-digest", "issues", [target]);
+    const fresh = store.nextDirty()!;
+    expect(fresh.generation).toBeGreaterThan(stale.generation);
+    expect(store.counts().failed).toBe(0);
+    expect(store.nextRetry()).toBeUndefined();
+    store.defer(stale, "old_failure", retry);
+    expect(
+      store.applyIssue(stale, { ...context(), body: "stale read" }, snapshot),
+    ).toBe(false);
+    expect(store.counts().inbox).toBe(2);
+    expect(store.applyIssue(fresh, context(), snapshot)).toBe(true);
+    expect(store.counts().inbox).toBe(0);
+    expect(
+      store.db
+        .prepare("SELECT processed FROM inbox ORDER BY delivery_id")
+        .all(),
+    ).toEqual([{ processed: 1 }, { processed: 1 }]);
+  });
+
+  it("upgrades v1 runtime state transactionally without rewriting old snapshots or budgets", async () => {
+    const { store, path, snapshot } = await database();
+    const job = seed(store, snapshot),
+      token = store.acquireLease(job.id, job.revision)!;
+    const legacy = JSON.parse(JSON.stringify(snapshot));
+    delete legacy.digest;
+    delete legacy.settings.limits.worker_processes;
+    delete legacy.settings.limits.worker_output_bytes;
+    delete legacy.settings.limits.worker_storage_bytes;
+    legacy.digest = digest(legacy);
+    store.saveSnapshot(legacy);
+    store.db
+      .prepare("UPDATE jobs SET snapshot_digest=? WHERE id=?")
+      .run(legacy.digest, job.id);
+    const before = JSON.stringify(store.snapshot(legacy.digest));
+    const budget = store.job(1)!.budget_json;
+    store.db.exec(
+      "DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
+    );
+    store.close();
+    const upgraded = new Store(path);
+    stores.push(upgraded);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(2);
+    expect(JSON.stringify(upgraded.snapshot(legacy.digest))).toBe(before);
+    expect(upgraded.job(1)!.budget_json).toBe(budget);
+    expect(upgraded.leases()).toMatchObject([{ token }]);
+    expect(upgraded.runs()).toEqual([]);
+  });
+
+  it("atomically shares model budgets across connections and rejects stale leases", async () => {
+    const { store, path, snapshot } = await database();
+    const job = seed(store, snapshot),
+      token = store.acquireLease(job.id, job.revision)!;
+    const deadline = store.startRuntimeLease(token, 10000);
+    const second = new Store(path);
+    stores.push(second);
+    expect(store.reserveModelRequest(token, 2)).toBe(true);
+    expect(second.reserveModelRequest(token, 2)).toBe(true);
+    expect(store.reserveModelRequest(token, 2)).toBe(false);
+    expect(JSON.parse(store.job(1)!.budget_json).model_requests).toBe(2);
+    const started = (
+      store.db.prepare("SELECT accounted_at FROM runtime_leases").get() as {
+        accounted_at: number;
+      }
+    ).accounted_at;
+    store.accountActive(token, started + 25);
+    second.accountActive(token, started + 25);
+    expect(JSON.parse(store.job(1)!.budget_json).active_ms).toBe(25);
+    store.discover([1], 1, true);
+    store.applyIssue(
+      store.nextDirty()!,
+      { ...context(), body: "changed" },
+      snapshot,
+    );
+    expect(store.runtimeCurrent(token)).toBe(false);
+    expect(second.reserveModelRequest(token, 20)).toBe(false);
+    store.accountActive(token, deadline + 10000);
+    expect(JSON.parse(store.job(1)!.budget_json).active_ms).toBe(10000);
+    expect(store.releaseLease(token)).toBe(true);
+    expect(store.db.prepare("SELECT * FROM runtime_leases").all()).toEqual([]);
+  });
+
+  it("retains role occupancy and refuses an artifact until a current run finishes", async () => {
+    const { store, snapshot } = await database();
+    const job = seed(store, snapshot);
+    const token = store.acquireLease(job.id, job.revision)!;
+    store.startRuntimeLease(token, 10000);
+    const run = {
+      id: "run",
+      job_id: job.id,
+      revision: job.revision,
+      role: "implementation" as const,
+      uid: 10001,
+      parent_id: null,
+      lease_token: token,
+      binding_json: "{}",
+    };
+    store.startRun(run);
+    expect(store.releaseLease(token)).toBe(false);
+    expect(() => store.startRun({ ...run, id: "other" })).toThrow();
+    const artifact = store.recordArtifact({
+      run_id: run.id,
+      job_id: job.id,
+      revision: job.revision,
+      source: context().source,
+      files: [],
+    });
+    expect(() => store.artifact(artifact, job.id, job.revision)).toThrow(
+      "artifact_unavailable",
+    );
+    store.finishRun(run.id, "completed", "session", artifact);
+    const review = {
+      ...run,
+      id: "review",
+      role: "output_review" as const,
+      uid: 10003,
+      parent_id: run.id,
+    };
+    store.startRun(review);
+    expect(store.releaseLease(token)).toBe(false);
+    store.finishRun(review.id, "failed", null, null);
+    expect(store.artifact(artifact, job.id, job.revision)).toMatchObject({
+      run_id: run.id,
+    });
+    store.startRun({ ...run, id: "next" });
+    store.discover([1], 1, true);
+    store.applyIssue(
+      store.nextDirty()!,
+      { ...context(), body: "changed" },
+      snapshot,
+    );
+    expect(() =>
+      store.recordArtifact({
+        run_id: "next",
+        job_id: job.id,
+        revision: job.revision,
+        source: context().source,
+        files: [],
+      }),
+    ).toThrow("revision_stale");
   });
 });

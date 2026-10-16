@@ -155,6 +155,9 @@ const configurationSchema = z.strictObject({
       infrastructure_retries: count.default(2),
       wait_hours: positive.default(24),
       reconciliation_minutes: positive.default(5),
+      worker_processes: positive.default(128),
+      worker_output_bytes: positive.default(16 * 1024 * 1024),
+      worker_storage_bytes: positive.default(4 * 1024 * 1024 * 1024),
     })
     .prefault({}),
   mcp: z

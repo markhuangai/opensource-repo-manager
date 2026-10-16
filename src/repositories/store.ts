@@ -12,6 +12,12 @@ import Database from "better-sqlite3";
 import { immutable } from "../config/bundles.ts";
 import type { RunSnapshot } from "../config/load.ts";
 import {
+  digest,
+  RuntimeError,
+  type AgentRunRecord,
+  type ArtifactManifest,
+} from "../domain/agents.ts";
+import {
   budgetUsage,
   initialBudget,
   IntakeError,
@@ -73,7 +79,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (version !== 0 && version !== 1)
+      if (version !== 0 && version !== 1 && version !== 2)
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -130,6 +136,32 @@ export class Store {
       `),
           )
           .immediate();
+      if (version === 0 || version === 1)
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE runtime_leases (
+            token TEXT PRIMARY KEY REFERENCES coding_lease(token) ON DELETE CASCADE,
+            deadline INTEGER NOT NULL, accounted_at INTEGER NOT NULL
+          );
+          CREATE TABLE agent_runs (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, role TEXT NOT NULL, uid INTEGER NOT NULL,
+            parent_id TEXT REFERENCES agent_runs(id), lease_token TEXT NOT NULL,
+            binding_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running',
+            session_id TEXT, artifact_digest TEXT,
+            started_at INTEGER NOT NULL, finished_at INTEGER
+          );
+          CREATE UNIQUE INDEX occupied_agent_user ON agent_runs(uid) WHERE finished_at IS NULL;
+          CREATE TABLE artifacts (
+            digest TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES agent_runs(id),
+            job_id INTEGER NOT NULL REFERENCES jobs(id), revision INTEGER NOT NULL,
+            manifest_json TEXT NOT NULL
+          );
+          PRAGMA user_version = 2;
+        `),
+          )
+          .immediate();
     } catch (error) {
       this.db.close();
       throw error;
@@ -181,7 +213,10 @@ export class Store {
     return immutable(JSON.parse(row.content) as RunSnapshot);
   }
 
-  private markDirty(target: Target): number {
+  private markDirty(
+    target: Target,
+    origin: "webhook" | "reconciliation",
+  ): number {
     const { generation } = this.db
       .prepare(
         "UPDATE reconciliation SET generation=generation+1 WHERE singleton=1 RETURNING generation",
@@ -190,9 +225,11 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO dirty(kind,number,generation) VALUES(@kind,@number,@generation)
-      ON CONFLICT(kind,number) DO UPDATE SET generation=excluded.generation`,
+      ON CONFLICT(kind,number) DO UPDATE SET generation=excluded.generation,
+      retry_at=CASE WHEN @fresh THEN 0 ELSE dirty.retry_at END,
+      failure_code=CASE WHEN @fresh THEN NULL ELSE dirty.failure_code END`,
       )
-      .run({ ...target, generation });
+      .run({ ...target, generation, fresh: Number(origin === "webhook") });
     return generation;
   }
 
@@ -226,7 +263,7 @@ export class Store {
             Number(targets.length === 0),
           );
         for (const target of targets) {
-          const generation = this.markDirty(target);
+          const generation = this.markDirty(target, "webhook");
           this.db
             .prepare(
               "INSERT OR IGNORE INTO delivery_targets(delivery_id,kind,number,generation) VALUES(?,?,?,?)",
@@ -249,7 +286,8 @@ export class Store {
   discover(issues: number[], page: number, finished: boolean) {
     this.db
       .transaction(() => {
-        for (const number of issues) this.markDirty({ kind: "issue", number });
+        for (const number of issues)
+          this.markDirty({ kind: "issue", number }, "reconciliation");
         this.db
           .prepare(
             "UPDATE reconciliation SET page=?,last_completed_at=CASE WHEN ? THEN ? ELSE last_completed_at END WHERE singleton=1",
@@ -263,9 +301,15 @@ export class Store {
     this.db
       .transaction(() => {
         for (const job of this.jobs())
-          this.markDirty({ kind: "issue", number: job.issue_number });
+          this.markDirty(
+            { kind: "issue", number: job.issue_number },
+            "reconciliation",
+          );
         for (const pull of this.ownedPulls())
-          this.markDirty({ kind: "pull", number: pull.number! });
+          this.markDirty(
+            { kind: "pull", number: pull.number! },
+            "reconciliation",
+          );
       })
       .immediate();
   }
@@ -392,6 +436,228 @@ export class Store {
       .get(number) as Job | undefined;
   }
 
+  jobById(id: number): Job | undefined {
+    return this.db.prepare("SELECT * FROM jobs WHERE id=?").get(id) as
+      Job | undefined;
+  }
+
+  leases() {
+    return this.db.prepare("SELECT * FROM coding_lease").all() as Array<{
+      slot: number;
+      job_id: number;
+      revision: number;
+      token: string;
+    }>;
+  }
+
+  startRuntimeLease(token: string, activeLimit: number): number {
+    return this.db
+      .transaction(() => {
+        const job = this.db
+          .prepare(
+            `SELECT jobs.* FROM jobs JOIN coding_lease
+        ON coding_lease.job_id=jobs.id AND coding_lease.revision=jobs.revision
+        WHERE coding_lease.token=? AND jobs.status='pending'`,
+          )
+          .get(token) as Job | undefined;
+        if (!job) throw new RuntimeError("revision_stale");
+        const used = budgetUsage.parse(JSON.parse(job.budget_json)).active_ms;
+        if (used >= activeLimit)
+          throw new RuntimeError("active_budget_exhausted");
+        const now = Date.now(),
+          deadline = now + activeLimit - used;
+        if (
+          !Number.isSafeInteger(activeLimit) ||
+          !Number.isSafeInteger(deadline)
+        )
+          throw new RuntimeError("active_budget_invalid");
+        this.db
+          .prepare("INSERT INTO runtime_leases VALUES(?,?,?)")
+          .run(token, deadline, now);
+        return deadline;
+      })
+      .immediate();
+  }
+
+  runtimeCurrent(token: string): boolean {
+    return Boolean(
+      this.db
+        .prepare(
+          `SELECT 1 FROM coding_lease JOIN jobs
+      ON jobs.id=coding_lease.job_id AND jobs.revision=coding_lease.revision
+      JOIN runtime_leases ON runtime_leases.token=coding_lease.token
+      WHERE coding_lease.token=? AND jobs.status='pending' AND runtime_leases.deadline>?`,
+        )
+        .get(token, Date.now()),
+    );
+  }
+
+  accountActive(token: string, now = Date.now()) {
+    this.db
+      .transaction(() => {
+        const lease = this.db
+          .prepare(
+            `SELECT coding_lease.job_id,runtime_leases.* FROM coding_lease
+        JOIN runtime_leases ON coding_lease.token=runtime_leases.token WHERE coding_lease.token=?`,
+          )
+          .get(token) as
+          | { job_id: number; deadline: number; accounted_at: number }
+          | undefined;
+        if (!lease) return;
+        const until = Math.max(
+          lease.accounted_at,
+          Math.min(now, lease.deadline),
+        );
+        this.db
+          .prepare(
+            `UPDATE jobs SET budget_json=json_set(budget_json,'$.active_ms',
+        json_extract(budget_json,'$.active_ms')+?) WHERE id=?`,
+          )
+          .run(until - lease.accounted_at, lease.job_id);
+        this.db
+          .prepare("UPDATE runtime_leases SET accounted_at=? WHERE token=?")
+          .run(until, token);
+      })
+      .immediate();
+  }
+
+  reserveModelRequest(token: string, limit: number) {
+    return (
+      this.db
+        .prepare(
+          `UPDATE jobs SET budget_json=json_set(budget_json,'$.model_requests',
+      json_extract(budget_json,'$.model_requests')+1) WHERE status='pending'
+      AND json_extract(budget_json,'$.model_requests')<? AND EXISTS
+      (SELECT 1 FROM coding_lease JOIN runtime_leases ON coding_lease.token=runtime_leases.token
+       WHERE coding_lease.token=? AND coding_lease.job_id=jobs.id
+       AND coding_lease.revision=jobs.revision AND runtime_leases.deadline>?)`,
+        )
+        .run(limit, token, Date.now()).changes === 1
+    );
+  }
+
+  startRun(
+    record: Pick<
+      AgentRunRecord,
+      | "id"
+      | "job_id"
+      | "revision"
+      | "role"
+      | "uid"
+      | "parent_id"
+      | "lease_token"
+      | "binding_json"
+    >,
+  ) {
+    this.db
+      .transaction(() => {
+        if (
+          !this.runtimeCurrent(record.lease_token) ||
+          !this.db
+            .prepare(
+              "SELECT 1 FROM coding_lease WHERE token=? AND job_id=? AND revision=?",
+            )
+            .get(record.lease_token, record.job_id, record.revision)
+        )
+          throw new RuntimeError("revision_stale");
+        this.db
+          .prepare(
+            `INSERT INTO agent_runs(id,job_id,revision,role,uid,parent_id,lease_token,binding_json,started_at)
+        VALUES(@id,@job_id,@revision,@role,@uid,@parent_id,@lease_token,@binding_json,@started_at)`,
+          )
+          .run({ ...record, started_at: Date.now() });
+      })
+      .immediate();
+  }
+
+  runs(): AgentRunRecord[] {
+    return this.db
+      .prepare("SELECT * FROM agent_runs ORDER BY started_at,rowid")
+      .all() as AgentRunRecord[];
+  }
+
+  bindRun(id: string, binding: string) {
+    this.db
+      .transaction(() => {
+        const run = this.db
+          .prepare(
+            "SELECT * FROM agent_runs WHERE id=? AND finished_at IS NULL",
+          )
+          .get(id) as AgentRunRecord | undefined;
+        if (!run || !this.runtimeCurrent(run.lease_token))
+          throw new RuntimeError("revision_stale");
+        this.db
+          .prepare("UPDATE agent_runs SET binding_json=? WHERE id=?")
+          .run(JSON.stringify({ binding }), id);
+      })
+      .immediate();
+  }
+
+  finishRun(
+    id: string,
+    status: string,
+    session: string | null,
+    artifact: string | null,
+  ) {
+    this.db
+      .transaction(() => {
+        const run = this.db
+          .prepare("SELECT * FROM agent_runs WHERE id=?")
+          .get(id) as AgentRunRecord | undefined;
+        if (!run || run.finished_at !== null)
+          throw new RuntimeError("run_not_active");
+        if (status === "completed" && !this.runtimeCurrent(run.lease_token))
+          throw new RuntimeError("revision_stale");
+        this.db
+          .prepare(
+            "UPDATE agent_runs SET status=?,session_id=?,artifact_digest=?,finished_at=? WHERE id=?",
+          )
+          .run(status, session, artifact, Date.now(), id);
+      })
+      .immediate();
+  }
+
+  recordArtifact(manifest: ArtifactManifest): string {
+    const hash = digest(manifest);
+    this.db
+      .transaction(() => {
+        const run = this.db
+          .prepare("SELECT * FROM agent_runs WHERE id=?")
+          .get(manifest.run_id) as AgentRunRecord | undefined;
+        if (
+          !run ||
+          run.job_id !== manifest.job_id ||
+          run.revision !== manifest.revision ||
+          !this.runtimeCurrent(run.lease_token)
+        )
+          throw new RuntimeError("revision_stale");
+        this.db
+          .prepare("INSERT INTO artifacts VALUES(?,?,?,?,?)")
+          .run(
+            hash,
+            run.id,
+            run.job_id,
+            run.revision,
+            JSON.stringify(manifest),
+          );
+      })
+      .immediate();
+    return hash;
+  }
+
+  artifact(hash: string, jobId: number, revision: number): ArtifactManifest {
+    const row = this.db
+      .prepare(
+        `SELECT artifacts.manifest_json FROM artifacts JOIN agent_runs ON agent_runs.id=artifacts.run_id
+      WHERE artifacts.digest=? AND artifacts.job_id=? AND artifacts.revision=? AND agent_runs.status='completed' AND agent_runs.finished_at IS NOT NULL`,
+      )
+      .get(hash, jobId, revision) as { manifest_json: string } | undefined;
+    if (!row) throw new RuntimeError("artifact_unavailable");
+    const manifest = JSON.parse(row.manifest_json) as ArtifactManifest;
+    if (digest(manifest) !== hash) throw new RuntimeError("artifact_corrupt");
+    return manifest;
+  }
+
   acquireLease(jobId: number, revision: number): string | undefined {
     const token = randomUUID();
     const result = this.db
@@ -405,8 +671,12 @@ export class Store {
 
   releaseLease(token: string) {
     return (
-      this.db.prepare("DELETE FROM coding_lease WHERE token=?").run(token)
-        .changes === 1
+      this.db
+        .prepare(
+          `DELETE FROM coding_lease WHERE token=? AND NOT EXISTS
+        (SELECT 1 FROM agent_runs WHERE agent_runs.lease_token=coding_lease.token AND finished_at IS NULL)`,
+        )
+        .run(token).changes === 1
     );
   }
 
