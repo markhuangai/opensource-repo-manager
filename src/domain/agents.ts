@@ -4,6 +4,7 @@ import type { RunSnapshot } from "../config/load.ts";
 import type { ModelProfile, Role } from "../config/schema.ts";
 import { isContainedReference } from "../config/files.ts";
 import type { SourceMetadata } from "./jobs.ts";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 export class RuntimeError extends Error {
   readonly code: string;
@@ -42,6 +43,7 @@ export interface McpSessionProvider {
     grants: RunSnapshot["roles"][Role]["mcp"];
     deadline: number;
     signal: AbortSignal;
+    available?: () => boolean;
   }): Promise<{
     connections: readonly McpConnection[];
     policy_identity: string;
@@ -49,6 +51,50 @@ export interface McpSessionProvider {
     close(): Promise<void>;
   }>;
 }
+
+export interface ReviewedMcpDispatcher {
+  dispatch(
+    request: Readonly<{
+      run_id: string;
+      job_id: number;
+      revision: number;
+      role: Role;
+      alias: string;
+      tool: string;
+      credential_binding: string;
+      policy_identity: string;
+      catalog_identity: string;
+      arguments: Readonly<Record<string, unknown>>;
+      request_digest: string;
+      deadline: number;
+      signal: AbortSignal;
+    }>,
+  ): Promise<CallToolResult>;
+}
+
+export type McpCallReceipt = {
+  id: string;
+  run_id: string;
+  job_id: number;
+  revision: number;
+  role: Role;
+  alias: string;
+  tool: string;
+  credential_binding: string;
+  policy_identity: string;
+  catalog_identity: string;
+  request_digest: string;
+  result_digest: string | null;
+  started_at: number;
+  finished_at: number | null;
+  outcome:
+    | "running"
+    | "completed"
+    | "tool_error"
+    | "failed"
+    | "cancelled"
+    | "interrupted";
+};
 
 export type SessionIdentity = Readonly<{ id: string; binding: string }>;
 export type AgentRunRequest = Readonly<{

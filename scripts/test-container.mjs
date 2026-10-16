@@ -928,6 +928,8 @@ try {
   );
   assert.equal(runtimeProof.runtime, "passed");
   assert.equal(runtimeProof.cleanup, "passed");
+  assert.equal(runtimeProof.mcp_gateway?.protocol, "streamable_http");
+  assert.equal(runtimeProof.mcp_gateway?.cleanup, "passed");
 
   const healthyDeadline = Date.now() + 30_000;
   while (

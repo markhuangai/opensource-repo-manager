@@ -90,7 +90,7 @@ describe("durable SQLite repositories", () => {
         private: false,
       }),
     ).toThrow("repository_changed");
-    store.db.pragma("user_version = 3");
+    store.db.pragma("user_version = 4");
     store.close();
     expect(() => new Store(path)).toThrow("schema_unsupported");
   });
@@ -291,16 +291,104 @@ describe("durable SQLite repositories", () => {
     const before = JSON.stringify(store.snapshot(legacy.digest));
     const budget = store.job(1)!.budget_json;
     store.db.exec(
-      "DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
+      "DROP TABLE mcp_calls; DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(2);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(3);
     expect(JSON.stringify(upgraded.snapshot(legacy.digest))).toBe(before);
     expect(upgraded.job(1)!.budget_json).toBe(budget);
     expect(upgraded.leases()).toMatchObject([{ token }]);
     expect(upgraded.runs()).toEqual([]);
+  });
+
+  it("upgrades v2 without changing jobs or runs and preserves call receipts through recovery", async () => {
+    const { store, path, snapshot } = await database();
+    const job = seed(store, snapshot),
+      token = store.acquireLease(job.id, job.revision)!;
+    store.startRuntimeLease(token, 10000);
+    const run = {
+      id: "mcp-run",
+      job_id: job.id,
+      revision: job.revision,
+      role: "investigation" as const,
+      uid: 10001,
+      parent_id: null,
+      lease_token: token,
+      binding_json: "{}",
+    };
+    store.startRun(run);
+    const before = {
+      jobs: store.jobs(),
+      runs: store.runs(),
+      snapshot: store.snapshot(snapshot.digest),
+    };
+    store.db.exec("DROP TABLE mcp_calls; PRAGMA user_version=2");
+    store.close();
+    const upgraded = new Store(path);
+    stores.push(upgraded);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(3);
+    expect({
+      jobs: upgraded.jobs(),
+      runs: upgraded.runs(),
+      snapshot: upgraded.snapshot(snapshot.digest),
+    }).toEqual(before);
+    const receipt = {
+      id: "call",
+      run_id: run.id,
+      job_id: job.id,
+      revision: job.revision,
+      role: run.role,
+      alias: "context",
+      tool: "read",
+      credential_binding: "a".repeat(64),
+      policy_identity: "b".repeat(64),
+      catalog_identity: "c".repeat(64),
+      request_digest: "d".repeat(64),
+      started_at: Date.now(),
+    };
+    upgraded.startMcpCall(receipt);
+    upgraded.close();
+    const recovered = new Store(path);
+    stores.push(recovered);
+    recovered.interruptMcpCalls();
+    expect(recovered.mcpCalls()).toMatchObject([
+      { ...receipt, outcome: "interrupted", result_digest: null },
+    ]);
+    expect(recovered.mcpCalls()[0].finished_at).not.toBeNull();
+    recovered.startMcpCall({ ...receipt, id: "completed" });
+    recovered.finishMcpCall("completed", "completed", "e".repeat(64));
+    recovered.interruptMcpCalls();
+    expect(recovered.mcpCalls().at(-1)?.outcome).toBe("completed");
+    expect(() => recovered.finishMcpCall("completed", "failed", null)).toThrow(
+      "mcp_receipt_not_active",
+    );
+    recovered.finishRun(run.id, "completed", null, null);
+    expect(() => recovered.startMcpCall({ ...receipt, id: "stale" })).toThrow(
+      "revision_stale",
+    );
+  });
+
+  it("rolls back a failed v3 migration without changing v2 data", async () => {
+    const { store, path, snapshot } = await database();
+    seed(store, snapshot);
+    const jobs = store.jobs();
+    store.db.exec(
+      "DROP TABLE mcp_calls; CREATE TABLE mcp_calls(marker TEXT); INSERT INTO mcp_calls VALUES('preserve'); PRAGMA user_version=2",
+    );
+    store.close();
+    expect(() => new Store(path)).toThrow();
+    const inspected = new Database(path);
+    try {
+      expect(inspected.pragma("user_version", { simple: true })).toBe(2);
+      expect(inspected.prepare("SELECT * FROM jobs").all()).toEqual(jobs);
+      expect(inspected.prepare("SELECT * FROM mcp_calls").all()).toEqual([
+        { marker: "preserve" },
+      ]);
+    } finally {
+      inspected.close();
+    }
   });
 
   it("atomically shares model budgets across connections and rejects stale leases", async () => {
