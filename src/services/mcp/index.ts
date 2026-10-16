@@ -31,6 +31,8 @@ import type { Store } from "../../repositories/store.ts";
 import { snapshotTool } from "./catalog.ts";
 import { UpstreamHttp, budget } from "./http.ts";
 
+const maxConcurrentCalls = 16;
+
 type OpenRequest = Parameters<McpSessionProvider["open"]>[0];
 type Session = {
   request: OpenRequest;
@@ -365,6 +367,8 @@ export class McpGateway implements McpSessionProvider {
         server.setRequestHandler(CallToolRequestSchema, (message, extra) => {
           const operation = (async () => {
             this.authorize(session);
+            if (session.calls.size >= maxConcurrentCalls)
+              throw new McpError(-32003, "mcp_concurrency_limit");
             const entry = session.tools.get(message.params.name);
             if (
               !entry ||
@@ -414,7 +418,8 @@ export class McpGateway implements McpSessionProvider {
                 "failed",
               resultDigest: string | null = null;
             let progressFailure: unknown;
-            const progressTasks: Promise<void>[] = [];
+            let progressBytes = 0;
+            const progressTasks = new Set<Promise<void>>();
             try {
               this.authorize(session);
               const result = await http.within(call.signal, () =>
@@ -429,20 +434,25 @@ export class McpGateway implements McpSessionProvider {
                     onprogress: (progress) => {
                       const task = (async () => {
                         this.authorize(session);
-                        this.checkVisible(progress, limits.max_response_bytes);
+                        const notification = {
+                          method: "notifications/progress" as const,
+                          params: {
+                            ...progress,
+                            progressToken: extra._meta?.progressToken ?? 0,
+                          },
+                        };
+                        progressBytes += this.checkVisible(
+                          { jsonrpc: "2.0", ...notification },
+                          limits.max_response_bytes - progressBytes,
+                        );
                         if (extra._meta?.progressToken !== undefined)
-                          await extra.sendNotification({
-                            method: "notifications/progress",
-                            params: {
-                              ...progress,
-                              progressToken: extra._meta.progressToken,
-                            },
-                          });
+                          await extra.sendNotification(notification);
                       })().catch((error) => {
                         progressFailure = error;
                         this.revoke(session);
                       });
-                      progressTasks.push(task);
+                      progressTasks.add(task);
+                      void task.then(() => progressTasks.delete(task));
                     },
                   },
                 ),
@@ -453,7 +463,7 @@ export class McpGateway implements McpSessionProvider {
               this.authorize(session);
               this.checkVisible(
                 { jsonrpc: "2.0", id: extra.requestId, result },
-                limits.max_response_bytes,
+                limits.max_response_bytes - progressBytes,
               );
               if (
                 entry.output &&
@@ -491,17 +501,22 @@ export class McpGateway implements McpSessionProvider {
           ) {
             if (!("id" in message))
               throw new RuntimeError("mcp_response_invalid");
-            await send(
-              {
-                jsonrpc: "2.0",
-                id: message.id,
-                error: {
-                  code: ErrorCode.InternalError,
-                  message: "mcp_response_invalid",
-                },
+            const replacement = {
+              jsonrpc: "2.0" as const,
+              id: message.id,
+              error: {
+                code: ErrorCode.InternalError,
+                message: "mcp_response_invalid",
               },
-              options,
-            );
+            };
+            if (
+              Buffer.byteLength(JSON.stringify(replacement)) >
+              limits.max_response_bytes
+            ) {
+              this.revoke(session);
+              throw new RuntimeError("mcp_response_limit");
+            }
+            await send(replacement, options);
             return;
           }
           await send(message, options);
@@ -602,10 +617,11 @@ export class McpGateway implements McpSessionProvider {
   }
 
   private checkVisible(value: unknown, maximum: number) {
-    if (Buffer.byteLength(JSON.stringify(value)) > maximum)
-      throw new RuntimeError("mcp_response_limit");
+    const bytes = Buffer.byteLength(JSON.stringify(value));
+    if (bytes > maximum) throw new RuntimeError("mcp_response_limit");
     if (this.secrets.contains(value) || this.containsAuthorization(value))
       throw new RuntimeError("mcp_secret_in_response");
+    return bytes;
   }
 
   private safeError(error: unknown, maximum: number): McpError {

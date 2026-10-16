@@ -64,6 +64,7 @@ async function setup(configure?: (config: Configuration) => void) {
     pageDelay: 0,
     hang: "",
     stateless: false,
+    progressOnGet: false,
     redirect: new Set<string>(),
     requests: [] as Array<{
       method: string;
@@ -164,15 +165,19 @@ async function setup(configure?: (config: Configuration) => void) {
           return state.execute(
             args,
             async (text) => {
-              if (extra._meta?.progressToken !== undefined)
-                await extra.sendNotification({
-                  method: "notifications/progress",
+              if (extra._meta?.progressToken !== undefined) {
+                const notification = {
+                  method: "notifications/progress" as const,
                   params: {
                     progressToken: extra._meta.progressToken,
                     progress: 1,
                     message: text,
                   },
-                });
+                };
+                if (state.progressOnGet)
+                  await server.notification(notification);
+                else await extra.sendNotification(notification);
+              }
             },
             extra.signal,
             authorization,
@@ -607,6 +612,40 @@ describe("scoped HTTP MCP gateway", () => {
     expect(f.store.mcpCalls().at(-1)?.outcome).toBe("completed");
   });
 
+  it("preserves Unicode, unanchored matching and distinct schema patterns", async () => {
+    const f = await setup();
+    f.state.catalog[0].inputSchema = {
+      type: "object",
+      properties: {
+        number: { type: "string", pattern: "^[0-9]+$" },
+        name: { type: "string", pattern: "^[a-z]+$" },
+        text: { type: "string", pattern: "needle" },
+        emoji: { type: "string", pattern: "^\\u{1F600}$" },
+      },
+      required: ["number", "name", "text", "emoji"],
+      additionalProperties: false,
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const args = {
+      number: "123",
+      name: "abc",
+      text: "a needle here",
+      emoji: "😀",
+    };
+    await client.callTool({ name: "read", arguments: args });
+    for (const invalid of [
+      { ...args, number: "abc" },
+      { ...args, name: "123" },
+      { ...args, text: "absent" },
+      { ...args, emoji: "😃" },
+    ])
+      await expect(
+        client.callTool({ name: "read", arguments: invalid }),
+      ).rejects.toThrow("mcp_arguments_invalid");
+    expect(f.state.calls.map((call) => call.args)).toEqual([args]);
+  });
+
   it.each(["input", "output"])(
     "rejects unsupported %s regex syntax explicitly",
     async (kind) => {
@@ -866,6 +905,125 @@ describe("scoped HTTP MCP gateway", () => {
       { outcome: "failed", result_digest: null },
     ]);
   });
+
+  it("revokes a session when its required error envelope cannot fit the response bound", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 1000;
+    });
+    const session = await f.open(),
+      { transport } = await f.connect(session.connections[0]);
+    let body = "";
+    try {
+      const response = await f.raw(
+        session.connections[0],
+        "POST",
+        {
+          jsonrpc: "2.0",
+          id: "r".repeat(2000),
+          method: "tools/call",
+          params: { name: "read" },
+        },
+        session.connections[0].authorization,
+        transport.sessionId,
+      );
+      body = await response.text();
+    } catch (error) {
+      expect(error).toBeInstanceOf(TypeError);
+    }
+    expect(Buffer.byteLength(body)).toBeLessThanOrEqual(1000);
+    expect((await f.raw(session.connections[0])).status).toBe(401);
+    expect(f.store.mcpCalls()).toMatchObject([
+      { outcome: "failed", result_digest: null },
+    ]);
+  });
+
+  it("bounds concurrent upstream calls and admits work after capacity is released", async () => {
+    const f = await setup(),
+      release: Array<() => void> = [];
+    f.state.execute = (_args, _progress, signal) =>
+      new Promise((resolve) => {
+        const finish = () => resolve({ content: [] });
+        release.push(finish);
+        signal.addEventListener("abort", finish, { once: true });
+      });
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    const calls = Array.from({ length: 16 }, () =>
+      client.callTool({ name: "read" }).catch((error: unknown) => error),
+    );
+    let until = performance.now() + 2000;
+    while (f.state.calls.length < 16 && performance.now() < until)
+      await delay(5);
+    expect(f.state.calls).toHaveLength(16);
+    await expect(client.callTool({ name: "read" })).rejects.toThrow(
+      "mcp_concurrency_limit",
+    );
+    expect(f.store.mcpCalls()).toHaveLength(16);
+    release[0]();
+    await calls[0];
+    calls.push(
+      client.callTool({ name: "read" }).catch((error: unknown) => error),
+    );
+    until = performance.now() + 2000;
+    while (f.state.calls.length < 17 && performance.now() < until)
+      await delay(5);
+    expect(f.state.calls).toHaveLength(17);
+    release.forEach((finish) => finish());
+    expect(await Promise.all(calls)).toMatchObject(
+      Array.from({ length: 17 }, () => ({ content: [] })),
+    );
+    expect(
+      f.store.mcpCalls().every((call) => call.outcome === "completed"),
+    ).toBe(true);
+  });
+
+  it.each(["within", "exceeded"])(
+    "enforces the %s call response budget for progress on the upstream GET stream",
+    async (mode) => {
+      const f = await setup((config) => {
+        config.mcp.max_response_bytes = 4096;
+      });
+      f.state.progressOnGet = true;
+      let observed = 0;
+      const count = mode === "within" ? 12 : 100;
+      f.state.execute = async (_args, progress, signal) => {
+        for (let i = 0; i < count && !signal.aborted; i++)
+          await progress("x".repeat(100));
+        const until = Date.now() + 2000;
+        while (observed < count && !signal.aborted && Date.now() < until)
+          await delay(5);
+        return { content: [] };
+      };
+      const session = await f.open(),
+        { client } = await f.connect(session.connections[0]);
+      const call = client.callTool({ name: "read" }, undefined, {
+        timeout: 2000,
+        onprogress: () => {
+          observed++;
+        },
+      });
+      const settled = call.then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+      if (mode === "within") {
+        expect(await settled).toMatchObject({ value: { content: [] } });
+        expect(observed).toBe(count);
+        expect(f.store.mcpCalls().at(-1)?.outcome).toBe("completed");
+      } else {
+        const until = performance.now() + 1000;
+        while (
+          f.store.mcpCalls().at(-1)?.outcome !== "cancelled" &&
+          performance.now() < until
+        )
+          await delay(5);
+        expect(f.store.mcpCalls().at(-1)?.outcome).toBe("cancelled");
+        expect(observed).toBeLessThan(count);
+        expect((await f.raw(session.connections[0])).status).toBe(401);
+        expect(await settled).toMatchObject({ error: expect.any(Error) });
+      }
+    },
+  );
 
   it("paginates the downstream snapshot within its response bound", async () => {
     const f = await setup((config) => {

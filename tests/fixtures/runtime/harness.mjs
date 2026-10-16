@@ -703,10 +703,17 @@ export async function runRuntimeTests() {
     const timed = seed({ limits: { active_minutes: 1 } });
     store.db
       .prepare(
-        "UPDATE jobs SET budget_json=json_set(budget_json,'$.active_ms',59000) WHERE id=?",
+        "UPDATE jobs SET budget_json=json_set(budget_json,'$.active_ms',55000) WHERE id=?",
       )
       .run(timed.job.id);
-    assert.equal((await run(timed, { mode: "hang" })).outcome, "limited");
+    const timedIterator = iterate(
+      supervisor.run(
+        supervisor.request(timed.job.id, "implementation", { mode: "hang" }),
+        new globalThis.AbortController().signal,
+      ),
+    );
+    assert.equal((await timedIterator.next()).value.message, "ready");
+    assert.equal(terminal(await remaining(timedIterator)).outcome, "limited");
     assert.equal(
       JSON.parse(store.jobById(timed.job.id).budget_json).active_ms,
       60000,

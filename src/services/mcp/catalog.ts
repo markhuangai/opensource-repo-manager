@@ -1,6 +1,6 @@
 import { Ajv, type ValidateFunction } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020.js";
-import { RE2 } from "re2-wasm";
+import { RE2JS } from "re2js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { RuntimeError } from "../../domain/agents.ts";
 import { immutable } from "../../config/bundles.ts";
@@ -15,8 +15,10 @@ export function compile(schema: object): ValidateFunction {
       ownProperties: true,
       code: {
         regExp: Object.assign(
-          (pattern: string, flags: string) => new RE2(pattern, flags),
-          { code: "((pattern, flags) => new RE2(pattern, flags))" },
+          (pattern: string) => RE2JS.compile(RE2JS.translateRegExp(pattern)),
+          {
+            code: "((pattern) => RE2JS.compile(RE2JS.translateRegExp(pattern)))",
+          },
         ),
       },
     };
