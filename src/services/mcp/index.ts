@@ -519,22 +519,27 @@ export class McpGateway implements McpSessionProvider {
               ];
               const inspectResult = (
                 value: unknown,
-                streams: ReturnType<typeof progressForks>,
+                streams?: ReturnType<typeof progressForks>,
               ) => {
                 if (typeof value === "string") {
                   inspectText(value, progressForks());
-                  inspectText(value, streams);
+                  inspectText(value, streams ?? progressForks());
+                } else if (Array.isArray(value)) {
+                  for (const item of value) inspectResult(item, streams);
                 } else if (value !== null && typeof value === "object") {
+                  const keyStreams = progressForks(),
+                    mixedStreams = progressForks();
                   for (const [key, item] of Object.entries(value)) {
                     inspectText(key, progressForks());
-                    inspectResult(item, streams);
+                    inspectText(key, keyStreams);
+                    inspectText(key, mixedStreams);
+                    if (typeof item === "string")
+                      inspectText(item, mixedStreams);
+                    inspectResult(item, streams ?? progressForks());
                   }
                 }
               };
-              for (const [key, value] of Object.entries(result)) {
-                inspectText(key, progressForks());
-                inspectResult(value, progressForks());
-              }
+              inspectResult(result);
               for (const content of result.content) {
                 if (content.type === "text") inspectText(content.text);
                 else if (

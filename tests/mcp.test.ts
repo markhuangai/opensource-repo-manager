@@ -890,6 +890,11 @@ describe("scoped HTTP MCP gateway", () => {
     ["credential", "progress-extension"],
     ["credential", "structured"],
     ["authorization", "structured"],
+    ["credential", "keys"],
+    ["authorization", "keys"],
+    ["credential", "key-value"],
+    ["credential", "root-keys"],
+    ["credential", "progress-keys-parts"],
   ])("blocks split %s text across %s", async (secret, channel) => {
     const f = await setup();
     const session = await f.open(),
@@ -941,6 +946,22 @@ describe("scoped HTTP MCP gateway", () => {
           content: [{ type: "text", text: "safe!" }],
           structuredContent: { first, second },
         };
+      if (channel === "keys")
+        return {
+          content: [],
+          structuredContent: { [first]: 0, [second]: 0 },
+        };
+      if (channel === "key-value")
+        return { content: [], structuredContent: { [first]: second } };
+      if (channel === "root-keys")
+        return { content: [], [first]: 0, [second]: 0 };
+      if (channel === "progress-keys-parts")
+        return {
+          content: [{ type: "text", text: "safe!" }],
+          structuredContent: {
+            nested: { [second.slice(0, 2)]: 0, [second.slice(2)]: 0 },
+          },
+        };
       return {
         content: [
           ...(channel === "result"
@@ -973,6 +994,35 @@ describe("scoped HTTP MCP gateway", () => {
     expect((await f.raw(connection)).status).toBe(401);
     expect(await settled).toMatchObject({ error: expect.any(Error) });
     expect(JSON.stringify(f.store.mcpCalls())).not.toContain(value);
+  });
+
+  it("does not treat implicit array indices as worker-visible text", async () => {
+    const f = await setup((config) => {
+      config.mcp.credentials.first.headers.Authorization =
+        "Bearer mcp-upstream-1";
+    });
+    const content = [
+      { type: "text" as const, text: "safe!" },
+      { type: "text" as const, text: "safe!" },
+    ];
+    f.state.execute = async (_args, progress) => {
+      await progress("mcp-upstream-");
+      return { content };
+    };
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]),
+      messages: string[] = [];
+    expect(
+      await client.callTool({ name: "read" }, undefined, {
+        timeout: 2000,
+        onprogress: (progress) => messages.push(progress.message ?? ""),
+      }),
+    ).toMatchObject({ content });
+    expect(messages).toEqual(["mcp-upstream-"]);
+    expect(f.store.mcpCalls()).toMatchObject([{ outcome: "completed" }]);
+    expect((await client.listTools()).tools.map((entry) => entry.name)).toEqual(
+      ["read"],
+    );
   });
 
   it("preserves progress order and flushes benign secret prefixes at completion", async () => {
