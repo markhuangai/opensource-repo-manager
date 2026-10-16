@@ -354,7 +354,10 @@ export class McpGateway implements McpSessionProvider {
             if (!tools.length && index < entries.length)
               throw new McpError(ErrorCode.InternalError, "mcp_response_limit");
             if (index === entries.length) return { tools };
-            const nextCursor = randomBytes(18).toString("base64url");
+            const nextCursor =
+              [...session.cursors].find(
+                ([, offset]) => offset === index,
+              )?.[0] ?? randomBytes(18).toString("base64url");
             session.cursors.set(nextCursor, index);
             return { tools, nextCursor };
           },
@@ -448,7 +451,10 @@ export class McpGateway implements McpSessionProvider {
               if (progressFailure) throw progressFailure;
               call.signal.throwIfAborted();
               this.authorize(session);
-              this.checkVisible(result, limits.max_response_bytes);
+              this.checkVisible(
+                { jsonrpc: "2.0", id: extra.requestId, result },
+                limits.max_response_bytes,
+              );
               if (
                 entry.output &&
                 !result.isError &&

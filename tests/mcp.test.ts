@@ -561,6 +561,67 @@ describe("scoped HTTP MCP gateway", () => {
     ).toBe(false);
   });
 
+  it.each([
+    ["input", "pattern"],
+    ["output", "pattern"],
+    ["input", "patternProperties"],
+    ["output", "patternProperties"],
+  ])("bounds untrusted %s schema %s evaluation", async (kind, keyword) => {
+    const f = await setup();
+    const schema = {
+      type: "object" as const,
+      additionalProperties: false,
+      ...(keyword === "pattern"
+        ? {
+            properties: { text: { type: "string", pattern: "^(a+)+$" } },
+            required: ["text"],
+          }
+        : { patternProperties: { "^(a+)+$": { type: "string" } } }),
+    };
+    if (kind === "input") f.state.catalog[0].inputSchema = schema;
+    else f.state.catalog[0].outputSchema = schema;
+    const invalid =
+      keyword === "pattern"
+        ? { text: "a".repeat(20_000) + "!" }
+        : { ["a".repeat(20_000) + "!"]: "value" };
+    const valid = keyword === "pattern" ? { text: "aaaa" } : { aaaa: "value" };
+    let output: Record<string, unknown> = invalid;
+    f.state.execute = async () => ({ content: [], structuredContent: output });
+    const session = await f.open(),
+      { client } = await f.connect(session.connections[0]);
+    await expect(
+      client.callTool({
+        name: "read",
+        arguments: kind === "input" ? invalid : {},
+      }),
+    ).rejects.toThrow(
+      kind === "input" ? "mcp_arguments_invalid" : "mcp_result_invalid",
+    );
+    if (kind === "input") expect(f.state.calls).toEqual([]);
+    else expect(f.store.mcpCalls().at(-1)?.outcome).toBe("failed");
+    output = valid;
+    await client.callTool({
+      name: "read",
+      arguments: kind === "input" ? valid : {},
+    });
+    expect(f.store.mcpCalls().at(-1)?.outcome).toBe("completed");
+  });
+
+  it.each(["input", "output"])(
+    "rejects unsupported %s regex syntax explicitly",
+    async (kind) => {
+      const f = await setup();
+      const schema = {
+        type: "object" as const,
+        properties: { text: { type: "string", pattern: "(?=a)a" } },
+      };
+      if (kind === "input") f.state.catalog[0].inputSchema = schema;
+      else f.state.catalog[0].outputSchema = schema;
+      await expect(f.open()).rejects.toThrow("mcp_schema_invalid");
+      expect(f.state.calls).toEqual([]);
+    },
+  );
+
   it("keeps identically named schema IDs isolated across credential-bound catalogs", async () => {
     const f = await setup((config) => {
       config.mcp.servers.second = {
@@ -778,6 +839,34 @@ describe("scoped HTTP MCP gateway", () => {
     await expect(catalog.open()).rejects.toThrow("mcp_catalog_limit");
   });
 
+  it("records oversized outgoing result envelopes as failures before sending", async () => {
+    const f = await setup((config) => {
+      config.mcp.max_response_bytes = 1000;
+    });
+    f.state.execute = async () => ({
+      content: [{ type: "text", text: "x".repeat(850) }],
+    });
+    const session = await f.open(),
+      { transport } = await f.connect(session.connections[0]);
+    const response = await f.raw(
+      session.connections[0],
+      "POST",
+      {
+        jsonrpc: "2.0",
+        id: "r".repeat(200),
+        method: "tools/call",
+        params: { name: "read" },
+      },
+      session.connections[0].authorization,
+      transport.sessionId,
+    );
+    expect(await response.text()).toContain("mcp_response_limit");
+    expect(f.state.calls).toHaveLength(1);
+    expect(f.store.mcpCalls()).toMatchObject([
+      { outcome: "failed", result_digest: null },
+    ]);
+  });
+
   it("paginates the downstream snapshot within its response bound", async () => {
     const f = await setup((config) => {
       config.mcp.max_response_bytes = 1000;
@@ -791,12 +880,19 @@ describe("scoped HTTP MCP gateway", () => {
     const first = await client.listTools();
     expect(first.tools).toHaveLength(1);
     expect(first.nextCursor).toBeDefined();
+    for (let i = 0; i < 8; i++)
+      expect((await client.listTools()).nextCursor).toBe(first.nextCursor);
     const second = await client.listTools({ cursor: first.nextCursor });
     expect(second.tools).toHaveLength(1);
     expect(second.nextCursor).toBeUndefined();
     await expect(client.listTools({ cursor: "forged" })).rejects.toThrow(
       "mcp_cursor_invalid",
     );
+    const other = await f.open(),
+      connected = await f.connect(other.connections[0]);
+    await expect(
+      connected.client.listTools({ cursor: first.nextCursor }),
+    ).rejects.toThrow("mcp_cursor_invalid");
   });
 
   it("forwards safe progress, preserves tool errors and validates structured results", async () => {

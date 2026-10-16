@@ -1,5 +1,6 @@
 import { Ajv, type ValidateFunction } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020.js";
+import { RE2 } from "re2-wasm";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { RuntimeError } from "../../domain/agents.ts";
 import { immutable } from "../../config/bundles.ts";
@@ -12,6 +13,12 @@ export function compile(schema: object): ValidateFunction {
       validateFormats: false,
       allErrors: false,
       ownProperties: true,
+      code: {
+        regExp: Object.assign(
+          (pattern: string, flags: string) => new RE2(pattern, flags),
+          { code: "((pattern, flags) => new RE2(pattern, flags))" },
+        ),
+      },
     };
     const ajv = dialect?.includes("draft-07")
       ? new Ajv(options)

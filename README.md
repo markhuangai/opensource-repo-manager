@@ -171,6 +171,8 @@ The service will ship unattended workflow skills derived from the SDLC developme
 
 Operators can configure generic remote Streamable HTTP MCP servers and grant exact reads to each agent role. MCP is optional. The gateway supports unauthenticated endpoints or protected bearer/API-key headers; local stdio servers and OAuth flows are deferred. Future SDK adapters will consume the implemented supervised connection contract; no vendor adapter is registered yet.
 
+Tool schemas support JSON Schema 2020-12 (the default) and draft-07. Other dialects fail explicitly. Schema patterns use RE2 to keep untrusted validation from blocking the supervisor; unsupported regex features such as lookaround and backreferences fail schema compilation. External schema references are never fetched.
+
 Each configured tool declares a read or reviewed-write effect. Reviewed writes remain unavailable until issue #14 implements scans, independent review, durable dispatch, and recovery. Its reviewer will run within the requesting job's lease with no MCP access, and uncertain unkeyed effects will require inspection.
 
 Dense-Mem will be a configuration example and integration fixture. The same runtime supports differently named tools on other compatible HTTP servers. Operators must use appropriate server-side credential scope and trust the configured tool's declared behavior; tool annotations and prompt text are not authorization boundaries.
