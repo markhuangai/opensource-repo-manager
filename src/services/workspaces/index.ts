@@ -7,6 +7,7 @@ import {
   lchown,
   mkdir,
   open,
+  lstat,
   readlink,
   readdir,
   rename,
@@ -27,7 +28,9 @@ import {
   roleUsers,
   type ArtifactFile,
   type ArtifactManifest,
+  digest,
 } from "../../domain/agents.ts";
+import type { KnownSecretChecker } from "../../logging/redact.ts";
 import type { SourceMetadata } from "../../domain/jobs.ts";
 import {
   cleanEnvironment,
@@ -41,6 +44,7 @@ export type PreparedWorkspace = {
   workspace: string;
   home: string;
   temporary: string;
+  session: string;
   prompts: { system: string; user: string; skills: string };
 };
 
@@ -177,7 +181,7 @@ export class WorkspaceService {
     await rootDirectory(this.root, 0o711);
     await rootDirectory(this.privateRoot);
     await rootDirectory(this.runsRoot, 0o711);
-    for (const part of ["sources", "blobs", "manifests"])
+    for (const part of ["sources", "blobs", "manifests", "sessions"])
       await rootDirectory(join(this.privateRoot, part));
   }
 
@@ -314,6 +318,8 @@ export class WorkspaceService {
       await chown(workspace, user.uid, user.gid);
       await ownedDirectory(home, user.uid, user.gid);
       await ownedDirectory(temporary, user.uid, user.gid);
+      const session = join(root, "session");
+      await ownedDirectory(session, user.uid, user.gid);
       await gitCommand(["checkout", "--detach", source.sha], {
         cwd: workspace,
         env: publicEnv,
@@ -356,6 +362,7 @@ export class WorkspaceService {
         workspace,
         home,
         temporary,
+        session,
         prompts: {
           system: join(trusted, "system.md"),
           user: join(trusted, "user.md"),
@@ -380,6 +387,7 @@ export class WorkspaceService {
     workspace: string,
     limit: number,
     signal: AbortSignal,
+    sessionCredentials?: KnownSecretChecker,
   ): Promise<ArtifactManifest> {
     const manifest: ArtifactManifest = { ...request, files: [] };
     let total = 0;
@@ -423,6 +431,13 @@ export class WorkspaceService {
         )
           throw new RuntimeError("artifact_type_invalid");
         const hash = createHash("sha256");
+        const decoder = new TextDecoder("utf8", { fatal: true });
+        const known = this.secrets.createCredentialStream(),
+          grant = sessionCredentials?.createStream();
+        const inspect = (text: string) => {
+          if (grant && (known.push(text) || grant.push(text)))
+            throw new RuntimeError("secret_in_session");
+        };
         let bytes = 0;
         await pipeline(
           handle.createReadStream({ autoClose: false }),
@@ -431,6 +446,12 @@ export class WorkspaceService {
               bytes += chunk.length;
               if (bytes > stat.size) done(new RuntimeError("artifact_changed"));
               else {
+                try {
+                  if (grant) inspect(decoder.decode(chunk, { stream: true }));
+                } catch (error) {
+                  done(error as Error);
+                  return;
+                }
                 hash.update(chunk);
                 done(null, chunk);
               }
@@ -439,6 +460,7 @@ export class WorkspaceService {
           createWriteStream(temporary, { flags: "wx", mode: 0o600 }),
           { signal },
         );
+        if (grant) inspect(decoder.decode());
         if (bytes !== stat.size) throw new RuntimeError("artifact_changed");
         const blob = hash.digest("hex");
         await chmod(temporary, 0o400);
@@ -455,6 +477,13 @@ export class WorkspaceService {
       }
     });
     validateArtifactLinks(manifest.files);
+    if (
+      sessionCredentials &&
+      (manifest.files.some((file) => file.kind !== "file") ||
+        this.secrets.containsCredentials(manifest) ||
+        sessionCredentials.contains(manifest))
+    )
+      throw new RuntimeError("session_invalid");
     if (Buffer.byteLength(JSON.stringify(manifest)) > 16 * 1024 * 1024)
       throw new RuntimeError("artifact_metadata_limit");
     return manifest;
@@ -538,5 +567,107 @@ export class WorkspaceService {
     await cleanSource(id, stage);
     await rm(stage, { recursive: true, force: true });
     await rm(join(this.runsRoot, id), { recursive: true, force: true });
+  }
+
+  async saveSession(
+    binding: string,
+    session: string,
+    workspace: ArtifactManifest,
+    payload: string,
+    limit: number,
+    signal: AbortSignal,
+    credentials: KnownSecretChecker,
+  ) {
+    if (!/^[a-f0-9-]{36}$/.test(workspace.run_id))
+      throw new RuntimeError("session_invalid");
+    const transcript = await this.freeze(
+      workspace,
+      payload,
+      limit,
+      signal,
+      credentials,
+    );
+    const checkpoint = { binding, session, workspace, transcript };
+    const directory = join(this.privateRoot, "sessions", workspace.run_id);
+    await mkdir(directory, { mode: 0o700 });
+    const content = JSON.stringify({ checkpoint, digest: digest(checkpoint) });
+    if (Buffer.byteLength(content) > 16 * 1024 * 1024)
+      throw new RuntimeError("session_invalid");
+    await writeFile(join(directory, "checkpoint.json"), content, {
+      mode: 0o400,
+      flag: "wx",
+    });
+  }
+
+  async restoreSession(
+    run: string,
+    binding: string,
+    session: string,
+    prepared: PreparedWorkspace,
+    role: Role,
+    limit: number,
+    signal: AbortSignal,
+  ) {
+    if (!/^[a-f0-9-]{36}$/.test(run)) throw new RuntimeError("session_invalid");
+    const directory = join(this.privateRoot, "sessions", run),
+      stat = await lstat(directory);
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      stat.uid !== process.getuid!() ||
+      stat.mode & 0o077
+    )
+      throw new RuntimeError("session_invalid");
+    const file = await open(
+      join(directory, "checkpoint.json"),
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    try {
+      const stat = await file.stat();
+      if (
+        !stat.isFile() ||
+        stat.nlink !== 1 ||
+        stat.uid !== process.getuid!() ||
+        stat.mode & 0o077 ||
+        stat.size > 16 * 1024 * 1024
+      )
+        throw new RuntimeError("session_invalid");
+      const saved = JSON.parse(await file.readFile("utf8")) as {
+        checkpoint: {
+          binding: string;
+          session: string;
+          workspace: ArtifactManifest;
+          transcript: ArtifactManifest;
+        };
+        digest: string;
+      };
+      const checkpoint = saved.checkpoint;
+      if (
+        saved.digest !== digest(checkpoint) ||
+        checkpoint.binding !== binding ||
+        checkpoint.session !== session ||
+        checkpoint.workspace.run_id !== run ||
+        checkpoint.transcript.run_id !== run ||
+        checkpoint.transcript.files.some((entry) => entry.kind !== "file")
+      )
+        throw new RuntimeError("session_invalid");
+      await this.restore(
+        checkpoint.workspace,
+        prepared.workspace,
+        role,
+        limit,
+        signal,
+      );
+      await this.restore(
+        checkpoint.transcript,
+        prepared.session,
+        role,
+        limit,
+        signal,
+      );
+      await treeBytes(prepared.root, limit);
+    } finally {
+      await file.close();
+    }
   }
 }

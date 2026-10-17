@@ -174,16 +174,24 @@ export async function* run(request, signal) {
     }
     return;
   }
-  if (input.mode === "mapped-deleted") {
+  if (["mapped-deleted", "nondumpable", "zombie-leader"].includes(input.mode)) {
     const source = join(request.temporary, "mapped.c"),
       binary = join(request.temporary, "mapped");
     await writeFile(
       source,
-      '#include <sys/mman.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <string.h>\nint main(int c,char **v){int f=open(v[1],O_CREAT|O_RDWR,0600);if(f<0||ftruncate(f,1048576))return 1;void *m=mmap(0,1048576,PROT_READ|PROT_WRITE,MAP_SHARED,f,0);if(m==MAP_FAILED||unlink(v[1])||close(f))return 2;memset(m,1,1048576);puts("ready");fflush(stdout);pause();}',
+      input.mode === "nondumpable"
+        ? '#include <sys/prctl.h>\n#include <unistd.h>\n#include <stdio.h>\nint main(){if(prctl(PR_SET_DUMPABLE,0))return 1;puts("ready");fflush(stdout);pause();}'
+        : input.mode === "zombie-leader"
+          ? '#include <pthread.h>\n#include <unistd.h>\n#include <stdio.h>\nvoid *hold(void *arg){for(;;)sleep(1);return 0;}\nint main(){pthread_t worker;if(pthread_create(&worker,0,hold,0))return 1;puts("ready");fflush(stdout);pthread_exit(0);}'
+          : '#include <sys/mman.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <string.h>\nint main(int c,char **v){int f=open(v[1],O_CREAT|O_RDWR,0600);if(f<0||ftruncate(f,1048576))return 1;void *m=mmap(0,1048576,PROT_READ|PROT_WRITE,MAP_SHARED,f,0);if(m==MAP_FAILED||unlink(v[1])||close(f))return 2;memset(m,1,1048576);puts("ready");fflush(stdout);pause();}',
     );
-    const compiled = spawnSync("/usr/bin/cc", [source, "-o", binary], {
-      timeout: 5000,
-    });
+    const compiled = spawnSync(
+      "/usr/bin/cc",
+      [source, "-pthread", "-o", binary],
+      {
+        timeout: 5000,
+      },
+    );
     assert.equal(compiled.status, 0);
     const child = spawn(binary, [join(request.temporary, "mapped-data")], {
       stdio: ["ignore", "pipe", "pipe"],
@@ -264,8 +272,14 @@ export async function* run(request, signal) {
       join(request.workspace, ".git/config"),
       `\n[core]\nfsmonitor = !touch ${input.hook}\n`,
     );
+    if (request.resume)
+      assert.equal(
+        await readFile(join(request.workspace, "safe-link"), "utf8"),
+        "candidate bytes",
+      );
     await writeFile(join(request.workspace, "app.txt"), "candidate bytes");
-    await symlink("app.txt", join(request.workspace, "safe-link"));
+    if (!request.resume)
+      await symlink("app.txt", join(request.workspace, "safe-link"));
     const prompt = await readFile(request.prompts.system, "utf8");
     assert(prompt.length > 0);
     yield { type: "session", id: "session-one" };

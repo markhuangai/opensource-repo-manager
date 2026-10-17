@@ -599,6 +599,20 @@ export class Store {
       AgentRunRecord | undefined;
   }
 
+  sessionRun(
+    job: number,
+    revision: number,
+    role: AgentRunRecord["role"],
+    session: string,
+  ) {
+    return this.db
+      .prepare(
+        `SELECT * FROM agent_runs WHERE job_id=? AND revision=? AND role=? AND session_id=?
+       ORDER BY started_at DESC,rowid DESC LIMIT 1`,
+      )
+      .get(job, revision, role, session) as AgentRunRecord | undefined;
+  }
+
   startMcpCall(
     receipt: Omit<McpCallReceipt, "result_digest" | "finished_at" | "outcome">,
   ) {

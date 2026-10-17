@@ -637,6 +637,8 @@ try {
   mounts.push(
     "--mount",
     `type=bind,src=${join(root, "tests", "fixtures", "runtime")},dst=/runtime-fixtures,readonly`,
+    "--mount",
+    `type=bind,src=${join(root, "tests", "integration", "agents")},dst=/agent-fixtures,readonly`,
   );
   const connection = [
     "--network",
@@ -923,13 +925,15 @@ try {
         "-e",
         "import {runRuntimeTests} from '/runtime-fixtures/harness.mjs'; await runRuntimeTests();",
       ],
-      { timeout: 180_000 },
+      { timeout: 600_000 },
     ),
   );
   assert.equal(runtimeProof.runtime, "passed");
   assert.equal(runtimeProof.cleanup, "passed");
   assert.equal(runtimeProof.mcp_gateway?.protocol, "streamable_http");
   assert.equal(runtimeProof.mcp_gateway?.cleanup, "passed");
+  assert.equal(runtimeProof.claude_sdk?.sdk, "0.3.296");
+  assert.equal(runtimeProof.claude_sdk?.cleanup, "passed");
 
   const healthyDeadline = Date.now() + 30_000;
   while (

@@ -29,6 +29,7 @@ import {
 } from "/opt/orm/app/dist/runtime/process.js";
 import { treeBytes } from "/opt/orm/app/dist/services/workspaces/files.js";
 import { verifyMcp } from "./mcp.mjs";
+import { verifyClaude } from "/agent-fixtures/claude.mjs";
 
 async function collect(iterable) {
   const events = [];
@@ -213,6 +214,52 @@ export async function runRuntimeTests() {
     });
   });
   const sourceUrl = (await listen(sourceServer)) + "/owner/repo.git";
+  function sourceWith(files) {
+    const entries = {};
+    for (const [path, bytes] of Object.entries(files)) {
+      const parts = path.split("/");
+      let directory = entries;
+      for (const part of parts.slice(0, -1)) directory = directory[part] ??= {};
+      directory[parts.at(-1)] = bytes;
+    }
+    const makeTree = (entries) =>
+      object(
+        "tree",
+        Buffer.concat(
+          Object.entries(entries)
+            .sort(([a, av], [b, bv]) =>
+              Buffer.compare(
+                Buffer.from(a + (typeof av === "string" ? "" : "/")),
+                Buffer.from(b + (typeof bv === "string" ? "" : "/")),
+              ),
+            )
+            .flatMap(([name, value]) => [
+              Buffer.from(
+                `${typeof value === "string" ? "100644" : "40000"} ${name}\0`,
+              ),
+              Buffer.from(
+                typeof value === "string"
+                  ? object("blob", value)
+                  : makeTree(value),
+                "hex",
+              ),
+            ]),
+        ),
+      );
+    const tree = makeTree(entries),
+      next = object(
+        "commit",
+        `tree ${tree}\nparent ${sha}\nauthor ${author}\ncommitter ${author}\n\nClaude fixture\n`,
+      );
+    git([
+      "--git-dir",
+      sourceGit,
+      "update-ref",
+      "refs/heads/claude-fixture",
+      next,
+    ]);
+    return { sha: next, tree_sha: tree, default_branch: "main" };
+  }
   const modelRequests = [];
   const modelServer = createServer(async (req, res) => {
     let data = "";
@@ -344,7 +391,8 @@ export async function runRuntimeTests() {
       ),
     );
   let tests = 0,
-    mcpProof;
+    mcpProof,
+    claudeProof;
   const errors = [];
   try {
     const bootstrap = spawn(
@@ -622,26 +670,28 @@ export async function runRuntimeTests() {
       "completed",
     );
     tests++;
-    const mapped = await collect(
-      supervisor.run(
-        supervisor.request(
-          seed({ limits: { worker_storage_bytes: 512 * 1024 } }).job.id,
-          "implementation",
-          { mode: "mapped-deleted" },
+    for (const mode of ["mapped-deleted", "nondumpable", "zombie-leader"]) {
+      const mapped = await collect(
+        supervisor.run(
+          supervisor.request(
+            seed({ limits: { worker_storage_bytes: 512 * 1024 } }).job.id,
+            "implementation",
+            { mode },
+          ),
+          new globalThis.AbortController().signal,
         ),
-        new globalThis.AbortController().signal,
-      ),
-    );
-    assert(
-      mapped.some(
-        (event) =>
-          event.type === "progress" && event.message === "mapped-ready",
-      ),
-    );
-    assert.equal(terminal(mapped).outcome, "failed");
-    assert.equal((await userProcesses(10001)).length, 0);
-    assert.equal(store.leases().length, 0);
-    tests++;
+      );
+      assert(
+        mapped.some(
+          (event) =>
+            event.type === "progress" && event.message === "mapped-ready",
+        ),
+      );
+      assert.equal(terminal(mapped).outcome, "failed");
+      assert.equal((await userProcesses(10001)).length, 0);
+      assert.equal(store.leases().length, 0);
+      tests++;
+    }
     assert.equal(
       (
         await run(seed({ limits: { worker_storage_bytes: 1 } }), {
@@ -1158,6 +1208,14 @@ export async function runRuntimeTests() {
       proxy,
       bundles,
     });
+    claudeProof = await verifyClaude({
+      store,
+      root,
+      sourceUrl,
+      source: { sha, tree_sha: tree, default_branch: "main" },
+      sourceWith,
+      bundles,
+    });
     assert.equal(
       terminal(await remaining(shutdownIterator)).outcome,
       "cancelled",
@@ -1267,6 +1325,7 @@ export async function runRuntimeTests() {
       nested_review: "one_lease",
       crash_recovery: "passed",
       mcp_gateway: mcpProof,
+      claude_sdk: claudeProof,
       cleanup: "passed",
     }),
   );

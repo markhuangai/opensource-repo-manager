@@ -48,6 +48,7 @@ const profile = z.discriminatedUnion("sdk", [
   z.strictObject({
     sdk: z.literal("claude"),
     model: text,
+    behaves_as: text.optional(),
     effort: z.enum(["low", "medium", "high", "xhigh", "max"]),
   }),
   z.strictObject({
