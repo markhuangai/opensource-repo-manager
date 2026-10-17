@@ -1386,7 +1386,8 @@ describe("scoped HTTP MCP gateway", () => {
           required: ["ok"],
         };
       f.state.progressOnGet = true;
-      const message = "p".repeat(
+      // Keep filler outside base64url so a random grant prefix cannot hold progress.
+      const message = "!".repeat(
         mode === "revoked" ? 500 : mode === "invalid-result" ? 3850 : 2800,
       );
       const errorText = "e".repeat(mode === "sanitized" ? 1800 : 500);

@@ -2,7 +2,7 @@
 
 ## Current implementation and scope
 
-- This is a TypeScript/Node 24 service. Health endpoints, process lifecycle, protected configuration loading, immutable workflow snapshots, GitHub enrollment/webhooks/backfill, SQLite persistence, unprivileged worker supervision, authenticated source workspaces, model relay, scoped read-only HTTP MCP gateway, Docker/Compose, checks, and CI are implemented. The application uses service-only startup with no CLI commands or pause/resume feature. Vendor SDK adapters, maintenance automation, and reviewed MCP writes are planned in the published issue graph.
+- This is a TypeScript/Node 24 service. Health endpoints, process lifecycle, protected configuration loading, immutable workflow snapshots, GitHub enrollment/webhooks/backfill, SQLite persistence, unprivileged worker supervision, authenticated source workspaces, model relay, scoped read-only HTTP MCP gateway, Docker/Compose, checks, and CI are implemented. The application uses service-only startup with no CLI commands or pause/resume feature. The Claude SDK adapter is implemented; Codex, maintenance automation, and reviewed MCP writes are planned in the published issue graph.
 - GitHub issue bodies govern ticket scope; native blocked-by relationships govern dependencies. A closed blocker is insufficient: verify its required PR merged on remote `main`. Implement one approved issue at a time, and preserve the human merge gate.
 - Inspect the actual implementation, callers, instructions, tests, and current branch before changes. Preserve the license and unrelated work. Use constructor injection and interfaces only at real boundaries; do not create empty layers or speculative frameworks.
 

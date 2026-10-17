@@ -453,6 +453,15 @@ describe("durable SQLite repositories", () => {
       "artifact_unavailable",
     );
     store.finishRun(run.id, "completed", "session", artifact);
+    expect(
+      store.sessionRun(job.id, job.revision, "implementation", "session")?.id,
+    ).toBe(run.id);
+    expect(
+      store.sessionRun(job.id, job.revision + 1, "implementation", "session"),
+    ).toBeUndefined();
+    expect(
+      store.sessionRun(job.id, job.revision, "audit", "session"),
+    ).toBeUndefined();
     const review = {
       ...run,
       id: "review",

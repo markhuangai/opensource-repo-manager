@@ -1,4 +1,5 @@
 import { readFile, readdir, stat } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 
 const uid = Number(process.argv[2]),
   limit = Number(process.argv[3]);
@@ -72,6 +73,26 @@ for (const pid of await readdir("/proc")) {
       mappings.add(`${device}:${inode}`);
     }
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EACCES") {
+      // Exiting processes can lose /proc access before reaping; a zombie leader with live threads still owns resources.
+      await delay(25);
+      try {
+        const current = await readFile(`/proc/${pid}/status`, "utf8");
+        if (
+          /^State:\s+[ZX]\b/m.test(current) &&
+          /^Threads:\s+1$/m.test(current)
+        )
+          continue;
+      } catch (ended) {
+        if (
+          ["ENOENT", "ESRCH"].includes(
+            (ended as NodeJS.ErrnoException).code ?? "",
+          )
+        )
+          continue;
+        throw ended;
+      }
+    }
     if (
       !["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")
     )

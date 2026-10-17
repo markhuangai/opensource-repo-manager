@@ -105,6 +105,7 @@ export type AgentRunRequest = Readonly<{
   snapshot_digest: string;
   profile: ModelProfile;
   input?: unknown;
+  output_schema?: Readonly<Record<string, unknown>>;
   resume?: SessionIdentity;
 }>;
 export type WorkerRequest = Omit<AgentRunRequest, "workspace"> & {
@@ -112,7 +113,14 @@ export type WorkerRequest = Omit<AgentRunRequest, "workspace"> & {
   workspace: string;
   home: string;
   temporary: string;
-  prompts: { system: string; user: string; skills: string };
+  session_directory: string;
+  deadline: number;
+  prompts: {
+    system: string;
+    user: string;
+    skills: string;
+    selected: readonly string[];
+  };
   relay: { url: string; authorization: string };
   mcp: readonly McpConnection[];
   binding: string;

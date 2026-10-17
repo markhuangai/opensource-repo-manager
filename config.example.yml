@@ -10,6 +10,7 @@ profiles:
   coding:
     sdk: claude
     model: your-claude-model-id
+    # Proxy aliases require a known capability model, for example: behaves_as: claude-opus-4-8
     effort: high
   review:
     sdk: codex

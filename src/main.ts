@@ -8,6 +8,7 @@ import { IntakeService } from "./services/intake.ts";
 import { RuntimeError } from "./domain/agents.ts";
 import { Supervisor } from "./runtime/supervisor.ts";
 import { McpGateway } from "./services/mcp/index.ts";
+import { fileURLToPath } from "node:url";
 import {
   createKnownSecretChecker,
   createSafeLogger,
@@ -29,7 +30,14 @@ try {
       store,
       loaded.snapshot,
       loaded.secrets,
-      { mcp },
+      {
+        mcp,
+        workers: {
+          claude: fileURLToPath(
+            new URL("./adapters/agents/claude.js", import.meta.url),
+          ),
+        },
+      },
     );
     await mcp.start();
     const reader = createGitHubReader(
