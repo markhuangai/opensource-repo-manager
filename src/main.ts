@@ -36,6 +36,9 @@ try {
           claude: fileURLToPath(
             new URL("./adapters/agents/claude.js", import.meta.url),
           ),
+          codex: fileURLToPath(
+            new URL("./adapters/agents/codex.js", import.meta.url),
+          ),
         },
       },
     );

@@ -24,12 +24,14 @@ import {
 import { Store } from "/opt/orm/app/dist/repositories/store.js";
 import { Supervisor } from "/opt/orm/app/dist/runtime/supervisor.js";
 import {
+  cleanSource,
   sourceProcesses,
   userProcesses,
 } from "/opt/orm/app/dist/runtime/process.js";
 import { treeBytes } from "/opt/orm/app/dist/services/workspaces/files.js";
 import { verifyMcp } from "./mcp.mjs";
 import { verifyClaude } from "/agent-fixtures/claude.mjs";
+import { verifyCodex } from "/agent-fixtures/codex.mjs";
 
 async function collect(iterable) {
   const events = [];
@@ -392,7 +394,8 @@ export async function runRuntimeTests() {
     );
   let tests = 0,
     mcpProof,
-    claudeProof;
+    claudeProof,
+    codexProof;
   const errors = [];
   try {
     const bootstrap = spawn(
@@ -461,6 +464,61 @@ export async function runRuntimeTests() {
       if (probe.exitCode === null && probe.signalCode === null)
         probe.kill("SIGKILL");
       await probeExited;
+    }
+    tests++;
+    const cleanupId = "source-cleanup-deadline",
+      cleanupStage = join(root, "private", "sources", cleanupId),
+      now = Date.now;
+    for (const quietScans of [1, 2, 3]) {
+      let ticks = 0;
+      Date.now = () => (ticks++ < quietScans ? 0 : 3000);
+      try {
+        const cleanup = cleanSource(cleanupId, cleanupStage);
+        if (quietScans < 3)
+          await assert.rejects(cleanup, { code: "cleanup_failed" });
+        else await cleanup;
+      } finally {
+        Date.now = now;
+      }
+    }
+    const sourceProbe = spawn(
+        process.execPath,
+        ["-e", 'console.log("ready");setInterval(()=>{},1000)'],
+        {
+          env: { PATH: "/usr/bin:/bin", ORM_SOURCE_RUN: cleanupId },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      ),
+      sourceExited = once(sourceProbe, "exit");
+    sourceProbe.stderr.resume();
+    try {
+      await Promise.race([
+        once(sourceProbe.stdout, "data", {
+          signal: AbortSignal.timeout(2000),
+        }),
+        sourceExited.then(() => {
+          throw new Error("source cleanup probe exited before discovery");
+        }),
+      ]);
+      assert.deepEqual(await sourceProcesses(cleanupId, cleanupStage), [
+        sourceProbe.pid,
+      ]);
+      let ticks = 0;
+      Date.now = () => (ticks++ === 0 ? 0 : 3000);
+      try {
+        await assert.rejects(cleanSource(cleanupId, cleanupStage), {
+          code: "cleanup_failed",
+        });
+      } finally {
+        Date.now = now;
+      }
+      const [, signal] = await sourceExited;
+      assert.equal(signal, "SIGKILL");
+      assert.deepEqual(await sourceProcesses(cleanupId, cleanupStage), []);
+    } finally {
+      if (sourceProbe.exitCode === null && sourceProbe.signalCode === null)
+        sourceProbe.kill("SIGKILL");
+      await sourceExited;
     }
     tests++;
     const fixture = seed();
@@ -1243,6 +1301,14 @@ export async function runRuntimeTests() {
       proxy,
       bundles,
     });
+    codexProof = await verifyCodex({
+      store,
+      root,
+      sourceUrl,
+      source: { sha, tree_sha: tree, default_branch: "main" },
+      sourceWith,
+      bundles,
+    });
     claudeProof = await verifyClaude({
       store,
       root,
@@ -1331,6 +1397,43 @@ export async function runRuntimeTests() {
     assert.deepEqual(await readdir(join(root, "runs")), []);
   } catch (error) {
     errors.push(error);
+    if (error?.code === "cleanup_failed") {
+      try {
+        const pending = [];
+        for (const run of store
+          .runs()
+          .filter((run) => run.finished_at === null)) {
+          const pids = await sourceProcesses(
+            run.id,
+            join(root, "private", "sources", run.id),
+          );
+          const processes = [];
+          for (const pid of pids) {
+            try {
+              const status = await readFile(`/proc/${pid}/status`, "utf8");
+              processes.push({
+                pid,
+                state: status.match(/^State:\s+(\S)/m)?.[1],
+              });
+            } catch (diagnostic) {
+              if (!["ENOENT", "ESRCH"].includes(diagnostic.code))
+                throw diagnostic;
+            }
+          }
+          pending.push({
+            id: run.id,
+            role: run.role,
+            elapsed_ms: Date.now() - run.started_at,
+            processes,
+          });
+        }
+        errors.push(
+          new Error(`Cleanup process diagnostics: ${JSON.stringify(pending)}`),
+        );
+      } catch (diagnostic) {
+        errors.push(diagnostic);
+      }
+    }
   } finally {
     for (const cleanup of [
       () => supervisor.close(),
@@ -1361,6 +1464,7 @@ export async function runRuntimeTests() {
       crash_recovery: "passed",
       mcp_gateway: mcpProof,
       claude_sdk: claudeProof,
+      codex_sdk: codexProof,
       cleanup: "passed",
     }),
   );
