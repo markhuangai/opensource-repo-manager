@@ -159,7 +159,8 @@ export async function cleanSource(id: string, stage: string) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
     }
-    if (Date.now() >= deadline) throw new RuntimeError("cleanup_failed");
+    if (quiet < 3 && Date.now() >= deadline)
+      throw new RuntimeError("cleanup_failed");
     await delay(25);
   }
 }

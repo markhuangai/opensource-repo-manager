@@ -934,6 +934,9 @@ try {
   assert.equal(runtimeProof.mcp_gateway?.cleanup, "passed");
   assert.equal(runtimeProof.claude_sdk?.sdk, "0.3.296");
   assert.equal(runtimeProof.claude_sdk?.cleanup, "passed");
+  assert.equal(runtimeProof.codex_sdk?.sdk, "0.162.1");
+  assert.equal(runtimeProof.codex_sdk?.protocol, "responses_http_sse");
+  assert.equal(runtimeProof.codex_sdk?.cleanup, "passed");
 
   const healthyDeadline = Date.now() + 30_000;
   while (
