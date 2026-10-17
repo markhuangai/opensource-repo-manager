@@ -33,19 +33,28 @@ function detached() {
 export async function* run(request, signal) {
   const input = request.input ?? {};
   if (input.mode === "checkpoint-storage") {
-    const path = join(
-      input.target === "workspace"
-        ? request.workspace
-        : request.session_directory,
-      "checkpoint-payload",
-    );
+    const paths = (
+      input.target === "aggregate"
+        ? [request.workspace, request.session_directory]
+        : [
+            input.target === "workspace"
+              ? request.workspace
+              : request.session_directory,
+          ]
+    ).map((directory) => join(directory, "checkpoint-payload"));
     if (request.resume)
-      assert.equal(await readFile(path, "utf8"), "sealed-state");
+      for (const path of paths)
+        assert.equal(await readFile(path, "utf8"), "sealed-state");
     yield { type: "session", id: "checkpoint-session" };
-    writeFileSync(
-      path,
-      request.resume ? Buffer.alloc(1024 * 1024) : "sealed-state",
-    );
+    for (const path of paths)
+      writeFileSync(
+        path,
+        request.resume
+          ? Buffer.alloc(
+              input.target === "aggregate" ? 384 * 1024 : 1024 * 1024,
+            )
+          : "sealed-state",
+      );
     yield {
       type: "terminal",
       outcome: "completed",

@@ -500,7 +500,7 @@ export async function runRuntimeTests() {
       resume: { id: "session-one", binding: "changed" },
     });
     assert.equal(invalidResume.outcome, "failed");
-    for (const target of ["workspace", "transcript"]) {
+    for (const target of ["workspace", "transcript", "aggregate"]) {
       const checkpoint = seed({ limits: { worker_storage_bytes: 512 * 1024 } }),
         input = { mode: "checkpoint-storage", target },
         saved = await run(checkpoint, input);

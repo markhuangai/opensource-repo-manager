@@ -669,6 +669,7 @@ export class Supervisor implements AgentRunner {
           signal,
         );
         if (session && identity.uid === 10001) {
+          await treeBytes(prepared.root, limits.storage);
           await this.workspaces.saveSession(
             binding,
             session,
