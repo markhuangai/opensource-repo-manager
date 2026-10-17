@@ -6,6 +6,22 @@ import { separateSecrets } from "../src/config/secrets.ts";
 import { fixtureConfiguration, fixtureMcp } from "./fixtures.ts";
 
 describe("strict protected configuration contract", () => {
+  it("preserves a declared Claude alias capability model without changing the wire model", () => {
+    const config = fixtureConfiguration();
+    config.profiles.coding = {
+      sdk: "claude",
+      model: "auto",
+      behaves_as: "claude-opus-4-8",
+      effort: "xhigh",
+    };
+    expect(parseConfiguration(stringify(config)).profiles.coding).toEqual(
+      config.profiles.coding,
+    );
+    config.profiles.review = { ...config.profiles.coding, sdk: "codex" };
+    expect(() => parseConfiguration(stringify(config))).toThrow(
+      "schema_invalid",
+    );
+  });
   it("accepts the documented example with both SDKs and v1 defaults", () => {
     const config = fixtureConfiguration();
     expect(config.profiles.coding.sdk).toBe("claude");

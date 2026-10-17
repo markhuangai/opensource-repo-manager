@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import {
   access,
   appendFile,
@@ -31,6 +32,36 @@ function detached() {
 
 export async function* run(request, signal) {
   const input = request.input ?? {};
+  if (input.mode === "checkpoint-storage") {
+    const paths = (
+      input.target === "aggregate"
+        ? [request.workspace, request.session_directory]
+        : [
+            input.target === "workspace"
+              ? request.workspace
+              : request.session_directory,
+          ]
+    ).map((directory) => join(directory, "checkpoint-payload"));
+    if (request.resume)
+      for (const path of paths)
+        assert.equal(await readFile(path, "utf8"), "sealed-state");
+    yield { type: "session", id: "checkpoint-session" };
+    for (const path of paths)
+      writeFileSync(
+        path,
+        request.resume
+          ? Buffer.alloc(
+              input.target === "aggregate" ? 384 * 1024 : 1024 * 1024,
+            )
+          : "sealed-state",
+      );
+    yield {
+      type: "terminal",
+      outcome: "completed",
+      result: { binding: request.binding },
+    };
+    return;
+  }
   if (input.mode === "mcp-real") {
     const { Client } =
       await import("/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js");
@@ -174,16 +205,24 @@ export async function* run(request, signal) {
     }
     return;
   }
-  if (input.mode === "mapped-deleted") {
+  if (["mapped-deleted", "nondumpable", "zombie-leader"].includes(input.mode)) {
     const source = join(request.temporary, "mapped.c"),
       binary = join(request.temporary, "mapped");
     await writeFile(
       source,
-      '#include <sys/mman.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <string.h>\nint main(int c,char **v){int f=open(v[1],O_CREAT|O_RDWR,0600);if(f<0||ftruncate(f,1048576))return 1;void *m=mmap(0,1048576,PROT_READ|PROT_WRITE,MAP_SHARED,f,0);if(m==MAP_FAILED||unlink(v[1])||close(f))return 2;memset(m,1,1048576);puts("ready");fflush(stdout);pause();}',
+      input.mode === "nondumpable"
+        ? '#include <sys/prctl.h>\n#include <unistd.h>\n#include <stdio.h>\nint main(){if(prctl(PR_SET_DUMPABLE,0))return 1;puts("ready");fflush(stdout);pause();}'
+        : input.mode === "zombie-leader"
+          ? '#include <pthread.h>\n#include <unistd.h>\n#include <stdio.h>\nvoid *hold(void *arg){for(;;)sleep(1);return 0;}\nint main(){pthread_t worker;if(pthread_create(&worker,0,hold,0))return 1;puts("ready");fflush(stdout);pthread_exit(0);}'
+          : '#include <sys/mman.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <string.h>\nint main(int c,char **v){int f=open(v[1],O_CREAT|O_RDWR,0600);if(f<0||ftruncate(f,1048576))return 1;void *m=mmap(0,1048576,PROT_READ|PROT_WRITE,MAP_SHARED,f,0);if(m==MAP_FAILED||unlink(v[1])||close(f))return 2;memset(m,1,1048576);puts("ready");fflush(stdout);pause();}',
     );
-    const compiled = spawnSync("/usr/bin/cc", [source, "-o", binary], {
-      timeout: 5000,
-    });
+    const compiled = spawnSync(
+      "/usr/bin/cc",
+      [source, "-pthread", "-o", binary],
+      {
+        timeout: 5000,
+      },
+    );
     assert.equal(compiled.status, 0);
     const child = spawn(binary, [join(request.temporary, "mapped-data")], {
       stdio: ["ignore", "pipe", "pipe"],
@@ -264,8 +303,14 @@ export async function* run(request, signal) {
       join(request.workspace, ".git/config"),
       `\n[core]\nfsmonitor = !touch ${input.hook}\n`,
     );
+    if (request.resume)
+      assert.equal(
+        await readFile(join(request.workspace, "safe-link"), "utf8"),
+        "candidate bytes",
+      );
     await writeFile(join(request.workspace, "app.txt"), "candidate bytes");
-    await symlink("app.txt", join(request.workspace, "safe-link"));
+    if (!request.resume)
+      await symlink("app.txt", join(request.workspace, "safe-link"));
     const prompt = await readFile(request.prompts.system, "utf8");
     assert(prompt.length > 0);
     yield { type: "session", id: "session-one" };

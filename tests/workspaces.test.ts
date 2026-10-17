@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { WorkspaceService } from "../src/services/workspaces/index.ts";
 import { treeBytes } from "../src/services/workspaces/files.ts";
 import { fixtureSnapshot } from "./fixtures.ts";
+import { createKnownSecretChecker } from "../src/logging/redact.ts";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -43,6 +44,86 @@ async function setup() {
 }
 
 describe("immutable workspace artifacts", () => {
+  it("seals private resume manifests separately from publishable artifacts and rejects tampering", async () => {
+    const { service, workspace, request } = await setup();
+    const run = { ...request, run_id: "11111111-1111-4111-8111-111111111111" };
+    await writeFile(
+      join(workspace, "transcript.jsonl"),
+      '{"type":"user","message":"context"}\n',
+    );
+    const manifest = await service.freeze(
+      run,
+      workspace,
+      100000,
+      new AbortController().signal,
+    );
+    await service.saveSession(
+      "binding",
+      "session",
+      manifest,
+      workspace,
+      100000,
+      new AbortController().signal,
+      createKnownSecretChecker(["ephemeral-token"]),
+    );
+    const path = join(
+      service.privateRoot,
+      "sessions",
+      run.run_id,
+      "checkpoint.json",
+    );
+    expect((await lstat(path)).mode & 0o777).toBe(0o400);
+    const saved = JSON.parse(await readFile(path, "utf8"));
+    expect(saved.checkpoint.workspace).toEqual(manifest);
+    expect(await readFile(path, "utf8")).not.toContain("ephemeral-token");
+    await expect(
+      service.restoreSession(
+        run.run_id,
+        "changed",
+        "session",
+        {
+          root: workspace,
+          workspace,
+          session: workspace,
+          home: workspace,
+          temporary: workspace,
+          prompts: { system: "", user: "", skills: "" },
+        },
+        "implementation",
+        100000,
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("session_invalid");
+  });
+  it.each(["credential", "link"])(
+    "rejects %s in persisted SDK state",
+    async (kind) => {
+      const { service, workspace, request } = await setup();
+      const run = {
+        ...request,
+        run_id: "11111111-1111-4111-8111-111111111111",
+      };
+      if (kind === "credential")
+        await writeFile(
+          join(workspace, "transcript.jsonl"),
+          "x".repeat(65530) + "ephemeral-token",
+        );
+      else await symlink("missing", join(workspace, "link"));
+      await expect(
+        service.saveSession(
+          "binding",
+          "session",
+          { ...run, files: [] },
+          workspace,
+          1000000,
+          new AbortController().signal,
+          createKnownSecretChecker(["ephemeral-token"]),
+        ),
+      ).rejects.toThrow(
+        kind === "credential" ? "secret_in_session" : "session_invalid",
+      );
+    },
+  );
   it("freezes real bytes, modes and safe links while ignoring worker Git metadata", async () => {
     const { service, workspace, request } = await setup();
     await writeFile(join(workspace, "file"), "candidate bytes", {

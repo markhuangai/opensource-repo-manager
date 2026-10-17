@@ -485,29 +485,39 @@ export class Supervisor implements AgentRunner {
         role: request.role,
         source: request.workspace.source,
         input: request.input,
+        output_schema: request.output_schema,
         artifact: request.workspace.artifact,
         snapshot: request.snapshot_digest,
         profile: request.profile,
         policy: mcp?.policy_identity ?? digest({}),
         catalog: mcp?.catalog_identity ?? digest({}),
       });
-      if (
-        request.resume &&
-        (["audit", "output_review"].includes(request.role) ||
-          !this.store
-            .runs()
-            .some(
-              (run) =>
-                run.finished_at !== null &&
-                run.job_id === request.job_id &&
-                run.revision === request.revision &&
-                run.role === request.role &&
-                run.session_id === request.resume!.id &&
-                run.binding_json === JSON.stringify({ binding }) &&
-                request.resume!.binding === binding,
-            ))
-      )
-        throw new RuntimeError("resume_mismatch");
+      if (request.resume) {
+        const previous = this.store.sessionRun(
+          request.job_id,
+          request.revision,
+          request.role,
+          request.resume.id,
+        );
+        if (
+          ["audit", "output_review"].includes(request.role) ||
+          !previous ||
+          previous.finished_at === null ||
+          !["completed", "limited"].includes(previous.status) ||
+          previous.binding_json !== JSON.stringify({ binding }) ||
+          request.resume.binding !== binding
+        )
+          throw new RuntimeError("resume_mismatch");
+        await this.workspaces.restoreSession(
+          previous.id,
+          binding,
+          request.resume.id,
+          prepared,
+          request.role,
+          limits.storage,
+          signal,
+        );
+      }
       this.store.bindRun(id, binding);
       relay = this.relay.authorize({
         lease,
@@ -525,7 +535,15 @@ export class Supervisor implements AgentRunner {
         workspace: prepared.workspace,
         home: prepared.home,
         temporary: prepared.temporary,
-        prompts: prepared.prompts,
+        session_directory: prepared.session,
+        deadline: context.deadline,
+        prompts: {
+          ...prepared.prompts,
+          selected: snapshot.settings.roles[request.role].skills.map(
+            (reference) =>
+              join(prepared!.prompts.skills, reference, "SKILL.md"),
+          ),
+        },
         relay: { url: relay.url, authorization: relay.authorization },
         mcp:
           mcp?.connections.map((connection) => ({
@@ -629,7 +647,7 @@ export class Supervisor implements AgentRunner {
       if (pending.length || !terminal || code !== 0)
         throw new RuntimeError("worker_failed");
       signal.throwIfAborted();
-      if (terminal.outcome !== "completed")
+      if (terminal.outcome !== "completed" && terminal.outcome !== "limited")
         throw new RuntimeError(terminal.outcome);
       revoke();
       await closeProvider;
@@ -638,25 +656,42 @@ export class Supervisor implements AgentRunner {
       if (cleanupFailure) throw new RuntimeError("cleanup_failed");
       if (!this.store.runtimeCurrent(lease))
         throw new RuntimeError("revision_stale");
-      const manifest = await this.workspaces.freeze(
-        {
-          run_id: id,
-          job_id: request.job_id,
-          revision: request.revision,
-          source: request.workspace.source,
-        },
-        prepared.workspace,
-        limits.storage,
-        signal,
-      );
-      const artifact = this.store.recordArtifact(manifest);
-      await writeFile(
-        join(this.workspaces.privateRoot, "manifests", artifact),
-        JSON.stringify(manifest),
-        { mode: 0o400, flag: "wx" },
-      );
-      terminal = { ...terminal, artifact };
+      if (terminal.outcome === "completed" || session) {
+        const manifest = await this.workspaces.freeze(
+          {
+            run_id: id,
+            job_id: request.job_id,
+            revision: request.revision,
+            source: request.workspace.source,
+          },
+          prepared.workspace,
+          limits.storage,
+          signal,
+        );
+        if (session && identity.uid === 10001) {
+          await treeBytes(prepared.root, limits.storage);
+          await this.workspaces.saveSession(
+            binding,
+            session,
+            manifest,
+            prepared.session,
+            limits.storage,
+            signal,
+            outputCredentials,
+          );
+        }
+        if (terminal.outcome === "completed") {
+          const artifact = this.store.recordArtifact(manifest);
+          await writeFile(
+            join(this.workspaces.privateRoot, "manifests", artifact),
+            JSON.stringify(manifest),
+            { mode: 0o400, flag: "wx" },
+          );
+          terminal = { ...terminal, artifact };
+        }
+      }
     } catch (error) {
+      session = null;
       const code = signal.aborted
         ? signal.reason instanceof RuntimeError
           ? signal.reason.code
@@ -706,7 +741,9 @@ export class Supervisor implements AgentRunner {
         cleanupStep = "receipt";
         if (!cleanupFailure) {
           if (
-            terminal?.outcome === "completed" &&
+            terminal &&
+            (terminal.outcome === "completed" ||
+              (terminal.outcome === "limited" && !signal.aborted)) &&
             !this.store.runtimeCurrent(lease)
           )
             terminal = { type: "terminal", outcome: "stale" };
@@ -714,7 +751,10 @@ export class Supervisor implements AgentRunner {
             this.store.finishRun(
               id,
               terminal!.outcome,
-              signal.aborted ? null : session,
+              !signal.aborted &&
+                ["completed", "limited"].includes(terminal!.outcome)
+                ? session
+                : null,
               terminal?.outcome === "completed"
                 ? (terminal.artifact ?? null)
                 : null,
