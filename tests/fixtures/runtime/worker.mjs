@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import {
   access,
   appendFile,
@@ -31,6 +32,27 @@ function detached() {
 
 export async function* run(request, signal) {
   const input = request.input ?? {};
+  if (input.mode === "checkpoint-storage") {
+    const path = join(
+      input.target === "workspace"
+        ? request.workspace
+        : request.session_directory,
+      "checkpoint-payload",
+    );
+    if (request.resume)
+      assert.equal(await readFile(path, "utf8"), "sealed-state");
+    yield { type: "session", id: "checkpoint-session" };
+    writeFileSync(
+      path,
+      request.resume ? Buffer.alloc(1024 * 1024) : "sealed-state",
+    );
+    yield {
+      type: "terminal",
+      outcome: "completed",
+      result: { binding: request.binding },
+    };
+    return;
+  }
   if (input.mode === "mcp-real") {
     const { Client } =
       await import("/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js");

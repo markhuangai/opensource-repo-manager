@@ -500,6 +500,41 @@ export async function runRuntimeTests() {
       resume: { id: "session-one", binding: "changed" },
     });
     assert.equal(invalidResume.outcome, "failed");
+    for (const target of ["workspace", "transcript"]) {
+      const checkpoint = seed({ limits: { worker_storage_bytes: 512 * 1024 } }),
+        input = { mode: "checkpoint-storage", target },
+        saved = await run(checkpoint, input);
+      assert.equal(saved.outcome, "completed");
+      const previous = store.sessionRun(
+        checkpoint.job.id,
+        1,
+        "implementation",
+        "checkpoint-session",
+      );
+      const overflow = await run(checkpoint, input, "implementation", {
+        resume: { id: "checkpoint-session", binding: saved.result.binding },
+      });
+      assert.equal(overflow.outcome, "limited");
+      assert.equal(overflow.artifact, undefined);
+      const failed = store
+        .runs()
+        .findLast((run) => run.job_id === checkpoint.job.id);
+      assert.equal(failed.session_id, null);
+      assert.equal(
+        store.sessionRun(
+          checkpoint.job.id,
+          1,
+          "implementation",
+          "checkpoint-session",
+        ).id,
+        previous.id,
+      );
+      await assert.rejects(
+        lstat(join(root, "private", "sessions", failed.id, "checkpoint.json")),
+      );
+      assert.equal((await userProcesses(10001)).length, 0);
+      tests++;
+    }
     const reviewed = terminal(
       await collect(
         supervisor.run(

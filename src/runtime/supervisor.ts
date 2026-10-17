@@ -690,6 +690,7 @@ export class Supervisor implements AgentRunner {
         }
       }
     } catch (error) {
+      session = null;
       const code = signal.aborted
         ? signal.reason instanceof RuntimeError
           ? signal.reason.code
