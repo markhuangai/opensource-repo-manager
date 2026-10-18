@@ -414,10 +414,33 @@ export async function inspectWorkspace(
       const pkg = files.get(prefix + "package.json") as
         Record<string, unknown> | undefined;
       if (
+        ["npm", "pnpm", "yarn"].includes(manager.name) &&
         pkg?.packageManager &&
         pkg.packageManager !== `${manager.name}@${manager.version}`
       )
         throw new RuntimeError("dependency_manager_mismatch");
+      if (manager.name === "npm") {
+        const root = nodeRoots(prefix + "package.json", "npm")[0]!;
+        const directories = [
+          root,
+          ...[...files.keys()]
+            .filter(
+              (path) =>
+                basename(path) === "package.json" &&
+                nodeRoots(path, "npm").includes(root),
+            )
+            .map(dirname),
+        ].map((cwd) => (cwd === "." ? "" : cwd + "/") + "node_modules");
+        if (
+          (original ?? source_files).some((path) =>
+            directories.some(
+              (directory) =>
+                path === directory || path.startsWith(directory + "/"),
+            ),
+          )
+        )
+          throw new RuntimeError("dependency_source_conflict");
+      }
     }
   }
   return { fingerprints, source_files };

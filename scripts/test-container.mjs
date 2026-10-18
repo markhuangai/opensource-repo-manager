@@ -970,7 +970,7 @@ try {
         "-e",
         "import {runBootstrapTests} from '/bootstrap-fixtures/harness.mjs'; console.log(JSON.stringify(await runBootstrapTests()));",
       ],
-      { timeout: 1_200_000 },
+      { timeout: 2_400_000 },
     ),
   );
   assert.equal(bootstrapProof.bootstrap, "passed");

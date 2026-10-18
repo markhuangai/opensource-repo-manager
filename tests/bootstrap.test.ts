@@ -1,4 +1,11 @@
-import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  writeFile,
+  rm,
+  symlink,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -220,6 +227,78 @@ describe("structured bootstrap policy", () => {
     await expect(
       inspectWorkspace(root, 100000, signal, prepared),
     ).rejects.toThrow("dependency_manager_required");
+  });
+  it("checks a co-located Node manager declaration independently of Python", async () => {
+    const root = await source({
+      "package.json": '{"packageManager":"npm@12.0.2"}',
+      "package-lock.json": "{}",
+      "requirements.txt": "packaging==25.0\n",
+    });
+    const prepared = bootstrapPlanSchema.parse({
+      ...plan,
+      toolchains: [
+        ...plan.toolchains,
+        { language: "python", version: "3.14.8" },
+      ],
+      package_managers: [
+        { name: "pip", version: "26.2.1", cwd: "." },
+        { name: "npm", version: "12.0.2", cwd: "." },
+      ],
+    });
+    await expect(
+      inspectWorkspace(root, 100000, signal, prepared),
+    ).resolves.toHaveProperty("fingerprints");
+    await writeFile(
+      join(root, "package.json"),
+      '{"packageManager":"npm@11.0.0"}',
+    );
+    await expect(
+      inspectWorkspace(root, 100000, signal, prepared),
+    ).rejects.toThrow("dependency_manager_mismatch");
+  });
+  it.each([
+    [".", "."],
+    ["packages/child", "."],
+    [".", "packages/child"],
+  ])(
+    "blocks npm from replacing original dependencies in %s from %s",
+    async (cwd, installCwd) => {
+      const prepared = bootstrapPlanSchema.parse({
+        ...plan,
+        package_managers: [{ name: "npm", version: "12.0.2", cwd: installCwd }],
+      });
+      const prefix = cwd === "." ? "" : cwd + "/";
+      const root = await source({
+        "package.json": '{"workspaces":["packages/*"]}',
+        "package-lock.json": "{}",
+        "packages/child/package.json": "{}",
+        "packages/child/package-lock.json": "{}",
+        [prefix + "node_modules/tracked.js"]: "tracked source",
+      });
+      await expect(
+        inspectWorkspace(root, 100000, signal, prepared),
+      ).rejects.toThrow("dependency_source_conflict");
+      expect(
+        await readFile(join(root, prefix, "node_modules/tracked.js"), "utf8"),
+      ).toBe("tracked source");
+    },
+  );
+  it("permits generated dependencies and unrelated tracked dependency trees", async () => {
+    const prepared = bootstrapPlanSchema.parse({
+      ...plan,
+      package_managers: [{ name: "npm", version: "12.0.2", cwd: "." }],
+    });
+    const root = await source({
+      "package.json": "{}",
+      "package-lock.json": "{}",
+      "other/node_modules/tracked.js": "tracked source",
+    });
+    const before = await inspectWorkspace(root, 100000, signal, prepared);
+    await mkdir(join(root, "node_modules"));
+    await writeFile(join(root, "node_modules/generated.js"), "generated");
+    await expect(
+      inspectWorkspace(root, 100000, signal, prepared, before.source_files),
+    ).resolves.toHaveProperty("fingerprints", before.fingerprints);
   });
   it("skips generated dependency trees while preserving original cache manifests", async () => {
     const root = await source({

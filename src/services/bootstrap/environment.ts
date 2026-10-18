@@ -136,6 +136,10 @@ for (const [name, content] of Object.entries(JSON.parse(files)))
   }
   const installed = new Map<string, string>();
   const projects: { cwd: string; path: string }[] = [];
+  const projectFor = (cwd: string) =>
+    projects.find(
+      (project) => cwd === project.cwd || cwd.startsWith(project.cwd + "/"),
+    );
   for (const manager of plan.package_managers) {
     const key = `${manager.name}@${manager.version}`;
     let binary = installed.get(key);
@@ -282,11 +286,20 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
       environment.PATH = `${dirnameOf(binary)}:${environment.PATH}`;
     }
     const cwd = await commandDirectory(workspace.workspace, manager.cwd);
+    const pythonProject = projectFor(cwd);
+    const dependencyEnvironment = pythonProject
+      ? {
+          ...environment,
+          VIRTUAL_ENV: pythonProject.path,
+          UV_PROJECT_ENVIRONMENT: pythonProject.path,
+          PATH: `${join(pythonProject.path, "bin")}:${environment.PATH}`,
+        }
+      : environment;
     if (manager.name === "npm")
       await execute(
         [binary, "ci", "--no-audit", "--no-fund"],
         cwd,
-        environment,
+        dependencyEnvironment,
         "dependencies",
       );
     if (manager.name === "pnpm")
@@ -299,7 +312,7 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
           join(workspace.home, "pnpm-store"),
         ],
         cwd,
-        environment,
+        dependencyEnvironment,
         "dependencies",
       );
     if (manager.name === "yarn")
@@ -312,12 +325,13 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
             : "--immutable",
         ],
         cwd,
-        environment,
+        dependencyEnvironment,
         "dependencies",
       );
     if (["pip", "poetry", "uv"].includes(manager.name)) {
       const project = join(workspace.home, "projects", digest(manager.cwd));
       projects.push({ cwd, path: project });
+      projects.sort((a, b) => b.cwd.length - a.cwd.length);
       await prepareFiles(dirnameOf(project));
       await execute(
         [binaries.get("python")!, "-m", "venv", project],
@@ -388,18 +402,21 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
         );
     }
   }
-  projects.sort((a, b) => b.cwd.length - a.cwd.length);
+  const basePath = environment.PATH;
+  let dispatcher: string | undefined;
+  let refreshLaunchers: (() => ReturnType<Execute>) | undefined;
   if (projects.length === 1 && projects[0]!.cwd === workspace.workspace) {
     environment.VIRTUAL_ENV = projects[0]!.path;
     environment.UV_PROJECT_ENVIRONMENT = projects[0]!.path;
     environment.PATH = `${join(projects[0]!.path, "bin")}:${environment.PATH}`;
   } else if (projects.length) {
     const directory = join(workspace.home, "python-bin");
+    dispatcher = directory;
     const launcher = `#!/opt/orm-runtime/bin/node
 const { existsSync } = require('node:fs');
 const { basename, join, delimiter } = require('node:path');
 const projects = ${JSON.stringify(projects)};
-const basePath = ${JSON.stringify(environment.PATH)};
+const basePath = ${JSON.stringify(basePath)};
 const cwd = process.cwd();
 const project = projects.find(project => cwd === project.cwd || cwd.startsWith(project.cwd + '/'));
 const name = basename(process.argv[1]);
@@ -420,41 +437,43 @@ const binary = candidates.find(path => existsSync(path));
 if (!binary) throw new Error('Python project executable unavailable: ' + name);
 process.execve(binary, [binary, ...process.argv.slice(2)], environment);
 `;
-    await execute(
-      [
-        "/opt/orm-runtime/bin/node",
-        "--input-type=module",
-        "-e",
-        `import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
+    refreshLaunchers = () =>
+      execute(
+        [
+          "/opt/orm-runtime/bin/node",
+          "--input-type=module",
+          "-e",
+          `import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 const [directory, projects, managers, launcher] = process.argv.slice(1);
-await mkdir(directory, { mode: 0o700 });
+await mkdir(directory, { recursive: true, mode: 0o700 });
 const names = new Set(JSON.parse(managers));
 for (const project of JSON.parse(projects))
   for (const name of await readdir(join(project.path, 'bin')))
     if ((await stat(join(project.path, 'bin', name))).mode & 0o111) names.add(name);
 for (const name of names)
   await writeFile(join(directory, name), launcher, { mode: 0o700 });`,
-        directory,
-        JSON.stringify(projects),
-        JSON.stringify(
-          plan.package_managers
-            .filter((manager) => ["pip", "poetry", "uv"].includes(manager.name))
-            .map((manager) => manager.name),
-        ),
-        launcher,
-      ],
-      workspace.workspace,
-      environment,
-      "environment-files",
-    );
+          directory,
+          JSON.stringify(projects),
+          JSON.stringify(
+            plan.package_managers
+              .filter((manager) =>
+                ["pip", "poetry", "uv"].includes(manager.name),
+              )
+              .map((manager) => manager.name),
+          ),
+          launcher,
+        ],
+        workspace.workspace,
+        environment,
+        "environment-files",
+      );
+    await refreshLaunchers();
     environment.PATH = `${directory}:${environment.PATH}`;
   }
   for (const command of plan.setup_commands) {
     const cwd = await commandDirectory(workspace.workspace, command.cwd);
-    const project = projects.find(
-      (project) => cwd === project.cwd || cwd.startsWith(project.cwd + "/"),
-    );
+    const project = projectFor(cwd);
     await execute(
       command.argv,
       cwd,
@@ -463,10 +482,14 @@ for (const name of names)
             ...environment,
             VIRTUAL_ENV: project.path,
             UV_PROJECT_ENVIRONMENT: project.path,
+            PATH: [dispatcher, join(project.path, "bin"), basePath]
+              .filter(Boolean)
+              .join(":"),
           }
         : environment,
       "project-setup",
     );
+    await refreshLaunchers?.();
   }
   const after = await inspectWorkspace(
     workspace.workspace,

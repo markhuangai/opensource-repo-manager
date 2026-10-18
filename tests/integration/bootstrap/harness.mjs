@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import {
   chmod,
   lstat,
@@ -52,6 +54,8 @@ async function files(directory, prefix = "") {
 }
 
 export async function runBootstrapTests() {
+  const timingStarted = performance.now(),
+    timings = [];
   const root = "/data/bootstrap-proof",
     gitRoot = join(root, "git"),
     sourceGit = join(gitRoot, "owner", "repo.git");
@@ -180,6 +184,15 @@ export async function runBootstrapTests() {
     rejectAudit = false,
     supervisor,
     fixture;
+  const markPhase = (phase) => {
+    const timing = {
+      sdk: currentSdk,
+      phase,
+      elapsed_ms: performance.now() - timingStarted,
+    };
+    timings.push(timing);
+    appendFileSync(join(root, "timings.jsonl"), JSON.stringify(timing) + "\n");
+  };
   const modelServer = createServer((req, res) =>
     (currentSdk === "codex" ? codex : claude)(req, res, fixture),
   );
@@ -271,6 +284,7 @@ export async function runBootstrapTests() {
   try {
     for (const sdk of ["claude", "codex"]) {
       currentSdk = sdk;
+      markPhase("sdk:start");
       const config = parseConfiguration(
         await readFile("/config/config.yml", "utf8"),
       );
@@ -345,6 +359,7 @@ export async function runBootstrapTests() {
           : ["npm"];
       let lastReceipt;
       const runCase = async (name) => {
+        markPhase(`${name}:start`);
         const python = ["pip", "poetry", "uv"].includes(name),
           go = ["go-cgo", "mixed"].includes(name);
         const sourceFiles = await files(
@@ -378,10 +393,19 @@ export async function runBootstrapTests() {
           go && name !== "mixed" ? undefined : name === "mixed" ? "npm" : name,
         );
         if (name === "pip") {
+          currentPlan.toolchains.push({
+            language: "node",
+            version: versions.toolchains.node,
+          });
           currentPlan.package_managers.push({
             name: "pip",
             version: versions.managers.pip,
             cwd: "nested",
+          });
+          currentPlan.package_managers.push({
+            name: "npm",
+            version: versions.managers.npm,
+            cwd: ".",
           });
           for (const [cwd, version] of [
             [".", "25.0"],
@@ -397,6 +421,31 @@ export async function runBootstrapTests() {
                 `python -c 'import os, sys, packaging; assert packaging.__version__ == "${version}"; assert sys.prefix == os.environ["VIRTUAL_ENV"]' && test "$(pip --version)" = "$(python3 -m pip --version)"`,
               ],
             });
+          for (const [cwd, version] of [
+            [".", "25.0"],
+            ["nested", "24.2"],
+          ]) {
+            currentPlan.setup_commands.push({
+              cwd,
+              argv: [
+                "/bin/sh",
+                "-c",
+                `python ${cwd === "." ? "create-command.py" : "../create-command.py"} && test "$(project-version)" = ${version}`,
+              ],
+            });
+            currentPlan.setup_commands.push({
+              cwd,
+              argv: ["project-version"],
+            });
+          }
+          currentPlan.setup_commands.push({
+            cwd: ".",
+            argv: [
+              "/bin/sh",
+              "-c",
+              'test "$(project-version)" = 25.0 && (cd nested/deep && test "$(project-version)" = 24.2) && (cd nested-other && test "$(project-version)" = 25.0) && test "$(cat .lifecycle-ran)" = passed',
+            ],
+          });
           currentPlan.test_commands.push({
             cwd: "nested",
             argv: ["python", "test.py"],
@@ -475,7 +524,7 @@ export async function runBootstrapTests() {
         fixture.environmentCommand = python
           ? "python test.py" +
             (name === "pip"
-              ? ` && (cd nested && python test.py) && (cd nested/deep && python probe.py) && (cd nested-other && python probe.py) && (cd "$HOME" && python -c 'import os, sys; assert sys.prefix == sys.base_prefix; assert "VIRTUAL_ENV" not in os.environ')`
+              ? ` && test "$(project-version)" = 25.0 && (cd nested && python test.py && test "$(project-version)" = 24.2) && (cd nested/deep && python probe.py) && (cd nested-other && python probe.py) && (cd "$HOME" && python -c 'import os, sys; assert sys.prefix == sys.base_prefix; assert "VIRTUAL_ENV" not in os.environ')`
               : "")
           : go
             ? `go test ./...${name === "mixed" ? " && npm test" : ""}`
@@ -541,10 +590,12 @@ export async function runBootstrapTests() {
             file.path.split("/").includes("node_modules"),
           ),
         );
-        if (name === "pip")
+        if (name === "pip") {
           assert(
             artifact.files.some((file) => file.path === "nested/.tests-ran"),
           );
+          assert(artifact.files.some((file) => file.path === ".lifecycle-ran"));
+        }
         if (name === "npm") {
           assert(
             artifact.files.some(
@@ -713,12 +764,14 @@ export async function runBootstrapTests() {
           ),
           commands: store.bootstrapCommands(receipt.id).length,
         });
+        markPhase(`${name}:complete`);
       };
       // Defer the Go tree until fixtures that repeatedly scan shared tool storage finish.
       for (const name of cases.filter(
         (name) => !["go-cgo", "mixed"].includes(name),
       ))
         await runCase(name);
+      markPhase("audit-rejection:start");
       currentPlan = makePlan(["node"], "npm");
       const source = sourceWith(
         await files("/bootstrap-fixtures/projects/npm"),
@@ -741,9 +794,12 @@ export async function runBootstrapTests() {
         before,
       );
       rejectAudit = false;
+      markPhase("audit-rejection:complete");
       if (sdk === "codex") {
+        markPhase("negative-and-recovery:start");
         const npmFiles = await files("/bootstrap-fixtures/projects/npm");
         const fails = async (label, files, change, pattern) => {
+          markPhase(`${label}:start`);
           currentPlan = makePlan(["node"], "npm");
           change(currentPlan);
           const failed = seed(snapshot, sourceWith(files));
@@ -762,8 +818,19 @@ export async function runBootstrapTests() {
           assert.equal(JSON.parse(row.receipt_json).status, "blocked");
           assert.equal(store.leases().length, 0);
           proof.push({ fixture: label, outcome: "blocked" });
+          markPhase(`${label}:complete`);
           return JSON.parse(row.receipt_json).id;
         };
+        const sourceConflict = await fails(
+          "tracked-node-modules",
+          {
+            ...npmFiles,
+            "node_modules/tracked.js": "tracked source sentinel\n",
+          },
+          () => {},
+          /dependency_source_conflict/,
+        );
+        assert.equal(store.bootstrapCommands(sourceConflict).length, 0);
         const pnpmFiles = await files("/bootstrap-fixtures/projects/pnpm");
         for (const attack of ["directory", "lock"]) {
           const sentinel = join(root, `manager-symlink-${attack}`),
@@ -877,6 +944,7 @@ export async function runBootstrapTests() {
           },
           /bootstrap_lock_mutated/,
         );
+        markPhase("stale-lock:start");
         const pythonFiles = await files(
           "/bootstrap-fixtures/projects/python-poetry",
         );
@@ -894,6 +962,8 @@ export async function runBootstrapTests() {
           /bootstrap_command_failed/,
         );
         proof.push({ fixture: "stale-lock", outcome: "blocked" });
+        markPhase("stale-lock:complete");
+        markPhase("nested-pins-mutation:start");
         const nestedPins = await files(
           "/bootstrap-fixtures/projects/python-pip",
         );
@@ -911,12 +981,14 @@ export async function runBootstrapTests() {
           /bootstrap_lock_mutated/,
         );
         proof.push({ fixture: "nested-pins-mutation", outcome: "blocked" });
+        markPhase("nested-pins-mutation:complete");
         currentPlan = makePlan(["node"], "npm");
         currentPlan.setup_commands.push({
           cwd: ".",
           argv: ["/bin/sh", "-c", "sleep 100"],
         });
         for (const mode of ["cancelled", "stale"]) {
+          markPhase(`${mode}:start`);
           const staleSource = sourceWith(npmFiles);
           const cancelled = seed(snapshot, staleSource),
             controller = new globalThis.AbortController();
@@ -999,7 +1071,9 @@ export async function runBootstrapTests() {
                 : "stale-revision",
             outcome: "passed",
           });
+          markPhase(`${mode}:complete`);
         }
+        markPhase("cache-tampering:start");
         const tamper = join(
           lastReceipt.environment.tools[0].path,
           "cache-tamper-proof",
@@ -1019,6 +1093,8 @@ export async function runBootstrapTests() {
           await unlink(tamper);
         }
         proof.push({ fixture: "cache-tampering", outcome: "blocked" });
+        markPhase("cache-tampering:complete");
+        markPhase("installer-limits:start");
         const limitedCommands = [];
         await assert.rejects(
           supervisor.bootstrap.toolchains.verify(
@@ -1062,6 +1138,7 @@ export async function runBootstrapTests() {
           ),
         );
         proof.push({ fixture: "installer-limits", outcome: "blocked" });
+        markPhase("installer-limits:complete");
         const partialVersion = "24.18.1";
         await mkdir(
           join(
@@ -1079,6 +1156,7 @@ export async function runBootstrapTests() {
           },
           /toolchain_install_incomplete/,
         );
+        markPhase("restart-recovery:start");
         const interruptedId = randomUUID(),
           interruptedCommand = randomUUID();
         const token = store.acquireLease(
@@ -1126,11 +1204,14 @@ export async function runBootstrapTests() {
         );
         assert.equal(store.bootstrap(lastReceipt.id).status, "ready");
         proof.push({ fixture: "restart-recovery", outcome: "passed" });
+        markPhase("restart-recovery:complete");
+        markPhase("negative-and-recovery:complete");
       }
       for (const name of cases.filter((name) =>
         ["go-cgo", "mixed"].includes(name),
       ))
         await runCase(name);
+      markPhase("sdk:complete");
       await supervisor.close();
       supervisor = undefined;
     }
@@ -1161,6 +1242,7 @@ export async function runBootstrapTests() {
     }
   } finally {
     for (const cleanup of [
+      () => markPhase("cleanup:start"),
       () => supervisor?.close(),
       () => store.close(),
       () => close(modelServer),
@@ -1169,6 +1251,7 @@ export async function runBootstrapTests() {
         await writeFile(join(root, "complete"), "bootstrap fixture finished");
         await chmod(join(root, "complete"), 0o400);
       },
+      () => markPhase("cleanup:complete"),
     ]) {
       try {
         await cleanup();
@@ -1185,6 +1268,7 @@ export async function runBootstrapTests() {
   return {
     bootstrap: "passed",
     cases: proof,
+    timings,
     audit_rejection: "passed",
     malicious_mise: "passed",
     cleanup: "passed",
