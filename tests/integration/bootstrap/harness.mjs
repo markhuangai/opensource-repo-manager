@@ -355,6 +355,11 @@ export async function runBootstrapTests() {
             sourceFiles,
             await files("/bootstrap-fixtures/projects/npm-workspace"),
           );
+        if (name === "pip")
+          Object.assign(
+            sourceFiles,
+            await files("/bootstrap-fixtures/projects/python-projects"),
+          );
         if (name === "mixed")
           Object.assign(
             sourceFiles,
@@ -372,6 +377,41 @@ export async function runBootstrapTests() {
               : ["node"],
           go && name !== "mixed" ? undefined : name === "mixed" ? "npm" : name,
         );
+        if (name === "pip") {
+          currentPlan.package_managers.push({
+            name: "pip",
+            version: versions.managers.pip,
+            cwd: "nested",
+          });
+          for (const [cwd, version] of [
+            [".", "25.0"],
+            ["nested", "24.2"],
+            ["nested/deep", "24.2"],
+            ["nested-other", "25.0"],
+          ])
+            currentPlan.setup_commands.push({
+              cwd,
+              argv: [
+                "/bin/sh",
+                "-c",
+                `python -c 'import os, sys, packaging; assert packaging.__version__ == "${version}"; assert sys.prefix == os.environ["VIRTUAL_ENV"]' && test "$(pip --version)" = "$(python3 -m pip --version)"`,
+              ],
+            });
+          currentPlan.test_commands.push({
+            cwd: "nested",
+            argv: ["python", "test.py"],
+            execution: "local",
+            platform: "linux",
+          });
+          currentPlan.setup_commands.push({
+            cwd: ".",
+            argv: [
+              "/bin/sh",
+              "-c",
+              `cd "$HOME" && python -c 'import os, sys; assert sys.prefix == sys.base_prefix; assert "VIRTUAL_ENV" not in os.environ; assert "UV_PROJECT_ENVIRONMENT" not in os.environ'`,
+            ],
+          });
+        }
         if (name === "npm") {
           sourceFiles[".github/workflows/ci.yml"] =
             'on: push\njobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    steps:\n      - uses: actions/setup-node@v7\n        with:\n          node-version: "24.18.0"\n';
@@ -433,7 +473,10 @@ export async function runBootstrapTests() {
         );
         const manager = name.startsWith("yarn") ? "yarn" : name;
         fixture.environmentCommand = python
-          ? "python test.py"
+          ? "python test.py" +
+            (name === "pip"
+              ? ` && (cd nested && python test.py) && (cd nested/deep && python probe.py) && (cd nested-other && python probe.py) && (cd "$HOME" && python -c 'import os, sys; assert sys.prefix == sys.base_prefix; assert "VIRTUAL_ENV" not in os.environ')`
+              : "")
           : go
             ? `go test ./...${name === "mixed" ? " && npm test" : ""}`
             : `${manager} test`;
@@ -498,6 +541,10 @@ export async function runBootstrapTests() {
             file.path.split("/").includes("node_modules"),
           ),
         );
+        if (name === "pip")
+          assert(
+            artifact.files.some((file) => file.path === "nested/.tests-ran"),
+          );
         if (name === "npm") {
           assert(
             artifact.files.some(

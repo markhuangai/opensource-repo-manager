@@ -135,6 +135,7 @@ for (const [name, content] of Object.entries(JSON.parse(files)))
     if (tool.language === "python") environment.UV_PYTHON = binary;
   }
   const installed = new Map<string, string>();
+  const projects: { cwd: string; path: string }[] = [];
   for (const manager of plan.package_managers) {
     const key = `${manager.name}@${manager.version}`;
     let binary = installed.get(key);
@@ -316,6 +317,7 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
       );
     if (["pip", "poetry", "uv"].includes(manager.name)) {
       const project = join(workspace.home, "projects", digest(manager.cwd));
+      projects.push({ cwd, path: project });
       await prepareFiles(dirnameOf(project));
       await execute(
         [binaries.get("python")!, "-m", "venv", project],
@@ -323,9 +325,12 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
         environment,
         "project-venv",
       );
-      environment.VIRTUAL_ENV = project;
-      environment.UV_PROJECT_ENVIRONMENT = project;
-      environment.PATH = `${join(project, "bin")}:${environment.PATH}`;
+      const projectEnvironment = {
+        ...environment,
+        VIRTUAL_ENV: project,
+        UV_PROJECT_ENVIRONMENT: project,
+        PATH: `${join(project, "bin")}:${environment.PATH}`,
+      };
       if (manager.name === "pip") {
         await execute(
           [
@@ -336,7 +341,7 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
             `pip==${manager.version}`,
           ],
           cwd,
-          environment,
+          projectEnvironment,
           "project-pip",
         );
         await execute(
@@ -350,13 +355,13 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
             "requirements.txt",
           ],
           cwd,
-          environment,
+          projectEnvironment,
           "dependencies",
         );
         await execute(
           [join(project, "bin", "python"), "-m", "pip", "check"],
           cwd,
-          environment,
+          projectEnvironment,
           "dependency-pins",
         );
       }
@@ -364,13 +369,13 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
         await execute(
           [binary, "check", "--lock"],
           cwd,
-          environment,
+          projectEnvironment,
           "dependency-lock",
         );
         await execute(
           [binary, "sync", "--no-interaction"],
           cwd,
-          environment,
+          projectEnvironment,
           "dependencies",
         );
       }
@@ -378,18 +383,91 @@ console.log(JSON.stringify(Object.fromEntries(await Promise.all(
         await execute(
           [binary, "sync", "--locked", "--python", binaries.get("python")!],
           cwd,
-          environment,
+          projectEnvironment,
           "dependencies",
         );
     }
   }
-  for (const command of plan.setup_commands)
+  projects.sort((a, b) => b.cwd.length - a.cwd.length);
+  if (projects.length === 1 && projects[0]!.cwd === workspace.workspace) {
+    environment.VIRTUAL_ENV = projects[0]!.path;
+    environment.UV_PROJECT_ENVIRONMENT = projects[0]!.path;
+    environment.PATH = `${join(projects[0]!.path, "bin")}:${environment.PATH}`;
+  } else if (projects.length) {
+    const directory = join(workspace.home, "python-bin");
+    const launcher = `#!/opt/orm-runtime/bin/node
+const { existsSync } = require('node:fs');
+const { basename, join, delimiter } = require('node:path');
+const projects = ${JSON.stringify(projects)};
+const basePath = ${JSON.stringify(environment.PATH)};
+const cwd = process.cwd();
+const project = projects.find(project => cwd === project.cwd || cwd.startsWith(project.cwd + '/'));
+const name = basename(process.argv[1]);
+const environment = { ...process.env, PATH: ${JSON.stringify(directory)} + ':' + basePath };
+delete environment.VIRTUAL_ENV;
+delete environment.UV_PROJECT_ENVIRONMENT;
+if (project) {
+  environment.VIRTUAL_ENV = project.path;
+  environment.UV_PROJECT_ENVIRONMENT = project.path;
+  environment.PATH = ${JSON.stringify(directory)} + ':' + join(project.path, 'bin') + ':' + basePath;
+}
+const candidates = [
+  ...(project ? [join(project.path, 'bin', name)] : []),
+  ...(/^python(?:[0-9]+(?:\\.[0-9]+)*)?$/.test(name) ? [join(${JSON.stringify(dirnameOf(binaries.get("python")!))}, name)] : []),
+  ...basePath.split(delimiter).map(directory => join(directory, name)),
+];
+const binary = candidates.find(path => existsSync(path));
+if (!binary) throw new Error('Python project executable unavailable: ' + name);
+process.execve(binary, [binary, ...process.argv.slice(2)], environment);
+`;
+    await execute(
+      [
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        `import { mkdir, readdir, stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+const [directory, projects, managers, launcher] = process.argv.slice(1);
+await mkdir(directory, { mode: 0o700 });
+const names = new Set(JSON.parse(managers));
+for (const project of JSON.parse(projects))
+  for (const name of await readdir(join(project.path, 'bin')))
+    if ((await stat(join(project.path, 'bin', name))).mode & 0o111) names.add(name);
+for (const name of names)
+  await writeFile(join(directory, name), launcher, { mode: 0o700 });`,
+        directory,
+        JSON.stringify(projects),
+        JSON.stringify(
+          plan.package_managers
+            .filter((manager) => ["pip", "poetry", "uv"].includes(manager.name))
+            .map((manager) => manager.name),
+        ),
+        launcher,
+      ],
+      workspace.workspace,
+      environment,
+      "environment-files",
+    );
+    environment.PATH = `${directory}:${environment.PATH}`;
+  }
+  for (const command of plan.setup_commands) {
+    const cwd = await commandDirectory(workspace.workspace, command.cwd);
+    const project = projects.find(
+      (project) => cwd === project.cwd || cwd.startsWith(project.cwd + "/"),
+    );
     await execute(
       command.argv,
-      await commandDirectory(workspace.workspace, command.cwd),
-      environment,
+      cwd,
+      project
+        ? {
+            ...environment,
+            VIRTUAL_ENV: project.path,
+            UV_PROJECT_ENVIRONMENT: project.path,
+          }
+        : environment,
       "project-setup",
     );
+  }
   const after = await inspectWorkspace(
     workspace.workspace,
     limit,
