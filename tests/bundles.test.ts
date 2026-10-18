@@ -46,6 +46,7 @@ async function fixture() {
     { mode: 0o644 },
   );
   const config = fixtureMcp();
+  for (const role of Object.values(config.roles)) role.skills = ["example"];
   return { root, roots, config, ...separateSecrets(config) };
 }
 

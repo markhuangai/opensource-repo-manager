@@ -107,6 +107,7 @@ export type AgentRunRequest = Readonly<{
   input?: unknown;
   output_schema?: Readonly<Record<string, unknown>>;
   resume?: SessionIdentity;
+  bootstrap_receipt?: string;
 }>;
 export type WorkerRequest = Omit<AgentRunRequest, "workspace"> & {
   run_id: string;
@@ -124,6 +125,7 @@ export type WorkerRequest = Omit<AgentRunRequest, "workspace"> & {
   relay: { url: string; authorization: string };
   mcp: readonly McpConnection[];
   binding: string;
+  environment?: Readonly<Record<string, string>>;
 };
 
 const text = z.string().max(65536);

@@ -24,6 +24,8 @@ import {
 import type { SourceMetadata } from "../domain/jobs.ts";
 import type { Store } from "../repositories/store.ts";
 import { ModelRelay } from "../services/model-relay.ts";
+import { BootstrapService } from "../services/bootstrap/index.ts";
+import { runCommand } from "../adapters/toolchains/process.ts";
 import {
   WorkspaceService,
   type PreparedWorkspace,
@@ -87,6 +89,13 @@ type ActiveRun = {
   reviewTask?: Promise<void>;
   reviewCleanupFailed?: boolean;
 };
+export type BootstrapLease = Readonly<{
+  lease: string;
+  deadline: number;
+  signal: AbortSignal;
+  request: AgentRunRequest;
+  abort: (reason: RuntimeError) => void;
+}>;
 export type SupervisorOptions = {
   root?: string;
   workers?: Partial<Record<"claude" | "codex", string>>;
@@ -99,6 +108,9 @@ export class Supervisor implements AgentRunner {
   private readonly active = new Map<string, ActiveRun>();
   private readonly tasks = new Set<Promise<void>>();
   readonly workspaces: WorkspaceService;
+  readonly bootstrap: BootstrapService;
+  private readonly bootstrapLeases = new Set<BootstrapLease>();
+  private readonly bootstrapOutput = new Map<string, number>();
   private readonly relay: ModelRelay;
   private readonly store: Store;
   private readonly snapshot: RunSnapshot;
@@ -120,6 +132,7 @@ export class Supervisor implements AgentRunner {
       options.sourceUrl,
     );
     this.relay = new ModelRelay(store, snapshot.settings.proxy.url, secrets);
+    this.bootstrap = new BootstrapService(this, store, secrets);
   }
 
   static async create(
@@ -136,6 +149,8 @@ export class Supervisor implements AgentRunner {
         await cleanUser(uid);
         await cleanTemporary(uid);
       }
+      store.interruptBootstrap();
+      await supervisor.bootstrap.initialize();
       for (const lease of store.leases()) store.accountActive(lease.token);
       for (const run of store
         .runs()
@@ -180,6 +195,272 @@ export class Supervisor implements AgentRunner {
     signal: AbortSignal,
   ): AsyncIterable<AgentEvent> {
     return this.execute(request, signal);
+  }
+
+  async withBootstrapLease<T>(
+    request: AgentRunRequest,
+    signal: AbortSignal,
+    operation: (session: BootstrapLease) => Promise<T>,
+  ): Promise<T> {
+    const snapshot = this.validate(request),
+      lease = this.store.acquireLease(request.job_id, request.revision);
+    if (!lease) throw new RuntimeError("lease_busy");
+    const controller = new AbortController();
+    let session: BootstrapLease | undefined;
+    const timer = setInterval(() => {
+      try {
+        this.store.accountActive(lease);
+        if (session && Date.now() >= session.deadline)
+          controller.abort(new RuntimeError("active_budget_exhausted"));
+        else if (!this.store.runtimeCurrent(lease))
+          controller.abort(new RuntimeError("revision_stale"));
+      } catch {
+        controller.abort(new RuntimeError("monitor_failed"));
+      }
+    }, 100);
+    const operationTask = (async () => {
+      let result: T | undefined, failure: { error: unknown } | undefined;
+      try {
+        const deadline = this.store.startRuntimeLease(
+          lease,
+          snapshot.settings.limits.active_minutes * 60_000,
+        );
+        session = {
+          lease,
+          deadline,
+          request,
+          signal: AbortSignal.any([
+            signal,
+            controller.signal,
+            this.controller.signal,
+          ]),
+          abort: (reason) => controller.abort(reason),
+        };
+        this.bootstrapLeases.add(session);
+        session.signal.throwIfAborted();
+        result = await operation(session);
+      } catch (error) {
+        failure = { error };
+      } finally {
+        clearInterval(timer);
+        if (session) this.bootstrapLeases.delete(session);
+        this.store.accountActive(lease);
+        if (!this.store.releaseLease(lease))
+          failure = {
+            error: new RuntimeError("cleanup_failed", {
+              cause:
+                failure?.error instanceof RuntimeError
+                  ? failure.error
+                  : undefined,
+            }),
+          };
+      }
+      if (failure) throw failure.error;
+      return result!;
+    })();
+    const tracked = operationTask.then(
+      () => {},
+      () => {},
+    );
+    this.tasks.add(tracked);
+    try {
+      return await operationTask;
+    } finally {
+      this.tasks.delete(tracked);
+    }
+  }
+
+  runBootstrapAgent(session: BootstrapLease, request: AgentRunRequest) {
+    this.validateBootstrapLease(session, request);
+    return this.execute(request, session.signal, undefined, session);
+  }
+
+  private validateBootstrapLease(
+    session: BootstrapLease,
+    request: AgentRunRequest,
+  ) {
+    if (
+      !this.bootstrapLeases.has(session) ||
+      !this.store.runtimeCurrent(session.lease) ||
+      request.job_id !== session.request.job_id ||
+      request.revision !== session.request.revision
+    )
+      throw new RuntimeError("revision_stale");
+    this.validate(request);
+    session.signal.throwIfAborted();
+  }
+
+  async bootstrapWorkspace<T>(
+    session: BootstrapLease,
+    request: AgentRunRequest,
+    operation: (workspace: PreparedWorkspace, runId: string) => Promise<T>,
+  ): Promise<T> {
+    this.validateBootstrapLease(session, request);
+    const snapshot = this.store.snapshot(request.snapshot_digest),
+      id = randomUUID(),
+      user = roleUsers[request.role],
+      limits = workerLimits(snapshot);
+    let prepared: PreparedWorkspace | undefined,
+      completed = false,
+      cleanupFailure: RuntimeError | undefined,
+      cleanupStep = "processes",
+      registered = false;
+    let watching: Promise<void> | undefined;
+    let result: T | undefined, failure: { error: unknown } | undefined;
+    const signal = session.signal;
+    const watch = setInterval(() => {
+      if (prepared && !watching)
+        watching = (async () => {
+          let used = await treeBytes(prepared!.root, limits.storage);
+          for (const path of ["/tmp", "/var/tmp", "/dev/shm", "/run/lock"]) {
+            try {
+              if (!(await lstat(path)).isSymbolicLink())
+                used += await treeBytes(path, limits.storage - used, user.uid);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+                throw error;
+            }
+          }
+          used += await deletedFileBytes(user.uid, limits.storage - used);
+          if (used > limits.storage) throw new RuntimeError("storage_limit");
+        })()
+          .catch((error) =>
+            session.abort(
+              error instanceof RuntimeError
+                ? error
+                : new RuntimeError("monitor_failed"),
+            ),
+          )
+          .finally(() => {
+            watching = undefined;
+          });
+    }, 100);
+    try {
+      if ((await userProcesses(user.uid)).length)
+        throw new RuntimeError("worker_user_busy");
+      this.store.startRun({
+        id,
+        job_id: request.job_id,
+        revision: request.revision,
+        role: request.role,
+        uid: user.uid,
+        parent_id: null,
+        lease_token: session.lease,
+        binding_json: "{}",
+      });
+      registered = true;
+      this.bootstrapOutput.set(id, 0);
+      prepared = await this.workspaces.prepare(
+        id,
+        request.role,
+        snapshot.roles[request.role].bundle,
+        request.workspace.source,
+        snapshot.settings.github.repository,
+        limits,
+        signal,
+      );
+      if (request.workspace.artifact) {
+        const artifact = this.store.artifact(
+          request.workspace.artifact,
+          request.job_id,
+          request.revision,
+        );
+        if (digest(artifact.source) !== digest(request.workspace.source))
+          throw new RuntimeError("artifact_source_mismatch");
+        await this.workspaces.restore(
+          artifact,
+          prepared.workspace,
+          request.role,
+          limits.storage,
+          signal,
+        );
+      }
+      result = await operation(prepared, id);
+      signal.throwIfAborted();
+      this.validateBootstrapLease(session, request);
+      completed = true;
+    } catch (error) {
+      failure = { error };
+    } finally {
+      clearInterval(watch);
+      this.bootstrapOutput.delete(id);
+      await watching;
+      try {
+        if (registered) {
+          await cleanUser(user.uid);
+          cleanupStep = "temporary";
+          await cleanTemporary(user.uid);
+          cleanupStep = "workspace";
+          await this.workspaces.remove(id);
+        }
+      } catch (error) {
+        const code =
+          error instanceof RuntimeError
+            ? error.code
+            : (error as NodeJS.ErrnoException)?.code;
+        const cause =
+          typeof code === "string" &&
+          /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(code) &&
+          !this.secrets.containsCredentials(code)
+            ? new RuntimeError(code)
+            : undefined;
+        cleanupFailure = new RuntimeError(`cleanup_${cleanupStep}_failed`, {
+          cause,
+        });
+      }
+      if (cleanupFailure)
+        failure = {
+          error: new RuntimeError("cleanup_failed", { cause: cleanupFailure }),
+        };
+      if (!cleanupFailure && this.store.run(id))
+        this.store.finishRun(
+          id,
+          completed ? "completed" : "failed",
+          null,
+          null,
+        );
+    }
+    if (failure) throw failure.error;
+    return result!;
+  }
+
+  async bootstrapCommand(
+    session: BootstrapLease,
+    request: AgentRunRequest,
+    prepared: PreparedWorkspace,
+    attempt: string,
+    runId: string,
+    argv: string[],
+    cwd: string,
+    environment: NodeJS.ProcessEnv,
+    operation: string,
+  ) {
+    this.validateBootstrapLease(session, request);
+    const limits = workerLimits(this.store.snapshot(request.snapshot_digest));
+    try {
+      return await runCommand(argv[0], argv.slice(1), {
+        cwd,
+        env: environment,
+        role: request.role,
+        processes: limits.processes,
+        signal: session.signal,
+        limit: limits.output - (this.bootstrapOutput.get(runId) ?? 0),
+        operation,
+        secrets: this.secrets,
+        record: (receipt) => {
+          this.store.recordBootstrapCommand(attempt, runId, receipt);
+          if (receipt.finished_at !== null)
+            this.bootstrapOutput.set(
+              runId,
+              (this.bootstrapOutput.get(runId) ?? 0) + receipt.output_bytes,
+            );
+        },
+      });
+    } finally {
+      await cleanUser(roleUsers[request.role].uid);
+      await cleanTemporary(roleUsers[request.role].uid);
+      await treeBytes(prepared.root, limits.storage);
+    }
   }
 
   async *runReview(
@@ -273,6 +554,7 @@ export class Supervisor implements AgentRunner {
     request: AgentRunRequest,
     signal: AbortSignal,
     parent?: ActiveRun,
+    held?: BootstrapLease,
   ): AsyncIterable<AgentEvent> {
     const snapshot = this.validate(request),
       worker = this.options.workers?.[request.profile.sdk];
@@ -296,18 +578,20 @@ export class Supervisor implements AgentRunner {
     combined.throwIfAborted();
     const lease =
       parent?.lease ??
+      held?.lease ??
       this.store.acquireLease(request.job_id, request.revision);
     if (!lease) throw new RuntimeError("lease_busy");
     let deadline: number;
     try {
       deadline =
         parent?.deadline ??
+        held?.deadline ??
         this.store.startRuntimeLease(
           lease,
           snapshot.settings.limits.active_minutes * 60_000,
         );
     } catch (error) {
-      if (!parent) this.store.releaseLease(lease);
+      if (!parent && !held) this.store.releaseLease(lease);
       throw error;
     }
     const context: ActiveRun = {
@@ -323,9 +607,14 @@ export class Supervisor implements AgentRunner {
     };
     this.active.set(context.id, context);
     const queue = new EventQueue();
-    const task = this.work(context, worker, bootstrap, queue, parent).catch(
-      (error) => queue.end(error),
-    );
+    const task = this.work(
+      context,
+      worker,
+      bootstrap,
+      queue,
+      parent,
+      held,
+    ).catch((error) => queue.end(error));
     this.tasks.add(task);
     try {
       yield* queue.events();
@@ -343,12 +632,15 @@ export class Supervisor implements AgentRunner {
     bootstrap: string,
     queue: EventQueue,
     parent?: ActiveRun,
+    held?: BootstrapLease,
   ) {
     const { request, snapshot, signal, lease, id } = context,
       identity = roleUsers[request.role],
       limits = workerLimits(snapshot);
     let prepared: PreparedWorkspace | undefined,
       mcp: Awaited<ReturnType<McpSessionProvider["open"]>> | undefined;
+    let environment: Readonly<Record<string, string>> | undefined;
+    let excluded: ((reference: string) => boolean) | undefined;
     let relay: ReturnType<ModelRelay["authorize"]> | undefined,
       registered = false,
       cleaned = false;
@@ -491,6 +783,15 @@ export class Supervisor implements AgentRunner {
         profile: request.profile,
         policy: mcp?.policy_identity ?? digest({}),
         catalog: mcp?.catalog_identity ?? digest({}),
+        ...(request.bootstrap_receipt
+          ? {
+              environment: digest({
+                plan: this.bootstrap.receipt(request).plan_digest,
+                tools: this.bootstrap.receipt(request).environment,
+                managers: this.bootstrap.receipt(request).manager_locks,
+              }),
+            }
+          : {}),
       });
       if (request.resume) {
         const previous = this.store.sessionRun(
@@ -519,6 +820,44 @@ export class Supervisor implements AgentRunner {
         );
       }
       this.store.bindRun(id, binding);
+      if (request.bootstrap_receipt) {
+        let setupOutput = 0;
+        const setup = await this.bootstrap.materialize(
+          request,
+          prepared,
+          id,
+          signal,
+          (argv, cwd, env, operation) =>
+            runCommand(argv[0], argv.slice(1), {
+              cwd,
+              env,
+              role: request.role,
+              processes: limits.processes,
+              signal,
+              limit: limits.output - setupOutput,
+              operation,
+              secrets: this.secrets,
+              record: (receipt) => {
+                this.store.recordBootstrapCommand(
+                  request.bootstrap_receipt!,
+                  id,
+                  receipt,
+                );
+                if (receipt.finished_at !== null)
+                  setupOutput += receipt.output_bytes;
+              },
+            }).finally(async () => {
+              await cleanUser(identity.uid);
+              await cleanTemporary(identity.uid);
+            }),
+        );
+        environment = Object.fromEntries(
+          Object.entries(setup.environment).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string",
+          ),
+        );
+        excluded = setup.excluded;
+      }
       relay = this.relay.authorize({
         lease,
         profile: request.profile,
@@ -554,6 +893,7 @@ export class Supervisor implements AgentRunner {
             deadline: connection.deadline,
           })) ?? [],
         binding,
+        ...(environment ? { environment } : {}),
       };
       const outputCredentials = createKnownSecretChecker([
           workerRequest.relay.authorization,
@@ -667,6 +1007,8 @@ export class Supervisor implements AgentRunner {
           prepared.workspace,
           limits.storage,
           signal,
+          undefined,
+          excluded,
         );
         if (session && identity.uid === 10001) {
           await treeBytes(prepared.root, limits.storage);
@@ -779,7 +1121,7 @@ export class Supervisor implements AgentRunner {
       signal.removeEventListener("abort", abort);
       if (!parent) {
         this.store.accountActive(lease);
-        if (cleaned && !this.store.releaseLease(lease))
+        if (cleaned && !held && !this.store.releaseLease(lease))
           cleanupFailure = new RuntimeError("cleanup_failed");
       }
     }

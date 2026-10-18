@@ -147,7 +147,7 @@ export async function sourceProcesses(
 }
 
 export async function cleanSource(id: string, stage: string) {
-  const deadline = Date.now() + 3000;
+  const deadline = performance.now() + 3000;
   let quiet = 0;
   while (quiet < 3) {
     const processes = await sourceProcesses(id, stage);
@@ -159,7 +159,7 @@ export async function cleanSource(id: string, stage: string) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
     }
-    if (quiet < 3 && Date.now() >= deadline)
+    if (quiet < 3 && performance.now() >= deadline)
       throw new RuntimeError("cleanup_failed");
     await delay(25);
   }

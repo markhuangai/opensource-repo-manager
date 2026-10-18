@@ -64,7 +64,7 @@ function send(res, output) {
   res.end();
 }
 
-async function respond(req, res, fixture) {
+export async function respond(req, res, fixture) {
   const { config, store, root, requests, histories, errors, mcpCredential } =
     fixture;
   try {
@@ -86,7 +86,9 @@ async function respond(req, res, fixture) {
     for (const secret of [config.proxy.key, config.github.token, mcpCredential])
       assert(!data.includes(secret));
     const text = strings(body.input).join("\n");
-    const scenario = /"scenario":"([^"]+)"/.exec(text)?.[1];
+    const scenario =
+      /"scenario":"([^"]+)"/.exec(text)?.[1] ??
+      /"task":"(bootstrap_[^"]+)"/.exec(text)?.[1];
     assert(scenario, "Missing verbatim task context");
     assert(data.includes("OPERATOR_SYSTEM_CANARY"));
     assert(data.includes("OPERATOR_SKILL_CANARY"));
@@ -164,7 +166,29 @@ async function respond(req, res, fixture) {
       fixture.held = true;
       return;
     }
-    if (scenario === "crash") {
+    if (scenario === "bootstrap_environment") {
+      if (!previous)
+        output = use("exec_command", {
+          cmd: fixture.environmentCommand,
+          yield_time_ms: 30000,
+          max_output_tokens: 2000,
+        });
+      else {
+        const latest = strings(results.at(-1)).join("\n");
+        const session = /Process running with session ID\s+(\d+)/i.exec(
+          latest,
+        )?.[1];
+        if (session)
+          output = use("write_stdin", {
+            session_id: Number(session),
+            chars: "",
+            yield_time_ms: 30000,
+            max_output_tokens: 2000,
+          });
+        else
+          assert(/(?:^|\n)BOOTSTRAP_TESTS_PASSED(?:\n|$)/.test(latest), latest);
+      }
+    } else if (scenario === "crash") {
       output = command('pkill -ABRT -u "$(id -u)" -x codex');
     } else if (scenario === "output_review") {
       assert(data.includes("PAYLOAD_EVIDENCE_CANARY"));
@@ -246,8 +270,9 @@ async function respond(req, res, fixture) {
     }
     if (previous && ["tools", "hostile"].includes(scenario))
       assert(strings(results).join("\n").includes("OPERATOR_REFERENCE_CANARY"));
-    const final =
-      scenario === "structured"
+    const final = ["bootstrap_plan", "bootstrap_audit"].includes(scenario)
+      ? JSON.stringify(fixture.bootstrap(scenario, text))
+      : scenario === "structured"
         ? '{"value":"validated"}'
         : scenario === "invalid"
           ? '{"value":123}'
