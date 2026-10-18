@@ -1,0 +1,16 @@
+{
+  "name": "bootstrap-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "npm@12.0.2",
+  "dependencies": {
+    "is-number": "7.0.0"
+  },
+  "scripts": {
+    "test": "node test.mjs && node packages/child/test.mjs",
+    "postinstall": "node setup.mjs"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
+}

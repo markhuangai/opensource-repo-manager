@@ -269,7 +269,7 @@ export async function runBootstrapTests() {
     ],
   });
   try {
-    for (const sdk of ["codex", "claude"]) {
+    for (const sdk of ["claude", "codex"]) {
       currentSdk = sdk;
       const config = parseConfiguration(
         await readFile("/config/config.yml", "utf8"),
@@ -344,12 +344,17 @@ export async function runBootstrapTests() {
             ]
           : ["npm"];
       let lastReceipt;
-      for (const name of cases) {
+      const runCase = async (name) => {
         const python = ["pip", "poetry", "uv"].includes(name),
           go = ["go-cgo", "mixed"].includes(name);
         const sourceFiles = await files(
           `/bootstrap-fixtures/projects/${python ? "python-" + name : name === "mixed" ? "npm" : name}`,
         );
+        if (sdk === "codex" && name === "npm")
+          Object.assign(
+            sourceFiles,
+            await files("/bootstrap-fixtures/projects/npm-workspace"),
+          );
         if (name === "mixed")
           Object.assign(
             sourceFiles,
@@ -661,7 +666,12 @@ export async function runBootstrapTests() {
           ),
           commands: store.bootstrapCommands(receipt.id).length,
         });
-      }
+      };
+      // Defer the Go tree until fixtures that repeatedly scan shared tool storage finish.
+      for (const name of cases.filter(
+        (name) => !["go-cgo", "mixed"].includes(name),
+      ))
+        await runCase(name);
       currentPlan = makePlan(["node"], "npm");
       const source = sourceWith(
         await files("/bootstrap-fixtures/projects/npm"),
@@ -973,14 +983,36 @@ export async function runBootstrapTests() {
           /output_limit/,
         );
         assert.equal(limitedCommands.at(-1).outcome, "failed");
+        await supervisor.bootstrap.toolchains.verify(
+          lastReceipt.environment,
+          new globalThis.AbortController().signal,
+          () => {},
+          { output: 16 * 1024 * 1024, storage: 1 },
+        );
+        const limitedVersion = "24.17.0",
+          growthCommands = [];
         await assert.rejects(
-          supervisor.bootstrap.toolchains.verify(
-            lastReceipt.environment,
+          supervisor.bootstrap.toolchains.ensure(
+            {
+              version: 1,
+              toolchains: [{ language: "node", version: limitedVersion }],
+              system_packages: [],
+              package_managers: [],
+              setup_commands: [],
+              test_commands: [],
+            },
             new globalThis.AbortController().signal,
-            () => {},
+            (command) => growthCommands.push({ ...command }),
             { output: 16 * 1024 * 1024, storage: 1 },
           ),
           /storage_limit/,
+        );
+        assert(
+          growthCommands.some(
+            (command) =>
+              command.uid === 0 &&
+              command.argv.includes(`node@${limitedVersion}`),
+          ),
         );
         proof.push({ fixture: "installer-limits", outcome: "blocked" });
         const partialVersion = "24.18.1";
@@ -1048,6 +1080,10 @@ export async function runBootstrapTests() {
         assert.equal(store.bootstrap(lastReceipt.id).status, "ready");
         proof.push({ fixture: "restart-recovery", outcome: "passed" });
       }
+      for (const name of cases.filter((name) =>
+        ["go-cgo", "mixed"].includes(name),
+      ))
+        await runCase(name);
       await supervisor.close();
       supervisor = undefined;
     }

@@ -142,6 +142,109 @@ describe("structured bootstrap policy", () => {
     const result = await inspectWorkspace(root, 100000, signal);
     expect(result.fingerprints["mise.toml"]).toMatch(/^[a-f0-9]{64}$/);
   });
+  it.each([
+    [
+      "npm",
+      "12.0.2",
+      "package-lock.json",
+      '{"workspaces":["./packages/*/"]}',
+      "",
+    ],
+    ["pnpm", "12.14.0", "pnpm-lock.yaml", "{}", "packages:\n  - packages/*\n"],
+    [
+      "yarn",
+      "1.22.22",
+      "yarn.lock",
+      '{"workspaces":{"packages":["packages/*"]}}',
+      "",
+    ],
+    ["yarn", "4.18.1", "yarn.lock", '{"workspaces":["packages/*"]}', ""],
+  ])(
+    "associates %s %s workspace dependencies with their root lock and manager",
+    async (name, version, lock, pkg, pnpm) => {
+      const files: Record<string, string> = {
+        "package.json": pkg,
+        [lock]: lock.endsWith(".json") ? "{}" : "",
+        "packages/child/package.json": '{"dependencies":{"is-number":"7.0.0"}}',
+      };
+      if (pnpm) files["pnpm-workspace.yaml"] = pnpm;
+      const root = await source(files),
+        before = await inspectWorkspace(root, 100000, signal),
+        prepared = bootstrapPlanSchema.parse({
+          ...plan,
+          package_managers: [{ name, version, cwd: "." }],
+        });
+      expect(before.fingerprints["packages/child/package.json"]).toMatch(
+        /^[a-f0-9]{64}$/,
+      );
+      await expect(
+        inspectWorkspace(root, 100000, signal, prepared),
+      ).resolves.toMatchObject({
+        fingerprints: before.fingerprints,
+      });
+    },
+  );
+  it.each(["unrelated/child", "packages/excluded"])(
+    "does not borrow a workspace lock for %s",
+    async (directory) => {
+      const root = await source({
+        "package.json": '{"workspaces":["packages/*","!packages/excluded"]}',
+        "package-lock.json": "{}",
+        [`${directory}/package.json`]: '{"dependencies":{"is-number":"7.0.0"}}',
+      });
+      await expect(inspectWorkspace(root, 100000, signal)).rejects.toThrow(
+        "dependency_lock_required",
+      );
+    },
+  );
+  it("requires the owning root lock even when a workspace member has its own lock", async () => {
+    const root = await source({
+      "package.json": '{"workspaces":["packages/*"]}',
+      "packages/child/package.json": '{"dependencies":{"is-number":"7.0.0"}}',
+      "packages/child/package-lock.json": "{}",
+    });
+    await expect(inspectWorkspace(root, 100000, signal)).rejects.toThrow(
+      "dependency_lock_required",
+    );
+  });
+  it("requires workspace membership supported by the selected manager", async () => {
+    const root = await source({
+      "package.json": '{"workspaces":["packages/*"]}',
+      "pnpm-lock.yaml": "",
+      "packages/child/package.json": '{"dependencies":{"is-number":"7.0.0"}}',
+    });
+    const prepared = bootstrapPlanSchema.parse({
+      ...plan,
+      package_managers: [{ name: "pnpm", version: "12.14.0", cwd: "." }],
+    });
+    await expect(
+      inspectWorkspace(root, 100000, signal, prepared),
+    ).rejects.toThrow("dependency_manager_required");
+  });
+  it("skips generated dependency trees while preserving original cache manifests", async () => {
+    const root = await source({
+      "package.json": "{}",
+      ".yarn/cache/tracked/package.json": "{}",
+    });
+    const before = await inspectWorkspace(root, 100000, signal);
+    await mkdir(join(root, "node_modules", "generated"), { recursive: true });
+    await writeFile(
+      join(root, "node_modules", "generated", "package.json"),
+      "invalid generated manifest",
+    );
+    const after = await inspectWorkspace(
+      root,
+      100000,
+      signal,
+      undefined,
+      before.source_files,
+    );
+    expect(after.fingerprints).toEqual(before.fingerprints);
+    expect(after.source_files).toContain(".yarn/cache/tracked/package.json");
+    expect(after.source_files).not.toContain(
+      "node_modules/generated/package.json",
+    );
+  });
   it("fingerprints CI expressions and action versions as planning evidence", async () => {
     const workflow =
       'on: push\njobs:\n  test:\n    runs-on: ${{ matrix.os }}\n    steps:\n      - uses: actions/setup-node@v7\n        with:\n          node-version: "24.18.0"\n      - run: echo "${{ github.sha }}"\n';

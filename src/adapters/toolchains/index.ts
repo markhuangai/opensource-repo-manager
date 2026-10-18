@@ -109,19 +109,19 @@ export class Toolchains {
     const controller = new AbortController(),
       combined = AbortSignal.any([signal, controller.signal]);
     let output = 0;
+    const tracked = [
+      this.installs,
+      this.privateRoot,
+      "/var/cache/apt",
+      "/var/lib/apt/lists",
+      ...system,
+    ];
     const baseline = await Promise.all(
-      system.map((path) => treeBytes(path, Infinity)),
+      tracked.map((path) => treeBytes(path, Infinity)),
     );
     const check = async () => {
       let used = 0;
-      for (const path of [
-        this.installs,
-        this.privateRoot,
-        "/var/cache/apt",
-        "/var/lib/apt/lists",
-      ])
-        used += await treeBytes(path, limits.storage - used);
-      for (const [index, path] of system.entries())
+      for (const [index, path] of tracked.entries())
         used += Math.max(
           0,
           (await treeBytes(path, baseline[index] + limits.storage - used)) -
@@ -164,7 +164,7 @@ export class Toolchains {
       return result;
     };
     try {
-      await check();
+      combined.throwIfAborted();
       const result = await operation(execute);
       if (timer) await check();
       combined.throwIfAborted();

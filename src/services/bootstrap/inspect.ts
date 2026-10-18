@@ -1,6 +1,6 @@
 import { constants, type Stats } from "node:fs";
 import { open } from "node:fs/promises";
-import { dirname, basename } from "node:path";
+import { dirname, basename, matchesGlob } from "node:path";
 import { createHash } from "node:crypto";
 import { parse as toml } from "smol-toml";
 import { parseAllDocuments } from "yaml";
@@ -212,16 +212,25 @@ export async function inspectWorkspace(
       await handle.close();
     }
   };
+  const originalSet = original && new Set(original);
   await walkTree(workspace, async (path, ref, stat) => {
     signal.throwIfAborted();
     if (ref.split("/").includes(".git")) return false;
     if (!isContainedReference(ref))
       throw new RuntimeError("dependency_manifest_invalid");
-    if (stat.isDirectory()) return;
+    if (stat.isDirectory()) {
+      if (
+        original &&
+        /(?:^|\/)(?:node_modules|\.yarn\/cache)$/.test(ref) &&
+        !original.some((source) => source.startsWith(ref + "/"))
+      )
+        return false;
+      return;
+    }
     source_files.push(ref);
     if (
-      original &&
-      !original.includes(ref) &&
+      originalSet &&
+      !originalSet.has(ref) &&
       (ref.split("/").includes("node_modules") || ref.includes(".yarn/cache/"))
     )
       return;
@@ -274,6 +283,54 @@ export async function inspectWorkspace(
   for (const path of [...files.keys()])
     if (/^requirements.*\.txt$/.test(basename(path)))
       await requirements(path, new Set());
+  const nodeRoots = (path: string, manager?: string) => {
+    const directory = dirname(path),
+      roots = [directory];
+    let child = directory;
+    while (child !== ".") {
+      const parent = dirname(child),
+        prefix = parent === "." ? "" : parent + "/",
+        member = directory.slice(prefix.length),
+        pkg = files.get(prefix + "package.json") as
+          { workspaces?: string[] | { packages?: string[] } } | undefined,
+        workspaces = pkg?.workspaces,
+        pnpm = files.get(prefix + "pnpm-workspace.yaml") as
+          Array<{ packages?: string[] }> | undefined;
+      const matches = (patterns: unknown) => {
+        if (!Array.isArray(patterns)) return false;
+        const globs = patterns.map((value) => {
+          if (typeof value !== "string")
+            throw new RuntimeError("dependency_manifest_invalid");
+          const pattern = value
+            .replace(/^(!?)(?:\.\/)+/, "$1")
+            .replace(/\/+$/, "");
+          if (!isContainedReference(pattern.replace(/^!/, "")))
+            throw new RuntimeError("dependency_manifest_invalid");
+          return pattern;
+        });
+        return (
+          globs.some(
+            (pattern) =>
+              !pattern.startsWith("!") && matchesGlob(member, pattern),
+          ) &&
+          !globs.some(
+            (pattern) =>
+              pattern.startsWith("!") && matchesGlob(member, pattern.slice(1)),
+          )
+        );
+      };
+      if (
+        (manager !== "pnpm" &&
+          matches(
+            Array.isArray(workspaces) ? workspaces : workspaces?.packages,
+          )) ||
+        ((!manager || manager === "pnpm") && matches(pnpm?.[0]?.packages))
+      )
+        roots.push(parent);
+      child = parent;
+    }
+    return roots.length > 1 ? roots.slice(1) : roots;
+  };
   for (const [path, value] of files) {
     const prefix = dirname(path) === "." ? "" : dirname(path) + "/";
     if (
@@ -320,12 +377,14 @@ export async function inspectWorkspace(
     ].some((field) => Object.keys((pkg[field] ?? {}) as object).length);
     if (
       hasDependencies &&
-      ![
-        "package-lock.json",
-        "npm-shrinkwrap.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-      ].some((lock) => files.has(prefix + lock))
+      !nodeRoots(path).some((root) =>
+        [
+          "package-lock.json",
+          "npm-shrinkwrap.json",
+          "pnpm-lock.yaml",
+          "yarn.lock",
+        ].some((lock) => files.has((root === "." ? "" : root + "/") + lock)),
+      )
     )
       throw new RuntimeError("dependency_lock_required");
     if (
@@ -333,8 +392,8 @@ export async function inspectWorkspace(
       hasDependencies &&
       !plan.package_managers.some(
         (manager) =>
-          manager.cwd === (prefix ? prefix.slice(0, -1) : ".") &&
-          ["npm", "pnpm", "yarn"].includes(manager.name),
+          ["npm", "pnpm", "yarn"].includes(manager.name) &&
+          nodeRoots(path, manager.name).includes(manager.cwd),
       )
     )
       throw new RuntimeError("dependency_manager_required");
