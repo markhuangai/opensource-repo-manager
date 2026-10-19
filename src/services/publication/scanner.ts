@@ -133,7 +133,7 @@ export class PublicationScanner {
             !isScalar(document.contents) ||
             typeof document.contents.value !== "string"
           )
-            throw new RuntimeError("publication_structured_invalid");
+            continue;
           strings(document.contents.value, depth + 1);
         }
       } else if (Array.isArray(item))
@@ -231,7 +231,12 @@ export class PublicationScanner {
       child.on("close", (code) => {
         clearTimeout(timer);
         signal.removeEventListener("abort", stop);
-        if (failed || code !== 0 || (version && output.trim() !== "8.30.1"))
+        if (signal.aborted && code === null) reject(signal.reason);
+        else if (
+          failed ||
+          code !== 0 ||
+          (version && output.trim() !== "8.30.1")
+        )
           reject(new RuntimeError("publication_scan_failed"));
         else resolve();
       });

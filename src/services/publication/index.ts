@@ -248,12 +248,15 @@ export class PublicationService {
         this.repository.save(receipt);
         return receipt;
       } catch (error) {
+        const cancelled =
+          publicationSignal.aborted && error === publicationSignal.reason;
         this.failed(receipt, error);
         receipt.status = receipt.steps.some(
           (step) => step.state === "dispatching" || step.state === "uncertain",
         )
           ? "uncertain"
-          : (error instanceof IntakeError &&
+          : cancelled ||
+              (error instanceof IntakeError &&
                 ["github_rate_limited", "github_publication_failed"].includes(
                   error.code,
                 )) ||
@@ -265,6 +268,7 @@ export class PublicationService {
               ? "reviewed"
               : "prepared"
             : "blocked";
+        if (cancelled) receipt.retry_pending = true;
         this.repository.save(receipt);
         return receipt;
       } finally {

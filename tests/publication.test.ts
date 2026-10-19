@@ -362,6 +362,19 @@ describe("GitHub publication HTTP adapter", () => {
     );
     expect((await writer.repository(signal)).id).toBe(42);
     expect(await writer.actor(signal)).toEqual(fixture.state.actor);
+    fixture.state.comments.set(2, [
+      {
+        id: 91,
+        body: "App comment",
+        author_id: 8,
+        author_login: "github-actions[bot]",
+      },
+      { id: 92, body: "Deleted author", author_id: null },
+    ]);
+    expect(await writer.comments(2, signal)).toEqual([
+      { id: 91, body: "App comment", author_id: 8 },
+      { id: 92, body: "Deleted author", author_id: null },
+    ]);
     const retryAfter = new Date(Date.now() + 300000).toUTCString();
     fixture.state.rateLimit = {
       method: "GET",
@@ -410,5 +423,13 @@ describe("GitHub publication HTTP adapter", () => {
       signal,
     );
     expect((await writer.pull(pull.number, signal)).body).toBe("New evidence");
+    const remotePull = fixture.state.pulls[0];
+    remotePull.author = 8;
+    remotePull.author_login = "github-actions[bot]";
+    expect((await writer.pulls(branch, signal))[0].author_id).toBe(8);
+    remotePull.author = null;
+    expect((await writer.pull(pull.number, signal)).author_id).toBeNull();
+    fixture.state.actor.login = "github-actions[bot]";
+    await expect(writer.actor(signal)).rejects.toThrow();
   });
 });

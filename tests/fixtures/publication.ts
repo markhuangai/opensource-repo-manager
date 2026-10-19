@@ -85,7 +85,8 @@ export async function createPublicationFixture(root: string) {
     branch: string;
     base: string;
     state: string;
-    author: number;
+    author: number | null;
+    author_login?: string;
     draft: boolean;
   };
   const state = {
@@ -97,7 +98,12 @@ export async function createPublicationFixture(root: string) {
     protected: new Set<string>(),
     comments: new Map<
       number,
-      Array<{ id: number; body: string; author_id: number }>
+      Array<{
+        id: number;
+        body: string;
+        author_id: number | null;
+        author_login?: string;
+      }>
     >(),
     pulls: [] as Pull[],
     mutations: [] as string[],
@@ -129,7 +135,10 @@ export async function createPublicationFixture(root: string) {
     body: row.body,
     state: row.state,
     draft: row.draft,
-    user: { id: row.author, login: "fixture" },
+    user:
+      row.author === null
+        ? null
+        : { id: row.author, login: row.author_login ?? "fixture" },
     head: {
       sha: head(row.branch),
       ref: row.branch,
@@ -307,7 +316,10 @@ export async function createPublicationFixture(root: string) {
         send(
           comments.slice((page - 1) * 100, page * 100).map((row) => ({
             ...row,
-            user: { id: row.author_id, login: "fixture" },
+            user:
+              row.author_id === null
+                ? null
+                : { id: row.author_id, login: row.author_login ?? "fixture" },
           })),
         );
         return;

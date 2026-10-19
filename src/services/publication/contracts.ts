@@ -60,7 +60,11 @@ export const reviewResultSchema = z.strictObject({
   binding: hash,
   findings: z.array(z.string().max(4096)).max(64),
 });
-export type OwnedComment = { id: number; body: string; author_id: number };
+export type OwnedComment = {
+  id: number;
+  body: string;
+  author_id: number | null;
+};
 export type OwnedPull = {
   id: number;
   number: number;
@@ -68,7 +72,7 @@ export type OwnedPull = {
   body: string;
   head: string;
   base: string;
-  author_id: number;
+  author_id: number | null;
 };
 export type PublicationTarget = {
   job_id: number;

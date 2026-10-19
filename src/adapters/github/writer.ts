@@ -2,6 +2,7 @@ import { Octokit } from "@octokit/rest";
 import { z } from "zod";
 import {
   githubId,
+  issueComment,
   repositoryIdentity,
   sha,
   IntakeError,
@@ -16,13 +17,13 @@ const user = z.object({
   id: githubId,
   login: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]*$/),
 });
-const comment = z.object({ id: githubId, body: z.string(), user });
+const comment = issueComment.pick({ id: true, body: true, user: true });
 const pull = z.object({
   id: githubId,
   number: githubId,
   title: z.string(),
   body: z.string().nullable(),
-  user,
+  user: issueComment.shape.user,
   state: z.enum(["open", "closed"]),
   draft: z.boolean(),
   head: z.object({ sha, ref: z.string(), repo: z.object({ id: githubId }) }),
@@ -237,7 +238,11 @@ export class OctokitWriter implements GitHubWriter {
       )
     ).map((value) => {
       const row = comment.parse(value);
-      return { id: row.id, body: row.body, author_id: row.user.id };
+      return {
+        id: row.id,
+        body: row.body ?? "",
+        author_id: row.user?.id ?? null,
+      };
     });
   }
   private projection(value: unknown): RemotePull {
@@ -249,7 +254,7 @@ export class OctokitWriter implements GitHubWriter {
       body: row.body ?? "",
       head: row.head.sha,
       base: row.base.ref,
-      author_id: row.user.id,
+      author_id: row.user?.id ?? null,
       state: row.state,
       draft: row.draft,
       branch: row.head.ref,

@@ -278,6 +278,27 @@ export async function runPublicationTests() {
       };
       const scanner = supervisor.publication.outputReview.scanner;
       await scanner.scan({ ordinary: "verified text" }, signal());
+      const sourceText = String.raw`const emoji = "\u{1F600}";` + "\n";
+      for (const value of [
+        { path: "emoji.js", mode: "100644", text: sourceText },
+        `Example: ${sourceText}`,
+        {
+          path: "example.yaml",
+          mode: "100644",
+          text: `example: |\n  ${sourceText}`,
+        },
+      ])
+        await scanner.scan(value, signal());
+      const scanCancellation = new globalThis.AbortController(),
+        scanReason = new Error("fixture scanner cancellation"),
+        cancelledScan = scanner.scan("ordinary", scanCancellation.signal),
+        scanTimer = setTimeout(() => scanCancellation.abort(scanReason), 0);
+      try {
+        await assert.rejects(cancelledScan, (error) => error === scanReason);
+      } finally {
+        clearTimeout(scanTimer);
+      }
+      proof.push({ sdk, scanner_cancellation: "passed" });
       const unknownSecret = "ghp_" + "Ab9Cd8Ef7Gh6Ij5Kl4Mn3Op2Qr1St0Uv9Wx8";
       await assert.rejects(
         scanner.scan(
@@ -384,6 +405,13 @@ export async function runPublicationTests() {
         proposal = status(commentJob, "Verified investigation result.");
       remote.state.comments.set(commentJob.issue_number, [
         { id: 1, body: "A genuine human using the PAT account", author_id: 7 },
+        {
+          id: 2,
+          body: "Unrelated App comment",
+          author_id: 8,
+          author_login: "github-actions[bot]",
+        },
+        { id: 3, body: "Deleted author", author_id: null },
       ]);
       remote.state.dropAfter = "comment";
       const commentReceipt = await publish(proposal);
@@ -403,7 +431,7 @@ export async function runPublicationTests() {
       assert.equal((await publish(proposal)).id, commentReceipt.id);
       assert.equal(
         remote.state.comments.get(commentJob.issue_number).length,
-        2,
+        4,
       );
       assert(!store.owns("issue_comment", 1));
       remote.state.dropAfter = "comment";
@@ -412,6 +440,18 @@ export async function runPublicationTests() {
       );
       assert.equal(changed.status, "confirmed");
       assert.equal(changed.target.comment.id, commentReceipt.target.comment.id);
+      const ownedComment = remote.state.comments
+        .get(commentJob.issue_number)
+        .find((row) => row.id === changed.target.comment.id);
+      ownedComment.author_id = null;
+      const beforeUnknownComment = remote.state.mutations.length;
+      assert.equal(
+        (await publish(status(commentJob, "Unknown author must block")))
+          .failure,
+        "publication_comment_changed",
+      );
+      assert.equal(remote.state.mutations.length, beforeUnknownComment);
+      ownedComment.author_id = remote.state.actor.id;
       remote.state.comments
         .get(commentJob.issue_number)
         .find((row) => row.id === changed.target.comment.id).body =
@@ -505,6 +545,58 @@ export async function runPublicationTests() {
       await cancellationResult;
       assert.equal(store.leases().length, 0);
       assert.equal((await userProcesses(10003)).length, 0);
+      for (const cause of ["caller", "shutdown"]) {
+        const cancelledJob = seed(),
+          cancelledProposal = status(cancelledJob, `Retry after ${cause}`),
+          publicationCancellation = new globalThis.AbortController(),
+          beforeCancellation = remote.state.mutations.length;
+        let releasePublication, closing;
+        holdReview = new Promise((resolve) => {
+          releasePublication = resolve;
+        });
+        reviewEntered = false;
+        const cancelling = supervisor.publication.publish(
+          cancelledProposal,
+          publicationCancellation.signal,
+        );
+        try {
+          await until(() => reviewEntered);
+          if (cause === "shutdown") closing = supervisor.close();
+          else publicationCancellation.abort();
+        } finally {
+          releasePublication();
+          holdReview = undefined;
+        }
+        const cancelledReceipt = await cancelling;
+        await closing;
+        assert.equal(cancelledReceipt.status, "prepared");
+        assert.equal(cancelledReceipt.retry_pending, true);
+        assert.equal(remote.state.mutations.length, beforeCancellation);
+        if (cause === "shutdown") {
+          store.close();
+          store = new Store(database);
+          fixture.store = store;
+          supervisor = await Supervisor.create(
+            store,
+            snapshot,
+            secrets,
+            options,
+          );
+        }
+        const resumedPublication = await publish(cancelledProposal);
+        assert.equal(resumedPublication.status, "confirmed");
+        assert.equal(resumedPublication.id, cancelledReceipt.id);
+        assert.equal(
+          JSON.parse(store.jobById(cancelledJob.id).budget_json)
+            .infrastructure_retries,
+          1,
+        );
+        assert.equal(
+          (await publish(cancelledProposal)).id,
+          cancelledReceipt.id,
+        );
+      }
+      proof.push({ sdk, cancelled_publication_retry: "passed" });
       proof.push({ sdk, exact_review_binding: "passed" });
 
       const concurrentJob = seed(),
@@ -569,7 +661,10 @@ export async function runPublicationTests() {
       proof.push({ sdk, safe_git_read_retry: "passed" });
 
       const changeJob = seed();
-      let change = await candidate(changeJob, `${sdk}-initial`);
+      let change = await candidate(changeJob, `${sdk}-initial`, false, {
+        path: "emoji.js",
+        content: sourceText,
+      });
       const missing = await publish({
         ...change,
         evidence_ids: ["a".repeat(64), "b".repeat(64)],
@@ -579,6 +674,10 @@ export async function runPublicationTests() {
       const first = await publish(change);
       assert.equal(first.status, "confirmed", JSON.stringify(first));
       assert.equal(remote.head(first.target.branch), first.commit);
+      assert.equal(
+        remote.git(["show", `${first.commit}:emoji.js`]),
+        sourceText.trim(),
+      );
       assert.equal(
         remote.git(["show", `${first.commit}:app.txt`]),
         `${sdk}-initial`,
@@ -620,6 +719,15 @@ export async function runPublicationTests() {
         ownedPull = remote.state.pulls.find(
           (row) => row.id === first.target.pull.id,
         );
+      ownedPull.author = null;
+      const beforeUnknownPull = remote.state.mutations.length;
+      assert.equal(
+        (await publish({ ...closedPullChange, title: "Unknown PR author" }))
+          .failure,
+        "publication_pull_changed",
+      );
+      assert.equal(remote.state.mutations.length, beforeUnknownPull);
+      ownedPull.author = remote.state.actor.id;
       ownedPull.state = "closed";
       const beforeClosed = remote.state.mutations.length;
       assert.equal(
@@ -1061,6 +1169,14 @@ export async function runPublicationTests() {
       );
       const activeExhausted = seed(),
         activeLimit = snapshot.settings.limits.active_minutes * 60000;
+      remote.state.comments.set(activeExhausted.issue_number, [
+        {
+          id: 900000,
+          body: "Unrelated App comment",
+          author_id: 8,
+          author_login: "github-actions[bot]",
+        },
+      ]);
       store.db
         .prepare(
           "UPDATE jobs SET budget_json=json_set(budget_json,'$.active_ms',?) WHERE id=?",
