@@ -1,0 +1,9 @@
+{
+  "name": "python-project-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "npm@12.0.2",
+  "scripts": {
+    "postinstall": "python3 -c \"import os, pathlib, sys, packaging; assert os.getuid() != 0; assert sys.prefix == os.environ['VIRTUAL_ENV']; assert packaging.__version__ == '25.0'; pathlib.Path('.lifecycle-ran').write_text('passed')\""
+  }
+}

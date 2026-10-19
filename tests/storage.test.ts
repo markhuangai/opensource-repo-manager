@@ -90,7 +90,7 @@ describe("durable SQLite repositories", () => {
         private: false,
       }),
     ).toThrow("repository_changed");
-    store.db.pragma("user_version = 4");
+    store.db.pragma("user_version = 5");
     store.close();
     expect(() => new Store(path)).toThrow("schema_unsupported");
   });
@@ -291,12 +291,12 @@ describe("durable SQLite repositories", () => {
     const before = JSON.stringify(store.snapshot(legacy.digest));
     const budget = store.job(1)!.budget_json;
     store.db.exec(
-      "DROP TABLE mcp_calls; DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
+      "DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(3);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(4);
     expect(JSON.stringify(upgraded.snapshot(legacy.digest))).toBe(before);
     expect(upgraded.job(1)!.budget_json).toBe(budget);
     expect(upgraded.leases()).toMatchObject([{ token }]);
@@ -324,11 +324,13 @@ describe("durable SQLite repositories", () => {
       runs: store.runs(),
       snapshot: store.snapshot(snapshot.digest),
     };
-    store.db.exec("DROP TABLE mcp_calls; PRAGMA user_version=2");
+    store.db.exec(
+      "DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; PRAGMA user_version=2",
+    );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(3);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(4);
     expect({
       jobs: upgraded.jobs(),
       runs: upgraded.runs(),
@@ -375,7 +377,7 @@ describe("durable SQLite repositories", () => {
     seed(store, snapshot);
     const jobs = store.jobs();
     store.db.exec(
-      "DROP TABLE mcp_calls; CREATE TABLE mcp_calls(marker TEXT); INSERT INTO mcp_calls VALUES('preserve'); PRAGMA user_version=2",
+      "DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; CREATE TABLE mcp_calls(marker TEXT); INSERT INTO mcp_calls VALUES('preserve'); PRAGMA user_version=2",
     );
     store.close();
     expect(() => new Store(path)).toThrow();
@@ -386,6 +388,89 @@ describe("durable SQLite repositories", () => {
       expect(inspected.prepare("SELECT * FROM mcp_calls").all()).toEqual([
         { marker: "preserve" },
       ]);
+    } finally {
+      inspected.close();
+    }
+  });
+
+  it("upgrades v3 transactionally while preserving jobs, budgets, snapshots, sessions and MCP evidence", async () => {
+    const { store, path, snapshot } = await database();
+    const job = seed(store, snapshot),
+      token = store.acquireLease(job.id, job.revision)!;
+    store.startRuntimeLease(token, 60000);
+    store.startRun({
+      id: "v3-preserved",
+      job_id: job.id,
+      revision: job.revision,
+      role: "implementation",
+      uid: 10001,
+      parent_id: null,
+      lease_token: token,
+      binding_json: '{"binding":"preserved"}',
+    });
+    store.startMcpCall({
+      id: "v3-call",
+      run_id: "v3-preserved",
+      job_id: job.id,
+      revision: job.revision,
+      role: "implementation",
+      alias: "context",
+      tool: "read",
+      credential_binding: "a".repeat(64),
+      policy_identity: "b".repeat(64),
+      catalog_identity: "c".repeat(64),
+      request_digest: "d".repeat(64),
+      started_at: Date.now(),
+    });
+    store.finishMcpCall("v3-call", "completed", "e".repeat(64));
+    store.finishRun("v3-preserved", "completed", "saved-session", null);
+    const before = {
+      jobs: store.jobs(),
+      runs: store.runs(),
+      calls: store.mcpCalls(),
+      snapshot: store.snapshot(snapshot.digest),
+    };
+    store.db.exec(
+      "DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; PRAGMA user_version=3",
+    );
+    store.close();
+    const upgraded = new Store(path);
+    stores.push(upgraded);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(4);
+    expect({
+      jobs: upgraded.jobs(),
+      runs: upgraded.runs(),
+      calls: upgraded.mcpCalls(),
+      snapshot: upgraded.snapshot(snapshot.digest),
+    }).toEqual(before);
+    expect(
+      upgraded.db.prepare("SELECT count(*) AS n FROM bootstrap_attempts").get(),
+    ).toEqual({ n: 0 });
+  });
+
+  it("rolls back a failed v4 migration without changing v3 state", async () => {
+    const { store, path, snapshot } = await database();
+    seed(store, snapshot);
+    const before = store.jobs();
+    store.db.exec(
+      "DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; CREATE TABLE bootstrap_attempts(marker TEXT); INSERT INTO bootstrap_attempts VALUES('preserve'); PRAGMA user_version=3",
+    );
+    store.close();
+    expect(() => new Store(path)).toThrow();
+    const inspected = new Database(path);
+    try {
+      expect(inspected.pragma("user_version", { simple: true })).toBe(3);
+      expect(inspected.prepare("SELECT * FROM jobs").all()).toEqual(before);
+      expect(
+        inspected.prepare("SELECT * FROM bootstrap_attempts").all(),
+      ).toEqual([{ marker: "preserve" }]);
+      expect(
+        inspected
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name='bootstrap_commands'",
+          )
+          .all(),
+      ).toEqual([]);
     } finally {
       inspected.close();
     }

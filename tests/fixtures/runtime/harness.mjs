@@ -16,6 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   loadProtectedConfiguration,
@@ -24,8 +25,12 @@ import {
 import { Store } from "/opt/orm/app/dist/repositories/store.js";
 import { Supervisor } from "/opt/orm/app/dist/runtime/supervisor.js";
 import {
+  cleanEnvironment,
   cleanSource,
+  cleanUser,
+  deletedFileBytes,
   sourceProcesses,
+  spawnAsRole,
   userProcesses,
 } from "/opt/orm/app/dist/runtime/process.js";
 import { treeBytes } from "/opt/orm/app/dist/services/workspaces/files.js";
@@ -398,6 +403,104 @@ export async function runRuntimeTests() {
     codexProof;
   const errors = [];
   try {
+    const storageControl = join(base, "storage-control");
+    await writeFile(
+      `${storageControl}.c`,
+      '#include <sys/prctl.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <stdlib.h>\nint main(int c,char **v){int f=open(v[1],O_CREAT|O_RDWR,0600);if(f<0||ftruncate(f,307200)||unlink(v[1])||dup(f)<0||prctl(PR_SET_DUMPABLE,0))return 1;puts("ready");fflush(stdout);char b;if(read(0,&b,1)!=1)return 2;int ms=atoi(v[2]);if(ms>=0){usleep(ms*1000);if(prctl(PR_SET_DUMPABLE,1))return 3;}for(;;)pause();}',
+    );
+    execFileSync("/usr/bin/cc", [`${storageControl}.c`, "-o", storageControl]);
+    await chmod(storageControl, 0o555);
+    for (const waits of [[125], [-1], [100, 400]]) {
+      const controls = [];
+      try {
+        for (const wait of waits) {
+          const child = spawnAsRole(
+              "implementation",
+              storageControl,
+              [
+                join("/tmp", `orm-storage-${randomBytes(8).toString("hex")}`),
+                String(wait),
+              ],
+              {
+                cwd: "/",
+                env: cleanEnvironment("/home/coding", "/tmp", "coding"),
+                processes: 128,
+              },
+            ),
+            closed = once(child, "close");
+          controls.push({ child, closed });
+          child.stderr.resume();
+          await Promise.race([
+            once(child.stdout, "data", { signal: AbortSignal.timeout(2000) }),
+            closed.then(() => {
+              throw new Error("storage control exited before readiness");
+            }),
+          ]);
+          child.stdout.resume();
+        }
+        const started = Date.now(),
+          probe = deletedFileBytes(10001, 1024 ** 2);
+        for (const { child } of controls) child.stdin.end("go");
+        if (waits.length === 1 && waits[0] >= 0) {
+          assert.equal(await probe, 300 * 1024);
+          await assert.rejects(deletedFileBytes(10001, 300 * 1024 - 1), {
+            code: "storage_limit",
+          });
+        } else {
+          await assert.rejects(probe, { code: "monitor_failed" });
+          assert(Date.now() - started >= 250);
+        }
+      } finally {
+        await cleanUser(10001);
+        await Promise.all(controls.map(({ closed }) => closed));
+      }
+      assert.deepEqual(await userProcesses(10001), []);
+      tests++;
+    }
+    const churnDeadline = Date.now() + 3000,
+      churn = Array.from({ length: 4 }, async () => {
+        do {
+          const child = spawnAsRole(
+              "implementation",
+              "/opt/orm-runtime/bin/node",
+              [
+                "-e",
+                'const memory=Array.from({length:128},()=>Buffer.alloc(1024*1024,1));console.log("ready");setInterval(()=>{},1000)',
+              ],
+              {
+                cwd: "/",
+                env: cleanEnvironment("/home/coding", "/tmp", "coding"),
+                processes: 128,
+              },
+            ),
+            closed = once(child, "close");
+          child.stderr.resume();
+          try {
+            await Promise.race([
+              once(child.stdout, "data", { signal: AbortSignal.timeout(2000) }),
+              closed.then(() => {
+                throw new Error("Node teardown worker exited before readiness");
+              }),
+            ]);
+          } finally {
+            child.kill("SIGKILL");
+            await closed;
+          }
+        } while (Date.now() < churnDeadline);
+      });
+    const churnObserved = Promise.allSettled(churn);
+    try {
+      do {
+        assert.equal(await deletedFileBytes(10001, 1024 ** 2), 0);
+      } while (Date.now() < churnDeadline);
+    } finally {
+      await churnObserved;
+      await cleanUser(10001);
+    }
+    for (const result of await churnObserved)
+      if (result.status === "rejected") throw result.reason;
+    assert.deepEqual(await userProcesses(10001), []);
+    tests++;
     const bootstrap = spawn(
       process.execPath,
       [
@@ -468,19 +571,28 @@ export async function runRuntimeTests() {
     tests++;
     const cleanupId = "source-cleanup-deadline",
       cleanupStage = join(root, "private", "sources", cleanupId),
-      now = Date.now;
+      now = performance.now;
     for (const quietScans of [1, 2, 3]) {
       let ticks = 0;
-      Date.now = () => (ticks++ < quietScans ? 0 : 3000);
+      performance.now = () => (ticks++ < quietScans ? 0 : 3000);
       try {
         const cleanup = cleanSource(cleanupId, cleanupStage);
         if (quietScans < 3)
           await assert.rejects(cleanup, { code: "cleanup_failed" });
         else await cleanup;
       } finally {
-        Date.now = now;
+        performance.now = now;
       }
     }
+    const wallClock = Date.now;
+    let wallClockReads = 0;
+    Date.now = () => wallClock() + (wallClockReads++ === 0 ? 0 : 5165);
+    try {
+      await cleanSource(cleanupId, cleanupStage);
+    } finally {
+      Date.now = wallClock;
+    }
+    tests++;
     const sourceProbe = spawn(
         process.execPath,
         ["-e", 'console.log("ready");setInterval(()=>{},1000)'],
@@ -504,13 +616,13 @@ export async function runRuntimeTests() {
         sourceProbe.pid,
       ]);
       let ticks = 0;
-      Date.now = () => (ticks++ === 0 ? 0 : 3000);
+      performance.now = () => (ticks++ === 0 ? 0 : 3000);
       try {
         await assert.rejects(cleanSource(cleanupId, cleanupStage), {
           code: "cleanup_failed",
         });
       } finally {
-        Date.now = now;
+        performance.now = now;
       }
       const [, signal] = await sourceExited;
       assert.equal(signal, "SIGKILL");

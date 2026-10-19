@@ -20,7 +20,7 @@ roles:
   bootstrap:
     profile: coding
     prompts: { system: system.md, user: user.md }
-    skills: [example]
+    skills: [example, bootstrap]
   investigation:
     profile: coding
     prompts: { system: system.md, user: user.md }
@@ -32,7 +32,7 @@ roles:
   audit:
     profile: review
     prompts: { system: system.md, user: user.md }
-    skills: [example]
+    skills: [example, bootstrap]
   output_review:
     profile: review
     prompts: { system: system.md, user: user.md }

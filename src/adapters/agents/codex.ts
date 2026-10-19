@@ -65,11 +65,14 @@ export function codexOptions(request: WorkerRequest): {
     throw new RuntimeError("codex_authorization_missing");
   if (request.role === "output_review" && request.mcp.length)
     throw new RuntimeError("codex_review_tools_forbidden");
-  const environment = cleanEnvironment(
-    request.home,
-    request.temporary,
-    roleUsers[request.role].name,
-  ) as Record<string, string>;
+  const environment = {
+    ...cleanEnvironment(
+      request.home,
+      request.temporary,
+      roleUsers[request.role].name,
+    ),
+    ...request.environment,
+  } as Record<string, string>;
   const connections = Object.fromEntries(
     request.mcp.map((server, index) => [
       server.alias,

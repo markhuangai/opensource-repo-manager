@@ -388,12 +388,14 @@ export class WorkspaceService {
     limit: number,
     signal: AbortSignal,
     sessionCredentials?: KnownSecretChecker,
+    excluded: (reference: string) => boolean = () => false,
   ): Promise<ArtifactManifest> {
     const manifest: ArtifactManifest = { ...request, files: [] };
     let total = 0;
     await walkTree(workspace, async (path, reference, stat) => {
       signal.throwIfAborted();
       if (reference.split("/").includes(".git")) return false;
+      if (excluded(reference)) return false;
       if (!isContainedReference(reference))
         throw new RuntimeError("artifact_path_invalid");
       total += stat.size;

@@ -45,6 +45,8 @@ const setup = `${id}-setup`;
 const volume = `${id}-data`;
 const network = `${id}-network`;
 const github = `${id}-github`;
+const bootstrapContainer = `${id}-bootstrap`;
+const bootstrapVolume = `${id}-bootstrap-data`;
 const canary = `orm-secret-canary-${randomUUID()}`;
 const resources = [];
 const cleanupErrors = [];
@@ -639,6 +641,8 @@ try {
     `type=bind,src=${join(root, "tests", "fixtures", "runtime")},dst=/runtime-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(root, "tests", "integration", "agents")},dst=/agent-fixtures,readonly`,
+    "--mount",
+    `type=bind,src=${join(root, "tests", "integration", "bootstrap")},dst=/bootstrap-fixtures,readonly`,
   );
   const connection = [
     "--network",
@@ -938,6 +942,45 @@ try {
   assert.equal(runtimeProof.codex_sdk?.protocol, "responses_http_sse");
   assert.equal(runtimeProof.codex_sdk?.cleanup, "passed");
 
+  register("volume", bootstrapVolume);
+  docker(["volume", "create", "--label", `${label}=${id}`, bootstrapVolume]);
+  register("container", bootstrapContainer);
+  docker([
+    "run",
+    "--detach",
+    "--name",
+    bootstrapContainer,
+    "--label",
+    `${label}=${id}`,
+    "--platform",
+    platform,
+    "--mount",
+    `type=volume,src=${bootstrapVolume},dst=/data`,
+    ...mounts,
+    image,
+  ]);
+  await waitForHealth(bootstrapContainer);
+  const bootstrapProof = JSON.parse(
+    docker(
+      [
+        "exec",
+        bootstrapContainer,
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        "import {runBootstrapTests} from '/bootstrap-fixtures/harness.mjs'; console.log(JSON.stringify(await runBootstrapTests()));",
+      ],
+      { timeout: 2_400_000 },
+    ),
+  );
+  assert.equal(bootstrapProof.bootstrap, "passed");
+  assert.equal(bootstrapProof.cleanup, "passed");
+  assert.equal(
+    request("/readyz", {}, bootstrapContainer).body.reason,
+    "automation_not_implemented",
+  );
+  stopCleanly(bootstrapContainer);
+
   const healthyDeadline = Date.now() + 30_000;
   while (
     inspectRuntime().State.Health.Status === "starting" &&
@@ -977,6 +1020,7 @@ try {
     webhook_intake_and_crash_recovery: "passed",
     immutable_secret_free_snapshots: "passed",
     supervised_workers: runtimeProof,
+    repository_bootstrap: bootstrapProof,
   };
 } catch (error) {
   failure = error;

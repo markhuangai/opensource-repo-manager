@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { verifyAgent } from "./conformance.mjs";
 
-async function respond(req, res, fixture) {
+export async function respond(req, res, fixture) {
   const { config, mcpCredential, store, root, requests, histories, errors } =
     fixture;
   try {
@@ -31,7 +31,9 @@ async function respond(req, res, fixture) {
               .map((block) => block.text),
       )
       .join("\n");
-    const scenario = /"scenario":"([^"]+)"/.exec(text)?.[1];
+    const scenario =
+      /"scenario":"([^"]+)"/.exec(text)?.[1] ??
+      /"task":"(bootstrap_[^"]+)"/.exec(text)?.[1];
     assert(scenario, "Missing verbatim task context");
     assert(JSON.stringify(body.system).includes("OPERATOR_SYSTEM_CANARY"));
     assert(JSON.stringify(body.system).includes("OPERATOR_SKILL_CANARY"));
@@ -81,7 +83,25 @@ async function respond(req, res, fixture) {
       res.end("event: message_start\ndata: {not-json}\n\n");
       return;
     }
-    if (scenario === "crash") {
+    if (["bootstrap_plan", "bootstrap_audit"].includes(scenario)) {
+      use("StructuredOutput", fixture.bootstrap(scenario, text));
+    } else if (scenario === "bootstrap_environment" && !results.length) {
+      use("Bash", {
+        command: fixture.environmentCommand,
+        timeout: 600000,
+        description: "Verify the prepared toolchain and dependency environment",
+      });
+    } else if (scenario === "bootstrap_environment") {
+      assert(!results.at(-1).is_error, JSON.stringify(results.at(-1)));
+      const latest =
+        typeof results.at(-1).content === "string"
+          ? results.at(-1).content
+          : results
+              .at(-1)
+              .content.map((block) => block.text ?? "")
+              .join("\n");
+      assert(/(?:^|\n)BOOTSTRAP_TESTS_PASSED(?:\n|$)/.test(latest), latest);
+    } else if (scenario === "crash") {
       use("Bash", {
         command: 'kill -ABRT "$PPID"',
         description: "Crash the native SDK process",

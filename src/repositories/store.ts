@@ -11,6 +11,10 @@ import { dirname, join, parse, relative, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { immutable } from "../config/bundles.ts";
 import type { RunSnapshot } from "../config/load.ts";
+import type {
+  BootstrapReceipt,
+  CommandReceipt,
+} from "../services/bootstrap/contracts.ts";
 import {
   digest,
   RuntimeError,
@@ -80,7 +84,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (version !== 0 && version !== 1 && version !== 2 && version !== 3)
+      if (![0, 1, 2, 3, 4].includes(version as number))
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -180,6 +184,22 @@ export class Store {
         `),
           )
           .immediate();
+      if ([0, 1, 2, 3].includes(version as number))
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE bootstrap_attempts (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, status TEXT NOT NULL, receipt_json TEXT NOT NULL
+          );
+          CREATE TABLE bootstrap_commands (
+            id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES bootstrap_attempts(id),
+            run_id TEXT, receipt_json TEXT NOT NULL
+          );
+          PRAGMA user_version = 4;
+        `),
+          )
+          .immediate();
     } catch (error) {
       this.db.close();
       throw error;
@@ -188,6 +208,83 @@ export class Store {
 
   close() {
     this.db.close();
+  }
+
+  saveBootstrap(receipt: BootstrapReceipt, lease: string) {
+    if (
+      !["blocked", "interrupted"].includes(receipt.status) &&
+      !this.runtimeCurrent(lease)
+    )
+      throw new RuntimeError("revision_stale");
+    const owned = this.db
+      .prepare(
+        "SELECT 1 FROM coding_lease WHERE token=? AND job_id=? AND revision=?",
+      )
+      .get(lease, receipt.job_id, receipt.revision);
+    if (!owned) throw new RuntimeError("revision_stale");
+    this.db
+      .prepare(
+        `INSERT INTO bootstrap_attempts VALUES(@id,@job_id,@revision,@status,@receipt)
+      ON CONFLICT(id) DO UPDATE SET status=excluded.status,receipt_json=excluded.receipt_json`,
+      )
+      .run({
+        id: receipt.id,
+        job_id: receipt.job_id,
+        revision: receipt.revision,
+        status: receipt.status,
+        receipt: JSON.stringify(receipt),
+      });
+  }
+
+  bootstrap(id: string): BootstrapReceipt {
+    const row = this.db
+      .prepare("SELECT receipt_json FROM bootstrap_attempts WHERE id=?")
+      .get(id) as { receipt_json: string } | undefined;
+    if (!row) throw new RuntimeError("bootstrap_receipt_missing");
+    return JSON.parse(row.receipt_json) as BootstrapReceipt;
+  }
+
+  recordBootstrapCommand(
+    attempt: string,
+    run: string | null,
+    receipt: CommandReceipt,
+  ) {
+    this.db
+      .prepare(
+        `INSERT INTO bootstrap_commands VALUES(?,?,?,?) ON CONFLICT(id)
+      DO UPDATE SET receipt_json=excluded.receipt_json`,
+      )
+      .run(receipt.id, attempt, run, JSON.stringify(receipt));
+  }
+
+  bootstrapCommands(attempt: string): CommandReceipt[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT receipt_json FROM bootstrap_commands WHERE attempt_id=? ORDER BY rowid",
+        )
+        .all(attempt) as { receipt_json: string }[]
+    ).map((row) => JSON.parse(row.receipt_json) as CommandReceipt);
+  }
+
+  interruptBootstrap() {
+    this.db
+      .transaction(() => {
+        this.db
+          .prepare(
+            `UPDATE bootstrap_attempts SET status='interrupted',
+        receipt_json=json_set(receipt_json,'$.status','interrupted','$.finished_at',?,'$.failure','bootstrap_interrupted')
+        WHERE status NOT IN ('ready','blocked','interrupted')`,
+          )
+          .run(Date.now());
+        this.db
+          .prepare(
+            `UPDATE bootstrap_commands SET receipt_json=json_set(receipt_json,
+        '$.outcome','interrupted','$.finished_at',?) WHERE json_extract(receipt_json,'$.outcome')='running'`,
+          )
+          .run(Date.now());
+      })
+      .immediate();
   }
 
   repository(): RepositoryIdentity | undefined {

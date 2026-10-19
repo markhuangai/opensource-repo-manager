@@ -119,6 +119,7 @@ export function claudeOptions(
         request.temporary,
         roleUsers[request.role].name,
       ),
+      ...request.environment,
       CLAUDE_CONFIG_DIR: join(request.home, ".claude"),
       CLAUDE_CODE_PROJECT_DIR_NAME: request.binding,
       ANTHROPIC_BASE_URL: request.relay.url.replace(/\/v1\/?$/, ""),
@@ -342,10 +343,14 @@ export async function* run(
         ...options,
         systemPrompt: [system, ...skills],
         spawnClaudeCodeProcess: ({ command, args, ...processOptions }) => {
-          const child = spawn(command, args, {
-            ...processOptions,
-            stdio: "pipe",
-          });
+          const child = spawn(
+            command === "node" ? process.execPath : command,
+            args,
+            {
+              ...processOptions,
+              stdio: "pipe",
+            },
+          );
           exited = new Promise((resolve) => {
             child.once("close", (code, signal) => resolve({ code, signal }));
             child.once("error", () => resolve({ code: null, signal: null }));
