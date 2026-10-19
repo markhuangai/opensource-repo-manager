@@ -968,11 +968,30 @@ export async function runPublicationTests() {
       const uncertainJob = seed(),
         uncertainProposal = status(uncertainJob, "Uncertain effect");
       remote.state.rejectBefore = "comment";
-      assert.equal((await publish(uncertainProposal)).status, "uncertain");
+      const uncertainReceipt = await publish(uncertainProposal);
+      assert.equal(uncertainReceipt.status, "uncertain");
       const beforeUncertain = remote.state.mutations.length;
       assert.equal((await publish(uncertainProposal)).status, "uncertain");
       await assert.rejects(
         publish(status(uncertainJob, "Another create")),
+        /publication_pending/,
+      );
+      assert.equal(remote.state.mutations.length, beforeUncertain);
+      store.db
+        .prepare("UPDATE jobs SET revision=revision+1 WHERE id=?")
+        .run(uncertainJob.id);
+      assert.equal(
+        (await supervisor.publication.reconcile(uncertainReceipt.id, signal()))
+          .status,
+        "uncertain",
+      );
+      await assert.rejects(
+        publish({
+          job_id: uncertainJob.id,
+          revision: uncertainJob.revision + 1,
+          kind: "notice",
+          reason: "publication_blocked",
+        }),
         /publication_pending/,
       );
       assert.equal(remote.state.mutations.length, beforeUncertain);
@@ -1058,7 +1077,7 @@ export async function runPublicationTests() {
         const result = await recovering;
         assert.equal(
           result.status,
-          boundary === "pull" ? "confirmed" : "reviewed",
+          boundary === "pull" ? "confirmed" : "blocked",
           JSON.stringify(result),
         );
         assert.equal(
@@ -1072,10 +1091,87 @@ export async function runPublicationTests() {
           ).length,
           boundary === "pull" ? 1 : 0,
         );
-        if (boundary === "branch")
-          await assert.rejects(publish(recoveryProposal), /revision_stale/);
+        assert.equal((await publish(recoveryProposal)).id, result.id);
+        assert.equal(
+          result.failure,
+          boundary === "branch" ? "revision_stale" : null,
+        );
+        const current = store.jobById(recoveryJob.id);
+        const currentNotice = await publish({
+          job_id: current.id,
+          revision: current.revision,
+          kind: "notice",
+          reason: "publication_blocked",
+        });
+        assert.equal(currentNotice.status, "confirmed");
+        assert.equal(currentNotice.target.head, pending.commit);
+        assert.deepEqual(remote.state.mutations.slice(beforeRecovery), [
+          "comment",
+        ]);
       }
       proof.push({ sdk, branch_pull_restart_and_serialization: "passed" });
+
+      const stalePreparedJob = seed(),
+        staleCancellation = new globalThis.AbortController();
+      let releasePreparation,
+        preparationEntered = false;
+      const heldPreparation = new Promise((resolve) => {
+        releasePreparation = resolve;
+      });
+      remote.state.beforeRequest = async (method, path) => {
+        if (method === "GET" && path === "/repos/owner/repo") {
+          preparationEntered = true;
+          await heldPreparation;
+        }
+      };
+      const preparing = supervisor.publication.publish(
+        status(stalePreparedJob, "Cancelled before payload preparation"),
+        staleCancellation.signal,
+      );
+      try {
+        await until(() => preparationEntered);
+        store.db
+          .prepare("UPDATE jobs SET revision=revision+1 WHERE id=?")
+          .run(stalePreparedJob.id);
+        staleCancellation.abort();
+      } finally {
+        remote.state.beforeRequest = undefined;
+        releasePreparation();
+      }
+      const stalePrepared = await preparing;
+      assert.equal(stalePrepared.status, "prepared");
+      assert.equal(stalePrepared.actor, null);
+      assert.equal(stalePrepared.payload, null);
+      store.db
+        .prepare(
+          "UPDATE jobs SET budget_json=json_set(budget_json,'$.infrastructure_retries',?) WHERE id=?",
+        )
+        .run(config.limits.infrastructure_retries, stalePreparedJob.id);
+      const beforeRetirement = remote.state.requests.length;
+      const retired = await supervisor.publication.reconcile(
+        stalePrepared.id,
+        signal(),
+      );
+      assert.equal(retired.status, "blocked");
+      assert.equal(retired.failure, "revision_stale");
+      assert.equal(remote.state.requests.length, beforeRetirement);
+      assert.equal(
+        JSON.parse(store.jobById(stalePreparedJob.id).budget_json)
+          .infrastructure_retries,
+        config.limits.infrastructure_retries,
+      );
+      assert.equal(
+        (
+          await publish({
+            job_id: stalePreparedJob.id,
+            revision: stalePreparedJob.revision + 1,
+            kind: "notice",
+            reason: "publication_blocked",
+          })
+        ).status,
+        "confirmed",
+      );
+      proof.push({ sdk, superseded_operation_recovery: "passed" });
 
       const nestedJob = seed(),
         cancellation = new globalThis.AbortController();
@@ -1125,6 +1221,62 @@ export async function runPublicationTests() {
         /output_review_cancelled/,
       );
       proof.push({ sdk, one_slot_review: "passed" });
+
+      const noticeCrashJob = seed(),
+        noticeCrashProposal = {
+          job_id: noticeCrashJob.id,
+          revision: noticeCrashJob.revision,
+          kind: "notice",
+          reason: "model_unavailable",
+        },
+        beforeNoticeCrash = remote.state.mutations.length,
+        beforeNoticeModels = requests.length;
+      modelDown = true;
+      remote.state.rejectBefore = "comment";
+      const interruptedNotice = await publish(noticeCrashProposal);
+      assert.equal(interruptedNotice.status, "uncertain");
+      assert.equal(remote.state.mutations.length, beforeNoticeCrash);
+      const orphanReview = supervisor.publication.repository.reviewed(
+        interruptedNotice.review_id,
+      );
+      const beforeReviewPointer = globalThis.structuredClone(interruptedNotice);
+      beforeReviewPointer.status = "prepared";
+      beforeReviewPointer.failure = null;
+      beforeReviewPointer.review_id = null;
+      beforeReviewPointer.retry_at = 0;
+      beforeReviewPointer.retry_pending = false;
+      for (const step of beforeReviewPointer.steps) step.state = "prepared";
+      // Reproduce the durable state after review insertion but before its operation pointer is saved.
+      supervisor.publication.repository.save(beforeReviewPointer);
+      await supervisor.close();
+      store.close();
+      store = new Store(database);
+      fixture.store = store;
+      supervisor = await Supervisor.create(store, snapshot, secrets, options);
+      const recoveredNotice = await publish(noticeCrashProposal);
+      assert.equal(recoveredNotice.status, "confirmed");
+      assert.equal(recoveredNotice.id, interruptedNotice.id);
+      assert.notEqual(recoveredNotice.review_id, orphanReview.id);
+      assert.deepEqual(
+        supervisor.publication.repository.reviewed(orphanReview.id),
+        orphanReview,
+      );
+      assert.equal(
+        supervisor.publication.repository.reviewed(recoveredNotice.review_id)
+          .binding,
+        orphanReview.binding,
+      );
+      assert.deepEqual(remote.state.mutations.slice(beforeNoticeCrash), [
+        "comment",
+      ]);
+      assert.equal(
+        remote.state.comments.get(noticeCrashJob.issue_number).length,
+        1,
+      );
+      assert.equal((await publish(noticeCrashProposal)).id, recoveredNotice.id);
+      assert.equal(requests.length, beforeNoticeModels);
+      modelDown = false;
+      proof.push({ sdk, notice_review_crash_recovery: "passed" });
 
       const outageJob = seed();
       modelDown = true;

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -157,7 +158,11 @@ export class PublicationService {
           await this.reconcileCurrent(receipt.id, publicationSignal);
           const reconciled = this.repository.operation(receipt.id)!;
           Object.assign(receipt, reconciled);
-          if (receipt.status === "uncertain" || receipt.status === "confirmed")
+          if (
+            receipt.status === "uncertain" ||
+            receipt.status === "confirmed" ||
+            receipt.status === "blocked"
+          )
             return receipt;
         }
         await this.authority(receipt, publicationSignal);
@@ -176,10 +181,7 @@ export class PublicationService {
           if (proposal.kind === "notice") {
             await this.outputReview.scanner.scan(payload, publicationSignal);
             receipt.review_id = this.repository.review({
-              id: digest({
-                operation: receipt.id,
-                binding: this.outputReview.binding(reviewRequest),
-              }),
+              id: randomUUID(),
               job_id: job.id,
               revision: job.revision,
               binding: this.outputReview.binding(reviewRequest),
@@ -239,9 +241,16 @@ export class PublicationService {
             if (publicationSignal.aborted || Date.now() < receipt.retry_at)
               return receipt;
           }
-          await this.reconcileCurrent(receipt.id, publicationSignal);
-          Object.assign(receipt, this.repository.operation(receipt.id)!);
-          if (receipt.status === "uncertain") return receipt;
+          const reconciled = await this.reconcileCurrent(
+            receipt.id,
+            publicationSignal,
+          );
+          Object.assign(receipt, reconciled);
+          if (
+            reconciled.status === "uncertain" ||
+            reconciled.status === "blocked"
+          )
+            return receipt;
         }
         receipt.status = "confirmed";
         receipt.failure = null;
@@ -305,6 +314,10 @@ export class PublicationService {
     if (!receipt) throw new RuntimeError("publication_missing");
     if (receipt.status === "confirmed" || receipt.status === "blocked")
       return receipt;
+    if (this.finishReconciliation(receipt)) {
+      this.repository.save(receipt);
+      return receipt;
+    }
     this.repository.retry(receipt);
     try {
       const job = this.store.jobById(receipt.job_id);
@@ -370,13 +383,7 @@ export class PublicationService {
           return receipt;
         }
       }
-      if (
-        receipt.steps.length &&
-        receipt.steps.every((step) => step.state === "confirmed")
-      ) {
-        receipt.status = "confirmed";
-        receipt.failure = null;
-      }
+      this.finishReconciliation(receipt);
       this.repository.save(receipt);
       return receipt;
     } catch (error) {
@@ -391,6 +398,31 @@ export class PublicationService {
       this.repository.save(receipt);
       return receipt;
     }
+  }
+
+  private finishReconciliation(receipt: PublicationReceipt) {
+    if (
+      !receipt.steps.every(
+        (step) => step.state === "confirmed" || step.state === "prepared",
+      )
+    )
+      return false;
+    const complete =
+      receipt.steps.length > 0 &&
+      receipt.steps.every((step) => step.state === "confirmed");
+    if (!complete) {
+      try {
+        this.repository.current(receipt.job_id, receipt.revision);
+        return false;
+      } catch (error) {
+        if (!(error instanceof RuntimeError) || error.code !== "revision_stale")
+          throw error;
+      }
+    }
+    receipt.status = complete ? "confirmed" : "blocked";
+    receipt.failure = complete ? null : "revision_stale";
+    receipt.retry_pending = false;
+    return true;
   }
 
   private async prepare(
