@@ -25,6 +25,8 @@ import type { SourceMetadata } from "../domain/jobs.ts";
 import type { Store } from "../repositories/store.ts";
 import { ModelRelay } from "../services/model-relay.ts";
 import { BootstrapService } from "../services/bootstrap/index.ts";
+import { PublicationService } from "../services/publication/index.ts";
+import type { GitHubWriter } from "../adapters/github/writer.ts";
 import { runCommand } from "../adapters/toolchains/process.ts";
 import {
   WorkspaceService,
@@ -101,6 +103,7 @@ export type SupervisorOptions = {
   workers?: Partial<Record<"claude" | "codex", string>>;
   mcp?: McpSessionProvider;
   sourceUrl?: (repository: string) => string;
+  publicationWriter?: (ready: () => void) => GitHubWriter;
 };
 
 export class Supervisor implements AgentRunner {
@@ -109,6 +112,7 @@ export class Supervisor implements AgentRunner {
   private readonly tasks = new Set<Promise<void>>();
   readonly workspaces: WorkspaceService;
   readonly bootstrap: BootstrapService;
+  readonly publication: PublicationService;
   private readonly bootstrapLeases = new Set<BootstrapLease>();
   private readonly bootstrapOutput = new Map<string, number>();
   private readonly relay: ModelRelay;
@@ -133,6 +137,10 @@ export class Supervisor implements AgentRunner {
     );
     this.relay = new ModelRelay(store, snapshot.settings.proxy.url, secrets);
     this.bootstrap = new BootstrapService(this, store, secrets);
+    this.publication = new PublicationService(this, store, secrets, {
+      writer: options.publicationWriter,
+      sourceUrl: options.sourceUrl,
+    });
   }
 
   static async create(
@@ -190,6 +198,22 @@ export class Supervisor implements AgentRunner {
     });
   }
 
+  repositoryName() {
+    return this.snapshot.settings.github.repository;
+  }
+
+  reviewCurrent(parentId: string, jobId: number, revision: number) {
+    const parent = this.active.get(parentId);
+    return (
+      !!parent &&
+      parent.request.job_id === jobId &&
+      parent.request.revision === revision &&
+      !parent.signal.aborted &&
+      parent.deadline > Date.now() &&
+      this.store.runtimeCurrent(parent.lease)
+    );
+  }
+
   run(
     request: AgentRunRequest,
     signal: AbortSignal,
@@ -198,6 +222,14 @@ export class Supervisor implements AgentRunner {
   }
 
   async withBootstrapLease<T>(
+    request: AgentRunRequest,
+    signal: AbortSignal,
+    operation: (session: BootstrapLease) => Promise<T>,
+  ): Promise<T> {
+    return this.withJobLease(request, signal, operation);
+  }
+
+  async withJobLease<T>(
     request: AgentRunRequest,
     signal: AbortSignal,
     operation: (session: BootstrapLease) => Promise<T>,
@@ -271,6 +303,10 @@ export class Supervisor implements AgentRunner {
   }
 
   runBootstrapAgent(session: BootstrapLease, request: AgentRunRequest) {
+    return this.runJobAgent(session, request);
+  }
+
+  runJobAgent(session: BootstrapLease, request: AgentRunRequest) {
     this.validateBootstrapLease(session, request);
     return this.execute(request, session.signal, undefined, session);
   }

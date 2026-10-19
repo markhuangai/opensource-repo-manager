@@ -48,7 +48,7 @@ export type PreparedWorkspace = {
   prompts: { system: string; user: string; skills: string };
 };
 
-function validateArtifactLinks(files: readonly ArtifactFile[]) {
+export function validateArtifactLinks(files: readonly ArtifactFile[]) {
   const entries = new Map<string, ArtifactFile>();
   for (const file of files) {
     if (

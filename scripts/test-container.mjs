@@ -643,6 +643,10 @@ try {
     `type=bind,src=${join(root, "tests", "integration", "agents")},dst=/agent-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(root, "tests", "integration", "bootstrap")},dst=/bootstrap-fixtures,readonly`,
+    "--mount",
+    `type=bind,src=${join(root, "tests", "integration", "publication")},dst=/publication-fixtures,readonly`,
+    "--mount",
+    `type=bind,src=${join(root, "tests", "fixtures", "publication.ts")},dst=/publication-fixture.ts,readonly`,
   );
   const connection = [
     "--network",
@@ -942,6 +946,22 @@ try {
   assert.equal(runtimeProof.codex_sdk?.protocol, "responses_http_sse");
   assert.equal(runtimeProof.codex_sdk?.cleanup, "passed");
 
+  const publicationProof = JSON.parse(
+    docker(
+      [
+        "exec",
+        runtime,
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        "import {runPublicationTests} from '/publication-fixtures/harness.mjs'; console.log(JSON.stringify(await runPublicationTests()));",
+      ],
+      { timeout: 600_000 },
+    ),
+  );
+  assert.equal(publicationProof.publication, "passed");
+  assert.equal(publicationProof.cleanup, "passed");
+
   register("volume", bootstrapVolume);
   docker(["volume", "create", "--label", `${label}=${id}`, bootstrapVolume]);
   register("container", bootstrapContainer);
@@ -1020,6 +1040,7 @@ try {
     webhook_intake_and_crash_recovery: "passed",
     immutable_secret_free_snapshots: "passed",
     supervised_workers: runtimeProof,
+    reviewed_publication: publicationProof,
     repository_bootstrap: bootstrapProof,
   };
 } catch (error) {
