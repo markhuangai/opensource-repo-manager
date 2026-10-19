@@ -229,6 +229,29 @@ export class Supervisor implements AgentRunner {
     return this.withJobLease(request, signal, operation);
   }
 
+  async withPublicationNotice<T>(
+    signal: AbortSignal,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const current = AbortSignal.any([
+      signal,
+      this.controller.signal,
+      AbortSignal.timeout(30000),
+    ]);
+    current.throwIfAborted();
+    const task = operation(current);
+    const tracked = task.then(
+      () => {},
+      () => {},
+    );
+    this.tasks.add(tracked);
+    try {
+      return await task;
+    } finally {
+      this.tasks.delete(tracked);
+    }
+  }
+
   async withJobLease<T>(
     request: AgentRunRequest,
     signal: AbortSignal,

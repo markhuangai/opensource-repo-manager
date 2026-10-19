@@ -11,7 +11,7 @@ import { digest, RuntimeError, workerLimits } from "../../domain/agents.ts";
 import { IntakeError } from "../../domain/jobs.ts";
 import type { Store } from "../../repositories/store.ts";
 import { PublicationRepository } from "../../repositories/publication.ts";
-import type { Supervisor } from "../../runtime/supervisor.ts";
+import type { BootstrapLease, Supervisor } from "../../runtime/supervisor.ts";
 import { rootDirectory } from "../workspaces/files.ts";
 import { ExternalOutputReview } from "./review.ts";
 import { policyIdentity } from "./scanner.ts";
@@ -119,8 +119,10 @@ export class PublicationService {
     if (previous?.status === "confirmed" || previous?.status === "blocked")
       return previous;
     this.repository.current(proposal.job_id, proposal.revision);
-    const request = this.supervisor.request(proposal.job_id, "output_review");
-    return this.supervisor.withJobLease(request, signal, async (lease) => {
+    const operation = async (
+      publicationSignal: AbortSignal,
+      lease?: BootstrapLease,
+    ) => {
       const job = this.repository.current(proposal.job_id, proposal.revision);
       const source = (
         JSON.parse(job.input_json) as { source: PublicationReceipt["source"] }
@@ -152,13 +154,13 @@ export class PublicationService {
               step.state === "dispatching" || step.state === "uncertain",
           )
         ) {
-          await this.reconcileCurrent(receipt.id, lease.signal);
+          await this.reconcileCurrent(receipt.id, publicationSignal);
           const reconciled = this.repository.operation(receipt.id)!;
           Object.assign(receipt, reconciled);
           if (receipt.status === "uncertain" || receipt.status === "confirmed")
             return receipt;
         }
-        await this.authority(receipt, lease.signal);
+        await this.authority(receipt, publicationSignal);
         await rootDirectory(this.root);
         directory = await mkdtemp(join(this.root, "git-"));
         await rmdir(directory);
@@ -168,11 +170,11 @@ export class PublicationService {
           this.supervisor.repositoryName(),
           this.options.sourceUrl,
         );
-        const payload = await this.prepare(receipt, git, lease.signal);
+        const payload = await this.prepare(receipt, git, publicationSignal);
         const reviewRequest = this.reviewRequest(receipt);
         if (!receipt.review_id) {
           if (proposal.kind === "notice") {
-            await this.outputReview.scanner.scan(payload, lease.signal);
+            await this.outputReview.scanner.scan(payload, publicationSignal);
             receipt.review_id = this.repository.review({
               id: digest({
                 operation: receipt.id,
@@ -188,7 +190,11 @@ export class PublicationService {
             }).id;
           } else
             receipt.review_id = (
-              await this.outputReview.review(reviewRequest, lease.signal, lease)
+              await this.outputReview.review(
+                reviewRequest,
+                publicationSignal,
+                lease,
+              )
             ).id;
           receipt.status = "reviewed";
           this.repository.save(receipt);
@@ -196,10 +202,10 @@ export class PublicationService {
         for (let index = 0; index < receipt.steps.length; index++) {
           const step = receipt.steps[index];
           if (step.state === "confirmed") continue;
-          await this.authority(receipt, lease.signal);
+          await this.authority(receipt, publicationSignal);
           this.approval(receipt);
-          await this.before(receipt, step, lease.signal);
-          lease.signal.throwIfAborted();
+          await this.before(receipt, step, publicationSignal);
+          publicationSignal.throwIfAborted();
           this.repository.current(job.id, job.revision);
           this.repository.providerReady();
           step.state = "dispatching";
@@ -211,29 +217,29 @@ export class PublicationService {
                 job.issue_number,
                 receipt.target.comment?.id ?? null,
                 payload.comment!,
-                lease.signal,
+                publicationSignal,
               );
             else if (step.kind === "branch")
               await git!.push(
                 receipt.commit!,
                 receipt.target.branch,
-                lease.signal,
+                publicationSignal,
               );
             else
               await this.writer.updatePull(
                 receipt.target.pull?.number ?? null,
                 payload.pull!,
-                lease.signal,
+                publicationSignal,
               );
           } catch (error) {
             this.failed(receipt, error);
             step.state = "uncertain";
             receipt.status = "uncertain";
             this.repository.save(receipt);
-            if (lease.signal.aborted || Date.now() < receipt.retry_at)
+            if (publicationSignal.aborted || Date.now() < receipt.retry_at)
               return receipt;
           }
-          await this.reconcileCurrent(receipt.id, lease.signal);
+          await this.reconcileCurrent(receipt.id, publicationSignal);
           Object.assign(receipt, this.repository.operation(receipt.id)!);
           if (receipt.status === "uncertain") return receipt;
         }
@@ -252,7 +258,9 @@ export class PublicationService {
                   error.code,
                 )) ||
               (error instanceof RuntimeError &&
-                error.code === "publication_backoff")
+                ["publication_backoff", "publication_git_failed"].includes(
+                  error.code,
+                ))
             ? receipt.review_id
               ? "reviewed"
               : "prepared"
@@ -262,7 +270,16 @@ export class PublicationService {
       } finally {
         if (directory) await rm(directory, { recursive: true, force: true });
       }
-    });
+    };
+    return proposal.kind === "notice"
+      ? this.supervisor.withPublicationNotice(signal, (noticeSignal) =>
+          operation(noticeSignal),
+        )
+      : this.supervisor.withJobLease(
+          this.supervisor.request(proposal.job_id, "output_review"),
+          signal,
+          (lease) => operation(lease.signal, lease),
+        );
   }
 
   async reconcile(
@@ -642,6 +659,10 @@ export class PublicationService {
       this.repository.deferProvider(error.retryAt);
       receipt.retry_at = Math.max(receipt.retry_at, error.retryAt);
       receipt.retry_pending = true;
-    }
+    } else if (
+      error instanceof RuntimeError &&
+      error.code === "publication_git_failed"
+    )
+      receipt.retry_pending = true;
   }
 }

@@ -535,6 +535,39 @@ export async function runPublicationTests() {
       );
       proof.push({ sdk, serialization: "passed" });
 
+      const gitRetryJob = seed(),
+        gitRetryChange = await candidate(gitRetryJob, `${sdk}-git-retry`),
+        beforeGitRetry = remote.state.mutations.length,
+        beforeInfrastructure = JSON.parse(
+          store.jobById(gitRetryJob.id).budget_json,
+        ).infrastructure_retries;
+      remote.state.rateLimit = {
+        method: "GET",
+        path: "/owner/repo.git/info/refs",
+        seconds: 0,
+      };
+      const failedFetch = await publish(gitRetryChange);
+      assert.equal(failedFetch.status, "prepared");
+      assert.equal(failedFetch.failure, "publication_git_failed");
+      assert.equal(remote.state.rateLimit, null);
+      assert.equal(failedFetch.retry_pending, true);
+      assert.equal(failedFetch.review_id, null);
+      assert.equal(remote.state.mutations.length, beforeGitRetry);
+      const retriedFetch = await publish(gitRetryChange);
+      assert.equal(
+        retriedFetch.status,
+        "confirmed",
+        JSON.stringify(retriedFetch),
+      );
+      assert.equal(retriedFetch.id, failedFetch.id);
+      assert.equal(
+        JSON.parse(store.jobById(gitRetryJob.id).budget_json)
+          .infrastructure_retries,
+        beforeInfrastructure + 1,
+      );
+      assert.equal((await publish(gitRetryChange)).id, retriedFetch.id);
+      proof.push({ sdk, safe_git_read_retry: "passed" });
+
       const changeJob = seed();
       let change = await candidate(changeJob, `${sdk}-initial`);
       const missing = await publish({
@@ -1026,6 +1059,37 @@ export async function runPublicationTests() {
         ).status,
         "confirmed",
       );
+      const activeExhausted = seed(),
+        activeLimit = snapshot.settings.limits.active_minutes * 60000;
+      store.db
+        .prepare(
+          "UPDATE jobs SET budget_json=json_set(budget_json,'$.active_ms',?) WHERE id=?",
+        )
+        .run(activeLimit, activeExhausted.id);
+      modelDown = true;
+      const beforeActiveNotice = requests.length;
+      await assert.rejects(
+        publish(status(activeExhausted, "No active-time budget")),
+        /active_budget_exhausted/,
+      );
+      assert.equal(
+        (
+          await publish({
+            job_id: activeExhausted.id,
+            revision: activeExhausted.revision,
+            kind: "notice",
+            reason: "budget_exhausted",
+          })
+        ).status,
+        "confirmed",
+      );
+      assert.equal(requests.length, beforeActiveNotice);
+      const activeUsage = JSON.parse(
+        store.jobById(activeExhausted.id).budget_json,
+      );
+      assert.equal(activeUsage.active_ms, activeLimit);
+      assert.equal(activeUsage.model_requests, 0);
+      modelDown = false;
       assert.equal(store.leases().length, 0);
       assert.equal(
         errors.length,
@@ -1033,7 +1097,48 @@ export async function runPublicationTests() {
         errors.map((error) => error.message).join("\n"),
       );
       proof.push({ sdk, outage_and_budgets: "passed" });
-      await supervisor.close();
+
+      let noticeEntered = false,
+        releaseNotice,
+        noticeTimer;
+      const heldNotice = new Promise((resolve) => {
+        releaseNotice = resolve;
+      });
+      remote.state.beforeRequest = async (method, path) => {
+        if (method === "GET" && path === "/repos/owner/repo") {
+          noticeEntered = true;
+          await heldNotice;
+        }
+      };
+      const beforeShutdown = remote.state.mutations.length;
+      const noticeDuringShutdown = publish({
+        job_id: activeExhausted.id,
+        revision: activeExhausted.revision,
+        kind: "notice",
+        reason: "publication_blocked",
+      });
+      await until(() => noticeEntered);
+      const stopping = supervisor.close();
+      try {
+        const [receipt] = await Promise.race([
+          Promise.all([noticeDuringShutdown, stopping]),
+          new Promise((_, reject) => {
+            noticeTimer = globalThis.setTimeout(
+              () => reject(new Error("notice shutdown timed out")),
+              5000,
+            );
+          }),
+        ]);
+        assert.equal(receipt.status, "prepared");
+        assert.equal(remote.state.mutations.length, beforeShutdown);
+        assert.equal(store.leases().length, 0);
+      } finally {
+        globalThis.clearTimeout(noticeTimer);
+        remote.state.beforeRequest = undefined;
+        releaseNotice();
+        await Promise.all([noticeDuringShutdown, stopping]);
+      }
+      proof.push({ sdk, notice_shutdown: "passed" });
       supervisor = undefined;
     }
     assert.equal(
