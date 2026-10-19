@@ -84,7 +84,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (![0, 1, 2, 3, 4].includes(version as number))
+      if (![0, 1, 2, 3, 4, 5].includes(version as number))
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -199,6 +199,26 @@ export class Store {
           PRAGMA user_version = 4;
         `),
           )
+          .immediate();
+      if ([0, 1, 2, 3, 4].includes(version as number))
+        this.db
+          .transaction(() => {
+            this.db.exec(`
+            CREATE TABLE publication_instance (id TEXT PRIMARY KEY, retry_at INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE publication_evidence (id TEXT PRIMARY KEY, content TEXT NOT NULL);
+            CREATE TABLE output_reviews (id TEXT PRIMARY KEY, content TEXT NOT NULL);
+            CREATE TABLE publication_targets (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), content TEXT NOT NULL);
+            CREATE TABLE publication_operations (
+              id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), status TEXT NOT NULL, content TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX pending_publication ON publication_operations(job_id)
+              WHERE status NOT IN ('confirmed','blocked');
+            PRAGMA user_version = 5;
+          `);
+            this.db
+              .prepare("INSERT INTO publication_instance(id) VALUES(?)")
+              .run(randomUUID());
+          })
           .immediate();
     } catch (error) {
       this.db.close();

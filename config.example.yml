@@ -36,7 +36,7 @@ roles:
   output_review:
     profile: review
     prompts: { system: system.md, user: user.md }
-    skills: [example]
+    skills: [example, output-review]
 notifications:
   webhook:
     enabled: true

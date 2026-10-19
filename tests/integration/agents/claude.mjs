@@ -33,7 +33,7 @@ export async function respond(req, res, fixture) {
       .join("\n");
     const scenario =
       /"scenario":"([^"]+)"/.exec(text)?.[1] ??
-      /"task":"(bootstrap_[^"]+)"/.exec(text)?.[1];
+      /"task":"(bootstrap_[^"]+|external_output_review)"/.exec(text)?.[1];
     assert(scenario, "Missing verbatim task context");
     assert(JSON.stringify(body.system).includes("OPERATOR_SYSTEM_CANARY"));
     assert(JSON.stringify(body.system).includes("OPERATOR_SKILL_CANARY"));
@@ -83,7 +83,11 @@ export async function respond(req, res, fixture) {
       res.end("event: message_start\ndata: {not-json}\n\n");
       return;
     }
-    if (["bootstrap_plan", "bootstrap_audit"].includes(scenario)) {
+    if (scenario === "external_output_review") {
+      assert(!toolNames.includes("Bash"));
+      assert(!toolNames.some((name) => name.startsWith("mcp__")));
+      use("StructuredOutput", await fixture.outputReview(text));
+    } else if (["bootstrap_plan", "bootstrap_audit"].includes(scenario)) {
       use("StructuredOutput", fixture.bootstrap(scenario, text));
     } else if (scenario === "bootstrap_environment" && !results.length) {
       use("Bash", {

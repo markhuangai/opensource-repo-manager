@@ -88,7 +88,7 @@ export async function respond(req, res, fixture) {
     const text = strings(body.input).join("\n");
     const scenario =
       /"scenario":"([^"]+)"/.exec(text)?.[1] ??
-      /"task":"(bootstrap_[^"]+)"/.exec(text)?.[1];
+      /"task":"(bootstrap_[^"]+|external_output_review)"/.exec(text)?.[1];
     assert(scenario, "Missing verbatim task context");
     assert(data.includes("OPERATOR_SYSTEM_CANARY"));
     assert(data.includes("OPERATOR_SKILL_CANARY"));
@@ -270,13 +270,20 @@ export async function respond(req, res, fixture) {
     }
     if (previous && ["tools", "hostile"].includes(scenario))
       assert(strings(results).join("\n").includes("OPERATOR_REFERENCE_CANARY"));
-    const final = ["bootstrap_plan", "bootstrap_audit"].includes(scenario)
-      ? JSON.stringify(fixture.bootstrap(scenario, text))
-      : scenario === "structured"
-        ? '{"value":"validated"}'
-        : scenario === "invalid"
-          ? '{"value":123}'
-          : "fixture-completed";
+    if (scenario === "external_output_review") {
+      assert(!names.includes("exec_command"));
+      assert(!names.some((name) => name.startsWith("mcp__")));
+    }
+    const final =
+      scenario === "external_output_review"
+        ? JSON.stringify(await fixture.outputReview(text))
+        : ["bootstrap_plan", "bootstrap_audit"].includes(scenario)
+          ? JSON.stringify(fixture.bootstrap(scenario, text))
+          : scenario === "structured"
+            ? '{"value":"validated"}'
+            : scenario === "invalid"
+              ? '{"value":123}'
+              : "fixture-completed";
     send(
       res,
       output

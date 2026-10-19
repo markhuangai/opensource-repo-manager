@@ -17,6 +17,15 @@ RUN apt-get update && apt-get install --no-install-recommends -y curl ca-certifi
     && printf '%s  /build/mise.tar.gz\n' "$mise_sha" | sha256sum --check - \
     && tar -xzf /build/mise.tar.gz -C /build \
     && chmod 0555 /build/mise/bin/mise
+RUN case "$TARGETARCH" in \
+      amd64) leaks_arch=x64; leaks_sha=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;; \
+      arm64) leaks_arch=arm64; leaks_sha=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080 ;; \
+      *) exit 1 ;; \
+    esac \
+    && curl --fail --silent --show-error --location "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${leaks_arch}.tar.gz" --output /build/gitleaks.tar.gz \
+    && printf '%s  /build/gitleaks.tar.gz\n' "$leaks_sha" | sha256sum --check - \
+    && tar -xzf /build/gitleaks.tar.gz -C /build gitleaks \
+    && chmod 0555 /build/gitleaks
 
 FROM node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
 RUN apt-get update \
@@ -38,6 +47,7 @@ COPY --from=build /build/package.json ./
 COPY --from=build /build/node_modules ./node_modules
 COPY --from=build /build/dist ./dist
 COPY --from=build /build/mise/bin/mise /opt/orm-runtime/bin/mise
+COPY --from=build --chown=0:0 /build/gitleaks /opt/orm-runtime/bin/gitleaks
 EXPOSE 8080
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
