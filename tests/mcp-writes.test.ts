@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { digest } from "../src/domain/agents.ts";
@@ -366,6 +367,135 @@ describe("MCP write schema and evidence contracts", () => {
 });
 
 describe("durable MCP writes", () => {
+  it("serves readiness within a bounded heap after retaining large provider results", async () => {
+    const f = await setup();
+    f.store.db.transaction(() => {
+      for (let number = 2; number < 202; number++) {
+        f.store.discover([number], 1, true);
+        f.store.applyIssue(
+          f.store.nextDirty()!,
+          { ...f.context, id: 10000 + number, number },
+          f.loaded.snapshot,
+        );
+        const job = f.store.job(number)!,
+          operation = f.operation(`history-${number}`);
+        operation.job_id = job.id;
+        operation.binding = { ...operation.binding, job_id: job.id };
+        f.repository.begin(operation);
+        f.repository.dispatch(operation, false);
+        f.repository.finish(
+          operation,
+          {
+            kind: "result",
+            value: {
+              content: [{ type: "text", text: "x".repeat(128 * 1024) }],
+            },
+          },
+          null,
+        );
+      }
+    })();
+    const script = `
+      import {Store} from ${JSON.stringify(new URL("../src/repositories/store.ts", import.meta.url).href)};
+      import {McpWriteService} from ${JSON.stringify(new URL("../src/services/mcp-writes/index.ts", import.meta.url).href)};
+      import {createApp} from ${JSON.stringify(new URL("../src/http/app.ts", import.meta.url).href)};
+      const store = new Store(process.argv[1]);
+      const service = new McpWriteService(null, store, null, null);
+      await service.initialize();
+      const app = createApp(undefined, undefined, undefined, service);
+      await app.ready();
+      globalThis.gc();
+      const response = await app.inject({method:'GET',url:'/readyz'});
+      console.log(JSON.stringify({status:response.statusCode,body:response.json()}));
+      await app.close();
+      store.close();
+    `;
+    const output = execFileSync(
+      process.execPath,
+      [
+        "--expose-gc",
+        "--max-old-space-size=64",
+        "--input-type=module",
+        "-e",
+        script,
+        f.path,
+      ],
+      { encoding: "utf8", timeout: 10000, stdio: "pipe" },
+    );
+    expect(JSON.parse(output)).toMatchObject({
+      status: 503,
+      body: {
+        reason: "automation_not_implemented",
+        mcp_writes: { response_recorded: 200, uncertain: 0, reason: null },
+      },
+    });
+  });
+
+  it("counts every state and notification failure while reconciling only interrupted writes", async () => {
+    const f = await setup(),
+      states = [
+        "proposed",
+        "rejected",
+        "dispatching",
+        "response_recorded",
+        "uncertain",
+      ] as const;
+    for (const [index, state] of states.entries()) {
+      const number = index + 2;
+      f.store.discover([number], 1, true);
+      f.store.applyIssue(
+        f.store.nextDirty()!,
+        { ...f.context, id: 10000 + number, number },
+        f.loaded.snapshot,
+      );
+      const job = f.store.job(number)!,
+        operation = f.operation(state);
+      operation.job_id = job.id;
+      operation.binding = { ...operation.binding, job_id: job.id };
+      f.repository.begin(operation);
+      if (state === "rejected") {
+        operation.state = "rejected";
+        f.repository.save(operation);
+      } else if (state !== "proposed") {
+        f.repository.dispatch(operation, false);
+        if (state !== "dispatching")
+          f.repository.finish(
+            operation,
+            state === "response_recorded"
+              ? { kind: "result", value: { content: [] } }
+              : null,
+            state === "uncertain" ? "mcp_timeout" : null,
+          );
+        if (state === "uncertain") {
+          operation.notification = "failed";
+          f.repository.save(operation);
+        }
+      }
+    }
+    expect(f.repository.counts()).toEqual({
+      proposed: 1,
+      rejected: 1,
+      dispatching: 1,
+      response_recorded: 1,
+      uncertain: 1,
+      notification_failed: 1,
+    });
+    expect(f.repository.all(["uncertain"]).map((op) => op.id)).toEqual([
+      "uncertain",
+    ]);
+    const settled = f.repository.receipt("response_recorded");
+    f.repository.interrupt();
+    expect(f.repository.counts()).toEqual({
+      proposed: 0,
+      rejected: 2,
+      dispatching: 0,
+      response_recorded: 1,
+      uncertain: 2,
+      notification_failed: 1,
+    });
+    expect(f.repository.receipt("response_recorded")).toEqual(settled);
+  });
+
   it("blocks ordinary leases when response persistence fails after dispatch intent", async () => {
     const f = await setup(),
       op = f.operation(),

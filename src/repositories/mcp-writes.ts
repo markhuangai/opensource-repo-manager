@@ -4,6 +4,7 @@ import { budgetUsage } from "../domain/jobs.ts";
 import type {
   McpWriteOperation,
   McpWriteAttempt,
+  WriteState,
   WriteResponse,
 } from "../services/mcp-writes/contracts.ts";
 import type { Store } from "./store.ts";
@@ -22,12 +23,44 @@ export class McpWriteRepository {
     return JSON.parse(row.content) as McpWriteOperation;
   }
 
-  all(): McpWriteOperation[] {
+  all(states?: readonly WriteState[]): McpWriteOperation[] {
     return (
       this.store.db
-        .prepare("SELECT content FROM mcp_write_operations ORDER BY rowid")
-        .all() as { content: string }[]
+        .prepare(
+          `SELECT content FROM mcp_write_operations
+          ${states ? `WHERE state IN (${states.map(() => "?").join(",")})` : ""}
+          ORDER BY rowid`,
+        )
+        .all(...(states ?? [])) as { content: string }[]
     ).map((row) => JSON.parse(row.content) as McpWriteOperation);
+  }
+
+  counts() {
+    const counts = {
+      proposed: 0,
+      rejected: 0,
+      dispatching: 0,
+      response_recorded: 0,
+      uncertain: 0,
+      notification_failed: 0,
+    };
+    const rows = this.store.db
+      .prepare(
+        "SELECT state,COUNT(*) AS total FROM mcp_write_operations GROUP BY state",
+      )
+      .all() as Array<{
+      state: WriteState;
+      total: number;
+    }>;
+    for (const row of rows) counts[row.state] = row.total;
+    counts.notification_failed = (
+      this.store.db
+        .prepare(
+          "SELECT COUNT(*) AS total FROM mcp_write_operations WHERE json_extract(content,'$.notification')='failed'",
+        )
+        .get() as { total: number }
+    ).total;
+    return counts;
   }
 
   attempts(id: string): McpWriteAttempt[] {
@@ -170,7 +203,7 @@ export class McpWriteRepository {
   }
 
   interrupt() {
-    for (const operation of this.all()) {
+    for (const operation of this.all(["proposed", "dispatching"])) {
       if (operation.state === "dispatching")
         this.finish(operation, null, "mcp_write_interrupted");
       else if (operation.state === "proposed") {

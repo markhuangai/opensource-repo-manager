@@ -268,13 +268,18 @@ export async function runMcpWriteTests() {
     supervisor.mcpWrites.repository
       .all()
       .findLast((op) => op.job_id === job.id);
-  const boot = async () => {
+  const boot = async (openFailures = []) => {
     gateway = new McpGateway(store, snapshot, secrets);
     const open = gateway.open.bind(gateway);
     gateway.open = async (request) => {
-      const session = await open(request);
-      workerAuthorization = session.connections[0]?.authorization;
-      return session;
+      try {
+        const session = await open(request);
+        workerAuthorization = session.connections[0]?.authorization;
+        return session;
+      } catch (error) {
+        openFailures.push(error.code);
+        throw error;
+      }
     };
     options.mcp = gateway;
     supervisor = await Supervisor.create(store, snapshot, secrets, options);
@@ -450,6 +455,50 @@ export async function runMcpWriteTests() {
           };
         },
       };
+      const normalSnapshot = snapshot,
+        normalSecrets = secrets,
+        unavailableConfig = globalThis.structuredClone(config),
+        openFailures = [];
+      unavailableConfig.profiles.reviewer =
+        sdk === "codex"
+          ? {
+              sdk: "claude",
+              model: "auto",
+              behaves_as: "claude-opus-4-8",
+              effort: "xhigh",
+            }
+          : { sdk: "codex", model: "gpt-5.5", effort: "xhigh" };
+      unavailableConfig.roles.output_review.profile = "reviewer";
+      const unavailable = separateSecrets(unavailableConfig);
+      snapshot = createRunSnapshot(
+        unavailable.settings,
+        bundles,
+        unavailable.secrets,
+      );
+      secrets = unavailable.secrets;
+      try {
+        await boot(openFailures);
+        const job = seed(),
+          before = calls.length;
+        assert.equal(supervisor.outputReviewAvailable(), false);
+        assert.equal((await run(job)).outcome, "failed");
+        assert.deepEqual(openFailures, ["mcp_write_review_unavailable"]);
+        assert.equal(calls.length, before);
+        assert.equal(operation(job), undefined);
+        assert.equal(
+          store
+            .runs()
+            .filter(
+              (run) => run.job_id === job.id && run.role === "output_review",
+            ).length,
+          0,
+        );
+        proof.push({ sdk, review_unavailable: "blocked" });
+      } finally {
+        await shutdown();
+        snapshot = normalSnapshot;
+        secrets = normalSecrets;
+      }
       await boot();
       const scanner = supervisor.publication.outputReview.scanner,
         generatedKey = "89abcdef-0123-4567-89ab-cdef01234567",

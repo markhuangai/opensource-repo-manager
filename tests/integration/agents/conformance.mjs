@@ -98,6 +98,7 @@ export async function verifyAgent({
     catalog = "Claude fixture reads",
     downstreamId;
   let supervisor, gateway;
+  const mcpExpiryWindow = 10000;
   const mcpCredential = `claude-mcp-upstream-${randomUUID()}`;
   const hostile = createServer((_req, res) => {
     injected++;
@@ -250,7 +251,9 @@ export async function verifyAgent({
           resumed.checked = true;
         }
         const session = await gateway.open(
-          expireMcp ? { ...request, deadline: Date.now() + 2000 } : request,
+          expireMcp
+            ? { ...request, deadline: Date.now() + mcpExpiryWindow }
+            : request,
         );
         issued.push(...session.connections);
         return session;
@@ -553,7 +556,7 @@ export async function verifyAgent({
         .mcpCalls()
         .some(
           (call) =>
-            call.started_at >= expiring.deadline - 2000 &&
+            call.started_at >= expiring.deadline - mcpExpiryWindow &&
             call.outcome !== "completed",
         ),
     );

@@ -57,7 +57,7 @@ export class McpWriteService implements McpWriteDispatcher {
 
   async initialize() {
     this.repository.interrupt();
-    for (const operation of this.repository.all())
+    for (const operation of this.repository.all(["uncertain"]))
       if (
         operation.state === "uncertain" &&
         operation.notification !== "enqueued"
@@ -75,18 +75,7 @@ export class McpWriteService implements McpWriteDispatcher {
   }
 
   status() {
-    const counts = {
-      proposed: 0,
-      rejected: 0,
-      dispatching: 0,
-      response_recorded: 0,
-      uncertain: 0,
-      notification_failed: 0,
-    };
-    for (const operation of this.repository.all()) {
-      counts[operation.state]++;
-      if (operation.notification === "failed") counts.notification_failed++;
-    }
+    const counts = this.repository.counts();
     return {
       ...counts,
       reason: counts.uncertain
