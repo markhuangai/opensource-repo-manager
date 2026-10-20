@@ -480,6 +480,68 @@ export async function runPublicationTests() {
         supervisor.publication.outputReview.verify(reviewed.id, request).id,
         reviewed.id,
       );
+      const notification = supervisor.notifications.prepare({
+        id: `reviewed-notification-${sdk}`,
+        job_id: reviewJob.id,
+        revision: reviewJob.revision,
+        repository_id: 42,
+        issue_number: reviewJob.issue_number,
+        occurred_at: 1792451961000,
+        outcome: "needs_attention",
+        reason: "workflow_blocked",
+        narrative: "A bounded operator summary for this workflow.",
+      });
+      await assert.rejects(
+        supervisor.notifications.enqueue(notification, {}, signal()),
+        /review_missing/,
+      );
+      await assert.rejects(
+        supervisor.notifications.enqueue(
+          notification,
+          { review_id: reviewed.id },
+          signal(),
+        ),
+        /output_review_mismatch/,
+      );
+      const notificationReview =
+        await supervisor.publication.outputReview.review(
+          notification.review,
+          signal(),
+        );
+      await supervisor.notifications.enqueue(
+        notification,
+        { review_id: notificationReview.id },
+        signal(),
+      );
+      assert(
+        supervisor.notifications
+          .receipt(notification.event.id)
+          .every((receipt) => receipt.state === "pending"),
+      );
+      const changedNotification = globalThis.structuredClone(notification);
+      changedNotification.event.narrative = "A different generated summary.";
+      await assert.rejects(
+        supervisor.notifications.enqueue(
+          changedNotification,
+          { review_id: notificationReview.id },
+          signal(),
+        ),
+        /prepared_mismatch/,
+      );
+      const changedDestination = globalThis.structuredClone(notification);
+      changedDestination.review.destination = {
+        type: "notification",
+        channels: {},
+      };
+      await assert.rejects(
+        supervisor.notifications.enqueue(
+          changedDestination,
+          { review_id: notificationReview.id },
+          signal(),
+        ),
+        /prepared_mismatch/,
+      );
+      proof.push({ sdk, reviewed_notifications: "passed" });
       assert.throws(
         () =>
           supervisor.publication.outputReview.verify(reviewed.id, {

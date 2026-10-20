@@ -56,6 +56,7 @@ try {
     );
     await startHttpService(logger, {
       intake,
+      notifications: supervisor.notifications,
       webhookSecret: loaded.secrets.get("github.webhook_secret"),
       close: async () => {
         try {

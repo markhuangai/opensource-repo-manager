@@ -26,6 +26,7 @@ import type { Store } from "../repositories/store.ts";
 import { ModelRelay } from "../services/model-relay.ts";
 import { BootstrapService } from "../services/bootstrap/index.ts";
 import { PublicationService } from "../services/publication/index.ts";
+import { NotificationService } from "../services/notifications/index.ts";
 import type { GitHubWriter } from "../adapters/github/writer.ts";
 import { runCommand } from "../adapters/toolchains/process.ts";
 import {
@@ -113,6 +114,7 @@ export class Supervisor implements AgentRunner {
   readonly workspaces: WorkspaceService;
   readonly bootstrap: BootstrapService;
   readonly publication: PublicationService;
+  readonly notifications: NotificationService;
   private readonly bootstrapLeases = new Set<BootstrapLease>();
   private readonly bootstrapOutput = new Map<string, number>();
   private readonly relay: ModelRelay;
@@ -141,6 +143,12 @@ export class Supervisor implements AgentRunner {
       writer: options.publicationWriter,
       sourceUrl: options.sourceUrl,
     });
+    this.notifications = new NotificationService(
+      store,
+      snapshot,
+      secrets,
+      this.publication.outputReview,
+    );
   }
 
   static async create(
@@ -1242,8 +1250,12 @@ export class Supervisor implements AgentRunner {
 
   async close() {
     this.controller.abort(new RuntimeError("cancelled"));
-    await Promise.all(this.tasks);
-    await this.relay.close();
+    try {
+      await this.notifications.stop();
+    } finally {
+      await Promise.all(this.tasks);
+      await this.relay.close();
+    }
     if (this.store.runs().some((run) => run.finished_at === null))
       throw new RuntimeError("cleanup_failed");
   }

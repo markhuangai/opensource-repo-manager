@@ -1,8 +1,13 @@
 import Fastify from "fastify";
 import type { IntakeService } from "../services/intake.ts";
 import { registerWebhooks } from "./webhooks.ts";
+import type { NotificationService } from "../services/notifications/index.ts";
 
-export function createApp(intake?: IntakeService, webhookSecret?: string) {
+export function createApp(
+  intake?: IntakeService,
+  webhookSecret?: string,
+  notifications?: NotificationService,
+) {
   const app = Fastify({ logger: false });
 
   app.setErrorHandler((error, _request, reply) => {
@@ -25,6 +30,7 @@ export function createApp(intake?: IntakeService, webhookSecret?: string) {
       status: "not_ready",
       reason: "automation_not_implemented",
       ...(intake ? { intake: intake.status() } : {}),
+      ...(notifications ? { notifications: notifications.status() } : {}),
     }),
   );
 
