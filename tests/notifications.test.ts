@@ -170,6 +170,52 @@ describe("durable notifications", () => {
     expect(f.fixture.requests).toHaveLength(2);
   });
 
+  it("delivers ready-for-review notifications for the exact owned PR head", async () => {
+    const f = await setup();
+    const head = "b".repeat(40);
+    const event: NotificationEvent = {
+      ...f.event,
+      outcome: "ready_for_review",
+      reason: "automation_clean",
+      pull_number: 77,
+      head_sha: head,
+    };
+    expect(() => f.service.prepare(event)).toThrow("event_stale");
+    f.store.recordPublication({
+      operation_key: "ready-pull",
+      job_id: f.job.id,
+      revision: f.job.revision,
+      kind: "pull_request",
+      object_id: "77",
+      number: 77,
+      head_sha: head,
+      receipt_json: "{}",
+    });
+    expect(() =>
+      f.service.prepare({ ...event, head_sha: "c".repeat(40) }),
+    ).toThrow("event_stale");
+    await f.enqueue(event);
+    f.service.start();
+    await until(() =>
+      f.service.receipt(event.id).every((row) => row.state === "confirmed"),
+    );
+    expect(f.fixture.requests).toHaveLength(2);
+    const webhook = f.fixture.requests.find((row) => row.path === "/webhook")!;
+    expect(webhook.body).toMatchObject({
+      outcome: "ready_for_review",
+      reason: "automation_clean",
+      pull: {
+        number: 77,
+        url: "https://github.com/owner/repo/pull/77",
+        head_sha: head,
+      },
+    });
+    const discord = f.fixture.requests.find((row) => row.path === "/discord")!;
+    const lines = String(discord.body.content).split("\n");
+    expect(lines).toContain("Repository maintenance: ready for human review");
+    expect(lines).toContain("https://github.com/owner/repo/pull/77");
+  });
+
   it("retries lost responses twice across restart without resending the confirmed channel", async () => {
     const f = await setup();
     f.fixture.modes["/webhook"] = { lose: true };

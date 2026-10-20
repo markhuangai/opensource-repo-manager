@@ -112,9 +112,9 @@ export async function runNotificationTests() {
       ),
     );
     assert(
-      fixture.messages[0].raw.includes(
-        "https://github.com/owner/repo/issues/1",
-      ),
+      fixture.messages[0].raw
+        .split(/\r?\n/)
+        .includes("https://github.com/owner/repo/issues/1"),
     );
     assert(!fixture.messages[0].raw.includes("Private source"));
     assert(fixture.auth.every((row) => row.secure));
