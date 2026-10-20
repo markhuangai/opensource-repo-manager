@@ -105,6 +105,13 @@ export async function respond(req, res, fixture) {
               .content.map((block) => block.text ?? "")
               .join("\n");
       assert(/(?:^|\n)BOOTSTRAP_TESTS_PASSED(?:\n|$)/.test(latest), latest);
+    } else if (scenario === "mcp_write") {
+      if (!results.length)
+        use(
+          `mcp__${fixture.writeAlias}__${fixture.writeTool}`,
+          fixture.writeInput,
+        );
+      else fixture.writeResults.push(results.at(-1));
     } else if (scenario === "crash") {
       use("Bash", {
         command: 'kill -ABRT "$PPID"',
@@ -208,7 +215,7 @@ export async function respond(req, res, fixture) {
     if (initial) content.unshift({ type: "text", text: history.marker });
     if (
       results.length &&
-      !["limited", "malformed", "expiry"].includes(scenario)
+      !["limited", "malformed", "expiry", "mcp_write"].includes(scenario)
     )
       assert(
         results.every((result) => !result.is_error),

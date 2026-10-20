@@ -230,13 +230,14 @@ async function setup(configure?: (config: Configuration) => void) {
   };
   config.mcp.servers.context = {
     transport: "streamable_http",
+    review_required_tools: [],
     url: endpoint,
     allow_plain_http: true,
     credential_ref: "first",
     tools: {
       read: { effect: "read" },
       hidden: { effect: "read" },
-      write: { effect: "reviewed_write" },
+      write: { effect: "write" },
     },
   };
   config.roles.investigation.mcp = { context: { tools: ["read"] } };
@@ -448,7 +449,7 @@ describe("scoped HTTP MCP gateway", () => {
     expect((await client.callTool({ name: "read" })).isError).not.toBe(true);
   });
 
-  it("allows empty grants without contacting any server and blocks every assigned write", async () => {
+  it("allows empty grants without contacting any server and rejects writes without a dispatcher", async () => {
     const f = await setup((config) => {
       config.roles.investigation.mcp = {};
     });
@@ -457,9 +458,7 @@ describe("scoped HTTP MCP gateway", () => {
     const write = await setup((config) => {
       config.roles.investigation.mcp.context.tools.push("write");
     });
-    await expect(write.open()).rejects.toThrow(
-      "mcp_reviewed_write_unavailable",
-    );
+    await expect(write.open()).rejects.toThrow("mcp_write_unavailable");
     expect(write.state.requests).toEqual([]);
   });
 

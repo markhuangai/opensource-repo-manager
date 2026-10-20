@@ -27,6 +27,8 @@ import { ModelRelay } from "../services/model-relay.ts";
 import { BootstrapService } from "../services/bootstrap/index.ts";
 import { PublicationService } from "../services/publication/index.ts";
 import { NotificationService } from "../services/notifications/index.ts";
+import { McpWriteService } from "../services/mcp-writes/index.ts";
+import type { McpWriteTransport } from "../services/mcp-writes/contracts.ts";
 import type { GitHubWriter } from "../adapters/github/writer.ts";
 import { runCommand } from "../adapters/toolchains/process.ts";
 import {
@@ -98,11 +100,12 @@ export type BootstrapLease = Readonly<{
   signal: AbortSignal;
   request: AgentRunRequest;
   abort: (reason: RuntimeError) => void;
+  recovery_operation?: string;
 }>;
 export type SupervisorOptions = {
   root?: string;
   workers?: Partial<Record<"claude" | "codex", string>>;
-  mcp?: McpSessionProvider;
+  mcp?: McpSessionProvider & Partial<McpWriteTransport>;
   sourceUrl?: (repository: string) => string;
   publicationWriter?: (ready: () => void) => GitHubWriter;
 };
@@ -115,6 +118,7 @@ export class Supervisor implements AgentRunner {
   readonly bootstrap: BootstrapService;
   readonly publication: PublicationService;
   readonly notifications: NotificationService;
+  readonly mcpWrites: McpWriteService;
   private readonly bootstrapLeases = new Set<BootstrapLease>();
   private readonly bootstrapOutput = new Map<string, number>();
   private readonly relay: ModelRelay;
@@ -149,6 +153,16 @@ export class Supervisor implements AgentRunner {
       secrets,
       this.publication.outputReview,
     );
+    this.mcpWrites = new McpWriteService(
+      this,
+      store,
+      secrets,
+      this.publication.outputReview,
+      options.mcp?.openRecovery
+        ? (options.mcp as McpSessionProvider & McpWriteTransport)
+        : undefined,
+      options.sourceUrl,
+    );
   }
 
   static async create(
@@ -175,6 +189,7 @@ export class Supervisor implements AgentRunner {
         store.finishRun(run.id, "interrupted", null, null);
       }
       for (const lease of store.leases()) store.releaseLease(lease.token);
+      await supervisor.mcpWrites.initialize();
       await supervisor.relay.start();
       return supervisor;
     } catch (error) {
@@ -208,6 +223,12 @@ export class Supervisor implements AgentRunner {
 
   repositoryName() {
     return this.snapshot.settings.github.repository;
+  }
+
+  outputReviewAvailable() {
+    return Boolean(
+      this.options.workers?.[this.snapshot.roles.output_review.profile.sdk],
+    );
   }
 
   reviewCurrent(parentId: string, jobId: number, revision: number) {
@@ -265,8 +286,44 @@ export class Supervisor implements AgentRunner {
     signal: AbortSignal,
     operation: (session: BootstrapLease) => Promise<T>,
   ): Promise<T> {
-    const snapshot = this.validate(request),
-      lease = this.store.acquireLease(request.job_id, request.revision);
+    return this.withLease(request, signal, operation);
+  }
+
+  async withMcpWriteRecovery<T>(
+    operationId: string,
+    signal: AbortSignal,
+    operation: (session: BootstrapLease) => Promise<T>,
+  ) {
+    const receipt = this.mcpWrites.receipt(operationId);
+    if (receipt.state !== "uncertain")
+      throw new RuntimeError("mcp_write_recovery_denied");
+    return this.withLease(
+      this.request(receipt.job_id, "output_review"),
+      signal,
+      operation,
+      operationId,
+    );
+  }
+
+  blockMcpWriteJob(jobId: number) {
+    for (const run of this.active.values())
+      if (run.request.job_id === jobId)
+        run.controller.abort(new RuntimeError("mcp_write_job_blocked"));
+    for (const lease of this.bootstrapLeases)
+      if (lease.request.job_id === jobId)
+        lease.abort(new RuntimeError("mcp_write_job_blocked"));
+  }
+
+  private async withLease<T>(
+    request: AgentRunRequest,
+    signal: AbortSignal,
+    operation: (session: BootstrapLease) => Promise<T>,
+    recovery?: string,
+  ): Promise<T> {
+    const snapshot = this.validate(request, recovery),
+      lease = recovery
+        ? this.store.acquireMcpWriteRecovery(recovery)
+        : this.store.acquireLease(request.job_id, request.revision);
     if (!lease) throw new RuntimeError("lease_busy");
     const controller = new AbortController();
     let session: BootstrapLease | undefined;
@@ -298,6 +355,7 @@ export class Supervisor implements AgentRunner {
             this.controller.signal,
           ]),
           abort: (reason) => controller.abort(reason),
+          ...(recovery ? { recovery_operation: recovery } : {}),
         };
         this.bootstrapLeases.add(session);
         session.signal.throwIfAborted();
@@ -353,7 +411,16 @@ export class Supervisor implements AgentRunner {
       request.revision !== session.request.revision
     )
       throw new RuntimeError("revision_stale");
-    this.validate(request);
+    if (
+      session.recovery_operation &&
+      (request.role !== "output_review" ||
+        !this.store.mcpWriteRecoveryCurrent(
+          session.lease,
+          session.recovery_operation,
+        ))
+    )
+      throw new RuntimeError("mcp_write_recovery_denied");
+    this.validate(request, session.recovery_operation);
     session.signal.throwIfAborted();
   }
 
@@ -541,7 +608,9 @@ export class Supervisor implements AgentRunner {
       !this.store.runtimeCurrent(parent.lease) ||
       parent.reviewing ||
       parent.suspended ||
-      roleUsers[parent.request.role].uid !== 10001 ||
+      ![10001, 10002].includes(roleUsers[parent.request.role].uid) ||
+      roleUsers[parent.request.role].uid === roleUsers[request.role].uid ||
+      (parent.request.role === "audit" && request.role !== "output_review") ||
       !["audit", "output_review"].includes(request.role) ||
       request.job_id !== parent.request.job_id ||
       request.revision !== parent.request.revision
@@ -554,7 +623,7 @@ export class Supervisor implements AgentRunner {
     const task = (async () => {
       let failure: unknown;
       try {
-        await suspendUser(10001);
+        await suspendUser(roleUsers[parent.request.role].uid);
         for await (const event of this.execute(
           request,
           AbortSignal.any([signal, parent.signal, controller.signal]),
@@ -572,7 +641,7 @@ export class Supervisor implements AgentRunner {
         parent.suspended = false;
         try {
           if (!parent.signal.aborted && !parent.reviewCleanupFailed)
-            await signalUser(10001, "SIGCONT");
+            await signalUser(roleUsers[parent.request.role].uid, "SIGCONT");
         } catch (error) {
           failure = error;
           parent.reviewCleanupFailed = true;
@@ -591,7 +660,7 @@ export class Supervisor implements AgentRunner {
     }
   }
 
-  private validate(request: AgentRunRequest) {
+  private validate(request: AgentRunRequest, recovery?: string) {
     const job = this.store.jobById(request.job_id);
     if (
       !job ||
@@ -601,6 +670,17 @@ export class Supervisor implements AgentRunner {
       !roleNames.includes(request.role)
     )
       throw new RuntimeError("revision_stale");
+    if (recovery) {
+      const operation = this.mcpWrites.receipt(recovery);
+      if (
+        operation.state !== "uncertain" ||
+        operation.job_id !== job.id ||
+        operation.revision !== job.revision ||
+        request.role !== "output_review"
+      )
+        throw new RuntimeError("mcp_write_recovery_denied");
+    } else if (this.store.hasUncertainMcpWrite(job.id))
+      throw new RuntimeError("mcp_write_job_blocked");
     const snapshot = this.store.snapshot(job.snapshot_digest),
       saved = JSON.parse(job.input_json) as { source: SourceMetadata };
     if (
@@ -623,7 +703,7 @@ export class Supervisor implements AgentRunner {
     parent?: ActiveRun,
     held?: BootstrapLease,
   ): AsyncIterable<AgentEvent> {
-    const snapshot = this.validate(request),
+    const snapshot = this.validate(request, held?.recovery_operation),
       worker = this.options.workers?.[request.profile.sdk];
     if (!worker) throw new RuntimeError("backend_unavailable");
     await trustedExecutable(worker);
@@ -834,6 +914,7 @@ export class Supervisor implements AgentRunner {
           deadline: context.deadline,
           signal,
           available: () => !context.suspended,
+          artifact_digest: request.workspace.artifact,
         });
         this.validateMcp(mcp, context);
       }

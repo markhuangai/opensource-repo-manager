@@ -5,6 +5,10 @@ import type { ModelProfile, Role } from "../config/schema.ts";
 import { isContainedReference } from "../config/files.ts";
 import type { SourceMetadata } from "./jobs.ts";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  McpWriteChannel,
+  WriteBinding,
+} from "../services/mcp-writes/contracts.ts";
 
 export class RuntimeError extends Error {
   readonly code: string;
@@ -44,6 +48,7 @@ export interface McpSessionProvider {
     deadline: number;
     signal: AbortSignal;
     available?: () => boolean;
+    artifact_digest?: string;
   }): Promise<{
     connections: readonly McpConnection[];
     policy_identity: string;
@@ -52,23 +57,16 @@ export interface McpSessionProvider {
   }>;
 }
 
-export interface ReviewedMcpDispatcher {
+export interface McpWriteDispatcher {
+  assertAvailable(reviewRequired: boolean): void;
   dispatch(
     request: Readonly<{
-      run_id: string;
-      job_id: number;
-      revision: number;
-      role: Role;
-      alias: string;
-      tool: string;
-      credential_binding: string;
-      policy_identity: string;
-      catalog_identity: string;
+      binding: WriteBinding;
       arguments: Readonly<Record<string, unknown>>;
-      request_digest: string;
       deadline: number;
       signal: AbortSignal;
     }>,
+    channel: McpWriteChannel,
   ): Promise<CallToolResult>;
 }
 

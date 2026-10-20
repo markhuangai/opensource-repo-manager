@@ -84,7 +84,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (![0, 1, 2, 3, 4, 5, 6].includes(version as number))
+      if (![0, 1, 2, 3, 4, 5, 6, 7].includes(version as number))
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -233,6 +233,29 @@ export class Store {
           CREATE INDEX notification_pending ON notification_deliveries(state,retry_at);
           CREATE TABLE notification_backoff (channel TEXT NOT NULL, binding TEXT NOT NULL, retry_at INTEGER NOT NULL, PRIMARY KEY(channel,binding));
           PRAGMA user_version = 6;
+        `),
+          )
+          .immediate();
+      if ((version as number) < 7)
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE mcp_write_operations (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), revision INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('proposed','rejected','dispatching','response_recorded','uncertain')),
+            content TEXT NOT NULL
+          );
+          CREATE UNIQUE INDEX pending_mcp_write ON mcp_write_operations(job_id)
+            WHERE state IN ('proposed','dispatching','uncertain');
+          CREATE TABLE mcp_write_attempts (
+            operation_id TEXT NOT NULL REFERENCES mcp_write_operations(id), number INTEGER NOT NULL,
+            content TEXT NOT NULL, PRIMARY KEY(operation_id,number)
+          );
+          CREATE TABLE mcp_write_recovery_leases (
+            token TEXT PRIMARY KEY REFERENCES coding_lease(token) ON DELETE CASCADE,
+            operation_id TEXT NOT NULL UNIQUE REFERENCES mcp_write_operations(id)
+          );
+          PRAGMA user_version = 7;
         `),
           )
           .immediate();
@@ -637,7 +660,9 @@ export class Store {
           `SELECT 1 FROM coding_lease JOIN jobs
       ON jobs.id=coding_lease.job_id AND jobs.revision=coding_lease.revision
       JOIN runtime_leases ON runtime_leases.token=coding_lease.token
-      WHERE coding_lease.token=? AND jobs.status='pending' AND runtime_leases.deadline>?`,
+      WHERE coding_lease.token=? AND jobs.status='pending' AND runtime_leases.deadline>?
+      AND NOT EXISTS (SELECT 1 FROM mcp_write_operations w WHERE w.job_id=jobs.id AND w.state='uncertain'
+        AND NOT EXISTS (SELECT 1 FROM mcp_write_recovery_leases r WHERE r.token=coding_lease.token AND r.operation_id=w.id))`,
         )
         .get(token, Date.now()),
     );
@@ -673,6 +698,7 @@ export class Store {
   }
 
   reserveModelRequest(token: string, limit: number) {
+    if (!this.runtimeCurrent(token)) return false;
     return (
       this.db
         .prepare(
@@ -704,6 +730,10 @@ export class Store {
       .transaction(() => {
         if (
           !this.runtimeCurrent(record.lease_token) ||
+          (record.role !== "output_review" &&
+            this.db
+              .prepare("SELECT 1 FROM mcp_write_recovery_leases WHERE token=?")
+              .get(record.lease_token)) ||
           !this.db
             .prepare(
               "SELECT 1 FROM coding_lease WHERE token=? AND job_id=? AND revision=?",
@@ -888,10 +918,54 @@ export class Store {
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO coding_lease SELECT 1,id,revision,?
-      FROM jobs WHERE id=? AND revision=? AND status='pending'`,
+      FROM jobs WHERE id=? AND revision=? AND status='pending'
+      AND NOT EXISTS (SELECT 1 FROM mcp_write_operations WHERE job_id=jobs.id AND state IN ('proposed','dispatching','uncertain'))`,
       )
       .run(token, jobId, revision);
     return result.changes ? token : undefined;
+  }
+
+  hasUncertainMcpWrite(jobId: number) {
+    return Boolean(
+      this.db
+        .prepare(
+          "SELECT 1 FROM mcp_write_operations WHERE job_id=? AND state='uncertain'",
+        )
+        .get(jobId),
+    );
+  }
+
+  acquireMcpWriteRecovery(operationId: string): string | undefined {
+    return this.db
+      .transaction(() => {
+        const token = randomUUID();
+        const result = this.db
+          .prepare(
+            `INSERT OR IGNORE INTO coding_lease
+        SELECT 1,j.id,j.revision,? FROM jobs j JOIN mcp_write_operations w ON w.job_id=j.id AND w.revision=j.revision
+        WHERE w.id=? AND w.state='uncertain' AND j.status='pending'`,
+          )
+          .run(token, operationId);
+        if (!result.changes) return undefined;
+        this.db
+          .prepare("INSERT INTO mcp_write_recovery_leases VALUES(?,?)")
+          .run(token, operationId);
+        return token;
+      })
+      .immediate();
+  }
+
+  mcpWriteRecoveryCurrent(token: string, operationId: string) {
+    return (
+      this.runtimeCurrent(token) &&
+      Boolean(
+        this.db
+          .prepare(
+            "SELECT 1 FROM mcp_write_recovery_leases WHERE token=? AND operation_id=?",
+          )
+          .get(token, operationId),
+      )
+    );
   }
 
   releaseLease(token: string) {

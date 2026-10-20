@@ -193,13 +193,14 @@ export async function verifyAgent({
   config.mcp.servers = {
     context: {
       transport: "streamable_http",
+      review_required_tools: [],
       url: mcpUrl + "/mcp",
       allow_plain_http: true,
       credential_ref: "service",
       tools: {
         read: { effect: "read" },
         hidden: { effect: "read" },
-        write: { effect: "reviewed_write", idempotency_argument: "operation" },
+        write: { effect: "write", idempotency_argument: "operation" },
       },
     },
   };

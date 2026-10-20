@@ -26,12 +26,19 @@ import {
   RuntimeError,
   type McpConnection,
   type McpSessionProvider,
+  type McpWriteDispatcher,
 } from "../../domain/agents.ts";
 import { createKnownSecretChecker } from "../../logging/redact.ts";
 import { immutable } from "../../config/bundles.ts";
 import type { Store } from "../../repositories/store.ts";
-import { snapshotTool } from "./catalog.ts";
+import { snapshotTool, writeTool } from "./catalog.ts";
 import { UpstreamHttp, budget } from "./http.ts";
+import type {
+  McpWriteChannel,
+  McpWriteTransport,
+  WriteBinding,
+} from "../mcp-writes/contracts.ts";
+import { policyIdentity } from "../publication/scanner.ts";
 
 const maxConcurrentCalls = 16;
 
@@ -48,6 +55,7 @@ type Session = {
   policy: string;
   catalog: string;
   tools: Map<string, ReturnType<typeof snapshotTool>>;
+  upstreamTools: Map<string, ReturnType<typeof snapshotTool>>;
   controller: AbortController;
   client: Client;
   http: UpstreamHttp;
@@ -60,7 +68,8 @@ type Session = {
   closing?: Promise<void>;
 };
 
-export class McpGateway implements McpSessionProvider {
+export class McpGateway implements McpSessionProvider, McpWriteTransport {
+  private dispatcher: McpWriteDispatcher | undefined;
   private readonly sessions = new Map<string, Session>();
   private readonly closing = new Set<Promise<void>>();
   private readonly failures: unknown[] = [];
@@ -108,6 +117,12 @@ export class McpGateway implements McpSessionProvider {
       }
     }, 100);
     this.watcher.unref();
+  }
+
+  setWriteDispatcher(dispatcher: McpWriteDispatcher) {
+    if (this.url || this.dispatcher)
+      throw new RuntimeError("mcp_dispatcher_already_set");
+    this.dispatcher = dispatcher;
   }
 
   async open(request: OpenRequest) {
@@ -169,8 +184,15 @@ export class McpGateway implements McpSessionProvider {
           digest(configured.tools[name]) !== digest(tool)
         )
           throw new RuntimeError("mcp_policy_mismatch");
-        if (tool.effect !== "read")
-          throw new RuntimeError("mcp_reviewed_write_unavailable");
+        if (
+          tool.effect !== "read" &&
+          (tool.effect !== "write" || !this.dispatcher)
+        )
+          throw new RuntimeError("mcp_write_unavailable");
+        if (tool.effect === "write")
+          this.dispatcher!.assertAvailable(
+            configured.review_required_tools.includes(name),
+          );
       }
     }
     for (const key of [
@@ -193,23 +215,22 @@ export class McpGateway implements McpSessionProvider {
     try {
       for (const [alias, grant] of aliases) {
         initialization.assertActive();
-        const configured = limits.servers[alias],
-          authentication = configured.credential_ref
-            ? this.secrets.mcpHeaders(configured.credential_ref)
-            : {};
-        const controller = new AbortController();
-        const http = new UpstreamHttp(
-          configured.url,
-          authentication,
-          controller.signal,
-          limits,
-          this.secrets,
-          (value) => this.containsAuthorization(value),
+        const upstream = await this.connectUpstream(
+          job.snapshot_digest,
+          request.role,
+          alias,
+          initialization.signal,
+          request.deadline,
         );
-        const client = new Client(
-          { name: "opensource-repo-manager", version: "0.1.0" },
-          { capabilities: {} },
-        );
+        const {
+          http,
+          client,
+          controller,
+          credential,
+          policy: upstreamPolicy,
+          catalog,
+          tools: upstreamTools,
+        } = upstream;
         const server = new Server(
           { name: "opensource-repo-manager-gateway", version: "0.1.0" },
           { capabilities: { tools: {} } },
@@ -220,12 +241,6 @@ export class McpGateway implements McpSessionProvider {
           keepAliveMs: 0,
         });
         const token = randomBytes(32).toString("base64url");
-        const credential = digest({
-          reference: configured.credential_ref,
-          headers: [...new Headers(authentication)].sort(([a], [b]) =>
-            a.localeCompare(b),
-          ),
-        });
         const session: Session = {
           request,
           phase: job.phase,
@@ -235,15 +250,26 @@ export class McpGateway implements McpSessionProvider {
           token,
           path: `/mcp/${randomUUID()}`,
           credential,
-          policy: digest({
-            alias,
-            configured,
-            grant,
-            credential,
-            limits: { ...limits, servers: undefined },
-          }),
-          catalog: "",
-          tools: new Map(),
+          policy: upstreamPolicy,
+          catalog,
+          upstreamTools,
+          tools: new Map(
+            [...upstreamTools].map(([name, entry]) => {
+              const definition = grant.tools[name];
+              return [
+                name,
+                definition.effect === "write"
+                  ? writeTool(
+                      entry.tool,
+                      limits.servers[alias].review_required_tools.includes(
+                        name,
+                      ),
+                      definition.idempotency_argument,
+                    )
+                  : entry,
+              ];
+            }),
+          ),
           cursors: new Map(),
           calls: new Set(),
           controller,
@@ -269,62 +295,6 @@ export class McpGateway implements McpSessionProvider {
         client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
           this.revoke(session);
         });
-        await http.within(initialization.signal, () =>
-          client.connect(
-            http.transport,
-            this.options(initialization.signal, request.deadline),
-          ),
-        );
-        if (!client.getServerCapabilities()?.tools)
-          throw new RuntimeError("mcp_tools_unavailable");
-        const seen = new Set<string>(),
-          cursors = new Set<string>();
-        let cursor: string | undefined,
-          bytes = 0;
-        do {
-          const page = await http.within(initialization.signal, () =>
-            client.request(
-              {
-                method: "tools/list",
-                ...(cursor === undefined ? {} : { params: { cursor } }),
-              },
-              ListToolsResultSchema,
-              this.options(initialization.signal, request.deadline),
-            ),
-          );
-          initialization.assertActive();
-          bytes += Buffer.byteLength(JSON.stringify(page));
-          if (bytes > limits.max_catalog_bytes)
-            throw new RuntimeError("mcp_catalog_limit");
-          for (const tool of page.tools) {
-            initialization.assertActive();
-            if (seen.has(tool.name))
-              throw new RuntimeError("mcp_catalog_invalid");
-            seen.add(tool.name);
-            const entry = snapshotTool(tool);
-            initialization.assertActive();
-            if (Object.hasOwn(grant.tools, tool.name)) {
-              if (tool.execution?.taskSupport === "required")
-                throw new RuntimeError("mcp_tool_unavailable");
-              this.checkVisible(entry.tool, limits.max_response_bytes);
-              session.tools.set(tool.name, entry);
-            }
-          }
-          cursor = page.nextCursor;
-          if (cursor !== undefined) {
-            if (cursors.has(cursor))
-              throw new RuntimeError("mcp_catalog_invalid");
-            cursors.add(cursor);
-          }
-        } while (cursor !== undefined);
-        if (Object.keys(grant.tools).some((name) => !session.tools.has(name)))
-          throw new RuntimeError("mcp_tool_unavailable");
-        session.tools = new Map(
-          [...session.tools].sort(([a], [b]) => a.localeCompare(b)),
-        );
-        session.catalog = digest(
-          [...session.tools.values()].map((entry) => entry.tool),
-        );
         server.setRequestHandler(
           ListToolsRequestSchema,
           async (message, extra) => {
@@ -381,12 +351,45 @@ export class McpGateway implements McpSessionProvider {
                 request.grants[alias].tools,
                 message.params.name,
               ) ||
-              request.grants[alias].tools[message.params.name].effect !==
-                "read" ||
               message.params.task
             )
               throw new McpError(ErrorCode.InvalidParams, "mcp_tool_denied");
             const args = message.params.arguments ?? {};
+            if (
+              request.grants[alias].tools[entry.tool.name].effect === "write"
+            ) {
+              const deadline = Math.min(
+                  request.deadline,
+                  Date.now() + limits.call_timeout_seconds * 1000,
+                ),
+                call = budget(
+                  deadline,
+                  AbortSignal.any([controller.signal, extra.signal]),
+                );
+              try {
+                const channel = this.writeChannel(session, entry.tool.name);
+                const result = await this.dispatcher!.dispatch(
+                  {
+                    binding: channel.binding,
+                    arguments: args,
+                    deadline,
+                    signal: call.signal,
+                  },
+                  channel,
+                );
+                call.assertActive();
+                this.authorize(session);
+                this.checkVisible(
+                  { jsonrpc: "2.0", id: extra.requestId, result },
+                  limits.max_response_bytes,
+                );
+                return result;
+              } catch (error) {
+                throw this.safeError(error, limits.max_response_bytes);
+              } finally {
+                call.dispose();
+              }
+            }
             if (this.secrets.contains(args) || this.containsAuthorization(args))
               throw new McpError(
                 ErrorCode.InvalidParams,
@@ -649,6 +652,332 @@ export class McpGateway implements McpSessionProvider {
         : new RuntimeError("mcp_initialization_failed");
     } finally {
       initialization.dispose();
+    }
+  }
+
+  private async connectUpstream(
+    snapshotDigest: string,
+    role: OpenRequest["role"],
+    alias: string,
+    signal: AbortSignal,
+    deadline: number,
+  ) {
+    const saved = this.store.snapshot(snapshotDigest),
+      limits = saved.settings.mcp,
+      configured = limits.servers[alias],
+      grant = saved.roles[role].mcp[alias];
+    if (
+      !configured ||
+      !grant ||
+      digest(configured) !==
+        digest(this.snapshot.settings.mcp.servers[alias]) ||
+      digest(saved.roles[role].mcp) !== digest(this.snapshot.roles[role].mcp) ||
+      digest({ ...limits, servers: undefined }) !==
+        digest({ ...this.snapshot.settings.mcp, servers: undefined })
+    )
+      throw new RuntimeError("mcp_policy_mismatch");
+    const endpoint = new URL(configured.url);
+    if (
+      !(
+        endpoint.protocol === "https:" ||
+        (endpoint.protocol === "http:" && configured.allow_plain_http)
+      ) ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.search ||
+      endpoint.hash
+    )
+      throw new RuntimeError("mcp_endpoint_invalid");
+    for (const [name, definition] of Object.entries(grant.tools))
+      if (
+        !Object.hasOwn(configured.tools, name) ||
+        digest(definition) !== digest(configured.tools[name]) ||
+        !["read", "write"].includes(definition.effect)
+      )
+        throw new RuntimeError("mcp_policy_mismatch");
+    const authentication = configured.credential_ref
+        ? this.secrets.mcpHeaders(configured.credential_ref)
+        : {},
+      credential = digest({
+        reference: configured.credential_ref,
+        headers: [...new Headers(authentication)].sort(([a], [b]) =>
+          a.localeCompare(b),
+        ),
+      }),
+      policy = digest({
+        alias,
+        configured,
+        grant,
+        credential,
+        limits: { ...limits, servers: undefined },
+      }),
+      controller = new AbortController(),
+      http = new UpstreamHttp(
+        configured.url,
+        authentication,
+        controller.signal,
+        limits,
+        this.secrets,
+        (value) => this.containsAuthorization(value),
+      ),
+      client = new Client(
+        { name: "opensource-repo-manager", version: "0.1.0" },
+        { capabilities: {} },
+      ),
+      tools = new Map<string, ReturnType<typeof snapshotTool>>();
+    const initialization = budget(
+      Math.min(
+        deadline,
+        Date.now() + limits.initialization_timeout_seconds * 1000,
+      ),
+      signal,
+    );
+    client.onerror = () =>
+      controller.abort(new RuntimeError("mcp_connection_failed"));
+    client.setNotificationHandler(ToolListChangedNotificationSchema, () =>
+      controller.abort(new RuntimeError("mcp_catalog_changed")),
+    );
+    try {
+      await http.within(initialization.signal, () =>
+        client.connect(
+          http.transport,
+          this.options(initialization.signal, deadline),
+        ),
+      );
+      if (!client.getServerCapabilities()?.tools)
+        throw new RuntimeError("mcp_tools_unavailable");
+      const seen = new Set<string>(),
+        cursors = new Set<string>();
+      let cursor: string | undefined,
+        bytes = 0;
+      do {
+        const page = await http.within(initialization.signal, () =>
+          client.request(
+            {
+              method: "tools/list",
+              ...(cursor === undefined ? {} : { params: { cursor } }),
+            },
+            ListToolsResultSchema,
+            this.options(initialization.signal, deadline),
+          ),
+        );
+        initialization.assertActive();
+        if (
+          (bytes += Buffer.byteLength(JSON.stringify(page))) >
+          limits.max_catalog_bytes
+        )
+          throw new RuntimeError("mcp_catalog_limit");
+        for (const tool of page.tools) {
+          initialization.assertActive();
+          if (seen.has(tool.name))
+            throw new RuntimeError("mcp_catalog_invalid");
+          seen.add(tool.name);
+          const entry = snapshotTool(tool);
+          if (Object.hasOwn(grant.tools, tool.name)) {
+            if (tool.execution?.taskSupport === "required")
+              throw new RuntimeError("mcp_tool_unavailable");
+            this.checkVisible(entry.tool, limits.max_response_bytes);
+            const definition = grant.tools[tool.name];
+            if (definition.effect === "write")
+              writeTool(
+                entry.tool,
+                configured.review_required_tools.includes(tool.name),
+                definition.idempotency_argument,
+              );
+            tools.set(tool.name, entry);
+          }
+        }
+        cursor = page.nextCursor;
+        if (cursor !== undefined) {
+          if (cursors.has(cursor))
+            throw new RuntimeError("mcp_catalog_invalid");
+          cursors.add(cursor);
+        }
+      } while (cursor !== undefined);
+      if (Object.keys(grant.tools).some((name) => !tools.has(name)))
+        throw new RuntimeError("mcp_tool_unavailable");
+      const ordered = new Map(
+        [...tools].sort(([a], [b]) => a.localeCompare(b)),
+      );
+      initialization.assertActive();
+      controller.signal.throwIfAborted();
+      return {
+        http,
+        client,
+        controller,
+        credential,
+        policy,
+        tools: ordered,
+        catalog: digest([...ordered.values()].map((entry) => entry.tool)),
+      };
+    } catch (error) {
+      controller.abort();
+      try {
+        await http.transport.terminateSession();
+      } finally {
+        await client.close();
+      }
+      throw error;
+    } finally {
+      initialization.dispose();
+    }
+  }
+
+  private writeChannel(session: Session, tool: string): McpWriteChannel {
+    const job = this.store.jobById(session.request.job_id)!,
+      repository = this.store.repository()!,
+      configured = this.store.snapshot(session.snapshot_digest).settings.mcp
+        .servers[session.alias],
+      definition = configured.tools[tool];
+    if (definition.effect !== "write")
+      throw new RuntimeError("mcp_tool_denied");
+    const binding: WriteBinding = {
+      repository_id: repository.id,
+      repository: repository.full_name,
+      job_id: job.id,
+      revision: job.revision,
+      phase: session.phase,
+      run_id: session.request.run_id,
+      role: session.request.role,
+      snapshot_digest: job.snapshot_digest,
+      source: (JSON.parse(job.input_json) as { source: WriteBinding["source"] })
+        .source,
+      artifact_digest: session.request.artifact_digest ?? null,
+      alias: session.alias,
+      endpoint: configured.url,
+      tool,
+      credential_binding: session.credential,
+      policy_identity: session.policy,
+      catalog_identity: session.catalog,
+      scanner_policy: policyIdentity,
+      review_required: configured.review_required_tools.includes(tool),
+      idempotency_argument: definition.idempotency_argument ?? null,
+    };
+    return this.channel(
+      binding,
+      session.upstreamTools.get(tool)!,
+      session,
+      () => this.authorize(session),
+      async () => {},
+    );
+  }
+
+  private channel(
+    binding: WriteBinding,
+    entry: ReturnType<typeof snapshotTool>,
+    upstream: { http: UpstreamHttp; client: Client },
+    assertCurrent: () => void,
+    close: () => Promise<void>,
+  ): McpWriteChannel {
+    const limit = this.store.snapshot(binding.snapshot_digest).settings.mcp
+      .max_response_bytes;
+    return {
+      binding: immutable(binding),
+      tool: entry.tool,
+      assertCurrent,
+      close,
+      validate: (args) => Boolean(entry.input(args)),
+      transmit: async (args, signal) => {
+        let result: CallToolResult;
+        try {
+          result = await upstream.http.within(signal, () =>
+            upstream.client.request(
+              {
+                method: "tools/call",
+                params: { name: binding.tool, arguments: args },
+              },
+              CallToolResultSchema,
+              this.options(
+                signal,
+                Date.now() +
+                  Math.min(
+                    2_147_483_647,
+                    this.store.snapshot(binding.snapshot_digest).settings.mcp
+                      .call_timeout_seconds * 1000,
+                  ),
+              ),
+            ),
+          );
+        } catch (error) {
+          if (error instanceof McpError)
+            this.checkVisible(
+              { code: error.code, message: error.message, data: error.data },
+              limit,
+            );
+          throw error;
+        }
+        this.checkVisible(result, limit);
+        if (
+          entry.output &&
+          !result.isError &&
+          (result.structuredContent === undefined ||
+            !entry.output(result.structuredContent))
+        )
+          throw new RuntimeError("mcp_result_invalid");
+        return result;
+      },
+    };
+  }
+
+  async openRecovery(
+    binding: WriteBinding,
+    deadline: number,
+    signal: AbortSignal,
+    current: () => void,
+  ) {
+    if (!this.url || this.stopped)
+      throw new RuntimeError("mcp_gateway_unavailable");
+    current();
+    const upstream = await this.connectUpstream(
+      binding.snapshot_digest,
+      binding.role,
+      binding.alias,
+      signal,
+      deadline,
+    );
+    const abort = () =>
+      upstream.controller.abort(new RuntimeError("mcp_cancelled"));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    const close = async () => {
+      signal.removeEventListener("abort", abort);
+      upstream.controller.abort();
+      try {
+        await upstream.http.transport.terminateSession();
+      } finally {
+        await upstream.client.close();
+      }
+    };
+    try {
+      const configured = this.snapshot.settings.mcp.servers[binding.alias],
+        definition = configured.tools[binding.tool];
+      if (
+        upstream.credential !== binding.credential_binding ||
+        upstream.policy !== binding.policy_identity ||
+        binding.scanner_policy !== policyIdentity ||
+        upstream.catalog !== binding.catalog_identity ||
+        configured.url !== binding.endpoint ||
+        definition?.effect !== "write" ||
+        configured.review_required_tools.includes(binding.tool) !==
+          binding.review_required ||
+        (definition.idempotency_argument ?? null) !==
+          binding.idempotency_argument
+      )
+        throw new RuntimeError("mcp_write_binding_changed");
+      return this.channel(
+        binding,
+        upstream.tools.get(binding.tool)!,
+        upstream,
+        () => {
+          current();
+          signal.throwIfAborted();
+          upstream.controller.signal.throwIfAborted();
+        },
+        close,
+      );
+    } catch (error) {
+      await close();
+      throw error;
     }
   }
 

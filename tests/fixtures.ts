@@ -22,13 +22,14 @@ export function fixtureMcp() {
   };
   config.mcp.servers.context = {
     transport: "streamable_http",
+    review_required_tools: [],
     url: "https://tools.example.invalid/mcp",
     allow_plain_http: false,
     credential_ref: "service",
     tools: {
       read_record: { effect: "read" },
       store_record: {
-        effect: "reviewed_write",
+        effect: "write",
         idempotency_argument: "operation_key",
       },
     },
