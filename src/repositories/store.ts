@@ -84,7 +84,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (![0, 1, 2, 3, 4, 5].includes(version as number))
+      if (![0, 1, 2, 3, 4, 5, 6].includes(version as number))
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -219,6 +219,22 @@ export class Store {
               .prepare("INSERT INTO publication_instance(id) VALUES(?)")
               .run(randomUUID());
           })
+          .immediate();
+      if ([0, 1, 2, 3, 4, 5].includes(version as number))
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE notification_events (id TEXT PRIMARY KEY, content TEXT NOT NULL, review_id TEXT);
+          CREATE TABLE notification_deliveries (
+            event_id TEXT NOT NULL REFERENCES notification_events(id), channel TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending','dispatching','confirmed','failed','uncertain','held')),
+            retry_at INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(event_id,channel)
+          );
+          CREATE INDEX notification_pending ON notification_deliveries(state,retry_at);
+          CREATE TABLE notification_backoff (channel TEXT NOT NULL, binding TEXT NOT NULL, retry_at INTEGER NOT NULL, PRIMARY KEY(channel,binding));
+          PRAGMA user_version = 6;
+        `),
+          )
           .immediate();
     } catch (error) {
       this.db.close();

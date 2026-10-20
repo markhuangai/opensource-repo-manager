@@ -38,6 +38,13 @@ roles:
     prompts: { system: system.md, user: user.md }
     skills: [example, output-review]
 notifications:
+  discord:
+    enabled: false
+    # When enabled, add webhook_url: https://discord.com/api/webhooks/ID/TOKEN
+  smtp:
+    enabled: false
+    # When enabled, add host, port, secure, username, password, from, and to.
+    # secure: true uses implicit TLS; false requires STARTTLS with certificate verification.
   webhook:
     enabled: true
     url: https://notify.example.invalid/orm

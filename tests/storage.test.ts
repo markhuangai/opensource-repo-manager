@@ -55,6 +55,61 @@ function seed(
 }
 
 describe("durable SQLite repositories", () => {
+  it("upgrades schema 5 additively and preserves schema 6 delivery records across reopen", async () => {
+    const { store, path, snapshot } = await database();
+    seed(store, snapshot);
+    const jobs = store.jobs();
+    const instance = new PublicationRepository(store).instance();
+    store.db.exec(
+      "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; PRAGMA user_version=5",
+    );
+    store.close();
+    const upgraded = new Store(path);
+    stores.push(upgraded);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(6);
+    expect(upgraded.jobs()).toEqual(jobs);
+    expect(upgraded.snapshot(snapshot.digest)).toEqual(snapshot);
+    expect(new PublicationRepository(upgraded).instance()).toBe(instance);
+    upgraded.db
+      .prepare("INSERT INTO notification_events VALUES(?,?,NULL)")
+      .run("event", "{}");
+    upgraded.db
+      .prepare("INSERT INTO notification_deliveries VALUES(?,?,?,?,?)")
+      .run("event", "webhook", "confirmed", 0, '{"receipt":"preserve"}');
+    upgraded.close();
+    const reopened = new Store(path);
+    stores.push(reopened);
+    expect(
+      reopened.db.prepare("SELECT content FROM notification_deliveries").get(),
+    ).toEqual({ content: '{"receipt":"preserve"}' });
+  });
+  it("rolls back a conflicting schema 6 migration without changing schema 5 state", async () => {
+    const { store, path, snapshot } = await database();
+    seed(store, snapshot);
+    const jobs = store.jobs();
+    store.db.exec(
+      "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; CREATE TABLE notification_deliveries(marker TEXT); INSERT INTO notification_deliveries VALUES('preserve'); PRAGMA user_version=5",
+    );
+    store.close();
+    expect(() => new Store(path)).toThrow();
+    const inspected = new Database(path);
+    try {
+      expect(inspected.pragma("user_version", { simple: true })).toBe(5);
+      expect(inspected.prepare("SELECT * FROM jobs").all()).toEqual(jobs);
+      expect(
+        inspected.prepare("SELECT * FROM notification_deliveries").all(),
+      ).toEqual([{ marker: "preserve" }]);
+      expect(
+        inspected
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name='notification_events'",
+          )
+          .all(),
+      ).toEqual([]);
+    } finally {
+      inspected.close();
+    }
+  });
   it.each(["issue_comment", "pull_request"] as const)(
     "upgrades v4 %s state without changing existing jobs, ownership, budgets or snapshots",
     async (kind) => {
@@ -76,12 +131,12 @@ describe("durable SQLite repositories", () => {
         publications: store.db.prepare("SELECT * FROM publications").all(),
       };
       store.db.exec(
-        "DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; PRAGMA user_version=4",
+        "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; PRAGMA user_version=4",
       );
       store.close();
       const upgraded = new Store(path);
       stores.push(upgraded);
-      expect(upgraded.db.pragma("user_version", { simple: true })).toBe(5);
+      expect(upgraded.db.pragma("user_version", { simple: true })).toBe(6);
       expect({
         jobs: upgraded.jobs(),
         snapshots: upgraded.snapshot(snapshot.digest),
@@ -104,7 +159,7 @@ describe("durable SQLite repositories", () => {
     seed(store, snapshot);
     const before = store.jobs();
     store.db.exec(
-      "DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; CREATE TABLE publication_evidence(marker TEXT); INSERT INTO publication_evidence VALUES('preserve'); PRAGMA user_version=4",
+      "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; CREATE TABLE publication_evidence(marker TEXT); INSERT INTO publication_evidence VALUES('preserve'); PRAGMA user_version=4",
     );
     store.close();
     expect(() => new Store(path)).toThrow();
@@ -198,7 +253,7 @@ describe("durable SQLite repositories", () => {
         private: false,
       }),
     ).toThrow("repository_changed");
-    store.db.pragma("user_version = 6");
+    store.db.pragma("user_version = 7");
     store.close();
     expect(() => new Store(path)).toThrow("schema_unsupported");
   });
@@ -399,12 +454,12 @@ describe("durable SQLite repositories", () => {
     const before = JSON.stringify(store.snapshot(legacy.digest));
     const budget = store.job(1)!.budget_json;
     store.db.exec(
-      "DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
+      "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(5);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(6);
     expect(JSON.stringify(upgraded.snapshot(legacy.digest))).toBe(before);
     expect(upgraded.job(1)!.budget_json).toBe(budget);
     expect(upgraded.leases()).toMatchObject([{ token }]);
@@ -433,12 +488,12 @@ describe("durable SQLite repositories", () => {
       snapshot: store.snapshot(snapshot.digest),
     };
     store.db.exec(
-      "DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; PRAGMA user_version=2",
+      "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; PRAGMA user_version=2",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(5);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(6);
     expect({
       jobs: upgraded.jobs(),
       runs: upgraded.runs(),
@@ -485,7 +540,7 @@ describe("durable SQLite repositories", () => {
     seed(store, snapshot);
     const jobs = store.jobs();
     store.db.exec(
-      "DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; CREATE TABLE mcp_calls(marker TEXT); INSERT INTO mcp_calls VALUES('preserve'); PRAGMA user_version=2",
+      "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; CREATE TABLE mcp_calls(marker TEXT); INSERT INTO mcp_calls VALUES('preserve'); PRAGMA user_version=2",
     );
     store.close();
     expect(() => new Store(path)).toThrow();
@@ -539,12 +594,12 @@ describe("durable SQLite repositories", () => {
       snapshot: store.snapshot(snapshot.digest),
     };
     store.db.exec(
-      "DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; PRAGMA user_version=3",
+      "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; PRAGMA user_version=3",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(5);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(6);
     expect({
       jobs: upgraded.jobs(),
       runs: upgraded.runs(),
@@ -561,7 +616,7 @@ describe("durable SQLite repositories", () => {
     seed(store, snapshot);
     const before = store.jobs();
     store.db.exec(
-      "DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; CREATE TABLE bootstrap_attempts(marker TEXT); INSERT INTO bootstrap_attempts VALUES('preserve'); PRAGMA user_version=3",
+      "DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; CREATE TABLE bootstrap_attempts(marker TEXT); INSERT INTO bootstrap_attempts VALUES('preserve'); PRAGMA user_version=3",
     );
     store.close();
     expect(() => new Store(path)).toThrow();

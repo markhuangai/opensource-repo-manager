@@ -111,6 +111,23 @@ describe("strict protected configuration contract", () => {
       "smtp-password-canary",
     );
   });
+  it.each([
+    "Host",
+    "content-type",
+    "IDEMPOTENCY-KEY",
+    "Connection",
+    "Transfer-Encoding",
+  ])("rejects notification transport header %s", (name) => {
+    const config = fixtureConfiguration();
+    config.notifications.webhook = {
+      enabled: true,
+      url: "https://notify.example.invalid",
+      headers: { [name]: "fixture" },
+    };
+    expect(() => parseConfiguration(stringify(config))).toThrow(
+      "schema_invalid",
+    );
+  });
   const invalid = [
     [
       "unsupported version",

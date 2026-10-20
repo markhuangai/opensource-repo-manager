@@ -309,7 +309,7 @@ try {
       "-subj",
       "/CN=api.github.com",
       "-addext",
-      "subjectAltName=DNS:api.github.com",
+      "subjectAltName=DNS:api.github.com,DNS:localhost",
       "-days",
       "1",
       "-keyout",
@@ -632,11 +632,33 @@ try {
   register("volume", volume);
   docker(["volume", "create", "--label", `${label}=${id}`, volume]);
   register("container", runtime);
+  const notificationFixtures = join(temporary, "notification-fixtures");
+  await mkdir(join(notificationFixtures, "node_modules"), { recursive: true });
+  await cp(
+    join(root, "tests", "fixtures", "notifications.ts"),
+    join(notificationFixtures, "fixture.mts"),
+  );
+  await cp(
+    join(root, "tests", "integration", "notifications", "harness.mjs"),
+    join(notificationFixtures, "harness.mjs"),
+  );
+  for (const dependency of ["smtp-server", "punycode.js", "ipv6-normalize"])
+    await cp(
+      join(root, "node_modules", dependency),
+      join(notificationFixtures, "node_modules", dependency),
+      { recursive: true },
+    );
+  await symlink(
+    "/opt/orm/app/node_modules/nodemailer",
+    join(notificationFixtures, "node_modules", "nodemailer"),
+  );
   const mounts = ["config", "skills", "prompts"].flatMap((directory) => [
     "--mount",
     `type=bind,src=${join(fixtures, directory)},dst=/${directory},readonly`,
   ]);
   mounts.push(
+    "--mount",
+    `type=bind,src=${notificationFixtures},dst=/notification-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(root, "tests", "fixtures", "runtime")},dst=/runtime-fixtures,readonly`,
     "--mount",
@@ -653,6 +675,8 @@ try {
     network,
     "--mount",
     `type=bind,src=${join(upstream, "ca.pem")},dst=/fixture-ca.pem,readonly`,
+    "--mount",
+    `type=bind,src=${join(upstream, "key.pem")},dst=/fixture-key.pem,readonly`,
     "--env",
     "NODE_EXTRA_CA_CERTS=/fixture-ca.pem",
   ];
@@ -962,6 +986,23 @@ try {
   assert.equal(publicationProof.publication, "passed");
   assert.equal(publicationProof.cleanup, "passed");
 
+  const notificationProof = JSON.parse(
+    docker(
+      [
+        "exec",
+        runtime,
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        "import {runNotificationTests} from '/notification-fixtures/harness.mjs'; console.log(JSON.stringify(await runNotificationTests()));",
+      ],
+      { timeout: 120000 },
+    ),
+  );
+  assert.equal(notificationProof.notifications, "passed");
+  assert.equal(notificationProof.cleanup, "passed");
+  assert.equal(request("/readyz").body.notifications.state, "running");
+
   register("volume", bootstrapVolume);
   docker(["volume", "create", "--label", `${label}=${id}`, bootstrapVolume]);
   register("container", bootstrapContainer);
@@ -1041,6 +1082,7 @@ try {
     immutable_secret_free_snapshots: "passed",
     supervised_workers: runtimeProof,
     reviewed_publication: publicationProof,
+    durable_notifications: notificationProof,
     repository_bootstrap: bootstrapProof,
   };
 } catch (error) {

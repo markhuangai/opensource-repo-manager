@@ -3,6 +3,7 @@ import { ConfigurationError } from "./errors.ts";
 import type { Configuration } from "./schema.ts";
 
 export function separateSecrets(config: Configuration) {
+  const notifications = structuredClone(config.notifications);
   const credentials = new Map<string, string>();
   const identifiers: string[] = [];
   const sensitive: string[] = [
@@ -60,6 +61,11 @@ export function separateSecrets(config: Configuration) {
       if (value === undefined)
         throw new ConfigurationError("reference_invalid");
       return value;
+    },
+    notification<K extends keyof Configuration["notifications"]>(
+      name: K,
+    ): Configuration["notifications"][K] {
+      return structuredClone(notifications[name]);
     },
     mcpHeaders(name: string): Readonly<Record<string, string>> {
       const headers = boundHeaders.get(name);

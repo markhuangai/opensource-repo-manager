@@ -126,7 +126,9 @@ const configurationSchema = z.strictObject({
         disabled,
         z.strictObject({
           enabled: z.literal(true),
-          host: text,
+          host: text.refine(
+            (value) => !/[\s/]/.test(value) && !value.includes("\0"),
+          ),
           port: z.number().int().min(1).max(65535),
           secure: z.boolean(),
           username: secret,
@@ -142,7 +144,16 @@ const configurationSchema = z.strictObject({
         z.strictObject({
           enabled: z.literal(true),
           url,
-          headers: headers.default({}),
+          headers: headers
+            .refine(
+              (value) =>
+                !Object.keys(value).some((name) =>
+                  /^(host|content-length|transfer-encoding|connection|content-type|idempotency-key|upgrade|trailer|expect|proxy-.*)$/i.test(
+                    name,
+                  ),
+                ),
+            )
+            .default({}),
         }),
       ])
       .default({ enabled: false }),
