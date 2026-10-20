@@ -479,6 +479,55 @@ describe("durable notifications", () => {
 });
 
 describe("real SMTP and TLS", () => {
+  it("maps normalized SMTP recipients to every original index while preserving local-part case", async () => {
+    const f = await setup();
+    const adapter = new SmtpNotificationChannel(
+      {
+        ...f.fixture.smtp,
+        to: [
+          "Case@EXAMPLE.invalid",
+          "case@Example.INVALID",
+          "Case@example.invalid",
+        ],
+      },
+      { ca: f.fixture.cert },
+    );
+    const event = {
+      id: "normalized-recipients",
+      payload: {
+        subject: "Safe",
+        text: "Safe",
+        occurred_at: f.event.occurred_at,
+      },
+      recipients: [0, 1, 2],
+    };
+    f.fixture.rejected.set("case@example.invalid", 550);
+    expect(
+      await adapter.deliver(event, AbortSignal.timeout(5000)),
+    ).toMatchObject({ outcome: "permanent", accepted: [0, 2], rejected: [1] });
+    expect(f.fixture.messages[0].to).toEqual(["Case@example.invalid"]);
+    f.fixture.rejected.set("Case@example.invalid", 450);
+    expect(
+      await adapter.deliver(event, AbortSignal.timeout(5000)),
+    ).toMatchObject({ outcome: "transient", rejected: [1] });
+    expect(f.fixture.messages).toHaveLength(1);
+    f.fixture.rejected.clear();
+    expect(
+      await adapter.deliver(
+        { ...event, recipients: [0, 2] },
+        AbortSignal.timeout(5000),
+      ),
+    ).toMatchObject({ outcome: "confirmed", accepted: [0, 2], rejected: [] });
+    expect(f.fixture.messages[1].to).toEqual(["Case@example.invalid"]);
+    expect(
+      await adapter.deliver(
+        { ...event, recipients: [1] },
+        AbortSignal.timeout(5000),
+      ),
+    ).toMatchObject({ outcome: "confirmed", accepted: [1], rejected: [] });
+    expect(f.fixture.messages[2].to).toEqual(["case@example.invalid"]);
+  });
+
   it("classifies temporary AUTH replies and preserves permanent indices when every recipient refuses", async () => {
     const f = await setup();
     const adapter = new SmtpNotificationChannel(f.fixture.smtp, {

@@ -1,6 +1,7 @@
 import { connect as tcpConnect, type Socket } from "node:net";
 import { connect as tlsConnect, type ConnectionOptions } from "node:tls";
 import { createTransport } from "nodemailer";
+import MailComposer from "nodemailer/lib/mail-composer";
 import { digest } from "../../domain/agents.ts";
 import type { Configuration } from "../../config/schema.ts";
 import type {
@@ -16,9 +17,13 @@ export class SmtpNotificationChannel implements NotificationChannel {
   readonly binding: string;
   readonly recipients: number;
   private readonly settings: Settings;
+  private readonly recipientAddresses: string[];
   private readonly trust: Pick<ConnectionOptions, "ca">;
   constructor(settings: Settings, trust: Pick<ConnectionOptions, "ca"> = {}) {
     this.settings = settings;
+    this.recipientAddresses = settings.to.map(
+      (to) => new MailComposer({ to }).compile().getEnvelope().to[0]!,
+    );
     this.trust = trust;
     this.binding = digest({ version: 1, kind: "smtp", settings });
     this.recipients = settings.to.length;
@@ -39,7 +44,7 @@ export class SmtpNotificationChannel implements NotificationChannel {
               error !== null &&
               typeof error === "object" &&
               "recipient" in error &&
-              error.recipient === config.to[index] &&
+              error.recipient === this.recipientAddresses[index] &&
               "responseCode" in error &&
               Number(error.responseCode) >= 500,
           ),
@@ -109,7 +114,7 @@ export class SmtpNotificationChannel implements NotificationChannel {
         disableUrlAccess: true,
       });
       const accepted = event.recipients.filter((index) =>
-        info.accepted.includes(config.to[index]),
+        info.accepted.includes(this.recipientAddresses[index]),
       );
       const rejected = permanentRecipients(info.rejectedErrors);
       return {

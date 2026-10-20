@@ -35,7 +35,10 @@ export async function runNotificationTests() {
       url: fixture.url + "/webhook",
       headers: { Authorization: "Bearer notification-production-canary" },
     },
-    smtp: fixture.smtp,
+    smtp: {
+      ...fixture.smtp,
+      to: ["first@EXAMPLE.invalid", "second@Example.INVALID"],
+    },
   };
   const loaded = await loadProtectedConfiguration();
   const { settings, secrets } = separateSecrets(config);
@@ -114,7 +117,7 @@ export async function runNotificationTests() {
     assert(
       fixture.messages[0].raw
         .split(/\r?\n/)
-        .includes("https://github.com/owner/repo/issues/1"),
+        .some((line) => line === "https://github.com/owner/repo/issues/1"),
     );
     assert(!fixture.messages[0].raw.includes("Private source"));
     assert(fixture.auth.every((row) => row.secure));
