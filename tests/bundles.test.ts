@@ -57,7 +57,7 @@ describe("immutable credential-free workflow snapshots", () => {
     const snapshot = createRunSnapshot(settings, bundles, secrets);
     expect(
       snapshot.roles.investigation.mcp.context.tools.store_record.effect,
-    ).toBe("reviewed_write");
+    ).toBe("write");
     expect(snapshot.roles.output_review.mcp).toEqual({});
     expect(snapshot.settings.mcp.servers.context.credential_ref).toBe(
       "service",
@@ -115,7 +115,7 @@ describe("immutable credential-free workflow snapshots", () => {
     expect(before.settings.limits.active_minutes).toBe(60);
     expect(
       before.roles.investigation.mcp.context.tools.store_record.effect,
-    ).toBe("reviewed_write");
+    ).toBe("write");
     expect(after.roles.audit.bundle.system).toBe(
       "Reconfigured system prompt\n",
     );

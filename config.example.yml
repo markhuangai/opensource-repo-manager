@@ -57,3 +57,5 @@ limits:
 mcp:
   credentials: {}
   servers: {}
+  # Each configured server may set review_required_tools: [store_record].
+  # Omitted or empty lists skip model review; write grants still require scanning and durable dispatch.

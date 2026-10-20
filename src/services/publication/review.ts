@@ -7,7 +7,11 @@ import type { Store } from "../../repositories/store.ts";
 import { PublicationRepository } from "../../repositories/publication.ts";
 import type { BootstrapLease, Supervisor } from "../../runtime/supervisor.ts";
 import { policyIdentity, PublicationScanner } from "./scanner.ts";
-import { reviewResultSchema, type ReviewRequest } from "./contracts.ts";
+import {
+  reviewResultSchema,
+  type ReviewRequest,
+  type ReviewReceipt,
+} from "./contracts.ts";
 
 export class ExternalOutputReview {
   readonly scanner: PublicationScanner;
@@ -45,6 +49,8 @@ export class ExternalOutputReview {
     input: ReviewRequest,
     signal: AbortSignal,
     lease?: BootstrapLease,
+    record?: (receipt: ReviewReceipt) => void,
+    generatedValues: readonly string[] = [],
   ) {
     const request = immutable(structuredClone(input)),
       binding = this.binding(request);
@@ -55,6 +61,7 @@ export class ExternalOutputReview {
         evidence: request.evidence,
       },
       signal,
+      generatedValues,
     );
     const agent = this.supervisor.request(request.job_id, "output_review", {
       task: "external_output_review",
@@ -112,6 +119,7 @@ export class ExternalOutputReview {
       run_id: runs.length === 1 ? runs[0].id : null,
       created_at: Date.now(),
     });
+    record?.(receipt);
     if (!approved) throw new RuntimeError("output_review_rejected");
     return receipt;
   }

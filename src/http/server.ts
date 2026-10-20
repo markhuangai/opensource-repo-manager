@@ -6,6 +6,7 @@ import {
 import { createApp } from "./app.ts";
 import type { IntakeService } from "../services/intake.ts";
 import type { NotificationService } from "../services/notifications/index.ts";
+import type { McpWriteService } from "../services/mcp-writes/index.ts";
 
 export async function startHttpService(
   logger: SafeLogger = createSafeLogger(createKnownSecretChecker([])),
@@ -13,6 +14,7 @@ export async function startHttpService(
     intake: IntakeService;
     webhookSecret: string;
     notifications?: NotificationService;
+    mcpWrites?: McpWriteService;
     close: () => void | Promise<void>;
   },
 ) {
@@ -20,6 +22,7 @@ export async function startHttpService(
     dependencies?.intake,
     dependencies?.webhookSecret,
     dependencies?.notifications,
+    dependencies?.mcpWrites,
   );
   app.addHook("onClose", async () => {
     try {

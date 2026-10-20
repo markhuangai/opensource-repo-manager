@@ -2,7 +2,7 @@
 
 A self-hosted GitHub maintenance service for repositories whose maintainers cannot watch every issue. The planned service investigates issues, prepares tested maintenance fixes, follows pull request feedback, and notifies the maintainer when a change is ready for human review.
 
-**Status: protected configuration, durable GitHub intake, worker runtime, and read-only HTTP MCP gateway implemented; maintenance automation planned.** The service verifies one public/private GitHub repository, backfills open issues, receives signed webhooks, and persists deduplicated pending workflows in SQLite. The runtime provides unprivileged workers, source workspaces, scoped model/MCP gateways, and immutable artifacts. Claude and Codex SDK adapters, audited bootstrap, and callable reviewed GitHub publication are implemented; durable notifications are implemented; issue investigation, fixes and reviewed MCP dispatch remain planned. No GHCR image has been published by this change.
+**Status: protected configuration, durable GitHub intake, worker runtime, and scoped HTTP MCP reads/writes implemented; maintenance automation planned.** The service verifies one public/private GitHub repository, backfills open issues, receives signed webhooks, and persists deduplicated pending workflows in SQLite. The runtime provides unprivileged workers, source workspaces, scoped model/MCP gateways, and immutable artifacts. Claude and Codex SDK adapters, audited bootstrap, and callable reviewed GitHub publication are implemented; durable notifications are implemented; issue investigation and fixes remain planned. No GHCR image has been published by this change.
 
 ## Run the service
 
@@ -66,34 +66,62 @@ mcp:
       transport: streamable_http
       url: https://tools.example.invalid/mcp
       credential_ref: service
+      review_required_tools: [store_record]
       tools:
         read_record:
           effect: read
         store_record:
-          effect: reviewed_write
+          effect: write
           idempotency_argument: operation_key
 ```
 
-Add `mcp: { project_context: { tools: [read_record] } }` to an existing role definition to grant that exact read. An omitted grant denies access; wildcard and unknown names fail. The gateway checks grants on discovery and raw HTTP calls. Granting any `reviewed_write` tool currently blocks the entire phase explicitly, including mixed read/write grants, until issue #14 supplies independent review and dispatch. Tool annotations never confer authority. The optional idempotency argument is reserved for that later gate and is not proof of safe replay. `output_review` cannot receive any MCP tool grant.
+Add `mcp: { project_context: { tools: [read_record, store_record] } }` to an existing role definition to grant those exact tools. An omitted grant denies access; wildcard and unknown names fail. `review_required_tools` is an exact-name server policy applying to all granted roles. Omission or `[]` skips independent model review. Duplicate names, unknown tools, and read tools in this list are rejected. Every write retains deterministic secret scanning, credential isolation, authority checks, and durable receipts. Tool annotations cannot grant access, require review, or authorize replay. `output_review` cannot receive MCP grants.
+
+**Breaking configuration conversion:** replace `effect: reviewed_write` with `effect: write` and list tools that need review in their server's `review_required_tools`. There is no compatibility alias. Stored snapshots and receipts retain their original policy; an incompatible old job is blocked rather than silently converted.
 
 For Dense-Mem, the same registry can use these declarations with a project-scoped credential and endpoint:
 
 ```yaml
+review_required_tools: [remember]
 tools:
   recall_memory:
     effect: read
   trace_memory:
     effect: read
   remember:
-    effect: reviewed_write
+    effect: write
     idempotency_argument: idempotency_key
 ```
 
-Grant only the required exact names to each phase. Runtime behavior does not depend on these example names. Server aliases, grants, effects, and non-secret credential references are captured in supervisor snapshots; protected header values remain separate.
+Treat MCP integrations as operator-trusted. Do not grant tools or provider credentials that bypass this repository's GitHub publication gates or human merge authority. Grant only the required exact names to each phase. Runtime behavior does not depend on these example names. Server aliases, grants, effects, and non-secret credential references are captured in supervisor snapshots; protected header values remain separate.
 
 The `mcp` defaults are `initialization_timeout_seconds: 30`, `call_timeout_seconds: 300`, and `max_request_bytes`, `max_response_bytes`, and `max_catalog_bytes` each set to `1048576`. Timeouts must be positive integers; sizes can be lowered but cannot exceed 1 MiB. One initialization deadline covers the handshake and complete paginated catalog. Each call has its own deadline, capped by the remaining job budget; progress cannot extend it. The gateway validates JSON Schema arguments without coercion or remote schema downloads, bounds HTTP/SSE input, and rejects redirects on every method. Transport-control headers cannot be used as authentication headers.
 
 Sessions and validators are isolated by run, job, revision, role, alias, and credential binding even when aliases share an endpoint. Workers receive only loopback URLs, short-lived bearer authorization, exact tool names, and the parent deadline. Cancellation, phase/revision changes, completion, catalog-change notifications, and cleanup revoke authorization. A fresh session rediscovers the catalog; changed policy, credentials, or catalog identity invalidates resume. Restarting with an incompatible assigned policy blocks an old job instead of expanding its grants. Known-secret checks cover arguments and worker-visible descriptions, schemas, progress, results, and errors. Returned resource links are data and are never followed automatically.
+
+A listed write uses this worker input (the generated idempotency property is hidden):
+
+```json
+{
+  "arguments": {
+    "text": "The captured issue requests a documentation correction."
+  },
+  "purpose": "Save the requested correction in project knowledge",
+  "evidence": [{ "kind": "job" }]
+}
+```
+
+Unlisted writes use ordinary provider arguments, such as `{ "text": "A proposed agent claim" }`. Skipped model review does not establish that a claim is supported. List knowledge-writing tools when independent factual review is required. The same behavior applies to `store_record`, Dense-Mem `remember`, or any other configured tool name.
+
+Reviewed evidence references are `{ "kind": "job" }`, `{ "kind": "source", "path": "README.md", "start_line": 1, "end_line": 5 }`, or `{ "kind": "publication_evidence", "id": "<controller receipt digest>" }`. The controller resolves captured issue context, pinned source bytes, and matching publication audit/test evidence. Worker proof text, arbitrary URLs, escaping paths, symlinks, unsupported binary files, and mismatched receipts are rejected. Review covers the frozen destination, final injected arguments, purpose, evidence, and policy. Coding and audit requesters are suspended under their actual UID while a separate, MCP-free reviewer shares the existing lease and budgets.
+
+Declare `idempotency_argument` only when the operator has verified that the provider guarantees safe replay of the same request/key for the entire recovery period. The controller generates the key, rejects worker substitution, and validates injected arguments against the original provider schema. Unsafe schema projection fails before discovery; schemas with references or identity anchors cannot currently be enveloped, and hidden-key projection supports plain object properties, required names, additional properties, and property counts. The hidden key must be a string property accepting generated 36-character UUIDs without enum, const, pattern, or conditional restrictions. There are no transport reconnect retries or automatic retries of tool/domain errors.
+
+Supervisor code exposes `supervisor.mcpWrites.receipt(operationId)`, `.status()`, and `.recover(operationId, signal)`. No worker tool or HTTP mutation endpoint exposes recovery. Receipts distinguish `proposed`, `rejected`, `dispatching`, `response_recorded`, and `uncertain`; `review` explicitly records `required` or `not_required`. Returned `_meta["opensource-repo-manager/receipt"]` is controller-owned. `response_recorded` means a bounded provider response or safe MCP error was retained, not that a business effect succeeded. Structured content and tool-error flags remain provider data.
+
+For an uncertain effect, stop and inspect the retained operation and provider state. Do not resubmit replacement arguments. The job remains durably blocked across issue revisions, with a stable needs-attention notification and aggregate `mcp_writes` readiness counts. Callable recovery returns an already recorded result, or rechecks authority, credentials, catalog, policy, the original deadline, and remaining budgets before a keyed replay. Required review is renewed under an operation-bound lease. Unkeyed uncertainty cannot be replayed automatically; denied recovery retains the block. Startup records interruptions and enqueues operational notices without sending MCP writes or resuming workflows. Notification failure remains visible and confirmed channels are retained.
+
+Remove write grants and stop dispatch before rollback. Preserve schema-7 operations, attempts, reviews, results, and unresolved job blocks. Older binaries may reject the upgraded database. Use a compatible roll-forward or an explicitly approved restoration procedure. Reverting code cannot undo external effects; corrective writes need explicit operator direction.
 
 ## GitHub intake and durable work
 
@@ -107,7 +135,7 @@ Enrollment backfills every open issue, filtering PRs from GitHub's mixed issue l
 
 Only PRs recorded as instance-owned are processed. Recorded outbound object IDs distinguish this instance's comments from genuine human comments made with the same PAT account. The callable publisher records owned object IDs and confirmed write receipts; queued intake does not invoke it automatically. A changed PR context advances the associated job revision and persists current-head context without claiming readiness.
 
-State lives in `/data/state/manager.sqlite`, inside a supervisor-owned `0700` directory with `0600` database files. SQLite uses WAL, full synchronous commits, prepared statements, transactions, and additive versioned migrations. Schema version 6 preserves earlier jobs, budgets, snapshots, runtime, MCP, bootstrap and ownership records with instance identity, publication evidence, output-review receipts, mutation intent, last-confirmed targets, notification events and per-channel delivery receipts. Raw tool arguments, results, and authentication are not stored in call receipts. Unfinished calls become interrupted on startup and are never replayed. Workers cannot access this state. Newer unsupported schemas are rejected. Backups must include committed WAL state; use a consistent SQLite backup or stop the container before copying the complete state directory. Preserve the data volume on rollback. Startup terminates interrupted role processes and verifies cleanup before releasing their coding leases; active time is conservatively charged through the recovery point or original deadline.
+State lives in `/data/state/manager.sqlite`, inside a supervisor-owned `0700` directory with `0600` database files. SQLite uses WAL, full synchronous commits, prepared statements, transactions, and additive versioned migrations. Schema version 7 preserves earlier jobs, budgets, snapshots, runtime, MCP, bootstrap, publication and notification records, and adds protected MCP write operations and attempts. Read-call receipts retain digests without raw arguments or results. Scanned write arguments, evidence and bounded provider responses are retained for operation-ID recovery; authentication is never stored. Interrupted reads are never replayed. Interrupted writes become uncertain and block their job until an authorized safe recovery records a response. Workers cannot access this state. Newer unsupported schemas are rejected. Backups must include committed WAL state; use a consistent SQLite backup or stop the container before copying the complete state directory. Preserve the data volume on rollback. Startup terminates interrupted role processes and verifies cleanup before releasing their coding leases; active time is conservatively charged through the recovery point or original deadline.
 
 `/healthz` remains process liveness. `/readyz` keeps automation unavailable while reporting intake `starting`, `ready`, or `degraded`, a fixed failure reason, and pending/inbox/failure counts. It exposes no repository names or issue contents. Authentication, rate-limit, and network failures preserve pending work and retry on the reconciliation schedule, respecting provider backoff. Secret-bearing input remains pending with a safe diagnostic. Stop/start the container to stop/restart the service; restarts preserve jobs, receipts, budgets, and snapshots.
 
@@ -125,9 +153,9 @@ Claude loads the selected immutable system/user prompts and phase skill files ex
 
 Codex uses a custom Responses provider over HTTP/SSE with WebSockets and transport retries disabled. A fresh Codex home and explicit untrusted-project settings prevent repository configuration from adding providers, hooks, MCP servers, skills or plugins. It loads the operator prompts and selected skills explicitly. Shell commands receive a separate clean environment without relay/MCP authorization or login-shell inheritance. Coding and audit execute within the existing container UID/workspace boundary; Codex's additional shell sandbox is disabled for these roles. Output review consumes the supplied payload and supporting evidence, with shell/MCP access disabled and native file writes denied by a read-only policy. Codex drains the event stream through successful process exit and validates structured output locally before completing. Native usage is cumulative: cached input and reasoning output are already included in totals, known prior totals are subtracted on resume, and unknown usage is omitted.
 
-The optional `McpSessionProvider` supplies only scoped loopback connection descriptors. Empty grants need no provider; configured grants require one. Cancellation, phase completion, revision changes and cleanup revoke sessions. An independent audit/output reviewer can run in the parent's existing lease while the requesting coding process tree is suspended. The reviewer uses fresh workspace/context and immutable input, with the parent budget still enforced.
+The optional `McpSessionProvider` supplies only scoped loopback connection descriptors. Empty grants need no provider; configured grants require one. Cancellation, phase completion, revision changes and cleanup revoke sessions. An independent audit/output reviewer can run in the parent's existing lease while the requesting coding or audit process tree is suspended. The reviewer uses fresh workspace/context and immutable input, with the parent budget still enforced.
 
-Disk usage is checked every second, including source staging, workspace/home/temp folders, role-owned shared temporary files and open deleted files. Verified Git objects move into the fresh checkout without duplication. A credential-free trusted probe uses the worker's effective identity to inspect deleted files while retaining protected root real/saved identities; workers cannot signal or inspect the probe. Deleted mappings without a measurable descriptor and other monitoring errors cancel the run. Exceeding a configured threshold also cancels the run. These are soft limits on ordinary disk storage, with no tmpfs requirement or hard filesystem quota. A rapid writer can exceed a threshold before detection and fill shared storage. Installer storage accounting bounds growth during each operation; operators size retained toolchain and download storage separately. Preserve space for state and artifacts when sizing the data volume. Stop workers and revoke authorization before rollback; retain the schema-6 database and call/runtime/bootstrap/publication receipts rather than downgrading persisted state.
+Disk usage is checked every second, including source staging, workspace/home/temp folders, role-owned shared temporary files and open deleted files. Verified Git objects move into the fresh checkout without duplication. A credential-free trusted probe uses the worker's effective identity to inspect deleted files while retaining protected root real/saved identities; workers cannot signal or inspect the probe. Deleted mappings without a measurable descriptor and other monitoring errors cancel the run. Exceeding a configured threshold also cancels the run. These are soft limits on ordinary disk storage, with no tmpfs requirement or hard filesystem quota. A rapid writer can exceed a threshold before detection and fill shared storage. Installer storage accounting bounds growth during each operation; operators size retained toolchain and download storage separately. Preserve space for state and artifacts when sizing the data volume. Stop workers and revoke authorization before rollback; retain the schema-7 database and call/runtime/bootstrap/publication receipts rather than downgrading persisted state.
 
 ## Development and validation
 
@@ -193,7 +221,7 @@ Receipts bind job/revision, pinned source/artifact, prompt snapshot, plan/audit,
 
 Decoded YAML scalar scanning includes duplicate keys, plain and quoted folding, and block scalars. YAML artifacts must parse completely. Scanner inputs are limited to 1 MiB per text field and 32 MiB in aggregate, with bounded document depth and node counts; incomplete coverage blocks publication.
 
-Every generated payload uses a fresh `output_review` context without write credentials or MCP access. Nested review suspends the requesting coding process and shares its existing lease and time/model budgets. Changed payloads or destinations invalidate approval. Fixed notices for model unavailability, budget exhaustion and publication blockage use checked templates without a model request. Select the sample `output-review` skill in the operator bundle; existing snapshots retain their original bundles.
+Every generated payload uses a fresh `output_review` context without write credentials or MCP access. Nested review suspends the requesting coding or audit process and shares its existing lease and time/model budgets. Changed payloads or destinations invalidate approval. Fixed notices for model unavailability, budget exhaustion and publication blockage use checked templates without a model request. Select the sample `output-review` skill in the operator bundle; existing snapshots retain their original bundles.
 
 The publisher preserves one owned status comment and one owned open PR per issue. Its branch namespace derives from the persisted instance ID and issue number. It rejects default/protected branches, branch rules, workflow/action definitions, CODEOWNERS, Dependabot configuration and submodule changes. Ordinary GitHub documentation and templates remain eligible. New/changed files must be UTF-8 text or contained symlinks; changed binaries and archives block explicitly. Unchanged binary blobs already on the remote remain intact.
 
@@ -203,7 +231,7 @@ Publication intent precedes each transmission. Exact markers, IDs, bytes and rem
 
 Publication and reconciliation serialize per issue. Provider backoff persists across restarts, and subsequent safe observation retries consume the job's infrastructure retry budget. Legacy ownership without confirmed target state blocks new objects. Reviewed PR title/body changes may reuse the confirmed branch head without creating a commit.
 
-Retain schema-6 state, artifacts and receipts during rollback. Stop callers before reverting the publisher. Reverting code does not remove comments, branches, commits or PRs, and this capability performs no automatic corrective writes or merges. Readiness continues to report unavailable maintenance automation.
+Retain schema-7 state, artifacts and receipts during rollback. Stop callers before reverting the publisher. Reverting code does not remove comments, branches, commits or PRs, and this capability performs no automatic corrective writes or merges. Readiness continues to report unavailable maintenance automation.
 
 ## Durable operator notifications
 
@@ -217,23 +245,23 @@ Webhook POSTs contain JSON `version: 1`, a stable `event_id`, repository/issue/o
 
 Ambiguous SMTP and Discord deliveries can produce duplicates: stable Message-IDs and event IDs do not guarantee provider deduplication. Attempt uncertainty remains recorded even when a later retry is confirmed; exhausted ambiguous deliveries remain `uncertain`. Permanent refusals become `failed`. Stale job revisions and changed or disabled destinations become `held`; restoring configuration does not release historical held messages. Stop the service and inspect retained state before deciding how to handle them. There is no automatic historical resend, notification-test command, application CLI, or mutation endpoint.
 
-`GET /readyz` continues returning HTTP 503 with `automation_not_implemented`, and adds aggregate/per-channel notification state, counts and safe reason codes. Full receipts are retained in the protected SQLite database. Preserve schema-6 state on rollback; disabling a channel retains its events and receipts. Production-container tests deliver only to local HTTP and SMTP/TLS fixtures and verify the existing output-review gate through both SDKs.
+`GET /readyz` continues returning HTTP 503 with `automation_not_implemented`, and adds aggregate/per-channel notification state, counts and safe reason codes. Full receipts are retained in the protected SQLite database. Preserve schema-7 state on rollback; disabling a channel retains its events and receipts. Production-container tests deliver only to local HTTP and SMTP/TLS fixtures and verify the existing output-review gate through both SDKs.
 
 ## HTTP MCP integrations
 
-Operators can configure generic remote Streamable HTTP MCP servers and grant exact reads to each agent role. MCP is optional. The gateway supports unauthenticated endpoints or protected bearer/API-key headers; local stdio servers and OAuth flows are deferred. Both registered SDK adapters consume supervisor-issued gateway descriptors and exact tool grants.
+Operators can configure generic remote Streamable HTTP MCP servers and grant exact reads and writes to each agent role. MCP is optional. The gateway supports unauthenticated endpoints or protected bearer/API-key headers; local stdio servers and OAuth flows are deferred. Both registered SDK adapters consume supervisor-issued gateway descriptors and exact tool grants.
 
 Tool schemas support JSON Schema 2020-12 (the default) and draft-07. Other dialects fail explicitly. Schema patterns use RE2 to keep untrusted validation from blocking the supervisor; unsupported regex features such as lookaround and backreferences fail schema compilation. External schema references are never fetched.
 
 Each session admits at most 16 concurrent tool calls; callers receive an explicit concurrency error until capacity is available. Requested progress notifications and the final result share the configured response byte budget. If even a required error envelope cannot fit that bound, the gateway revokes the session.
 
-Each configured tool declares a read or reviewed-write effect. Reviewed writes remain unavailable until issue #14 implements scans, independent review, durable dispatch, and recovery. Its reviewer will run within the requesting job's lease with no MCP access, and uncertain unkeyed effects will require inspection.
+Each configured tool declares a read or write effect. Every write uses deterministic scans and durable dispatch; the server `review_required_tools` list selects independent review. The reviewer shares the requesting job's lease without MCP access. Uncertain unkeyed effects require operator inspection.
 
 Dense-Mem will be a configuration example and integration fixture. The same runtime supports differently named tools on other compatible HTTP servers. Operators must use appropriate server-side credential scope and trust the configured tool's declared behavior; tool annotations and prompt text are not authorization boundaries.
 
 ## Configuration and security boundaries
 
-The root supervisor reads `/config/config.yml` from a read-only, root-owned mount without group or other access. The YAML contains protected GitHub, webhook, model-proxy, notification, and optional MCP credentials. `/skills` and `/prompts` are read-only operator mounts; `/data` holds protected state/artifacts and separate disk-backed worker folders. The worker supervisor, model relay, read-only MCP gateway, and both SDK adapters are implemented; reviewed writes remain planned.
+The root supervisor reads `/config/config.yml` from a read-only, root-owned mount without group or other access. The YAML contains protected GitHub, webhook, model-proxy, notification, and optional MCP credentials. `/skills` and `/prompts` are read-only operator mounts; `/data` holds protected state/artifacts and separate disk-backed worker folders. The worker supervisor, model relay, scoped MCP gateway with selectively reviewed writes, and both SDK adapters are implemented; maintenance orchestration remains planned.
 
 Separate coding, audit, and output-review users receive clean environments and credential-free workspaces. A supervisor-owned model relay injects upstream credentials outside SDK processes, and only the supervisor publishes to GitHub. Issue text, comments, repository instructions, command output, and agent results remain untrusted inputs.
 
@@ -277,7 +305,7 @@ Program: `opensource-repo-manager-v1-20261013T234247Z`. All tickets are planned 
 | T07    | [Bootstrap Go, Node, and Python repositories from AI-generated setup plans](https://github.com/markhuangai/opensource-repo-manager/issues/7) | #6             |
 | T08    | [Gate and reconcile every GitHub publication](https://github.com/markhuangai/opensource-repo-manager/issues/8)                               | #7             |
 | T09    | [Deliver durable Discord, SMTP, and HTTP webhook notifications](https://github.com/markhuangai/opensource-repo-manager/issues/9)             | #8             |
-| T14    | [Review and reconcile configured MCP writes](https://github.com/markhuangai/opensource-repo-manager/issues/14)                               | #9             |
+| T14    | [Dispatch configured MCP writes with selective review and recovery](https://github.com/markhuangai/opensource-repo-manager/issues/14)        | #9             |
 | T10    | [Investigate issues and maintain one reviewed status comment](https://github.com/markhuangai/opensource-repo-manager/issues/10)              | #14            |
 | T11    | [Turn confirmed maintenance issues into audited and tested pull requests](https://github.com/markhuangai/opensource-repo-manager/issues/11)  | #10            |
 | T12    | [Monitor PR feedback and current-head CI until human review is ready](https://github.com/markhuangai/opensource-repo-manager/issues/12)      | #11            |

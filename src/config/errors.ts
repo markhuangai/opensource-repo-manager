@@ -6,6 +6,7 @@ export type ConfigurationErrorCode =
   | "reference_invalid"
   | "bundle_invalid"
   | "secret_in_snapshot"
+  | "mcp_write_migration_required"
   | "arguments_invalid";
 
 export const configurationSections = [
@@ -28,6 +29,9 @@ export class ConfigurationError extends Error {
   ) {
     super(
       `Configuration rejected (${code}).` +
+        (code === "mcp_write_migration_required"
+          ? " Replace effect: reviewed_write with effect: write and configure review_required_tools on its server."
+          : "") +
         (location ? ` Line ${location.line}, column ${location.column}.` : "") +
         (section ? ` Section ${section}.` : ""),
     );

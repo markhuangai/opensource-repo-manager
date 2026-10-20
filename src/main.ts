@@ -42,6 +42,7 @@ try {
         },
       },
     );
+    mcp.setWriteDispatcher(supervisor.mcpWrites);
     await mcp.start();
     const reader = createGitHubReader(
       loaded.snapshot.settings.github.repository,
@@ -57,6 +58,7 @@ try {
     await startHttpService(logger, {
       intake,
       notifications: supervisor.notifications,
+      mcpWrites: supervisor.mcpWrites,
       webhookSecret: loaded.secrets.get("github.webhook_secret"),
       close: async () => {
         try {

@@ -15,10 +15,11 @@ import {
 } from "yaml";
 
 export const scannerPolicy = Object.freeze({
-  version: "gitleaks-8.30.1-publication-v1",
+  version: "gitleaks-8.30.1-publication-v2",
   config: "[extend]\nuseDefault = true\n",
   inline_suppression: false,
   binary_changes: false,
+  generated_values: "exact-digest-or-uuid-v4",
 });
 export const policyIdentity = digest(scannerPolicy);
 
@@ -57,10 +58,24 @@ export class PublicationScanner {
     this.executable = executable;
   }
 
-  async scan(value: unknown, signal: AbortSignal) {
+  async scan(
+    value: unknown,
+    signal: AbortSignal,
+    generatedValues: readonly string[] = [],
+  ) {
     signal.throwIfAborted();
-    if (this.secrets.containsCredentials(value))
+    if (this.secrets.containsCredentials([value, generatedValues]))
       throw new RuntimeError("publication_secret");
+    if (
+      generatedValues.length > 2 ||
+      generatedValues.some(
+        (entry) =>
+          !/^(?:[a-f0-9]{64}|[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})$/.test(
+            entry,
+          ),
+      )
+    )
+      throw new RuntimeError("publication_scan_failed");
     const pieces: string[] = [];
     let bytes = 0;
     function append(text: string) {
@@ -163,9 +178,14 @@ export class PublicationScanner {
     await rootDirectory(this.root);
     const directory = await mkdtemp(join(this.root, "scan-"));
     try {
-      await writeFile(join(directory, "policy.toml"), scannerPolicy.config, {
-        mode: 0o400,
-      });
+      const generatedPolicy = generatedValues.length
+        ? `\n[[allowlists]]\ndescription = "Exact controller-generated values"\nregexTarget = "secret"\nregexes = [${generatedValues.map((entry) => `'^${entry}$'`).join(", ")}]\n`
+        : "";
+      await writeFile(
+        join(directory, "policy.toml"),
+        scannerPolicy.config + generatedPolicy,
+        { mode: 0o400 },
+      );
       await writeFile(join(directory, ".gitleaksignore"), "", { mode: 0o400 });
       await this.execute(["version"], directory, undefined, signal, true);
       // Framing prevents Gitleaks from silently classifying a text payload as a binary file.

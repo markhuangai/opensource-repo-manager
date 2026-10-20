@@ -77,8 +77,8 @@ const role = z.strictObject({
 const tool = z.discriminatedUnion("effect", [
   z.strictObject({ effect: z.literal("read") }),
   z.strictObject({
-    effect: z.literal("reviewed_write"),
-    idempotency_argument: text.optional(),
+    effect: z.literal("write"),
+    idempotency_argument: toolName.optional(),
   }),
 ]);
 const server = z.strictObject({
@@ -86,6 +86,7 @@ const server = z.strictObject({
   url: endpointUrl,
   allow_plain_http: z.boolean().default(false),
   credential_ref: name.optional(),
+  review_required_tools: z.array(toolName).max(1024).default([]),
   tools: z.record(toolName, tool),
 });
 const positive = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -213,6 +214,31 @@ export function parseConfiguration(source: string): Configuration {
   }
   const parsed = configurationSchema.safeParse(input);
   if (!parsed.success) {
+    const legacy = z
+      .object({
+        mcp: z.object({
+          servers: z.record(
+            z.string(),
+            z.object({
+              tools: z.record(z.string(), z.object({ effect: z.unknown() })),
+            }),
+          ),
+        }),
+      })
+      .safeParse(input);
+    if (
+      legacy.success &&
+      Object.values(legacy.data.mcp.servers).some((server) =>
+        Object.values(server.tools).some(
+          (tool) => tool.effect === "reviewed_write",
+        ),
+      )
+    )
+      throw new ConfigurationError(
+        "mcp_write_migration_required",
+        undefined,
+        "mcp",
+      );
     const first = parsed.error.issues[0]?.path[0];
     const section = configurationSections.find((section) => section === first);
     throw new ConfigurationError("schema_invalid", undefined, section);
@@ -221,6 +247,14 @@ export function parseConfiguration(source: string): Configuration {
   if (!Object.values(config.notifications).some((channel) => channel.enabled))
     throw new ConfigurationError("schema_invalid");
   for (const entry of Object.values(config.mcp.servers)) {
+    if (
+      new Set(entry.review_required_tools).size !==
+        entry.review_required_tools.length ||
+      entry.review_required_tools.some(
+        (name) => entry.tools[name]?.effect !== "write",
+      )
+    )
+      throw new ConfigurationError("schema_invalid", undefined, "mcp");
     if (new URL(entry.url).protocol === "http:" && !entry.allow_plain_http)
       throw new ConfigurationError("schema_invalid");
     if (

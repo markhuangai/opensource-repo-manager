@@ -540,13 +540,14 @@ try {
     servers: {
       fixture: {
         transport: "streamable_http",
+        review_required_tools: [],
         url: "http://fixture.invalid/mcp",
         allow_plain_http: true,
         credential_ref: "service",
         tools: {
           read_item: { effect: "read" },
           write_item: {
-            effect: "reviewed_write",
+            effect: "write",
             idempotency_argument: "operation_key",
           },
         },
@@ -667,6 +668,8 @@ try {
     `type=bind,src=${join(root, "tests", "integration", "bootstrap")},dst=/bootstrap-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(root, "tests", "integration", "publication")},dst=/publication-fixtures,readonly`,
+    "--mount",
+    `type=bind,src=${join(root, "tests", "integration", "mcp-writes")},dst=/mcp-write-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(root, "tests", "fixtures", "publication.ts")},dst=/publication-fixture.ts,readonly`,
   );
@@ -986,6 +989,23 @@ try {
   assert.equal(publicationProof.publication, "passed");
   assert.equal(publicationProof.cleanup, "passed");
 
+  const mcpWriteProof = JSON.parse(
+    docker(
+      [
+        "exec",
+        runtime,
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        "import {runMcpWriteTests} from '/mcp-write-fixtures/harness.mjs'; console.log(JSON.stringify(await runMcpWriteTests()));",
+      ],
+      { timeout: 900_000 },
+    ),
+  );
+  assert.equal(mcpWriteProof.mcp_writes, "passed");
+  assert.equal(mcpWriteProof.cleanup, "passed");
+  assert.equal(request("/readyz").body.mcp_writes.uncertain, 0);
+
   const notificationProof = JSON.parse(
     docker(
       [
@@ -1082,6 +1102,7 @@ try {
     immutable_secret_free_snapshots: "passed",
     supervised_workers: runtimeProof,
     reviewed_publication: publicationProof,
+    selective_mcp_writes: mcpWriteProof,
     durable_notifications: notificationProof,
     repository_bootstrap: bootstrapProof,
   };

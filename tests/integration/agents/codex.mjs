@@ -188,6 +188,13 @@ export async function respond(req, res, fixture) {
         else
           assert(/(?:^|\n)BOOTSTRAP_TESTS_PASSED(?:\n|$)/.test(latest), latest);
       }
+    } else if (scenario === "mcp_write") {
+      if (!previous)
+        output = use(
+          `mcp__${fixture.writeAlias}__${fixture.writeTool}`,
+          fixture.writeInput,
+        );
+      else fixture.writeResults.push(results.at(-1));
     } else if (scenario === "crash") {
       output = command('pkill -ABRT -u "$(id -u)" -x codex');
     } else if (scenario === "output_review") {

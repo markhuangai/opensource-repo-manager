@@ -288,12 +288,40 @@ describe("strict protected configuration contract", () => {
 });
 
 describe("generic HTTP MCP policy configuration", () => {
+  it("defaults review to skipped and validates exact per-server write lists", () => {
+    const config = fixtureMcp();
+    for (const list of [undefined, [], ["store_record"]]) {
+      const source = JSON.parse(JSON.stringify(config));
+      source.mcp.servers.context.review_required_tools = list;
+      expect(
+        parseConfiguration(stringify(source)).mcp.servers.context
+          .review_required_tools,
+      ).toEqual(list ?? []);
+    }
+    for (const list of [
+      ["store_record", "store_record"],
+      ["missing"],
+      ["read_record"],
+    ]) {
+      config.mcp.servers.context.review_required_tools = list;
+      expect(() => parseConfiguration(stringify(config))).toThrow(
+        "schema_invalid",
+      );
+    }
+  });
+  it("rejects the obsolete declaration with a safe migration instruction", () => {
+    const config = JSON.parse(JSON.stringify(fixtureMcp()));
+    config.mcp.servers.context.tools.store_record.effect = "reviewed_write";
+    expect(() => parseConfiguration(stringify(config))).toThrow(
+      "Replace effect: reviewed_write with effect: write and configure review_required_tools",
+    );
+  });
   it("accepts generic read/write grants, static headers and binding identity without secrets", () => {
     const parsed = parseConfiguration(stringify(fixtureMcp()));
     const { settings, secrets } = separateSecrets(parsed);
     expect(settings.mcp.servers.context.credential_ref).toBe("service");
     expect(settings.mcp.servers.context.tools.store_record).toEqual({
-      effect: "reviewed_write",
+      effect: "write",
       idempotency_argument: "operation_key",
     });
     expect(JSON.stringify(settings)).not.toContain("mcp-credential-canary");
@@ -318,7 +346,7 @@ describe("generic HTTP MCP policy configuration", () => {
       recall_memory: { effect: "read" },
       trace_memory: { effect: "read" },
       remember: {
-        effect: "reviewed_write",
+        effect: "write",
         idempotency_argument: "idempotency_key",
       },
     };
@@ -329,7 +357,7 @@ describe("generic HTTP MCP policy configuration", () => {
     ];
     const parsed = parseConfiguration(stringify(config));
     expect(parsed.mcp.servers.context.tools.remember).toEqual({
-      effect: "reviewed_write",
+      effect: "write",
       idempotency_argument: "idempotency_key",
     });
   });
