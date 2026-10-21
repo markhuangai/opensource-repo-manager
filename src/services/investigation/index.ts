@@ -229,6 +229,7 @@ export class InvestigationService {
         record.stage === "completed" ||
         (record.stage === "blocked" && !record.retry_stage)
       ) {
+        if (record.stage === "blocked") await this.publishBlocked(record);
         await this.notify(record);
         continue;
       }
@@ -745,25 +746,37 @@ export class InvestigationService {
     }
     this.repository.save(record);
     this.logger.error(`Investigation blocked (${record.failure}).`);
-    if (!this.supervisor.publication.repository.pending(job.id)) {
-      try {
-        const currentPublication = record.publication_id
-          ? this.supervisor.publication.repository.operation(
-              record.publication_id,
-            )
-          : undefined;
-        await this.publishStage(
-          record,
-          "blocked",
-          currentPublication?.status === "confirmed"
-            ? record.publication_id
-            : record.previous_operation,
-        );
-      } catch {
-        this.failure = "investigation_publication_unconfirmed";
-      }
-    }
+    await this.publishBlocked(record);
     await this.notify(record);
+  }
+
+  private async publishBlocked(record: Investigation) {
+    const pending = this.supervisor.publication.repository.pending(
+      record.job_id,
+    );
+    if (
+      pending &&
+      (pending.id !== record.status_operation ||
+        pending.proposal.kind !== "investigation_stage" ||
+        pending.proposal.stage !== "blocked")
+    )
+      return;
+    try {
+      const currentPublication = record.publication_id
+        ? this.supervisor.publication.repository.operation(
+            record.publication_id,
+          )
+        : undefined;
+      await this.publishStage(
+        record,
+        "blocked",
+        currentPublication?.status === "confirmed"
+          ? record.publication_id
+          : record.previous_operation,
+      );
+    } catch {
+      this.failure = "investigation_publication_unconfirmed";
+    }
   }
 
   private async notify(record: Investigation) {

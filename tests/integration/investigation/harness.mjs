@@ -847,6 +847,103 @@ export async function runInvestigationTests() {
             .some((comment) => comment.body.includes("Confirmed maintenance")),
         );
       }
+
+      for (const recovery of ["cycle", "restart", "exhausted"]) {
+        const terminal = await add("forged_receipt");
+        let failed = false;
+        remote.state.beforeRequest = async (method, path) => {
+          if (
+            !failed &&
+            method === "GET" &&
+            path === `/repos/owner/repo/issues/${terminal.issue_number}` &&
+            record(terminal)?.stage === "blocked"
+          ) {
+            failed = true;
+            remote.state.rateLimit = { method, path, seconds: 5 };
+          }
+        };
+        await investigation.reconcile();
+        remote.state.beforeRequest = undefined;
+        assert(failed, "Blocked status publication fault was not reached");
+        const blocked = record(terminal),
+          pending = supervisor.publication.repository.pending(terminal.id),
+          comments = remote.state.comments.get(terminal.issue_number),
+          commentId = comments[0].id,
+          effects = remote.state.mutations.length,
+          runs = store.runs().length,
+          budget = JSON.parse(store.job(terminal.issue_number).budget_json);
+        assert.equal(blocked.stage, "blocked");
+        assert.equal(blocked.failure, "investigation_evidence_invalid");
+        assert.equal(blocked.retry_stage, null);
+        assert.equal(pending.id, blocked.status_operation);
+        assert.equal(pending.proposal.kind, "investigation_stage");
+        assert.equal(pending.proposal.stage, "blocked");
+        assert.equal(pending.status, "prepared");
+        assert(!comments[0].body.startsWith("Investigation is blocked"));
+        await investigation.reconcile();
+        assert.equal(remote.state.mutations.length, effects);
+        assert.deepEqual(
+          JSON.parse(store.job(terminal.issue_number).budget_json),
+          budget,
+        );
+        if (recovery === "exhausted")
+          store.db
+            .prepare(
+              "UPDATE jobs SET budget_json=json_set(budget_json,'$.infrastructure_retries',?) WHERE id=?",
+            )
+            .run(config.limits.infrastructure_retries, terminal.id);
+        if (recovery !== "cycle") {
+          await closeRuntime();
+          await start();
+        }
+        await delay(Math.max(0, pending.retry_at - Date.now()) + 25);
+        await investigation.reconcile();
+        const recovered = record(terminal),
+          publication = supervisor.publication.repository.operation(pending.id),
+          usage = JSON.parse(store.job(terminal.issue_number).budget_json);
+        assert.equal(recovered.stage, "blocked");
+        assert.equal(recovered.failure, blocked.failure);
+        assert.equal(recovered.retry_stage, null);
+        assert.equal(recovered.agent_pending, blocked.agent_pending);
+        assert.equal(recovered.status_operation, pending.id);
+        assert.equal(store.runs().length, runs);
+        assert.equal(usage.model_requests, budget.model_requests);
+        assert.equal(comments.length, 1);
+        assert.equal(comments[0].id, commentId);
+        assert.equal(
+          comments[0].body.startsWith("Investigation is blocked"),
+          recovery !== "exhausted",
+        );
+        assert.equal(
+          publication.status,
+          recovery === "exhausted" ? "prepared" : "confirmed",
+        );
+        assert.equal(
+          usage.infrastructure_retries,
+          recovery === "exhausted"
+            ? config.limits.infrastructure_retries
+            : budget.infrastructure_retries + 1,
+        );
+        assert.equal(
+          Boolean(usage.infrastructure_exhausted),
+          recovery === "exhausted",
+        );
+        const finalEffects = remote.state.mutations.length;
+        await closeRuntime();
+        await start();
+        await investigation.reconcile();
+        assert.equal(remote.state.mutations.length, finalEffects);
+        assert.equal(store.runs().length, runs);
+        assert.deepEqual(
+          JSON.parse(store.job(terminal.issue_number).budget_json),
+          usage,
+        );
+        proof.push({
+          sdk,
+          terminal_blocked_publication_recovery: recovery,
+          result: "passed",
+        });
+      }
       controls.rejectReview = true;
       const rejected = await run("source_only");
       assert.equal(rejected.record.failure, "output_review_rejected");
