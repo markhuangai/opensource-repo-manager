@@ -273,13 +273,7 @@ export class InvestigationService {
         status.proposal.kind === "investigation_stage" &&
         status.proposal.stage === "blocked"
       ) {
-        await this.confirm({
-          kind: "investigation_stage",
-          job_id: record.job_id,
-          revision: record.revision,
-          stage: "completed",
-          previous_operation: record.publication_id,
-        });
+        await this.publishStage(record, "completed", record.publication_id);
         await this.refresh(record);
       }
       this.repository.finish(record);
@@ -650,13 +644,32 @@ export class InvestigationService {
   private async stage(record: Investigation, stage: InvestigationStage) {
     this.repository.assertCurrent(record);
     record.stage = stage;
-    const proposal: PublicationProposal = {
-      kind: "investigation_stage",
-      job_id: record.job_id,
-      revision: record.revision,
-      stage,
-      previous_operation: record.previous_operation,
-    };
+    await this.publishStage(record, stage, record.previous_operation);
+  }
+
+  private async publishStage(
+    record: Investigation,
+    stage: InvestigationStage | "completed",
+    previousOperation: string | null,
+  ) {
+    const previous = record.status_operation
+      ? this.supervisor.publication.repository.operation(
+          record.status_operation,
+        )
+      : undefined;
+    const proposal: PublicationProposal =
+      previous?.proposal.kind === "investigation_stage" &&
+      previous.proposal.stage === stage &&
+      previous.proposal.previous_operation === previousOperation
+        ? previous.proposal
+        : {
+            kind: "investigation_stage",
+            job_id: record.job_id,
+            revision: record.revision,
+            stage,
+            previous_operation: previousOperation,
+            after_operation: record.status_operation,
+          };
     record.status_operation = this.supervisor.publication.operationId(proposal);
     this.repository.save(record);
     await this.confirm(proposal);
@@ -739,20 +752,13 @@ export class InvestigationService {
               record.publication_id,
             )
           : undefined;
-        const proposal: PublicationProposal = {
-          kind: "investigation_stage",
-          job_id: job.id,
-          revision: job.revision,
-          stage: "blocked",
-          previous_operation:
-            currentPublication?.status === "confirmed"
-              ? record.publication_id
-              : record.previous_operation,
-        };
-        record.status_operation =
-          this.supervisor.publication.operationId(proposal);
-        this.repository.save(record);
-        await this.confirm(proposal);
+        await this.publishStage(
+          record,
+          "blocked",
+          currentPublication?.status === "confirmed"
+            ? record.publication_id
+            : record.previous_operation,
+        );
       } catch {
         this.failure = "investigation_publication_unconfirmed";
       }
@@ -761,6 +767,7 @@ export class InvestigationService {
   }
 
   private async notify(record: Investigation) {
+    if (record.retry_stage) return;
     const outcome =
       record.stage === "blocked" ? "blocked" : record.result?.outcome;
     if (

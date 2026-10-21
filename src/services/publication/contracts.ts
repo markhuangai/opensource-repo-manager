@@ -16,6 +16,7 @@ export const proposalSchema = z.discriminatedUnion("kind", [
     kind: z.literal("investigation_stage"),
     stage: z.union([investigationStage, z.literal("completed")]),
     previous_operation: hash.nullable(),
+    after_operation: hash.nullable(),
   }),
   z.strictObject({ ...job, kind: z.literal("status"), body: text.min(1) }),
   z.strictObject({

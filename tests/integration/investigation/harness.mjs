@@ -72,6 +72,7 @@ export async function runInvestigationTests() {
     await app?.close();
     await supervisor?.close();
     await gateway?.close();
+    if (fixture) errors.push(...fixture.errors.splice(0));
     if (store?.db.open) store.close();
     investigation = undefined;
     intake = undefined;
@@ -427,13 +428,11 @@ export async function runInvestigationTests() {
         const budget = JSON.parse(
           store.job(lateFailure.issue_number).budget_json,
         );
-        await until(
-          () =>
-            notifications.some(
-              (entry) =>
-                entry.event_id === `investigation-${blocked.id}-blocked`,
-            ),
-          "Blocker notification was not delivered",
+        assert.equal(
+          supervisor.notifications.repository.event(
+            `investigation-${blocked.id}-blocked`,
+          ),
+          undefined,
         );
         if (mode === "source_only") {
           remote.state.issues.get(lateFailure.issue_number).body +=
@@ -513,7 +512,7 @@ export async function runInvestigationTests() {
         const events = notifications.filter((entry) =>
           entry.event_id.startsWith(`investigation-${blocked.id}-`),
         );
-        assert.equal(events.length, mode === "source_only" ? 1 : 2);
+        assert.equal(events.length, 1);
         await closeRuntime();
         await start();
         await investigation.reconcile();
@@ -532,6 +531,92 @@ export async function runInvestigationTests() {
         sdk,
         post_publication_read_recovery_and_distinct_notifications: "passed",
       });
+
+      if (sdk === "codex") {
+        const repeating = await add("source_only");
+        store.db
+          .prepare(
+            "UPDATE jobs SET budget_json=json_set(budget_json,'$.infrastructure_retries',?) WHERE id=?",
+          )
+          .run(config.limits.infrastructure_retries - 1, repeating.id);
+        let failures = 0,
+          afterRestore = false;
+        remote.state.beforeRequest = async (method, path) => {
+          const value = record(repeating);
+          if (
+            method !== "GET" ||
+            path !== `/repos/owner/repo/issues/${repeating.issue_number}` ||
+            !value?.publication_id ||
+            supervisor.publication.repository.operation(value.publication_id)
+              ?.status !== "confirmed"
+          )
+            return;
+          const body = remote.state.comments.get(repeating.issue_number)?.[0]
+            ?.body;
+          if (
+            failures === 0 ||
+            (failures === 1 &&
+              afterRestore &&
+              body?.startsWith("Confirmed maintenance candidate"))
+          ) {
+            failures++;
+            remote.state.rateLimit = { method, path, seconds: 1 };
+          }
+        };
+        await investigation.reconcile();
+        const blocked = record(repeating),
+          comments = remote.state.comments.get(repeating.issue_number),
+          commentId = comments[0].id,
+          runs = store.runs().length,
+          notification = `investigation-${blocked.id}-blocked`;
+        assert.equal(failures, 1);
+        assert(blocked.retry_stage);
+        assert(comments[0].body.startsWith("Investigation is blocked"));
+        assert.equal(
+          supervisor.notifications.repository.event(notification),
+          undefined,
+        );
+        afterRestore = true;
+        await delay(Math.max(0, blocked.retry_at - Date.now()) + 25);
+        await investigation.reconcile();
+        remote.state.beforeRequest = undefined;
+        const final = record(repeating);
+        assert.equal(failures, 2);
+        assert.equal(final.stage, "blocked");
+        assert.equal(final.failure, "infrastructure_budget_exhausted");
+        assert.equal(final.retry_stage, null);
+        assert.notEqual(final.status_operation, blocked.status_operation);
+        assert.equal(store.job(repeating.issue_number).phase, "investigation");
+        assert.equal(store.runs().length, runs);
+        assert.equal(comments.length, 1);
+        assert.equal(comments[0].id, commentId);
+        assert(comments[0].body.startsWith("Investigation is blocked"));
+        assert(comments[0].body.includes(blocked.result.summary));
+        assert(comments[0].body.includes(blocked.source.sha));
+        await until(
+          () => notifications.some((entry) => entry.event_id === notification),
+          "Final blocker notification was not delivered",
+        );
+        const notices = notifications.filter(
+          (entry) => entry.event_id === notification,
+        );
+        assert.equal(notices.length, 1);
+        assert.equal(notices[0].reason, "budget_exhausted");
+        const effects = remote.state.mutations.length;
+        await closeRuntime();
+        await start();
+        await investigation.reconcile();
+        assert.equal(remote.state.mutations.length, effects);
+        assert.equal(
+          notifications.filter((entry) => entry.event_id === notification)
+            .length,
+          1,
+        );
+        proof.push({
+          sdk,
+          repeated_recovery_status_and_final_notification: "passed",
+        });
+      }
 
       for (const boundary of [
         "plan",
@@ -619,11 +704,24 @@ export async function runInvestigationTests() {
           finalUsage.infrastructure_retries <=
             config.limits.infrastructure_retries,
         );
-        if (boundary === "active_worker")
+        if (boundary === "active_worker") {
           assert.equal(
             finalUsage.infrastructure_retries,
             usage.infrastructure_retries + 1,
           );
+          const inspecting = store.db
+            .prepare(
+              "SELECT content FROM publication_operations WHERE job_id=? AND status='confirmed'",
+            )
+            .all(recovering.id)
+            .map(({ content }) => JSON.parse(content))
+            .filter(
+              (operation) =>
+                operation.proposal.kind === "investigation_stage" &&
+                operation.proposal.stage === "inspecting",
+            );
+          assert.equal(inspecting.length, 1);
+        }
         assert(!finalUsage.infrastructure_exhausted);
         const commands = resumed.evidence_ids
           .map((id) =>
@@ -1048,7 +1146,6 @@ export async function runInvestigationTests() {
       assert(!ready.body.includes("owner/repo"));
       assert(!logs.join("\n").includes(config.github.token));
       assert(!logs.join("\n").includes(config.proxy.key));
-      errors.push(...fixture.errors);
       await closeRuntime();
       for (const uid of [10001, 10002, 10003])
         assert.deepEqual(await userProcesses(uid), []);
