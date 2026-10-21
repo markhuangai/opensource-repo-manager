@@ -21,6 +21,10 @@ export const reviewedWriteInput = z.strictObject({
           kind: z.literal("publication_evidence"),
           id: z.string().regex(/^[a-f0-9]{64}$/),
         }),
+        z.strictObject({
+          kind: z.literal("investigation_evidence"),
+          id: z.string().regex(/^[a-f0-9]{64}$/),
+        }),
       ]),
     )
     .min(1)

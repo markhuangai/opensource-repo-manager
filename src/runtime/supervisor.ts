@@ -25,6 +25,11 @@ import type { SourceMetadata } from "../domain/jobs.ts";
 import type { Store } from "../repositories/store.ts";
 import { ModelRelay } from "../services/model-relay.ts";
 import { BootstrapService } from "../services/bootstrap/index.ts";
+import { commandDirectory } from "../services/bootstrap/environment.ts";
+import type {
+  BootstrapCommand,
+  CommandReceipt,
+} from "../services/bootstrap/contracts.ts";
 import { PublicationService } from "../services/publication/index.ts";
 import { NotificationService } from "../services/notifications/index.ts";
 import { McpWriteService } from "../services/mcp-writes/index.ts";
@@ -568,6 +573,7 @@ export class Supervisor implements AgentRunner {
     cwd: string,
     environment: NodeJS.ProcessEnv,
     operation: string,
+    captureNonzero = false,
   ) {
     this.validateBootstrapLease(session, request);
     const limits = workerLimits(this.store.snapshot(request.snapshot_digest));
@@ -580,6 +586,7 @@ export class Supervisor implements AgentRunner {
         signal: session.signal,
         limit: limits.output - (this.bootstrapOutput.get(runId) ?? 0),
         operation,
+        capture_nonzero: captureNonzero,
         secrets: this.secrets,
         record: (receipt) => {
           this.store.recordBootstrapCommand(attempt, runId, receipt);
@@ -595,6 +602,72 @@ export class Supervisor implements AgentRunner {
       await cleanTemporary(roleUsers[request.role].uid);
       await treeBytes(prepared.root, limits.storage);
     }
+  }
+
+  async reproduce(
+    request: AgentRunRequest,
+    command: BootstrapCommand,
+    signal: AbortSignal,
+  ) {
+    if (
+      request.role !== "investigation" ||
+      !request.bootstrap_receipt ||
+      request.workspace.artifact
+    )
+      throw new RuntimeError("investigation_command_invalid");
+    const bootstrap = this.bootstrap.receipt(request);
+    return this.withJobLease(request, signal, (lease) =>
+      this.bootstrapWorkspace(lease, request, async (workspace, runId) => {
+        const setup = await this.bootstrap.materialize(
+          request,
+          workspace,
+          runId,
+          lease.signal,
+          (argv, cwd, env, operation) =>
+            this.bootstrapCommand(
+              lease,
+              request,
+              workspace,
+              bootstrap.id,
+              runId,
+              argv,
+              cwd,
+              env,
+              operation,
+            ),
+        );
+        const cwd = await commandDirectory(workspace.workspace, command.cwd);
+        const output = await this.bootstrapCommand(
+          lease,
+          request,
+          workspace,
+          bootstrap.id,
+          runId,
+          command.argv,
+          cwd,
+          setup.environment,
+          "investigation-reproduction",
+          true,
+        );
+        const receipt = this.store
+          .bootstrapCommands(bootstrap.id)
+          .filter((entry) => entry.operation === "investigation-reproduction")
+          .at(-1) as CommandReceipt | undefined;
+        if (
+          !receipt ||
+          receipt.finished_at === null ||
+          receipt.exit_code !== output.exit_code
+        )
+          throw new RuntimeError("investigation_command_receipt_missing");
+        return {
+          run_id: runId,
+          bootstrap_receipt: bootstrap.id,
+          environment: bootstrap.environment,
+          command: { ...receipt, cwd: command.cwd },
+          output,
+        };
+      }),
+    );
   }
 
   async *runReview(

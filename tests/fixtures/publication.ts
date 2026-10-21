@@ -90,6 +90,16 @@ export async function createPublicationFixture(root: string) {
     draft: boolean;
   };
   const state = {
+    issues: new Map<
+      number,
+      {
+        id: number;
+        number: number;
+        title: string;
+        body: string | null;
+        updated_at: string;
+      }
+    >(),
     token: "github-fixture-token",
     actor: { id: 7, login: "fixture" },
     repository_id: 42,
@@ -281,6 +291,24 @@ export async function createPublicationFixture(root: string) {
       });
       return;
     }
+    if (path === `${base}/issues` && req.method === "GET") {
+      const page = Number(url.searchParams.get("page") ?? 1);
+      send(
+        [...state.issues.values()]
+          .filter((item) => !state.closed.has(item.number))
+          .slice((page - 1) * 100, page * 100)
+          .map((item) => ({ ...item, state: "open" })),
+      );
+      return;
+    }
+    if (path === `${base}/commits/${state.default_branch}`) {
+      const sha = head(state.default_branch);
+      send({
+        sha,
+        commit: { tree: { sha: git(["rev-parse", `${sha}^{tree}`]) } },
+      });
+      return;
+    }
     const rules = path.match(/^\/repos\/owner\/repo\/rules\/branches\/(.+)$/);
     if (rules) {
       send(state.protected.has(rules[1]) ? [{ type: "deletion" }] : []);
@@ -307,7 +335,11 @@ export async function createPublicationFixture(root: string) {
     if (issue) {
       const number = Number(issue[1]);
       if (!issue[2]) {
-        send({ number, state: state.closed.has(number) ? "closed" : "open" });
+        send({
+          ...state.issues.get(number),
+          number,
+          state: state.closed.has(number) ? "closed" : "open",
+        });
         return;
       }
       const comments = state.comments.get(number) ?? [];
@@ -316,6 +348,7 @@ export async function createPublicationFixture(root: string) {
         send(
           comments.slice((page - 1) * 100, page * 100).map((row) => ({
             ...row,
+            updated_at: "2026-10-21T00:00:00Z",
             user:
               row.author_id === null
                 ? null

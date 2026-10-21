@@ -84,7 +84,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (![0, 1, 2, 3, 4, 5, 6, 7].includes(version as number))
+      if (![0, 1, 2, 3, 4, 5, 6, 7, 8].includes(version as number))
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -259,6 +259,24 @@ export class Store {
         `),
           )
           .immediate();
+      if ((version as number) < 8)
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE investigations (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL,
+            UNIQUE(job_id,revision)
+          );
+          CREATE TABLE investigation_evidence (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, content TEXT NOT NULL
+          );
+          CREATE TABLE mcp_read_results (id TEXT PRIMARY KEY REFERENCES mcp_calls(id), content TEXT NOT NULL);
+          PRAGMA user_version = 8;
+        `),
+          )
+          .immediate();
     } catch (error) {
       this.db.close();
       throw error;
@@ -420,10 +438,12 @@ export class Store {
           .get(delivery) as
           { payload_digest: string; event: string } | undefined;
         if (previous) {
-          if (
-            previous.payload_digest !== payloadDigest ||
-            previous.event !== event
-          )
+          const sameEvent =
+            previous.event === event ||
+            [previous.event, event].every(
+              (value) => value === "issues" || value === "issues.reopened",
+            );
+          if (previous.payload_digest !== payloadDigest || !sameEvent)
             throw new IntakeError("delivery_conflict");
           return false;
         }
@@ -496,6 +516,14 @@ export class Store {
       .get(Date.now()) as DirtyTarget | undefined;
   }
 
+  refreshIssue(number: number): DirtyTarget {
+    return {
+      kind: "issue",
+      number,
+      generation: this.markDirty({ kind: "issue", number }, "reconciliation"),
+    };
+  }
+
   defer(target: DirtyTarget, code: string, retryAt: number) {
     this.db
       .prepare(
@@ -550,6 +578,38 @@ export class Store {
         const previous = this.job(context.number);
         if (previous && previous.issue_id !== context.id)
           throw new IntakeError("issue_identity_changed");
+        const reopened = Boolean(
+          context.state === "open" &&
+          this.db
+            .prepare(
+              `SELECT 1 FROM delivery_targets AS target JOIN inbox USING(delivery_id)
+              WHERE target.kind='issue' AND target.number=? AND target.generation<=?
+                AND target.done=0 AND inbox.event='issues.reopened'`,
+            )
+            .get(context.number, target.generation),
+        );
+        if (
+          previous &&
+          previous.status === "pending" &&
+          context.state === "open" &&
+          !reopened
+        ) {
+          const completed = this.db
+            .prepare(
+              `SELECT 1 FROM investigations WHERE job_id=? AND revision=? AND state='completed'
+            AND json_extract(content,'$.result.outcome') IN ('needs_information','no_fix','manual_feature')`,
+            )
+            .get(previous.id, previous.revision);
+          const prior = JSON.parse(previous.input_json) as IssueContext;
+          if (
+            completed &&
+            inputJson({ ...context, source: prior.source }) ===
+              previous.input_json
+          ) {
+            this.complete(target);
+            return true;
+          }
+        }
         if (previous || context.state === "open") {
           const input = inputJson(context);
           const inputDigest = createHash("sha256").update(input).digest("hex");
@@ -558,8 +618,9 @@ export class Store {
             .prepare(
               `INSERT INTO jobs(issue_id,issue_number,status,input_digest,input_json,snapshot_digest,budget_json)
           VALUES(?,?,?,?,?,?,?) ON CONFLICT(issue_number) DO UPDATE SET
-          revision=jobs.revision+1,status=excluded.status,input_digest=excluded.input_digest,input_json=excluded.input_json
-          WHERE jobs.input_digest<>excluded.input_digest OR jobs.status<>excluded.status`,
+          revision=jobs.revision+1,status=excluded.status,input_digest=excluded.input_digest,input_json=excluded.input_json,
+          phase=CASE WHEN EXISTS (SELECT 1 FROM investigations WHERE job_id=jobs.id AND revision=jobs.revision) THEN 'investigation' ELSE jobs.phase END
+          WHERE jobs.input_digest<>excluded.input_digest OR jobs.status<>excluded.status OR ?`,
             )
             .run(
               context.id,
@@ -569,6 +630,7 @@ export class Store {
               input,
               snapshot.digest,
               JSON.stringify(initialBudget),
+              Number(reopened),
             );
         }
         this.complete(target);
@@ -713,6 +775,27 @@ export class Store {
     );
   }
 
+  reserveInfrastructureRetry(jobId: number) {
+    return this.db
+      .transaction(() => {
+        const job = this.jobById(jobId);
+        if (!job) throw new RuntimeError("request_invalid");
+        const usage = budgetUsage.parse(JSON.parse(job.budget_json));
+        const limit = this.snapshot(job.snapshot_digest).settings.limits
+          .infrastructure_retries;
+        const reserved =
+          !usage.infrastructure_exhausted &&
+          usage.infrastructure_retries < limit;
+        if (reserved) usage.infrastructure_retries++;
+        else usage.infrastructure_exhausted = true;
+        this.db
+          .prepare("UPDATE jobs SET budget_json=? WHERE id=?")
+          .run(JSON.stringify(usage), job.id);
+        return reserved;
+      })
+      .immediate();
+  }
+
   startRun(
     record: Pick<
       AgentRunRecord,
@@ -829,6 +912,20 @@ export class Store {
     return this.db
       .prepare("SELECT * FROM mcp_calls ORDER BY started_at,rowid")
       .all() as McpCallReceipt[];
+  }
+
+  saveMcpReadResult(id: string, result: unknown) {
+    this.db
+      .prepare("INSERT INTO mcp_read_results VALUES(?,?)")
+      .run(id, JSON.stringify(result));
+  }
+
+  mcpReadResult(id: string): unknown {
+    const row = this.db
+      .prepare("SELECT content FROM mcp_read_results WHERE id=?")
+      .get(id) as { content: string } | undefined;
+    if (!row) throw new RuntimeError("mcp_read_result_missing");
+    return JSON.parse(row.content) as unknown;
   }
 
   bindRun(id: string, binding: string) {

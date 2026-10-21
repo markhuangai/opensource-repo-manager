@@ -1,6 +1,5 @@
 import { immutable } from "../config/bundles.ts";
 import { digest, RuntimeError } from "../domain/agents.ts";
-import { budgetUsage } from "../domain/jobs.ts";
 import type {
   McpWriteOperation,
   McpWriteAttempt,
@@ -107,7 +106,7 @@ export class McpWriteRepository {
   }
 
   dispatch(operation: McpWriteOperation, recovery: boolean) {
-    this.store.db
+    const dispatched = this.store.db
       .transaction(() => {
         const previous = this.operation(operation.id);
         if (
@@ -145,17 +144,8 @@ export class McpWriteRepository {
         )
           throw new RuntimeError("revision_stale");
         const attempts = this.attempts(operation.id);
-        if (recovery) {
-          const usage = budgetUsage.parse(JSON.parse(job.budget_json));
-          const limit = this.store.snapshot(job.snapshot_digest).settings.limits
-            .infrastructure_retries;
-          if (usage.infrastructure_retries >= limit)
-            throw new RuntimeError("infrastructure_budget_exhausted");
-          usage.infrastructure_retries++;
-          this.store.db
-            .prepare("UPDATE jobs SET budget_json=? WHERE id=?")
-            .run(JSON.stringify(usage), job.id);
-        }
+        if (recovery && !this.store.reserveInfrastructureRetry(job.id))
+          return false;
         const attempt: McpWriteAttempt = {
           operation_id: operation.id,
           number: attempts.length + 1,
@@ -170,8 +160,10 @@ export class McpWriteRepository {
         this.store.db
           .prepare("INSERT INTO mcp_write_attempts VALUES(?,?,?)")
           .run(operation.id, attempt.number, JSON.stringify(attempt));
+        return true;
       })
       .immediate();
+    if (!dispatched) throw new RuntimeError("infrastructure_budget_exhausted");
   }
 
   finish(

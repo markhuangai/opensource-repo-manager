@@ -5,6 +5,7 @@ import { startHttpService } from "./http/server.ts";
 import { IntakeError } from "./domain/jobs.ts";
 import { Store } from "./repositories/store.ts";
 import { IntakeService } from "./services/intake.ts";
+import { InvestigationService } from "./services/investigation/index.ts";
 import { RuntimeError } from "./domain/agents.ts";
 import { Supervisor } from "./runtime/supervisor.ts";
 import { McpGateway } from "./services/mcp/index.ts";
@@ -43,6 +44,7 @@ try {
       },
     );
     mcp.setWriteDispatcher(supervisor.mcpWrites);
+    mcp.setReadResultScanner(supervisor.publication.outputReview.scanner);
     await mcp.start();
     const reader = createGitHubReader(
       loaded.snapshot.settings.github.repository,
@@ -54,9 +56,22 @@ try {
       loaded.snapshot,
       loaded.secrets,
       logger,
+      {
+        beforeIssue: async (context, signal) =>
+          investigation?.beforeIssue(context, signal),
+        changed: () => investigation?.wake(),
+      },
+    );
+    const investigation: InvestigationService = new InvestigationService(
+      store,
+      intake,
+      supervisor,
+      loaded.secrets,
+      logger,
     );
     await startHttpService(logger, {
       intake,
+      investigation,
       notifications: supervisor.notifications,
       mcpWrites: supervisor.mcpWrites,
       webhookSecret: loaded.secrets.get("github.webhook_secret"),

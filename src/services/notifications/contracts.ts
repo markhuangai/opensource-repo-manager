@@ -13,6 +13,9 @@ export const reasons = {
   review_timeout: "The workflow timed out waiting for review.",
   checks_failed: "Required checks failed.",
   infrastructure_failed: "Workflow infrastructure needs attention.",
+  manual_feature:
+    "A feature request has been investigated and needs a manual maintainer handoff.",
+  needs_information: "An issue investigation needs more information.",
 } as const;
 export const eventSchema = z
   .strictObject({
