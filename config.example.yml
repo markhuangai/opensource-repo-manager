@@ -23,8 +23,8 @@ roles:
     skills: [example, bootstrap]
   investigation:
     profile: coding
-    prompts: { system: system.md, user: user.md }
-    skills: [example]
+    prompts: { system: system.md, user: investigation.md }
+    skills: [example, investigate]
   implementation:
     profile: coding
     prompts: { system: system.md, user: user.md }

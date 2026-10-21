@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { immutable } from "../config/bundles.ts";
-import { budgetUsage } from "../domain/jobs.ts";
 import { digest, RuntimeError } from "../domain/agents.ts";
 import type { Store } from "./store.ts";
 import {
@@ -108,6 +107,15 @@ export class PublicationRepository {
     return this.read<PublicationReceipt>("publication_operations", id);
   }
 
+  pending(job: number): PublicationReceipt | undefined {
+    const row = this.store.db
+      .prepare(
+        "SELECT content FROM publication_operations WHERE job_id=? AND status NOT IN ('confirmed','blocked')",
+      )
+      .get(job) as { content: string } | undefined;
+    return row && (JSON.parse(row.content) as PublicationReceipt);
+  }
+
   begin(receipt: PublicationReceipt) {
     return this.store.db
       .transaction(() => {
@@ -146,24 +154,17 @@ export class PublicationRepository {
     if (Date.now() < receipt.retry_at)
       throw new RuntimeError("publication_backoff");
     if (!receipt.retry_pending) return;
-    this.store.db
+    const reserved = this.store.db
       .transaction(() => {
-        const job = this.store.jobById(receipt.job_id);
-        if (!job) throw new RuntimeError("request_invalid");
-        const usage = budgetUsage.parse(JSON.parse(job.budget_json));
-        const limit = this.store.snapshot(job.snapshot_digest).settings.limits
-          .infrastructure_retries;
-        if (usage.infrastructure_retries >= limit)
-          throw new RuntimeError("infrastructure_budget_exhausted");
-        usage.infrastructure_retries++;
-        this.store.db
-          .prepare("UPDATE jobs SET budget_json=? WHERE id=?")
-          .run(JSON.stringify(usage), job.id);
+        if (!this.store.reserveInfrastructureRetry(receipt.job_id))
+          return false;
         receipt.retry_pending = false;
         receipt.retry_at = 0;
         this.save(receipt);
+        return true;
       })
       .immediate();
+    if (!reserved) throw new RuntimeError("infrastructure_budget_exhausted");
   }
 
   providerReady() {

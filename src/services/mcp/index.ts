@@ -39,6 +39,7 @@ import type {
   WriteBinding,
 } from "../mcp-writes/contracts.ts";
 import { policyIdentity } from "../publication/scanner.ts";
+import type { PublicationScanner } from "../publication/scanner.ts";
 
 const maxConcurrentCalls = 16;
 
@@ -69,6 +70,7 @@ type Session = {
 };
 
 export class McpGateway implements McpSessionProvider, McpWriteTransport {
+  private readScanner: PublicationScanner | undefined;
   private dispatcher: McpWriteDispatcher | undefined;
   private readonly sessions = new Map<string, Session>();
   private readonly closing = new Set<Promise<void>>();
@@ -123,6 +125,12 @@ export class McpGateway implements McpSessionProvider, McpWriteTransport {
     if (this.url || this.dispatcher)
       throw new RuntimeError("mcp_dispatcher_already_set");
     this.dispatcher = dispatcher;
+  }
+
+  setReadResultScanner(scanner: PublicationScanner) {
+    if (this.url || this.readScanner)
+      throw new RuntimeError("mcp_dispatcher_already_set");
+    this.readScanner = scanner;
   }
 
   async open(request: OpenRequest) {
@@ -546,9 +554,28 @@ export class McpGateway implements McpSessionProvider, McpWriteTransport {
               this.authorize(session);
               resultDigest = completedDigest;
               outcome = result.isError ? "tool_error" : "completed";
+              if (request.role === "investigation" && this.readScanner) {
+                await this.readScanner.scan(result, call.signal);
+                call.assertActive();
+                this.authorize(session);
+                const visible = {
+                  ...result,
+                  _meta: {
+                    ...result._meta,
+                    "opensource-repo-manager/read-receipt": { call_id: id },
+                  },
+                };
+                this.checkVisible(
+                  { jsonrpc: "2.0", id: extra.requestId, result: visible },
+                  limits.max_response_bytes - progressBytes,
+                );
+                this.store.saveMcpReadResult(id, result);
+                return visible;
+              }
               return result;
             } catch (error) {
-              if (call.signal.aborted) outcome = "cancelled";
+              outcome = call.signal.aborted ? "cancelled" : "failed";
+              resultDigest = null;
               const remaining = limits.max_response_bytes - progressBytes;
               const failure = this.safeError(error, remaining);
               if (

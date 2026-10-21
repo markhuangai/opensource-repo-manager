@@ -12,6 +12,8 @@ import { digest, RuntimeError, workerLimits } from "../../domain/agents.ts";
 import { IntakeError } from "../../domain/jobs.ts";
 import type { Store } from "../../repositories/store.ts";
 import { PublicationRepository } from "../../repositories/publication.ts";
+import { InvestigationRepository } from "../../repositories/investigation.ts";
+import { renderFindings, stageText } from "../investigation/contracts.ts";
 import type { BootstrapLease, Supervisor } from "../../runtime/supervisor.ts";
 import { rootDirectory } from "../workspaces/files.ts";
 import { ExternalOutputReview } from "./review.ts";
@@ -31,7 +33,8 @@ type FrozenPayload = {
   comment?: string;
   pull?: { title: string; body: string; branch: string; base: string };
   candidate?: Awaited<ReturnType<PublicationGit["build"]>>;
-  evidence: PublicationEvidence[];
+  evidence: unknown[];
+  narrative?: string;
 };
 type PublicationOptions = {
   writer?: (ready: () => void) => GitHubWriter;
@@ -99,6 +102,13 @@ export class PublicationService {
     );
   }
 
+  operationId(proposal: PublicationProposal) {
+    return digest({
+      instance: this.repository.instance(),
+      proposal: proposalSchema.parse(proposal),
+    });
+  }
+
   private async exclusive<T>(jobId: number, operation: () => Promise<T>) {
     if (this.active.has(jobId)) throw new RuntimeError("publication_busy");
     this.active.add(jobId);
@@ -115,7 +125,7 @@ export class PublicationService {
   ): Promise<PublicationReceipt> {
     if (this.secrets.containsCredentials(proposal))
       throw new RuntimeError("publication_secret");
-    const id = digest({ instance: this.repository.instance(), proposal });
+    const id = this.operationId(proposal);
     const previous = this.repository.operation(id);
     if (previous?.status === "confirmed" || previous?.status === "blocked")
       return previous;
@@ -178,7 +188,10 @@ export class PublicationService {
         const payload = await this.prepare(receipt, git, publicationSignal);
         const reviewRequest = this.reviewRequest(receipt);
         if (!receipt.review_id) {
-          if (proposal.kind === "notice") {
+          if (
+            proposal.kind === "notice" ||
+            proposal.kind === "investigation_stage"
+          ) {
             await this.outputReview.scanner.scan(payload, publicationSignal);
             receipt.review_id = this.repository.review({
               id: randomUUID(),
@@ -284,7 +297,7 @@ export class PublicationService {
         if (directory) await rm(directory, { recursive: true, force: true });
       }
     };
-    return proposal.kind === "notice"
+    return proposal.kind === "notice" || proposal.kind === "investigation_stage"
       ? this.supervisor.withPublicationNotice(signal, (noticeSignal) =>
           operation(noticeSignal),
         )
@@ -447,7 +460,34 @@ export class PublicationService {
       },
       evidence: [],
     };
-    if (proposal.kind !== "change")
+    if (proposal.kind === "investigation") {
+      const investigations = new InvestigationRepository(this.store);
+      const record = investigations.get(proposal.investigation_id);
+      investigations.assertCurrent(record);
+      if (
+        record.job_id !== job.id ||
+        record.revision !== job.revision ||
+        !record.result
+      )
+        throw new RuntimeError("investigation_evidence_mismatch");
+      const evidence = record.result.evidence_ids.map((id) => ({
+        id,
+        ...investigations.evidence(id, job.id, job.revision, receipt.source),
+      }));
+      payload.narrative = renderFindings(
+        record,
+        evidence,
+        this.supervisor.repositoryName(),
+      );
+      payload.evidence = evidence;
+      payload.comment = `${payload.narrative}${this.pullReference(receipt)}\n\n${marker}`;
+    } else if (proposal.kind === "investigation_stage") {
+      payload.narrative = this.previousNarrative(
+        proposal.previous_operation,
+        job.id,
+      );
+      payload.comment = `${this.investigationStatus(proposal.stage, payload.narrative)}${this.pullReference(receipt)}\n\n${marker}`;
+    } else if (proposal.kind !== "change")
       payload.comment = `${proposal.kind === "notice" ? notices[proposal.reason] : proposal.body}\n\n${marker}`;
     else {
       if (
@@ -462,14 +502,15 @@ export class PublicationService {
       );
       if (digest(manifest.source) !== digest(receipt.source))
         throw new RuntimeError("artifact_source_mismatch");
-      payload.evidence = proposal.evidence_ids.map((id) =>
+      const evidence = proposal.evidence_ids.map((id) =>
         this.repository.evidence(id),
       );
+      payload.evidence = evidence;
       if (
         !["audit", "test"].every((kind) =>
-          payload.evidence.some((item) => item.kind === kind),
+          evidence.some((item) => item.kind === kind),
         ) ||
-        payload.evidence.some(
+        evidence.some(
           (item) =>
             item.job_id !== job.id ||
             item.revision !== job.revision ||
@@ -507,6 +548,8 @@ export class PublicationService {
         throw new RuntimeError("publication_candidate_changed");
       receipt.commit = payload.candidate.commit;
     }
+    if (payload.comment && Buffer.byteLength(payload.comment) > 65536)
+      throw new RuntimeError("publication_size_limit");
     if (receipt.payload !== null && digest(receipt.payload) !== digest(payload))
       throw new RuntimeError("publication_payload_changed");
     receipt.payload = payload;
@@ -559,11 +602,19 @@ export class PublicationService {
   private approval(receipt: PublicationReceipt) {
     if (!receipt.review_id) throw new RuntimeError("output_review_missing");
     const request = this.reviewRequest(receipt);
-    if (receipt.proposal.kind !== "notice") {
+    if (
+      receipt.proposal.kind !== "notice" &&
+      receipt.proposal.kind !== "investigation_stage"
+    ) {
       this.outputReview.verify(receipt.review_id, request);
       return;
     }
-    const expected = `${notices[receipt.proposal.reason]}\n\n<!-- orm:${this.repository.instance()}:${receipt.job_id}:${receipt.id} -->`;
+    const proposal = receipt.proposal;
+    const narrative =
+      proposal.kind === "investigation_stage"
+        ? this.previousNarrative(proposal.previous_operation, receipt.job_id)
+        : "";
+    const expected = `${proposal.kind === "notice" ? notices[proposal.reason] : `${this.investigationStatus(proposal.stage, narrative)}${this.pullReference(receipt)}`}\n\n<!-- orm:${this.repository.instance()}:${receipt.job_id}:${receipt.id} -->`;
     const review = this.repository.reviewed(receipt.review_id);
     if (
       (receipt.payload as FrozenPayload).comment !== expected ||
@@ -573,6 +624,65 @@ export class PublicationService {
       review.binding !== this.outputReview.binding(request)
     )
       throw new RuntimeError("output_review_mismatch");
+  }
+
+  private pullReference(receipt: PublicationReceipt) {
+    const pull = receipt.target.pull;
+    return pull
+      ? `\n\nPull request: https://github.com/${this.supervisor.repositoryName()}/pull/${pull.number}`
+      : "";
+  }
+
+  private investigationStatus(
+    stage: keyof typeof stageText | "completed",
+    narrative: string,
+  ) {
+    if (stage === "completed") {
+      if (!narrative)
+        throw new RuntimeError("investigation_summary_unreviewed");
+      return narrative;
+    }
+    return `${stageText[stage]}${narrative ? `\n\nPrevious reviewed findings:\n\n${narrative}` : ""}`;
+  }
+
+  private previousNarrative(id: string | null, jobId: number) {
+    if (id === null) return "";
+    const operation = this.repository.operation(id);
+    if (
+      !operation ||
+      operation.job_id !== jobId ||
+      operation.status !== "confirmed" ||
+      operation.proposal.kind !== "investigation" ||
+      !operation.review_id
+    )
+      throw new RuntimeError("investigation_summary_unreviewed");
+    const payload = operation.payload as FrozenPayload;
+    const receipt = this.repository.reviewed(operation.review_id);
+    const run = receipt.run_id ? this.store.run(receipt.run_id) : undefined;
+    const expected = digest({
+      job_id: jobId,
+      revision: operation.revision,
+      destination: payload.destination,
+      payload,
+      evidence: payload.evidence,
+      artifact_digest: null,
+      parent_run_id: null,
+      snapshot_digest: this.store.jobById(jobId)!.snapshot_digest,
+      policy_identity: policyIdentity,
+    });
+    if (
+      !payload.narrative ||
+      !receipt.approved ||
+      receipt.binding !== expected ||
+      receipt.policy_identity !== policyIdentity ||
+      run?.role !== "output_review" ||
+      run.job_id !== jobId ||
+      run.revision !== operation.revision ||
+      run.status !== "completed" ||
+      run.finished_at === null
+    )
+      throw new RuntimeError("investigation_summary_unreviewed");
+    return payload.narrative;
   }
   private async authority(receipt: PublicationReceipt, signal: AbortSignal) {
     signal.throwIfAborted();

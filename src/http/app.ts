@@ -3,12 +3,14 @@ import type { IntakeService } from "../services/intake.ts";
 import { registerWebhooks } from "./webhooks.ts";
 import type { NotificationService } from "../services/notifications/index.ts";
 import type { McpWriteService } from "../services/mcp-writes/index.ts";
+import type { InvestigationService } from "../services/investigation/index.ts";
 
 export function createApp(
   intake?: IntakeService,
   webhookSecret?: string,
   notifications?: NotificationService,
   mcpWrites?: McpWriteService,
+  investigation?: InvestigationService,
 ) {
   const app = Fastify({ logger: false });
 
@@ -34,6 +36,7 @@ export function createApp(
       ...(intake ? { intake: intake.status() } : {}),
       ...(notifications ? { notifications: notifications.status() } : {}),
       ...(mcpWrites ? { mcp_writes: mcpWrites.status() } : {}),
+      ...(investigation ? { investigation: investigation.status() } : {}),
     }),
   );
 

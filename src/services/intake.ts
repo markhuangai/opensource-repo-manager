@@ -3,12 +3,19 @@ import { z } from "zod";
 import type { GitHubReader } from "../adapters/github/reader.ts";
 import type { RunSnapshot } from "../config/load.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
-import { githubId, IntakeError, type Target } from "../domain/jobs.ts";
+import {
+  githubId,
+  IntakeError,
+  type Target,
+  type DirtyTarget,
+  type IssueContext,
+} from "../domain/jobs.ts";
 import type { SafeLogger } from "../logging/redact.ts";
 import type { Store } from "../repositories/store.ts";
 
 const envelope = z.object({
   repository: z.object({ id: githubId }),
+  action: z.string().optional(),
   issue: z
     .object({
       id: githubId,
@@ -38,12 +45,18 @@ const envelope = z.object({
   sha: z.string().optional(),
 });
 
+type IntakeHooks = {
+  beforeIssue?: (context: IssueContext, signal: AbortSignal) => Promise<void>;
+  changed?: () => void;
+};
+
 export class IntakeService {
   private readonly store: Store;
   private readonly reader: GitHubReader;
   private readonly snapshot: RunSnapshot;
   private readonly secrets: Pick<SecretAccessor, "containsCredentials">;
   private readonly logger: SafeLogger;
+  private readonly hooks: IntakeHooks;
   private readonly controller = new AbortController();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running: Promise<void> | undefined;
@@ -60,12 +73,14 @@ export class IntakeService {
     snapshot: RunSnapshot,
     secrets: Pick<SecretAccessor, "containsCredentials">,
     logger: SafeLogger,
+    hooks: IntakeHooks = {},
   ) {
     this.store = store;
     this.reader = reader;
     this.snapshot = snapshot;
     this.secrets = secrets;
     this.logger = logger;
+    this.hooks = hooks;
     store.saveSnapshot(snapshot);
   }
 
@@ -145,7 +160,9 @@ export class IntakeService {
     const accepted = this.store.accept(
       delivery,
       createHash("sha256").update(bytes).digest("hex"),
-      event,
+      event === "issues" && data.action === "reopened"
+        ? "issues.reopened"
+        : event,
       unique,
     );
     if (this.started) this.wake();
@@ -217,6 +234,7 @@ export class IntakeService {
       this.retryAt = 0;
       this.state = this.store.counts().failed ? "degraded" : "ready";
       if (this.state === "ready") this.failure = null;
+      this.hooks.changed?.();
     } catch (error) {
       if (this.controller.signal.aborted) return;
       this.failure =
@@ -238,17 +256,7 @@ export class IntakeService {
     ) {
       try {
         if (target.kind === "issue") {
-          const context = await this.reader.issue(
-            target.number,
-            this.store.repository()!,
-            this.controller.signal,
-          );
-          context.comments = context.comments.filter(
-            (comment) => !this.store.owns("issue_comment", comment.id),
-          );
-          if (this.secrets.containsCredentials(context))
-            throw new IntakeError("secret_in_input");
-          this.store.applyIssue(target, context, this.snapshot);
+          await this.readIssue(target, this.controller.signal);
         } else {
           const context = await this.reader.pull(
             target.number,
@@ -290,6 +298,7 @@ export class IntakeService {
             "pull_identity_changed",
             "issue_is_pull_request",
             "secret_in_input",
+            "publication_pending",
           ].includes(code)
         )
           throw error;
@@ -303,6 +312,39 @@ export class IntakeService {
         );
       }
     }
+  }
+
+  async refresh(number: number, signal: AbortSignal) {
+    if (!this.verified || Date.now() < this.retryAt)
+      throw new IntakeError("enrollment_pending", this.retryAt);
+    await this.readIssue(
+      this.store.refreshIssue(number),
+      AbortSignal.any([signal, this.controller.signal]),
+    );
+  }
+
+  private async readIssue(target: DirtyTarget, signal: AbortSignal) {
+    const context = await this.reader.issue(
+      target.number,
+      this.store.repository()!,
+      signal,
+    );
+    await this.hooks.beforeIssue?.(context, signal);
+    context.comments = context.comments.filter(
+      (comment) => !this.store.owns("issue_comment", comment.id),
+    );
+    if (this.secrets.containsCredentials(context))
+      throw new IntakeError("secret_in_input");
+    this.store.applyIssue(target, context, this.snapshot);
+    this.hooks.changed?.();
+  }
+
+  enrolled() {
+    return (
+      this.verified &&
+      !this.controller.signal.aborted &&
+      Date.now() >= this.retryAt
+    );
   }
 
   async stop() {

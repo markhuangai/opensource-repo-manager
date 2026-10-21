@@ -52,6 +52,7 @@ export type BudgetUsage = {
   model_requests: number;
   repair_cycles: number;
   infrastructure_retries: number;
+  infrastructure_exhausted?: boolean;
   wait_ms: number;
 };
 export const budgetUsage = z.strictObject({
@@ -59,6 +60,7 @@ export const budgetUsage = z.strictObject({
   model_requests: z.number().int().nonnegative().safe(),
   repair_cycles: z.number().int().nonnegative().safe(),
   infrastructure_retries: z.number().int().nonnegative().safe(),
+  infrastructure_exhausted: z.boolean().optional(),
   wait_ms: z.number().int().nonnegative().safe(),
 });
 export const initialBudget: BudgetUsage = {

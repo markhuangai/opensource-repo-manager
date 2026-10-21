@@ -33,7 +33,9 @@ export async function respond(req, res, fixture) {
       .join("\n");
     const scenario =
       /"scenario":"([^"]+)"/.exec(text)?.[1] ??
-      /"task":"(bootstrap_[^"]+|external_output_review)"/.exec(text)?.[1];
+      /"task":"(bootstrap_[^"]+|investigation_[^"]+|external_output_review)"/.exec(
+        text,
+      )?.[1];
     assert(scenario, "Missing verbatim task context");
     assert(JSON.stringify(body.system).includes("OPERATOR_SYSTEM_CANARY"));
     assert(JSON.stringify(body.system).includes("OPERATOR_SKILL_CANARY"));
@@ -87,6 +89,12 @@ export async function respond(req, res, fixture) {
       assert(!toolNames.includes("Bash"));
       assert(!toolNames.some((name) => name.startsWith("mcp__")));
       use("StructuredOutput", await fixture.outputReview(text));
+    } else if (
+      ["investigation_plan", "investigation_result"].includes(scenario)
+    ) {
+      const call = await fixture.investigation(scenario, text, results);
+      if (call.tool) use(call.tool, call.arguments);
+      else use("StructuredOutput", call.result);
     } else if (["bootstrap_plan", "bootstrap_audit"].includes(scenario)) {
       use("StructuredOutput", fixture.bootstrap(scenario, text));
     } else if (scenario === "bootstrap_environment" && !results.length) {
@@ -215,7 +223,13 @@ export async function respond(req, res, fixture) {
     if (initial) content.unshift({ type: "text", text: history.marker });
     if (
       results.length &&
-      !["limited", "malformed", "expiry", "mcp_write"].includes(scenario)
+      ![
+        "limited",
+        "malformed",
+        "expiry",
+        "mcp_write",
+        "investigation_plan",
+      ].includes(scenario)
     )
       assert(
         results.every((result) => !result.is_error),

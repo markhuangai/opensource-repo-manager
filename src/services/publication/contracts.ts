@@ -1,10 +1,23 @@
 import { z } from "zod";
 import { githubId, sha, type SourceMetadata } from "../../domain/jobs.ts";
+import { investigationStage } from "../investigation/contracts.ts";
 
 export const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const text = z.string().max(65536);
 const job = { job_id: githubId, revision: githubId };
 export const proposalSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...job,
+    kind: z.literal("investigation"),
+    investigation_id: z.uuid(),
+  }),
+  z.strictObject({
+    ...job,
+    kind: z.literal("investigation_stage"),
+    stage: z.union([investigationStage, z.literal("completed")]),
+    previous_operation: hash.nullable(),
+    after_operation: hash.nullable(),
+  }),
   z.strictObject({ ...job, kind: z.literal("status"), body: text.min(1) }),
   z.strictObject({
     ...job,

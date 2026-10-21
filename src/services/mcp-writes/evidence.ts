@@ -5,6 +5,7 @@ import type { SecretAccessor } from "../../config/secrets.ts";
 import { digest, RuntimeError } from "../../domain/agents.ts";
 import type { Store } from "../../repositories/store.ts";
 import { PublicationRepository } from "../../repositories/publication.ts";
+import { InvestigationRepository } from "../../repositories/investigation.ts";
 import { rootDirectory } from "../workspaces/files.ts";
 import { publicationText } from "../publication/scanner.ts";
 import type { ReviewedWriteInput, WriteBinding } from "./contracts.ts";
@@ -13,7 +14,15 @@ export async function resolveWriteEvidence(
   store: Store,
   secrets: SecretAccessor,
   root: string,
-  binding: WriteBinding,
+  binding: Pick<
+    WriteBinding,
+    | "job_id"
+    | "revision"
+    | "snapshot_digest"
+    | "source"
+    | "artifact_digest"
+    | "repository"
+  >,
   references: ReviewedWriteInput["evidence"],
   limit: number,
   signal: AbortSignal,
@@ -62,6 +71,17 @@ export async function resolveWriteEvidence(
           kind: reference.kind,
           id: reference.id,
           receipt: evidence,
+        });
+      } else if (reference.kind === "investigation_evidence") {
+        result.push({
+          kind: reference.kind,
+          id: reference.id,
+          receipt: new InvestigationRepository(store).evidence(
+            reference.id,
+            job.id,
+            job.revision,
+            binding.source,
+          ),
         });
       } else {
         if (reference.end_line < reference.start_line)

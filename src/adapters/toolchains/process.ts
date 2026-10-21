@@ -19,6 +19,7 @@ export async function runCommand(
     operation: string;
     secrets: SecretAccessor;
     record: (receipt: CommandReceipt) => void;
+    capture_nonzero?: boolean;
   },
 ) {
   options.signal.throwIfAborted();
@@ -102,7 +103,8 @@ export async function runCommand(
     if (failure?.code === "cleanup_failed") throw failure;
     options.signal.throwIfAborted();
     if (failure) throw failure;
-    if (code !== 0) {
+    if (code === null) throw new RuntimeError("command_interrupted");
+    if (code !== 0 && !options.capture_nonzero) {
       if (
         options.role &&
         /(?:\b(?:E401|E403|401 Unauthorized|403 Forbidden)\b|authentication required|credentials required)/i.test(
@@ -114,6 +116,7 @@ export async function runCommand(
     }
     receipt.outcome = "completed";
     return {
+      exit_code: code,
       stdout: Buffer.concat(output).toString("utf8"),
       stderr: Buffer.concat(errors).toString("utf8"),
     };

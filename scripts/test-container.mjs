@@ -184,8 +184,8 @@ function webhook(
   );
 }
 
-async function waitUntil(probe, message) {
-  const deadline = Date.now() + 30_000;
+async function waitUntil(probe, message, timeout = 30_000) {
+  const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (probe()) return;
     await delay(200);
@@ -309,7 +309,7 @@ try {
       "-subj",
       "/CN=api.github.com",
       "-addext",
-      "subjectAltName=DNS:api.github.com,DNS:localhost",
+      "subjectAltName=DNS:api.github.com,DNS:github.com,DNS:localhost",
       "-days",
       "1",
       "-keyout",
@@ -377,7 +377,7 @@ try {
     "/fixture/server.mjs",
   ]);
 
-  for (const directory of ["config", "skills", "prompts"])
+  for (const directory of ["config", "skills", "prompts", "investigations"])
     await mkdir(join(fixtures, directory), { recursive: true });
   await cp(
     join(root, "examples", "workflow", "skills"),
@@ -670,6 +670,8 @@ try {
     `type=bind,src=${join(root, "tests", "integration", "publication")},dst=/publication-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(root, "tests", "integration", "mcp-writes")},dst=/mcp-write-fixtures,readonly`,
+    "--mount",
+    `type=bind,src=${join(root, "tests", "integration", "investigation")},dst=/investigation-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(root, "tests", "fixtures", "publication.ts")},dst=/publication-fixture.ts,readonly`,
   );
@@ -1023,6 +1025,247 @@ try {
   assert.equal(notificationProof.cleanup, "passed");
   assert.equal(request("/readyz").body.notifications.state, "running");
 
+  const investigationProof = JSON.parse(
+    docker(
+      [
+        "exec",
+        runtime,
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        "import {runInvestigationTests} from '/investigation-fixtures/harness.mjs'; console.log(JSON.stringify(await runInvestigationTests()));",
+      ],
+      { timeout: 1200000 },
+    ),
+  );
+  assert.equal(investigationProof.investigation, "passed");
+  assert.equal(investigationProof.cleanup, "passed");
+
+  const investigationStartupProof = [];
+  for (const sdk of ["codex", "claude"]) {
+    const prefix = `${id}-investigation-${sdk}`,
+      data = `${prefix}-data`,
+      net = `${prefix}-network`,
+      upstreamName = `${prefix}-upstream`,
+      manager = `${prefix}-manager`;
+    const directory = join(fixtures, "investigations", sdk);
+    await mkdir(join(directory, "config"), { recursive: true });
+    for (const name of ["skills", "prompts"])
+      await cp(join(fixtures, name), join(directory, name), {
+        recursive: true,
+      });
+    const prompts = join(directory, "prompts");
+    for (const name of ["system.md", "user.md", "investigation.md"])
+      await writeFile(
+        join(prompts, name),
+        (await readFile(join(prompts, name), "utf8")) +
+          `\n${name === "system.md" ? "OPERATOR_SYSTEM_CANARY" : "OPERATOR_USER_CANARY"}\n`,
+      );
+    const skill = join(directory, "skills", "example", "SKILL.md");
+    await writeFile(
+      skill,
+      (await readFile(skill, "utf8")) + "\nOPERATOR_SKILL_CANARY\n",
+    );
+    const config = globalThis.structuredClone(validConfig);
+    config.proxy.url = "http://investigation-fixture:8317/v1";
+    config.profiles = {
+      worker:
+        sdk === "codex"
+          ? { sdk, model: "gpt-5.5", effort: "xhigh" }
+          : {
+              sdk,
+              model: "auto",
+              behaves_as: "claude-opus-4-8",
+              effort: "xhigh",
+            },
+    };
+    for (const role of Object.keys(config.roles)) {
+      config.roles[role].profile = "worker";
+      config.roles[role].mcp = {};
+    }
+    config.mcp = { credentials: {}, servers: {} };
+    config.notifications = {
+      discord: { enabled: false },
+      smtp: { enabled: false },
+      webhook: {
+        enabled: true,
+        url: "http://investigation-fixture:8317/notify",
+        headers: {},
+      },
+    };
+    await writeFile(
+      join(directory, "config", "config.yml"),
+      stringifyYaml(config),
+    );
+    await writeFile(
+      join(directory, "configuration.json"),
+      JSON.stringify(config),
+    );
+    const caBundle = docker([
+      "run",
+      "--rm",
+      "--name",
+      setup,
+      "--label",
+      `${label}=${id}`,
+      "--entrypoint",
+      "/bin/cat",
+      image,
+      "/etc/ssl/certs/ca-certificates.crt",
+    ]);
+    await writeFile(
+      join(directory, "ca-bundle.pem"),
+      caBundle + "\n" + (await readFile(join(upstream, "ca.pem"), "utf8")),
+    );
+    docker([
+      "run",
+      "--rm",
+      "--name",
+      setup,
+      "--label",
+      `${label}=${id}`,
+      "--mount",
+      `type=bind,src=${directory},dst=/fixture`,
+      "--entrypoint",
+      "/bin/sh",
+      image,
+      "-c",
+      "chown -R 0:0 /fixture && chmod 700 /fixture/config && chmod 600 /fixture/config/config.yml",
+    ]);
+    register("network", net);
+    docker(["network", "create", "--label", `${label}=${id}`, net]);
+    register("volume", data);
+    docker(["volume", "create", "--label", `${label}=${id}`, data]);
+    register("container", upstreamName);
+    docker([
+      "run",
+      "--detach",
+      "--name",
+      upstreamName,
+      "--label",
+      `${label}=${id}`,
+      "--network",
+      net,
+      "--network-alias",
+      "api.github.com",
+      "--network-alias",
+      "github.com",
+      "--network-alias",
+      "investigation-fixture",
+      "--mount",
+      `type=volume,src=${data},dst=/data,readonly`,
+      "--mount",
+      `type=bind,src=${directory},dst=/fixture`,
+      "--mount",
+      `type=bind,src=${join(upstream, "key.pem")},dst=/fixture-key.pem,readonly`,
+      "--mount",
+      `type=bind,src=${join(upstream, "ca.pem")},dst=/fixture-ca.pem,readonly`,
+      ...mounts,
+      "--entrypoint",
+      "/opt/orm-runtime/bin/node",
+      image,
+      "/investigation-fixtures/server.mjs",
+    ]);
+    await waitUntil(
+      () =>
+        result([
+          "exec",
+          upstreamName,
+          "/opt/orm-runtime/bin/node",
+          "-e",
+          "fetch('http://localhost:8317/proof').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]).status === 0,
+      "Investigation upstream fixture did not start",
+    );
+    register("container", manager);
+    docker([
+      "run",
+      "--detach",
+      "--name",
+      manager,
+      "--label",
+      `${label}=${id}`,
+      "--network",
+      net,
+      "--mount",
+      `type=volume,src=${data},dst=/data`,
+      "--mount",
+      `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
+      "--env",
+      "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+      ...["config", "skills", "prompts"].flatMap((name) => [
+        "--mount",
+        `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
+      ]),
+      image,
+    ]);
+    await waitForHealth(manager);
+    await waitUntil(
+      () =>
+        request("/readyz", {}, manager).body.investigation
+          .implementation_queued === 1,
+      "Production entrypoint did not automatically investigate a backfilled issue",
+      180000,
+    );
+    docker([
+      "exec",
+      manager,
+      "/opt/orm-runtime/bin/node",
+      "--input-type=module",
+      "-e",
+      `
+      import {readFileSync} from 'node:fs'; import {createHmac} from 'node:crypto'; import {parse} from '/opt/orm/app/node_modules/yaml/dist/index.js';
+      await fetch('http://investigation-fixture:8317/new',{method:'POST'});
+      const config=parse(readFileSync('/config/config.yml','utf8'));
+      const body=JSON.stringify({repository:{id:42},issue:{id:1002,number:2}});
+      const response=await fetch('http://localhost:8080/webhooks/github',{method:'POST',body,headers:{'content-type':'application/json','x-github-delivery':'investigation-new-issue','x-github-event':'issues','x-hub-signature-256':'sha256='+createHmac('sha256',config.github.webhook_secret).update(body).digest('hex')}});
+      if(response.status!==202)throw Error('webhook rejected');
+    `,
+    ]);
+    await waitUntil(
+      () =>
+        JSON.parse(
+          docker([
+            "exec",
+            manager,
+            "/opt/orm-runtime/bin/node",
+            "-e",
+            "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+          ]),
+        ).comments.some(
+          ([number, comments]) =>
+            number === 2 &&
+            comments[0]?.body.includes("Feature request investigated"),
+        ),
+      "Production webhook did not trigger investigation",
+      180000,
+    );
+    const evidence = JSON.parse(
+      docker([
+        "exec",
+        manager,
+        "/opt/orm-runtime/bin/node",
+        "-e",
+        "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+      ]),
+    );
+    assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
+    assert.equal(evidence.comments.length, 2);
+    assert(evidence.comments.every(([, comments]) => comments.length === 1));
+    assert(
+      evidence.requests.includes("investigation_plan") &&
+        evidence.requests.includes("investigation_result") &&
+        evidence.requests.includes("external_output_review"),
+    );
+    assert.equal(request("/readyz", {}, manager).status, 503);
+    stopCleanly(manager);
+    investigationStartupProof.push({
+      sdk,
+      production_entrypoint_backfill_and_webhook: "passed",
+      one_comment_per_issue: "passed",
+    });
+  }
+
   register("volume", bootstrapVolume);
   docker(["volume", "create", "--label", `${label}=${id}`, bootstrapVolume]);
   register("container", bootstrapContainer);
@@ -1103,6 +1346,8 @@ try {
     supervised_workers: runtimeProof,
     reviewed_publication: publicationProof,
     selective_mcp_writes: mcpWriteProof,
+    issue_investigation: investigationProof,
+    investigation_startup: investigationStartupProof,
     durable_notifications: notificationProof,
     repository_bootstrap: bootstrapProof,
   };
@@ -1126,7 +1371,7 @@ try {
         "/bin/sh",
         image,
         "-c",
-        `find /fixture/config /fixture/cases -exec chown -h ${process.getuid()}:${process.getgid()} {} + && chmod 700 /fixture/config /fixture/cases /fixture/cases/*`,
+        `find /fixture/config /fixture/cases /fixture/investigations -exec chown -h ${process.getuid()}:${process.getgid()} {} + && chmod 700 /fixture/config /fixture/cases /fixture/cases/*`,
       ]);
     } catch (error) {
       cleanupErrors.push(error);

@@ -7,6 +7,7 @@ import { createApp } from "./app.ts";
 import type { IntakeService } from "../services/intake.ts";
 import type { NotificationService } from "../services/notifications/index.ts";
 import type { McpWriteService } from "../services/mcp-writes/index.ts";
+import type { InvestigationService } from "../services/investigation/index.ts";
 
 export async function startHttpService(
   logger: SafeLogger = createSafeLogger(createKnownSecretChecker([])),
@@ -15,6 +16,7 @@ export async function startHttpService(
     webhookSecret: string;
     notifications?: NotificationService;
     mcpWrites?: McpWriteService;
+    investigation?: InvestigationService;
     close: () => void | Promise<void>;
   },
 ) {
@@ -23,9 +25,11 @@ export async function startHttpService(
     dependencies?.webhookSecret,
     dependencies?.notifications,
     dependencies?.mcpWrites,
+    dependencies?.investigation,
   );
   app.addHook("onClose", async () => {
     try {
+      await dependencies?.investigation?.stop();
       await dependencies?.intake.stop();
     } finally {
       await dependencies?.close();
@@ -58,6 +62,7 @@ export async function startHttpService(
     );
     dependencies?.intake.start();
     dependencies?.notifications?.start();
+    dependencies?.investigation?.start();
   } catch {
     logger.error("HTTP startup failed.");
     process.exitCode = 1;

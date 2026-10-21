@@ -88,7 +88,9 @@ export async function respond(req, res, fixture) {
     const text = strings(body.input).join("\n");
     const scenario =
       /"scenario":"([^"]+)"/.exec(text)?.[1] ??
-      /"task":"(bootstrap_[^"]+|external_output_review)"/.exec(text)?.[1];
+      /"task":"(bootstrap_[^"]+|investigation_[^"]+|external_output_review)"/.exec(
+        text,
+      )?.[1];
     assert(scenario, "Missing verbatim task context");
     assert(data.includes("OPERATOR_SYSTEM_CANARY"));
     assert(data.includes("OPERATOR_SKILL_CANARY"));
@@ -156,7 +158,7 @@ export async function respond(req, res, fixture) {
     };
     const command = (cmd) =>
       use("exec_command", { cmd, max_output_tokens: 2000 });
-    let output;
+    let output, investigation;
     if (scenario === "malformed") {
       res.setHeader("content-type", "text/event-stream");
       res.end("event: response.created\ndata: {not-json}\n\n");
@@ -166,7 +168,11 @@ export async function respond(req, res, fixture) {
       fixture.held = true;
       return;
     }
-    if (scenario === "bootstrap_environment") {
+    if (["investigation_plan", "investigation_result"].includes(scenario)) {
+      investigation = await fixture.investigation(scenario, text, results);
+      if (investigation.tool)
+        output = use(investigation.tool, investigation.arguments);
+    } else if (scenario === "bootstrap_environment") {
       if (!previous)
         output = use("exec_command", {
           cmd: fixture.environmentCommand,
@@ -284,13 +290,15 @@ export async function respond(req, res, fixture) {
     const final =
       scenario === "external_output_review"
         ? JSON.stringify(await fixture.outputReview(text))
-        : ["bootstrap_plan", "bootstrap_audit"].includes(scenario)
-          ? JSON.stringify(fixture.bootstrap(scenario, text))
-          : scenario === "structured"
-            ? '{"value":"validated"}'
-            : scenario === "invalid"
-              ? '{"value":123}'
-              : "fixture-completed";
+        : investigation
+          ? JSON.stringify(investigation.result)
+          : ["bootstrap_plan", "bootstrap_audit"].includes(scenario)
+            ? JSON.stringify(fixture.bootstrap(scenario, text))
+            : scenario === "structured"
+              ? '{"value":"validated"}'
+              : scenario === "invalid"
+                ? '{"value":123}'
+                : "fixture-completed";
     send(
       res,
       output
