@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { randomBytes } from "node:crypto";
+import { tracingChannel } from "node:diagnostics_channel";
 import { lstatSync } from "node:fs";
 import { createServer } from "node:http";
 import {
@@ -401,7 +402,29 @@ export async function runRuntimeTests() {
     mcpProof,
     claudeProof,
     codexProof;
-  const errors = [];
+  const errors = [],
+    probeOutcomes = [],
+    probes = tracingChannel("child_process.spawn").start;
+  const observeProbe = ({ process: child }) => {
+    if (!child.spawnargs?.[1]?.endsWith("/runtime/storage.js")) return;
+    const started = performance.now();
+    let stderr = "";
+    child.once("spawn", () =>
+      child.stderr?.on("data", (chunk) => {
+        stderr = (stderr + chunk.toString()).slice(-4096);
+      }),
+    );
+    child.once("close", (code, signal) => {
+      probeOutcomes.push({
+        elapsed_ms: performance.now() - started,
+        code,
+        signal,
+        error: stderr.match(/EACCES|EPERM|ENOENT|ESRCH|monitor_failed/)?.[0],
+      });
+      if (probeOutcomes.length > 8) probeOutcomes.shift();
+    });
+  };
+  probes.subscribe(observeProbe);
   try {
     const storageControl = join(base, "storage-control");
     await writeFile(
@@ -1624,6 +1647,7 @@ int main(int count, char **values) {
       }
     }
   } finally {
+    probes.unsubscribe(observeProbe);
     for (const cleanup of [
       () => supervisor.close(),
       () => store.close(),
@@ -1641,7 +1665,7 @@ int main(int count, char **values) {
   if (errors.length)
     throw new AggregateError(
       errors,
-      `Runtime verification or cleanup failed after ${tests} completed scenario groups`,
+      `Runtime verification or cleanup failed after ${tests} completed scenario groups; recent storage probes: ${JSON.stringify(probeOutcomes)}`,
     );
   console.log(
     JSON.stringify({

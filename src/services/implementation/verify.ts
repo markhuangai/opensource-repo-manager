@@ -12,7 +12,11 @@ import {
 import type { Store } from "../../repositories/store.ts";
 import type { Supervisor } from "../../runtime/supervisor.ts";
 import { protectedPath } from "../../adapters/github/git.ts";
-import { commandDirectory } from "../bootstrap/environment.ts";
+import {
+  commandDirectory,
+  dependencyExclusions,
+} from "../bootstrap/environment.ts";
+import { walkTree } from "../workspaces/files.ts";
 import type { Implementation, VerificationReceipt } from "./contracts.ts";
 
 export function artifactFiles(manifest: ArtifactManifest) {
@@ -73,6 +77,15 @@ export async function assertWorkspace(
   workspace: string,
   manifest: ArtifactManifest,
 ) {
+  const paths = manifest.files.map((file) => file.path),
+    expected = new Set(paths),
+    excluded = dependencyExclusions(paths);
+  await walkTree(workspace, async (_path, reference, stat) => {
+    if (reference.split("/").includes(".git") || excluded(reference))
+      return false;
+    if (!stat.isDirectory() && !expected.has(reference))
+      throw new RuntimeError("implementation_source_mutated");
+  });
   for (const file of manifest.files) {
     let parent = workspace;
     for (const part of file.path.split("/").slice(0, -1)) {

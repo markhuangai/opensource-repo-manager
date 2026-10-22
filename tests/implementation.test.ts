@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -355,6 +356,78 @@ describe("candidate and verification boundaries", () => {
     await mkdir(join(root, "other"));
     await writeFile(join(root, "other/bug.ts"), "original");
     await symlink("other", join(root, "src"));
+    await expect(assertWorkspace(root, manifest)).rejects.toThrow(
+      "implementation_source_mutated",
+    );
+  });
+
+  it("rejects added files that change real Node module resolution", async () => {
+    const root = await mkdtemp(join(tmpdir(), "orm-verify-membership-"));
+    cleanup.push(() => rm(root, { recursive: true }));
+    const files = {
+      "package.json": '{"type":"commonjs"}',
+      "bug.json": '{"ok":false}',
+      "check.cjs":
+        'require("node:assert/strict").equal(require("./bug").ok, true);',
+    };
+    for (const [path, content] of Object.entries(files))
+      await writeFile(join(root, path), content, { mode: 0o644 });
+    const manifest: ArtifactManifest = {
+      ...base,
+      files: Object.entries(files).map(([path, content]) => ({
+        path,
+        kind: "file",
+        mode: 0o644,
+        digest: createHash("sha256").update(content).digest("hex"),
+      })),
+    };
+    const run = () => spawnSync(process.execPath, ["check.cjs"], { cwd: root });
+    expect(run().status).toBe(1);
+    await assertWorkspace(root, manifest);
+    await writeFile(join(root, "bug.js"), "module.exports = {ok: true};");
+    expect(run().status).toBe(0);
+    await expect(assertWorkspace(root, manifest)).rejects.toThrow(
+      "implementation_source_mutated",
+    );
+    await rm(join(root, "bug.js"));
+    await symlink("bug.json", join(root, "bug.js"));
+    await expect(assertWorkspace(root, manifest)).rejects.toThrow(
+      "implementation_source_mutated",
+    );
+  });
+
+  it("permits dependency outputs while protecting original dependency source", async () => {
+    const root = await mkdtemp(join(tmpdir(), "orm-verify-dependencies-"));
+    cleanup.push(() => rm(root, { recursive: true }));
+    const path = "node_modules/tracked.cjs";
+    await mkdir(join(root, "node_modules"));
+    await writeFile(join(root, path), "original", { mode: 0o644 });
+    const manifest: ArtifactManifest = {
+      ...base,
+      files: [
+        {
+          path,
+          kind: "file",
+          mode: 0o644,
+          digest: createHash("sha256").update("original").digest("hex"),
+        },
+      ],
+    };
+    for (const output of [
+      "node_modules/dependency/index.cjs",
+      "packages/child/node_modules/dependency/index.cjs",
+      ".yarn/cache/dependency.zip",
+      ".yarn/install-state.gz",
+      ".yarn/unplugged/dependency/index.cjs",
+      ".pnp.cjs",
+      ".pnp.loader.mjs",
+      ".git/HEAD",
+    ]) {
+      await mkdir(join(root, output, ".."), { recursive: true });
+      await writeFile(join(root, output), "generated");
+    }
+    await assertWorkspace(root, manifest);
+    await writeFile(join(root, path), "changed");
     await expect(assertWorkspace(root, manifest)).rejects.toThrow(
       "implementation_source_mutated",
     );

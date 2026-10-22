@@ -360,6 +360,7 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
         "audit_mismatch",
         "audit_mutation",
         "test_mutation",
+        "test_addition",
         "failed_tests",
         "audit_rejection",
       ]) {
@@ -382,6 +383,13 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
                 command: maintenanceCommand(1, {
                   "regression.mjs":
                     "import fs from 'node:fs'; fs.writeFileSync('bug.mjs', 'changed after audit');\n",
+                }),
+              };
+            if (mode === "test_addition")
+              return {
+                command: maintenanceCommand(1, {
+                  "regression.mjs":
+                    "import fs from 'node:fs'; fs.writeFileSync('added-source.mjs', 'export const changed = true;');\n",
                 }),
               };
             if (mode === "failed_tests")
@@ -439,7 +447,7 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
             3,
           );
         }
-        if (mode === "test_mutation")
+        if (["test_mutation", "test_addition"].includes(mode))
           assert.equal(result.failure, "implementation_source_mutated");
         proof.push({ sdk, scenario: mode, gate: "blocked_before_publication" });
       }
@@ -525,6 +533,27 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
       }
 
       const restartJob = await add("restart_branch");
+      const scanner = supervisor.publication.outputReview.scanner,
+        scan = scanner.scan.bind(scanner);
+      let scopeScanStop;
+      scanner.scan = (...args) => {
+        if (args[0]?.job_id === restartJob.id && args[0]?.plan)
+          scopeScanStop ??= investigation.stop();
+        return scan(...args);
+      };
+      await advance(restartJob);
+      assert(scopeScanStop, "Scope scan shutdown boundary was not exercised");
+      await scopeScanStop;
+      scanner.scan = scan;
+      assert.equal(record(restartJob).scope, null);
+      assert.equal(record(restartJob).scope_digest, null);
+      assert.equal(
+        record(restartJob).agent_pending.task,
+        "implementation_plan",
+      );
+      noPull(restartJob);
+      await closeRuntime();
+      await start();
       let stopping;
       remote.state.afterMutation = (kind) => {
         if (kind === "branch" && !stopping) stopping = investigation.stop();
@@ -566,7 +595,11 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
         ).length,
         1,
       );
-      proof.push({ sdk, restart_after_branch_preserves_receipts: "passed" });
+      proof.push({
+        sdk,
+        restart_during_scope_scan: "passed",
+        restart_after_branch_preserves_receipts: "passed",
+      });
 
       remote.state.dropAfter = "pull";
       const responseLoss = await run("lost_pull_response");
@@ -650,9 +683,57 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
             },
           };
       };
-      const mcpJob = await add("implementation_mcp"),
-        mcpResult = await advance(mcpJob);
+      const mcpJob = await add("implementation_mcp");
+      let publicationLimited = false;
+      controls.review = (text) => {
+        if (publicationLimited || !text.includes('"kind":"change"')) return;
+        publicationLimited = true;
+        remote.state.rateLimit = {
+          method: "GET",
+          path: "/repos/owner/repo",
+          seconds: 1,
+        };
+      };
+      const mcpCheckpoint = await advance(mcpJob);
+      controls.review = undefined;
+      assert(publicationLimited, "Publication read failure was not exercised");
+      assert.equal(mcpCheckpoint.stage, "blocked");
+      assert.equal(mcpCheckpoint.failure, "github_rate_limited");
+      assert.equal(mcpCheckpoint.retry_stage, "publishing");
+      assert.equal(mcpCheckpoint.milestone_done, true);
+      assert.equal(mcpCheckpoint.agent_pending, null);
+      noPull(mcpJob);
+      const implementationRuns = store
+          .runs()
+          .filter(
+            (run) => run.job_id === mcpJob.id && run.role === "implementation",
+          )
+          .map((run) => run.id),
+        checkpointEffects = context.effects.size;
+      await closeRuntime();
+      await start();
+      await delay(Math.max(0, mcpCheckpoint.retry_at - Date.now()) + 100);
+      const mcpResult = await advance(mcpJob);
       assert.equal(mcpResult.stage, "remote_review", JSON.stringify(mcpResult));
+      assert.equal(mcpResult.test_id, mcpCheckpoint.test_id);
+      assert.equal(mcpResult.audit_id, mcpCheckpoint.audit_id);
+      assert.equal(mcpResult.publication_id, mcpCheckpoint.publication_id);
+      assert.deepEqual(
+        store
+          .runs()
+          .filter(
+            (run) => run.job_id === mcpJob.id && run.role === "implementation",
+          )
+          .map((run) => run.id),
+        implementationRuns,
+      );
+      assert.equal(context.effects.size, checkpointEffects);
+      const mcpTarget = supervisor.publication.repository.target(mcpJob.id);
+      assert.equal(
+        remote.state.pulls.filter((pull) => pull.branch === mcpTarget.branch)
+          .length,
+        1,
+      );
       const writes = supervisor.mcpWrites.repository
         .all()
         .filter((item) => item.job_id === mcpJob.id);
@@ -707,6 +788,7 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
       proof.push({
         sdk,
         generic_reviewed_mcp_tested_milestone: "passed",
+        publication_retry_after_completed_mcp: "passed",
         uncertain_write_restart_preserves_tests: "passed",
         disabled_mcp: "passed",
       });

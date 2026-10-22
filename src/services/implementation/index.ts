@@ -307,7 +307,7 @@ export class ImplementationService {
       ];
       if (!unique.length)
         throw new RuntimeError("implementation_checks_missing");
-      record.scope = {
+      const scope = {
         job_id: job.id,
         revision: job.revision,
         investigation_id: record.investigation_id,
@@ -321,10 +321,11 @@ export class ImplementationService {
         ),
       };
       await this.supervisor.publication.outputReview.scanner.scan(
-        record.scope,
+        scope,
         signal,
       );
-      record.scope_digest = digest(record.scope);
+      record.scope = scope;
+      record.scope_digest = digest(scope);
       record.agent_pending = null;
       this.repository.save(record);
     }
@@ -821,14 +822,7 @@ export class ImplementationService {
     const pending = this.supervisor.publication.repository.pending(job.id);
     if (
       transient.has(code) &&
-      !this.supervisor.mcpWrites.repository
-        .all()
-        .some(
-          (item) =>
-            item.job_id === job.id &&
-            item.binding.role === "implementation" &&
-            item.state !== "rejected",
-        ) &&
+      record.failure !== "mcp_write_uncertain" &&
       (pending || this.store.reserveInfrastructureRetry(job.id))
     ) {
       record.retry_stage = failedStage;
