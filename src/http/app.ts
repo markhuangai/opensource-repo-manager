@@ -37,6 +37,9 @@ export function createApp(
       ...(notifications ? { notifications: notifications.status() } : {}),
       ...(mcpWrites ? { mcp_writes: mcpWrites.status() } : {}),
       ...(investigation ? { investigation: investigation.status() } : {}),
+      ...(investigation?.implementation
+        ? { implementation: investigation.implementation.status() }
+        : {}),
     }),
   );
 

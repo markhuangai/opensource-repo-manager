@@ -673,6 +673,8 @@ try {
     "--mount",
     `type=bind,src=${join(root, "tests", "integration", "investigation")},dst=/investigation-fixtures,readonly`,
     "--mount",
+    `type=bind,src=${join(root, "tests", "integration", "implementation")},dst=/implementation-fixtures,readonly`,
+    "--mount",
     `type=bind,src=${join(root, "tests", "fixtures", "publication.ts")},dst=/publication-fixture.ts,readonly`,
   );
   const connection = [
@@ -1035,11 +1037,80 @@ try {
         "-e",
         "import {runInvestigationTests} from '/investigation-fixtures/harness.mjs'; console.log(JSON.stringify(await runInvestigationTests()));",
       ],
-      { timeout: 1200000 },
+      { timeout: 2400000 },
     ),
   );
   assert.equal(investigationProof.investigation, "passed");
   assert.equal(investigationProof.cleanup, "passed");
+
+  const implementationContainers = ["codex", "claude"].map((sdk) => {
+    const name = `${id}-implementation-${sdk}`,
+      data = `${name}-data`;
+    register("volume", data);
+    docker(["volume", "create", "--label", `${label}=${id}`, data]);
+    register("container", name);
+    docker([
+      "run",
+      "--detach",
+      "--name",
+      name,
+      "--label",
+      `${label}=${id}`,
+      "--platform",
+      platform,
+      "--mount",
+      `type=volume,src=${data},dst=/data`,
+      ...mounts,
+      "--entrypoint",
+      "/usr/bin/tini",
+      image,
+      "--",
+      "/opt/orm-runtime/bin/node",
+      "--input-type=module",
+      "-e",
+      `import {runImplementationTests} from '/implementation-fixtures/harness.mjs'; console.log(JSON.stringify(await runImplementationTests([${JSON.stringify(sdk)}])));`,
+    ]);
+    return { sdk, name };
+  });
+  const implementationDeadline = Date.now() + 90 * 60000;
+  for (;;) {
+    const states = JSON.parse(
+      docker([
+        "container",
+        "inspect",
+        ...implementationContainers.map(({ name }) => name),
+      ]),
+    );
+    for (const state of states) {
+      assert.equal(state.Config.Labels[label], id);
+      assert(["", "private"].includes(state.HostConfig.PidMode));
+      if (!state.State.Running && state.State.ExitCode !== 0)
+        assert.fail(`${state.Name.slice(1)}: ${logs(state.Name.slice(1))}`);
+    }
+    if (states.every((state) => !state.State.Running)) break;
+    assert(
+      Date.now() < implementationDeadline,
+      "Maintenance SDK tests timed out",
+    );
+    await delay(1000);
+  }
+  const implementationReceipts = implementationContainers.map(
+    ({ sdk, name }) => {
+      const output = result(["container", "logs", name]);
+      assert.equal(output.status, 0, output.stderr);
+      const proof = JSON.parse(output.stdout);
+      assert.equal(proof.implementation, "passed");
+      assert.equal(proof.cleanup, "passed");
+      assert(proof.scenarios.length > 0);
+      assert(proof.scenarios.every((scenario) => scenario.sdk === sdk));
+      return proof;
+    },
+  );
+  const implementationProof = {
+    implementation: "passed",
+    scenarios: implementationReceipts.flatMap((proof) => proof.scenarios),
+    cleanup: "passed",
+  };
 
   const investigationStartupProof = [];
   for (const sdk of ["codex", "claude"]) {
@@ -1202,10 +1273,10 @@ try {
     await waitForHealth(manager);
     await waitUntil(
       () =>
-        request("/readyz", {}, manager).body.investigation
-          .implementation_queued === 1,
-      "Production entrypoint did not automatically investigate a backfilled issue",
-      180000,
+        request("/readyz", {}, manager).body.implementation
+          .awaiting_remote_validation === 1,
+      "Production entrypoint did not automatically implement a backfilled maintenance issue",
+      300000,
     );
     docker([
       "exec",
@@ -1251,11 +1322,15 @@ try {
     );
     assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
     assert.equal(evidence.comments.length, 2);
+    assert.equal(evidence.pulls.length, 1);
+    assert.equal(evidence.pulls[0].draft, false);
     assert(evidence.comments.every(([, comments]) => comments.length === 1));
     assert(
       evidence.requests.includes("investigation_plan") &&
         evidence.requests.includes("investigation_result") &&
-        evidence.requests.includes("external_output_review"),
+        evidence.requests.includes("external_output_review") &&
+        evidence.requests.includes("implementation_change") &&
+        evidence.requests.includes("implementation_audit"),
     );
     assert.equal(request("/readyz", {}, manager).status, 503);
     stopCleanly(manager);
@@ -1347,6 +1422,7 @@ try {
     reviewed_publication: publicationProof,
     selective_mcp_writes: mcpWriteProof,
     issue_investigation: investigationProof,
+    maintenance_implementation: implementationProof,
     investigation_startup: investigationStartupProof,
     durable_notifications: notificationProof,
     repository_bootstrap: bootstrapProof,

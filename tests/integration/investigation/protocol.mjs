@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export const sourceFiles = {
   ".node-version": "24.18.0\n",
@@ -8,6 +10,17 @@ export const sourceFiles = {
     "import assert from 'node:assert/strict'; import { increment } from './bug.mjs'; assert.equal(increment(1), 2);\n",
   "README.md": "increment(value) adds one to the input.\n",
 };
+
+export function maintenanceCommand(increment = 1, extra = {}) {
+  const files = {
+    "bug.mjs": `export const increment = (value) => value + ${increment};\n`,
+    "regression.mjs":
+      "import assert from 'node:assert/strict'; import { increment } from './bug.mjs'; assert.equal(increment(-1), 0); assert.equal(increment(0), 1);\n",
+    ...extra,
+  };
+  const script = `import fs from 'node:fs'; for (const [path, content] of Object.entries(${JSON.stringify(files)})) { fs.mkdirSync(path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '.', {recursive:true}); fs.writeFileSync(path, content); }`;
+  return `node --input-type=module -e '${script.replaceAll("'", "'\\''")}'`;
+}
 
 export function bundlesWithCanaries(loaded) {
   const bundles = {};
@@ -69,6 +82,77 @@ export function modelFixture(config, store, root, controls = {}) {
         findings: controls.rejectBootstrap ? ["fixture setup rejection"] : [],
         plan_digest: /"plan_digest":"([a-f0-9]{64})"/.exec(text)[1],
         source_digest: /"source_digest":"([a-f0-9]{64})"/.exec(text)[1],
+      };
+    },
+    async implementation(task, text, results) {
+      const { run, job, mode } = current();
+      if (run.role === "implementation") {
+        const target = store.db
+          .prepare("SELECT content FROM publication_targets WHERE job_id=?")
+          .get(job.id);
+        assert.equal(
+          (
+            await readFile(
+              join(root, "runs", run.id, "workspace", ".git", "HEAD"),
+              "utf8",
+            )
+          ).trim(),
+          `ref: refs/heads/${JSON.parse(target.content).branch}`,
+        );
+      }
+      const row = store.db
+        .prepare(
+          "SELECT content FROM implementations WHERE job_id=? AND revision=?",
+        )
+        .get(job.id, job.revision);
+      const record = row && JSON.parse(row.content);
+      const override = await controls.implementation?.(task, {
+        run,
+        job,
+        mode,
+        record,
+        text,
+        results,
+      });
+      if (override) return override;
+      if (task === "implementation_plan")
+        return {
+          result: {
+            acceptance: [
+              "increment adds exactly one, matching the reviewed objective",
+              "A real regression exercises supported inputs",
+            ],
+            paths: ["bug.mjs", "regression.mjs"],
+            regression: { cwd: ".", argv: ["node", "repro.mjs"] },
+            checks: [{ cwd: ".", argv: ["node", "regression.mjs"] }],
+          },
+        };
+      if (task === "implementation_audit")
+        return {
+          result: {
+            approved: true,
+            findings: [],
+            scope_digest: record.scope_digest,
+            artifact_digest: record.artifact_digest,
+          },
+        };
+      if (task === "implementation_milestone")
+        return {
+          result: {
+            summary:
+              "A tested candidate exists; publication and remote checks remain pending.",
+          },
+        };
+      assert.equal(task, "implementation_change");
+      assert.equal(run.uid, 10001);
+      if (!results.length) return { command: maintenanceCommand() };
+      return {
+        result: {
+          summary:
+            "Correct increment to add one and cover supported inputs with a real regression.",
+          title: "Fix increment off-by-one defect",
+          commit_message: "Fix increment off-by-one defect",
+        },
       };
     },
     async outputReview(text) {

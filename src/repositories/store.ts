@@ -84,7 +84,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (![0, 1, 2, 3, 4, 5, 6, 7, 8].includes(version as number))
+      if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].includes(version as number))
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -274,6 +274,19 @@ export class Store {
           );
           CREATE TABLE mcp_read_results (id TEXT PRIMARY KEY REFERENCES mcp_calls(id), content TEXT NOT NULL);
           PRAGMA user_version = 8;
+        `),
+          )
+          .immediate();
+      if ((version as number) < 9)
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE implementations (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL,
+            UNIQUE(job_id,revision)
+          );
+          PRAGMA user_version = 9;
         `),
           )
           .immediate();
@@ -619,7 +632,8 @@ export class Store {
               `INSERT INTO jobs(issue_id,issue_number,status,input_digest,input_json,snapshot_digest,budget_json)
           VALUES(?,?,?,?,?,?,?) ON CONFLICT(issue_number) DO UPDATE SET
           revision=jobs.revision+1,status=excluded.status,input_digest=excluded.input_digest,input_json=excluded.input_json,
-          phase=CASE WHEN EXISTS (SELECT 1 FROM investigations WHERE job_id=jobs.id AND revision=jobs.revision) THEN 'investigation' ELSE jobs.phase END
+          phase=CASE WHEN EXISTS (SELECT 1 FROM publications WHERE job_id=jobs.id AND kind='pull_request') THEN 'remote_review'
+          WHEN EXISTS (SELECT 1 FROM investigations WHERE job_id=jobs.id AND revision=jobs.revision) THEN 'investigation' ELSE jobs.phase END
           WHERE jobs.input_digest<>excluded.input_digest OR jobs.status<>excluded.status OR ?`,
             )
             .run(

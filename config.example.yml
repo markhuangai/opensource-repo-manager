@@ -28,11 +28,11 @@ roles:
   implementation:
     profile: coding
     prompts: { system: system.md, user: user.md }
-    skills: [example]
+    skills: [example, implement]
   audit:
     profile: review
     prompts: { system: system.md, user: user.md }
-    skills: [example, bootstrap]
+    skills: [example, bootstrap, audit]
   output_review:
     profile: review
     prompts: { system: system.md, user: user.md }

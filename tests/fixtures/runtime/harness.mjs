@@ -410,13 +410,63 @@ export async function runRuntimeTests() {
     );
     execFileSync("/usr/bin/cc", [`${storageControl}.c`, "-o", storageControl]);
     await chmod(storageControl, 0o555);
-    for (const waits of [[125], [-1], [100, 400]]) {
+    const teardownControl = `${storageControl}-teardown`;
+    await writeFile(
+      `${teardownControl}.c`,
+      `#include <sys/prctl.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+int descriptor;
+void *retain(void *argument) {
+  char byte;
+  if (read(0, &byte, 1) != 1) _exit(2);
+  int wait = atoi(argument);
+  if (wait >= 0) {
+    usleep(wait * 1000);
+    _exit(0);
+  }
+  for (;;) {
+    if (pwrite(descriptor, "x", 1, 0) != 1) _exit(3);
+    usleep(10000);
+  }
+}
+int main(int count, char **values) {
+  if (count != 3) return 1;
+  descriptor = open(values[1], O_CREAT | O_RDWR, 0600);
+  if (descriptor < 0 || ftruncate(descriptor, 307200) ||
+      unlink(values[1]) || prctl(PR_SET_DUMPABLE, 0)) return 1;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, retain, values[2])) return 1;
+  puts("ready");
+  fflush(stdout);
+  pthread_exit(NULL);
+}
+`,
+    );
+    execFileSync("/usr/bin/cc", [
+      `${teardownControl}.c`,
+      "-pthread",
+      "-o",
+      teardownControl,
+    ]);
+    await chmod(teardownControl, 0o555);
+    for (const [teardown, waits] of [
+      [false, [125]],
+      [false, [-1]],
+      [false, [100, 400]],
+      [true, [600]],
+      [true, [-1]],
+      [true, [700, 1600]],
+    ]) {
       const controls = [];
       try {
         for (const wait of waits) {
           const child = spawnAsRole(
               "implementation",
-              storageControl,
+              teardown ? teardownControl : storageControl,
               [
                 join("/tmp", `orm-storage-${randomBytes(8).toString("hex")}`),
                 String(wait),
@@ -437,11 +487,38 @@ export async function runRuntimeTests() {
             }),
           ]);
           child.stdout.resume();
+          if (teardown)
+            await until(async () => {
+              const status = await readFile(
+                `/proc/${child.pid}/status`,
+                "utf8",
+              );
+              return (
+                /^State:\s+Z\b/m.test(status) && /^Threads:\s+2$/m.test(status)
+              );
+            });
         }
         const started = Date.now(),
+          monotonicStarted = performance.now(),
           probe = deletedFileBytes(10001, 1024 ** 2);
         for (const { child } of controls) child.stdin.end("go");
-        if (waits.length === 1 && waits[0] >= 0) {
+        if (teardown && waits.length === 1 && waits[0] >= 0) {
+          assert.equal(await probe, 0);
+          assert(Date.now() - started >= 600);
+        } else if (teardown) {
+          await assert.rejects(probe, { code: "monitor_failed" });
+          const elapsed = performance.now() - monotonicStarted;
+          assert(
+            elapsed >= 1000,
+            `teardown rejection after ${elapsed} ms for waits ${waits.join(",")}`,
+          );
+          const status = await readFile(
+            `/proc/${controls.at(-1).child.pid}/status`,
+            "utf8",
+          );
+          assert.match(status, /^State:\s+Z\b/m);
+          assert.match(status, /^Threads:\s+2$/m);
+        } else if (waits.length === 1 && waits[0] >= 0) {
           assert.equal(await probe, 300 * 1024);
           await assert.rejects(deletedFileBytes(10001, 300 * 1024 - 1), {
             code: "storage_limit",

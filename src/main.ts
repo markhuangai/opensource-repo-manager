@@ -6,6 +6,7 @@ import { IntakeError } from "./domain/jobs.ts";
 import { Store } from "./repositories/store.ts";
 import { IntakeService } from "./services/intake.ts";
 import { InvestigationService } from "./services/investigation/index.ts";
+import { ImplementationService } from "./services/implementation/index.ts";
 import { RuntimeError } from "./domain/agents.ts";
 import { Supervisor } from "./runtime/supervisor.ts";
 import { McpGateway } from "./services/mcp/index.ts";
@@ -62,12 +63,21 @@ try {
         changed: () => investigation?.wake(),
       },
     );
+    const implementation = new ImplementationService(
+      store,
+      intake,
+      supervisor,
+      loaded.secrets,
+      logger,
+    );
     const investigation: InvestigationService = new InvestigationService(
       store,
       intake,
       supervisor,
       loaded.secrets,
       logger,
+      undefined,
+      implementation,
     );
     await startHttpService(logger, {
       intake,
