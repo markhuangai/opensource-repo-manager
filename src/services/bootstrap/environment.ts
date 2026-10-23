@@ -71,6 +71,7 @@ export async function materialize(
     YARN_NPM_REGISTRY_SERVER: "https://registry.npmjs.org/",
     YARN_ENABLE_IMMUTABLE_INSTALLS: "true",
     YARN_GLOBAL_FOLDER: join(workspace.home, "yarn"),
+    PYTHONDONTWRITEBYTECODE: "1",
     PIP_CONFIG_FILE: "/dev/null",
     PIP_INDEX_URL: "https://pypi.org/simple",
     PIP_NO_INPUT: "1",
