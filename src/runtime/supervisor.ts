@@ -38,6 +38,7 @@ import type { GitHubWriter } from "../adapters/github/writer.ts";
 import { runCommand } from "../adapters/toolchains/process.ts";
 import {
   WorkspaceService,
+  gitCommand,
   type PreparedWorkspace,
 } from "../services/workspaces/index.ts";
 import { cleanTemporary, treeBytes } from "../services/workspaces/files.ts";
@@ -1041,6 +1042,26 @@ export class Supervisor implements AgentRunner {
         );
       }
       this.store.bindRun(id, binding);
+      if (request.role === "implementation")
+        await gitCommand(
+          [
+            "checkout",
+            "-b",
+            this.publication.repository.target(request.job_id).branch,
+            request.workspace.source.sha,
+          ],
+          {
+            cwd: prepared.workspace,
+            env: cleanEnvironment(
+              prepared.home,
+              prepared.temporary,
+              identity.name,
+            ),
+            signal,
+            role: request.role,
+            processes: limits.processes,
+          },
+        );
       if (request.bootstrap_receipt) {
         let setupOutput = 0;
         const setup = await this.bootstrap.materialize(

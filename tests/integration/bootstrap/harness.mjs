@@ -475,6 +475,17 @@ export async function runBootstrapTests() {
             ],
           });
         }
+        if (python) {
+          sourceFiles["cache_probe.py"] = "ok = True\n";
+          currentPlan.setup_commands.push({
+            cwd: ".",
+            argv: [
+              "python",
+              "-c",
+              'from pathlib import Path; import cache_probe; assert cache_probe.ok; assert not Path("__pycache__").exists()',
+            ],
+          });
+        }
         const source = sourceWith(sourceFiles),
           job = seed(snapshot, source),
           request = supervisor.request(job.id, "bootstrap");
@@ -487,6 +498,17 @@ export async function runBootstrapTests() {
         assert.equal(receipt.plan_digest, digest(currentPlan));
         assert.equal(receipt.audit.result.approved, true);
         const commandReceipts = store.bootstrapCommands(receipt.id);
+        if (python)
+          for (const uid of [10001, 10002])
+            assert(
+              commandReceipts.some(
+                (command) =>
+                  command.uid === uid &&
+                  command.argv[0] === "python" &&
+                  command.argv[2]?.includes("import cache_probe") &&
+                  command.outcome === "completed",
+              ),
+            );
         assert(
           commandReceipts.some(
             (command) => command.operation === "environment-files",

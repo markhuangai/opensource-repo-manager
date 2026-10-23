@@ -23,7 +23,8 @@ const files = new Map<string, bigint>(),
   measured = new Set<string>(),
   mappings = new Set<string>();
 let bytes = 0n,
-  retryDeadline: number | undefined;
+  retryDeadline: number | undefined,
+  teardownDeadline: number | undefined;
 for (const pid of await readdir("/proc")) {
   if (!/^\d+$/.test(pid)) continue;
   let directory;
@@ -98,7 +99,15 @@ for (const pid of await readdir("/proc")) {
           )
             break;
           retryDeadline ??= performance.now() + 250;
-          const remaining = retryDeadline - performance.now();
+          const threads = Number(current.match(/^Threads:\s+(\d+)$/m)?.[1]),
+            exitingGroup =
+              /^State:\s+[ZX]\b/m.test(current) &&
+              Number.isSafeInteger(threads) &&
+              threads > 1,
+            deadline = exitingGroup
+              ? (teardownDeadline ??= performance.now() + 1000)
+              : retryDeadline,
+            remaining = deadline - performance.now();
           if (remaining > 0) {
             await delay(Math.min(25, remaining));
             continue;

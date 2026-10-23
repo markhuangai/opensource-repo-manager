@@ -89,7 +89,7 @@ export function renderFindings(
   const result = record.result!;
   const labels: Record<InvestigationResult["outcome"], string> = {
     maintenance_candidate:
-      "Confirmed maintenance candidate; queued for implementation. Implementation automation is not yet available.",
+      "Confirmed maintenance candidate; queued for audited implementation and real verification.",
     needs_information:
       "More information is needed before investigation can continue.",
     no_fix: "Investigation completed; no maintenance fix is proposed.",

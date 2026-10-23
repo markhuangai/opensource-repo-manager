@@ -12,6 +12,7 @@ import type { Store } from "../../repositories/store.ts";
 import { InvestigationRepository } from "../../repositories/investigation.ts";
 import type { Supervisor } from "../../runtime/supervisor.ts";
 import type { IntakeService } from "../intake.ts";
+import type { ImplementationService } from "../implementation/index.ts";
 import { resolveWriteEvidence } from "../mcp-writes/evidence.ts";
 import type {
   PublicationProposal,
@@ -68,6 +69,7 @@ const safeFailures = new Set([
 
 export class InvestigationService {
   readonly repository: InvestigationRepository;
+  readonly implementation?: ImplementationService;
   private readonly controller = new AbortController();
   private running: Promise<void> | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -89,6 +91,7 @@ export class InvestigationService {
     secrets: SecretAccessor,
     logger: SafeLogger,
     sourceUrl?: (repository: string) => string,
+    implementation?: ImplementationService,
   ) {
     this.store = store;
     this.intake = intake;
@@ -96,6 +99,7 @@ export class InvestigationService {
     this.secrets = secrets;
     this.logger = logger;
     this.sourceUrl = sourceUrl;
+    this.implementation = implementation;
     this.repository = new InvestigationRepository(store);
   }
 
@@ -129,7 +133,8 @@ export class InvestigationService {
       implementation_queued: records.filter(
         (item) =>
           item.result?.outcome === "maintenance_candidate" &&
-          item.stage === "completed",
+          item.stage === "completed" &&
+          this.store.jobById(item.job_id)?.phase === "implementation",
       ).length,
       reason: this.failure,
     };
@@ -173,10 +178,8 @@ export class InvestigationService {
     if (!job) return;
     const pending = this.supervisor.publication.repository.pending(job.id);
     if (
-      !pending?.steps.some(
-        (step) =>
-          step.kind === "comment" &&
-          ["dispatching", "uncertain"].includes(step.state),
+      !pending?.steps.some((step) =>
+        ["dispatching", "uncertain"].includes(step.state),
       )
     )
       return;
@@ -185,7 +188,13 @@ export class InvestigationService {
         pending.id,
         signal,
       );
-      if (receipt.status !== "confirmed" && receipt.status !== "blocked")
+      if (
+        receipt.status !== "confirmed" &&
+        receipt.status !== "blocked" &&
+        receipt.steps.some((step) =>
+          ["dispatching", "uncertain"].includes(step.state),
+        )
+      )
         throw new IntakeError("publication_pending");
     } catch {
       throw new IntakeError("publication_pending");
@@ -204,6 +213,7 @@ export class InvestigationService {
 
   private async cycle() {
     if (!this.intake.enrolled() || this.controller.signal.aborted) return;
+    await this.implementation?.reconcile(this.controller.signal);
     for (const record of this.repository.all()) {
       const job = this.store.jobById(record.job_id);
       if (
@@ -218,7 +228,12 @@ export class InvestigationService {
     }
     for (const job of this.store.jobs()) {
       if (this.controller.signal.aborted) break;
-      if (job.status !== "pending" || job.phase !== "investigation") continue;
+      if (job.status !== "pending") continue;
+      if (job.phase === "implementation") {
+        await this.implementation?.advance(job, this.controller.signal);
+        continue;
+      }
+      if (job.phase !== "investigation") continue;
       const record = this.repository.ensure(job);
       if (
         record.stage === "blocked" &&

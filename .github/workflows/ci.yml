@@ -53,7 +53,7 @@ jobs:
   containers:
     name: Container smoke (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:

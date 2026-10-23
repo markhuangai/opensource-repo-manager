@@ -66,6 +66,7 @@ const http = createServer(async (req, res) => {
       JSON.stringify({
         source,
         comments: [...remote.state.comments.entries()],
+        pulls: remote.state.pulls,
         mutations: remote.state.mutations,
         errors: fixture.errors.map((error) => error.message),
         requests: fixture.requests.map((item) => item.scenario),

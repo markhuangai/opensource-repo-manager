@@ -88,7 +88,7 @@ export async function respond(req, res, fixture) {
     const text = strings(body.input).join("\n");
     const scenario =
       /"scenario":"([^"]+)"/.exec(text)?.[1] ??
-      /"task":"(bootstrap_[^"]+|investigation_[^"]+|external_output_review)"/.exec(
+      /"task":"(bootstrap_[^"]+|investigation_[^"]+|implementation_[^"]+|external_output_review)"/.exec(
         text,
       )?.[1];
     assert(scenario, "Missing verbatim task context");
@@ -168,9 +168,17 @@ export async function respond(req, res, fixture) {
       fixture.held = true;
       return;
     }
-    if (["investigation_plan", "investigation_result"].includes(scenario)) {
-      investigation = await fixture.investigation(scenario, text, results);
-      if (investigation.tool)
+    if (
+      ["investigation_plan", "investigation_result"].includes(scenario) ||
+      scenario.startsWith("implementation_")
+    ) {
+      investigation = await fixture[
+        scenario.startsWith("implementation_")
+          ? "implementation"
+          : "investigation"
+      ](scenario, text, results);
+      if (investigation.command) output = command(investigation.command);
+      else if (investigation.tool)
         output = use(investigation.tool, investigation.arguments);
     } else if (scenario === "bootstrap_environment") {
       if (!previous)

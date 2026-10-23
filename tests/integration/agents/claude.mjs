@@ -33,7 +33,7 @@ export async function respond(req, res, fixture) {
       .join("\n");
     const scenario =
       /"scenario":"([^"]+)"/.exec(text)?.[1] ??
-      /"task":"(bootstrap_[^"]+|investigation_[^"]+|external_output_review)"/.exec(
+      /"task":"(bootstrap_[^"]+|investigation_[^"]+|implementation_[^"]+|external_output_review)"/.exec(
         text,
       )?.[1];
     assert(scenario, "Missing verbatim task context");
@@ -90,10 +90,20 @@ export async function respond(req, res, fixture) {
       assert(!toolNames.some((name) => name.startsWith("mcp__")));
       use("StructuredOutput", await fixture.outputReview(text));
     } else if (
-      ["investigation_plan", "investigation_result"].includes(scenario)
+      ["investigation_plan", "investigation_result"].includes(scenario) ||
+      scenario.startsWith("implementation_")
     ) {
-      const call = await fixture.investigation(scenario, text, results);
-      if (call.tool) use(call.tool, call.arguments);
+      const call = await fixture[
+        scenario.startsWith("implementation_")
+          ? "implementation"
+          : "investigation"
+      ](scenario, text, results);
+      if (call.command)
+        use("Bash", {
+          command: call.command,
+          description: "Apply the bounded fixture maintenance fix",
+        });
+      else if (call.tool) use(call.tool, call.arguments);
       else use("StructuredOutput", call.result);
     } else if (["bootstrap_plan", "bootstrap_audit"].includes(scenario)) {
       use("StructuredOutput", fixture.bootstrap(scenario, text));
@@ -229,6 +239,7 @@ export async function respond(req, res, fixture) {
         "expiry",
         "mcp_write",
         "investigation_plan",
+        "implementation_milestone",
       ].includes(scenario)
     )
       assert(
