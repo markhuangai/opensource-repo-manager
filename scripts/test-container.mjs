@@ -954,6 +954,7 @@ try {
   assert.notEqual(deniedWrite.status, 0);
   assert(deniedWrite.stderr.includes("Read-only file system"));
 
+  console.log("Verifying supervised runtime workers");
   const runtimeProof = JSON.parse(
     docker(
       [
@@ -977,6 +978,7 @@ try {
   assert.equal(runtimeProof.codex_sdk?.protocol, "responses_http_sse");
   assert.equal(runtimeProof.codex_sdk?.cleanup, "passed");
 
+  console.log("Verifying reviewed GitHub publication");
   const publicationProof = JSON.parse(
     docker(
       [
@@ -993,6 +995,7 @@ try {
   assert.equal(publicationProof.publication, "passed");
   assert.equal(publicationProof.cleanup, "passed");
 
+  console.log("Verifying scoped MCP writes");
   const mcpWriteProof = JSON.parse(
     docker(
       [
@@ -1010,6 +1013,7 @@ try {
   assert.equal(mcpWriteProof.cleanup, "passed");
   assert.equal(request("/readyz").body.mcp_writes.uncertain, 0);
 
+  console.log("Verifying durable notifications");
   const notificationProof = JSON.parse(
     docker(
       [
@@ -1027,6 +1031,7 @@ try {
   assert.equal(notificationProof.cleanup, "passed");
   assert.equal(request("/readyz").body.notifications.state, "running");
 
+  console.log("Verifying issue investigation");
   const investigationProof = JSON.parse(
     docker(
       [
@@ -1043,6 +1048,7 @@ try {
   assert.equal(investigationProof.investigation, "passed");
   assert.equal(investigationProof.cleanup, "passed");
 
+  console.log("Verifying maintenance implementation through both SDKs");
   const implementationContainers = ["codex", "claude"].map((sdk) => {
     const name = `${id}-implementation-${sdk}`,
       data = `${name}-data`;
@@ -1114,6 +1120,7 @@ try {
 
   const investigationStartupProof = [];
   for (const sdk of ["codex", "claude"]) {
+    console.log(`Verifying production startup through ${sdk}`);
     const prefix = `${id}-investigation-${sdk}`,
       data = `${prefix}-data`,
       net = `${prefix}-network`,
@@ -1341,6 +1348,7 @@ try {
     });
   }
 
+  console.log("Verifying repository bootstrap");
   register("volume", bootstrapVolume);
   docker(["volume", "create", "--label", `${label}=${id}`, bootstrapVolume]);
   register("container", bootstrapContainer);
@@ -1380,6 +1388,7 @@ try {
   );
   stopCleanly(bootstrapContainer);
 
+  console.log("Verifying shutdown and persistence");
   const healthyDeadline = Date.now() + 30_000;
   while (
     inspectRuntime().State.Health.Status === "starting" &&
@@ -1430,6 +1439,7 @@ try {
 } catch (error) {
   failure = error;
 } finally {
+  console.log("Cleaning owned test resources");
   if (protectedFixtures) {
     try {
       const [inspection] = JSON.parse(docker(["image", "inspect", image]));
