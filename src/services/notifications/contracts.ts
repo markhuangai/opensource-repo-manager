@@ -26,6 +26,10 @@ export const eventSchema = z
     issue_number: githubId,
     pull_number: githubId.optional(),
     head_sha: sha.optional(),
+    readiness_id: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
     occurred_at: z.number().int().positive().max(8_640_000_000_000_000),
     outcome: z.enum(["ready_for_review", "needs_attention"]),
     reason: z.enum(
@@ -52,7 +56,7 @@ export const eventSchema = z
       (event.outcome === "ready_for_review") !==
         (event.reason === "automation_clean") ||
       (event.outcome === "ready_for_review" &&
-        (!event.pull_number || !event.head_sha))
+        (!event.pull_number || !event.head_sha || !event.readiness_id))
     )
       ctx.addIssue({ code: "custom", message: "notification_event_invalid" });
   });

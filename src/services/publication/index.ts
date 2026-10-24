@@ -5,14 +5,17 @@ import {
   createGitHubWriter,
   type GitHubWriter,
   type RemotePull,
+  type RemoteThread,
 } from "../../adapters/github/writer.ts";
 import { PublicationGit } from "../../adapters/github/git.ts";
 import type { SecretAccessor } from "../../config/secrets.ts";
 import { digest, RuntimeError, workerLimits } from "../../domain/agents.ts";
-import { IntakeError } from "../../domain/jobs.ts";
+import { IntakeError, type IssueContext } from "../../domain/jobs.ts";
 import type { Store } from "../../repositories/store.ts";
 import { PublicationRepository } from "../../repositories/publication.ts";
 import { InvestigationRepository } from "../../repositories/investigation.ts";
+import { PrMonitorRepository } from "../../repositories/pr-monitor.ts";
+import { findingIdentity } from "../pr-monitor/policy.ts";
 import { renderFindings, stageText } from "../investigation/contracts.ts";
 import type { BootstrapLease, Supervisor } from "../../runtime/supervisor.ts";
 import { rootDirectory } from "../workspaces/files.ts";
@@ -35,6 +38,12 @@ type FrozenPayload = {
   candidate?: Awaited<ReturnType<PublicationGit["build"]>>;
   evidence: unknown[];
   narrative?: string;
+  feedback?: {
+    thread: string | null;
+    before: RemoteThread | null;
+    body: string;
+    resolve: boolean;
+  };
 };
 type PublicationOptions = {
   writer?: (ready: () => void) => GitHubWriter;
@@ -59,6 +68,10 @@ export class PublicationService {
   private readonly store: Store;
   private readonly secrets: SecretAccessor;
   private readonly options: PublicationOptions;
+  private readinessValidator?: (
+    id: string,
+    signal: AbortSignal,
+  ) => Promise<void>;
   constructor(
     supervisor: Supervisor,
     store: Store,
@@ -90,6 +103,12 @@ export class PublicationService {
     const frozen = structuredClone(evidence);
     await this.outputReview.scanner.scan(frozen, signal);
     return this.repository.recordEvidence(frozen);
+  }
+
+  setReadinessValidator(
+    validate: (id: string, signal: AbortSignal) => Promise<void>,
+  ) {
+    this.readinessValidator = validate;
   }
 
   async publish(
@@ -190,7 +209,8 @@ export class PublicationService {
         if (!receipt.review_id) {
           if (
             proposal.kind === "notice" ||
-            proposal.kind === "investigation_stage"
+            proposal.kind === "investigation_stage" ||
+            proposal.kind === "pr_stage"
           ) {
             await this.outputReview.scanner.scan(payload, publicationSignal);
             receipt.review_id = this.repository.review({
@@ -220,6 +240,7 @@ export class PublicationService {
           await this.authority(receipt, publicationSignal);
           this.approval(receipt);
           await this.before(receipt, step, publicationSignal);
+          if (receipt.steps[index].state === "confirmed") continue;
           publicationSignal.throwIfAborted();
           this.repository.current(job.id, job.revision);
           this.repository.providerReady();
@@ -238,6 +259,25 @@ export class PublicationService {
               await git!.push(
                 receipt.commit!,
                 receipt.target.branch,
+                publicationSignal,
+              );
+            else if (step.kind === "feedback_reply") {
+              if (payload.feedback!.thread)
+                await this.writer.replyThread(
+                  payload.feedback!.thread,
+                  payload.feedback!.body,
+                  publicationSignal,
+                );
+              else
+                await this.writer.comment(
+                  receipt.target.pull!.number,
+                  null,
+                  payload.feedback!.body,
+                  publicationSignal,
+                );
+            } else if (step.kind === "thread_resolution")
+              await this.writer.resolveThread(
+                payload.feedback!.thread!,
                 publicationSignal,
               );
             else
@@ -297,7 +337,9 @@ export class PublicationService {
         if (directory) await rm(directory, { recursive: true, force: true });
       }
     };
-    return proposal.kind === "notice" || proposal.kind === "investigation_stage"
+    return proposal.kind === "notice" ||
+      proposal.kind === "investigation_stage" ||
+      proposal.kind === "pr_stage"
       ? this.supervisor.withPublicationNotice(signal, (noticeSignal) =>
           operation(noticeSignal),
         )
@@ -370,6 +412,49 @@ export class PublicationService {
             receipt.target.head = branch.head;
             if (receipt.target.pull) receipt.target.pull.head = branch.head!;
             matched = true;
+          }
+        } else if (
+          step.kind === "feedback_reply" ||
+          step.kind === "thread_resolution"
+        ) {
+          const feedback = payload.feedback!;
+          if (feedback.thread) {
+            const thread = await this.writer.thread(feedback.thread, signal);
+            if (
+              thread.pull_id !== receipt.target.pull!.id ||
+              thread.repository_id !== this.store.repository()!.id
+            )
+              throw new RuntimeError("publication_thread_changed");
+            const matches = thread.comments.filter(
+              (comment) =>
+                comment.body === feedback.body &&
+                comment.author_login?.toLowerCase().replace(/\[bot\]$/, "") ===
+                  receipt.actor!.login.toLowerCase().replace(/\[bot\]$/, ""),
+            );
+            matched =
+              matches.length === 1 &&
+              (step.kind === "feedback_reply" || thread.resolved);
+            if (matches.length === 1)
+              this.repository.feedbackObject(
+                receipt,
+                "review_comment",
+                matches[0].id,
+              );
+          } else {
+            const matches = (
+              await this.writer.comments(receipt.target.pull!.number, signal)
+            ).filter(
+              (comment) =>
+                comment.body === feedback.body &&
+                comment.author_id === receipt.actor!.id,
+            );
+            matched = matches.length === 1;
+            if (matched)
+              this.repository.feedbackObject(
+                receipt,
+                "issue_comment",
+                matches[0].id,
+              );
           }
         } else {
           const matches = (
@@ -487,6 +572,83 @@ export class PublicationService {
         job.id,
       );
       payload.comment = `${this.investigationStatus(proposal.stage, payload.narrative)}${this.pullReference(receipt)}\n\n${marker}`;
+    } else if (proposal.kind === "pr_stage") {
+      payload.narrative = this.previousNarrative(
+        proposal.previous_operation,
+        job.id,
+      );
+      payload.comment = `${this.prStatus(receipt, payload.narrative)}\n\n${marker}`;
+      if (proposal.readiness_id)
+        payload.evidence = [
+          new PrMonitorRepository(this.store).readiness(proposal.readiness_id),
+        ];
+    } else if (proposal.kind === "feedback") {
+      const monitors = new PrMonitorRepository(this.store),
+        monitor = monitors.get(job.id);
+      if (
+        !monitor ||
+        monitor.expected_head !== proposal.expected_head ||
+        monitor.observed_head !== proposal.expected_head
+      )
+        throw new RuntimeError("publication_head_changed");
+      monitors.current(monitor);
+      const finding = monitor.findings.find(
+        (item) => findingIdentity(item) === proposal.finding_id,
+      );
+      if (
+        !finding ||
+        finding.disposition === "blocked" ||
+        (finding.disposition === "fix" &&
+          finding.fixed_head !== proposal.expected_head)
+      )
+        throw new RuntimeError("publication_feedback_unverified");
+      const snapshot =
+        monitor.snapshot_digest &&
+        monitors.read<{
+          snapshot: import("../pr-monitor/contracts.ts").PrSnapshot;
+        }>(monitor.snapshot_digest).snapshot;
+      if (!snapshot || snapshot.head_sha !== proposal.expected_head)
+        throw new RuntimeError("publication_head_changed");
+      const thread = finding.surface.thread_id
+        ? snapshot.threads.find((item) => item.id === finding.surface.thread_id)
+        : null;
+      if (finding.surface.thread_id && !thread)
+        throw new RuntimeError("publication_thread_changed");
+      const fixed =
+        finding.disposition === "fixed" || finding.fixed_head !== null;
+      const body = `${fixed ? `Fixed in ${proposal.expected_head}:` : finding.disposition === "informational" ? "Reviewed:" : "Not actionable for this PR:"} ${finding.explanation}\n\n${marker}`;
+      payload.feedback = {
+        thread: thread?.id ?? null,
+        before: thread
+          ? {
+              id: thread.id,
+              pull_id: snapshot.id,
+              pull_number: snapshot.number,
+              repository_id: snapshot.repository_id,
+              resolved: thread.isResolved,
+              comments: thread.comments.map((item) => ({
+                id: item.databaseId,
+                node_id: item.id,
+                body: item.body,
+                author_login: item.author?.login ?? null,
+              })),
+            }
+          : null,
+        body,
+        resolve: !!thread && !thread.isResolved,
+      };
+      payload.evidence = [
+        finding,
+        {
+          snapshot_digest: monitor.snapshot_digest,
+          head_sha: snapshot.head_sha,
+        },
+      ];
+      if (receipt.payload !== null) {
+        const frozen = receipt.payload as FrozenPayload;
+        payload.feedback = frozen.feedback;
+        payload.evidence = frozen.evidence;
+      }
     } else if (proposal.kind !== "change")
       payload.comment = `${proposal.kind === "notice" ? notices[proposal.reason] : proposal.body}\n\n${marker}`;
     else {
@@ -555,33 +717,52 @@ export class PublicationService {
     receipt.payload = payload;
     if (!receipt.steps.length)
       receipt.steps =
-        proposal.kind === "change"
+        proposal.kind === "feedback"
           ? [
-              ...(payload.candidate!.changes.length
+              {
+                kind: "feedback_reply",
+                before: payload.feedback!.before,
+                after: payload.feedback!.body,
+                state: "prepared",
+              },
+              ...(payload.feedback!.resolve
                 ? [
                     {
-                      kind: "branch",
-                      before: proposal.expected_head,
-                      after: receipt.commit,
-                      state: "prepared",
-                    } as MutationStep,
+                      kind: "thread_resolution" as const,
+                      before: false,
+                      after: true,
+                      state: "prepared" as const,
+                    },
                   ]
                 : []),
-              {
-                kind: "pull",
-                before: receipt.target.pull,
-                after: payload.pull!,
-                state: "prepared",
-              },
             ]
-          : [
-              {
-                kind: "comment",
-                before: receipt.target.comment,
-                after: payload.comment,
-                state: "prepared",
-              },
-            ];
+          : proposal.kind === "change"
+            ? [
+                ...(payload.candidate!.changes.length
+                  ? [
+                      {
+                        kind: "branch",
+                        before: proposal.expected_head,
+                        after: receipt.commit,
+                        state: "prepared",
+                      } as MutationStep,
+                    ]
+                  : []),
+                {
+                  kind: "pull",
+                  before: receipt.target.pull,
+                  after: payload.pull!,
+                  state: "prepared",
+                },
+              ]
+            : [
+                {
+                  kind: "comment",
+                  before: receipt.target.comment,
+                  after: payload.comment,
+                  state: "prepared",
+                },
+              ];
     this.repository.save(receipt);
     return payload;
   }
@@ -596,7 +777,15 @@ export class PublicationService {
       evidence: payload.evidence,
       ...(receipt.proposal.kind === "change"
         ? { artifact_digest: receipt.proposal.artifact_digest }
-        : {}),
+        : receipt.proposal.kind === "feedback"
+          ? {
+              artifact_digest: new PrMonitorRepository(
+                this.store,
+              ).implementation(
+                new PrMonitorRepository(this.store).get(receipt.job_id)!,
+              ).artifact_digest!,
+            }
+          : {}),
     };
   }
   private approval(receipt: PublicationReceipt) {
@@ -604,17 +793,18 @@ export class PublicationService {
     const request = this.reviewRequest(receipt);
     if (
       receipt.proposal.kind !== "notice" &&
-      receipt.proposal.kind !== "investigation_stage"
+      receipt.proposal.kind !== "investigation_stage" &&
+      receipt.proposal.kind !== "pr_stage"
     ) {
       this.outputReview.verify(receipt.review_id, request);
       return;
     }
     const proposal = receipt.proposal;
     const narrative =
-      proposal.kind === "investigation_stage"
+      proposal.kind === "investigation_stage" || proposal.kind === "pr_stage"
         ? this.previousNarrative(proposal.previous_operation, receipt.job_id)
         : "";
-    const expected = `${proposal.kind === "notice" ? notices[proposal.reason] : `${this.investigationStatus(proposal.stage, narrative)}${this.pullReference(receipt)}`}\n\n<!-- orm:${this.repository.instance()}:${receipt.job_id}:${receipt.id} -->`;
+    const expected = `${proposal.kind === "notice" ? notices[proposal.reason] : proposal.kind === "pr_stage" ? this.prStatus(receipt, narrative) : `${this.investigationStatus(proposal.stage, narrative)}${this.pullReference(receipt)}`}\n\n<!-- orm:${this.repository.instance()}:${receipt.job_id}:${receipt.id} -->`;
     const review = this.repository.reviewed(receipt.review_id);
     if (
       (receipt.payload as FrozenPayload).comment !== expected ||
@@ -631,6 +821,19 @@ export class PublicationService {
     return pull
       ? `\n\nPull request: https://github.com/${this.supervisor.repositoryName()}/pull/${pull.number}`
       : "";
+  }
+
+  private prStatus(receipt: PublicationReceipt, narrative: string) {
+    const proposal = receipt.proposal;
+    if (proposal.kind !== "pr_stage")
+      throw new RuntimeError("publication_invalid");
+    const text =
+      proposal.stage === "ready"
+        ? "Automation clean; awaiting human review. Human merge remains required."
+        : proposal.stage === "blocked"
+          ? "PR maintenance is blocked and needs operator attention. No readiness is claimed."
+          : "The pull request is awaiting current-head CI and automated review. No readiness is claimed.";
+    return `${text}\n\nRecorded instance head: ${proposal.expected_head}${narrative ? `\n\nPrevious reviewed findings:\n\n${narrative}` : ""}${this.pullReference(receipt)}`;
   }
 
   private investigationStatus(
@@ -696,12 +899,56 @@ export class PublicationService {
       repository.default_branch !== receipt.source.default_branch
     )
       throw new RuntimeError("publication_repository_changed");
-    if (!(await this.writer.issueOpen(job.issue_number, signal)))
-      throw new RuntimeError("publication_issue_closed");
+    const checkScope =
+      receipt.target.pull &&
+      (receipt.proposal.kind === "change" ||
+        receipt.proposal.kind === "feedback" ||
+        (receipt.proposal.kind === "pr_stage" &&
+          receipt.proposal.stage !== "blocked"));
+    if (checkScope) this.store.assertPublishedScope(job.id);
+    if (
+      !(await this.writer.issueOpen(
+        job.issue_number,
+        signal,
+        checkScope ? (JSON.parse(job.input_json) as IssueContext) : undefined,
+      ))
+    )
+      throw new RuntimeError(
+        checkScope ? "pr_scope_changed" : "publication_issue_closed",
+      );
     const actor = await this.writer.actor(signal);
     if (receipt.actor && digest(receipt.actor) !== digest(actor))
       throw new RuntimeError("publication_actor_changed");
     receipt.actor = actor;
+    if (
+      receipt.proposal.kind === "feedback" ||
+      receipt.proposal.kind === "pr_stage"
+    ) {
+      const current = await this.writer.pull(
+        receipt.target.pull!.number,
+        signal,
+      );
+      const expected = receipt.proposal.expected_head;
+      if (
+        !this.matchesPull(
+          receipt,
+          current,
+          receipt.proposal.kind === "pr_stage" &&
+            receipt.proposal.stage === "blocked"
+            ? current.head
+            : expected,
+        )
+      )
+        throw new RuntimeError("publication_pull_changed");
+      if (
+        receipt.proposal.kind === "pr_stage" &&
+        receipt.proposal.stage === "ready"
+      ) {
+        if (!receipt.proposal.readiness_id || !this.readinessValidator)
+          throw new RuntimeError("pr_readiness_missing");
+        await this.readinessValidator(receipt.proposal.readiness_id, signal);
+      }
+    }
     if (receipt.proposal.kind === "change") {
       const branch = await this.writer.branch(receipt.target.branch, signal);
       if (
@@ -722,6 +969,45 @@ export class PublicationService {
     signal: AbortSignal,
   ) {
     const job = this.store.jobById(receipt.job_id)!;
+    if (step.kind === "feedback_reply" || step.kind === "thread_resolution") {
+      const feedback = (receipt.payload as FrozenPayload).feedback!;
+      if (feedback.thread) {
+        const thread = await this.writer.thread(feedback.thread, signal);
+        if (
+          thread.pull_id !== receipt.target.pull!.id ||
+          thread.repository_id !== this.store.repository()!.id
+        )
+          throw new RuntimeError("publication_thread_changed");
+        if (
+          step.kind === "feedback_reply" &&
+          digest(thread) !== digest(feedback.before)
+        )
+          throw new RuntimeError("publication_thread_changed");
+        if (step.kind === "thread_resolution") {
+          if (
+            !thread.comments.some(
+              (comment) =>
+                comment.body === feedback.body &&
+                comment.author_login === receipt.actor!.login,
+            )
+          )
+            throw new RuntimeError("publication_feedback_unverified");
+          const original = feedback.before!.comments;
+          const foreign = thread.comments.filter(
+            (comment) =>
+              comment.body !== feedback.body ||
+              comment.author_login !== receipt.actor!.login,
+          );
+          if (digest(foreign) !== digest(original))
+            throw new RuntimeError("publication_thread_changed");
+          if (thread.resolved) {
+            step.state = "confirmed";
+            this.repository.finishStep(receipt, step.kind);
+          }
+        }
+      }
+      return;
+    }
     if (step.kind === "branch" && receipt.target.pull) {
       const current = await this.writer.pull(
         receipt.target.pull.number,

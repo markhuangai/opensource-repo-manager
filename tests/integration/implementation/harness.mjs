@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -22,7 +23,13 @@ import {
 import { parseConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
 import { userProcesses } from "/opt/orm/app/dist/runtime/process.js";
-import { createPublicationFixture } from "/publication-fixture.ts";
+import {
+  createPublicationFixture,
+  makeCheck,
+  makeThread,
+} from "/publication-fixture.ts";
+import { PrMonitorService } from "/opt/orm/app/dist/services/pr-monitor/index.js";
+import { evaluateReadiness } from "/opt/orm/app/dist/services/pr-monitor/policy.js";
 import { respond as claude } from "/agent-fixtures/claude.mjs";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
 import {
@@ -30,6 +37,7 @@ import {
   bundlesWithCanaries,
   modelFixture,
   maintenanceCommand,
+  taskInput,
 } from "/investigation-fixtures/protocol.mjs";
 import { contextServer } from "/investigation-fixtures/mcp.mjs";
 
@@ -53,6 +61,7 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
     intake,
     investigation,
     implementation,
+    monitor,
     app,
     remote;
   const controls = {};
@@ -62,7 +71,12 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
   const notifier = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
-    notifications.push(JSON.parse(body));
+    const event = JSON.parse(body);
+    notifications.push(event);
+    if (controls.loseReady && event.outcome === "ready_for_review") {
+      res.destroy();
+      return;
+    }
     res.end("accepted");
   });
   await new Promise((resolve) => model.listen(0, "127.0.0.1", resolve));
@@ -72,6 +86,7 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
     error: (message) => logs.push(message),
   };
   const closeRuntime = async () => {
+    await monitor?.stop();
     await investigation?.stop();
     await intake?.stop();
     await app?.close();
@@ -80,6 +95,7 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
     if (fixture) errors.push(...fixture.errors.splice(0));
     if (store?.db.open) store.close();
     investigation = undefined;
+    monitor = undefined;
     intake = undefined;
     app = undefined;
     supervisor = undefined;
@@ -805,6 +821,950 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
             !JSON.stringify(item).includes('"outcome":"ready_for_review"'),
         ),
       );
+
+      await closeRuntime();
+      config.pr_monitor = {
+        enabled: true,
+        requirements_source: "github",
+        required_checks: ["Fixture CI"],
+        automated_reviewers: [
+          { login: "chatgpt-codex-connector[bot]", signal: "codex" },
+          { login: "coderabbitai[bot]", signal: "coderabbit" },
+        ],
+        local_checks_only: false,
+      };
+      configure(false);
+      await start();
+      const attachMonitor = () => {
+        monitor = new PrMonitorService(
+          store,
+          intake,
+          new OctokitReader(
+            "owner/repo",
+            new Octokit({
+              auth: remote.state.token,
+              baseUrl: remote.url,
+              log: {
+                debug: () => {},
+                info: () => {},
+                warn: () => {},
+                error: () => {},
+              },
+            }),
+          ),
+          implementation,
+          supervisor,
+          snapshot,
+          secrets,
+          logger,
+        );
+      };
+      attachMonitor();
+      const certify = (job) => {
+        const target = supervisor.publication.repository.target(job.id),
+          head = target.head;
+        remote.state.checks.set(head, [makeCheck(head)]);
+        remote.state.reviews.set(
+          target.pull.number,
+          ["chatgpt-codex-connector[bot]", "coderabbitai[bot]"].map(
+            (login, index) => ({
+              id: 40000 + job.id * 100 + record(job).audits.length * 10 + index,
+              node_id: `R_${head}_${index}`,
+              user: { id: 200 + index, login },
+              commit_id: head,
+              state: "COMMENTED",
+              body: "",
+              submitted_at: new Date().toISOString(),
+            }),
+          ),
+        );
+      };
+      const pump = async (job, condition, rounds = 12) => {
+        for (let cycle = 0; cycle < rounds; cycle++) {
+          await monitor.reconcile();
+          if (condition(monitor.repository.get(job.id)))
+            return monitor.repository.get(job.id);
+          await investigation.reconcile();
+        }
+        assert.fail(
+          `PR monitor failed to reach its expected state: ${JSON.stringify(monitor.repository.get(job.id))}; errors ${fixture.errors.map((error) => error.stack).join("\n")}`,
+        );
+      };
+      const until = async (condition, message) => {
+        const deadline = Date.now() + 15000;
+        while (!condition()) {
+          assert(Date.now() < deadline, message);
+          await delay(20);
+        }
+      };
+      const monitored = await run("monitor_pipeline");
+      const first = supervisor.publication.repository.target(monitored.job.id);
+      await monitor.reconcile();
+      assert.equal(monitor.repository.get(monitored.job.id).stage, "waiting");
+      assert.deepEqual(store.leases(), []);
+      certify(monitored.job);
+      remote.state.threads.set(first.pull.number, [
+        makeThread(30001, first.head),
+      ]);
+      const originalRevision = store.jobById(monitored.job.id).revision;
+      let oldHeadMarkerAt;
+      controls.review = (text) => {
+        if (text.includes('"kind":"change"') && text.includes(first.head)) {
+          oldHeadMarkerAt = new Date().toISOString();
+          remote.state.reactions.set(first.pull.number, [
+            {
+              id: 99001,
+              content: "+1",
+              user: { id: 200, login: "chatgpt-codex-connector[bot]" },
+              created_at: oldHeadMarkerAt,
+            },
+          ]);
+          remote.state.comments.set(first.pull.number, [
+            {
+              id: 99002,
+              body: "No actionable comments were generated in the recent review",
+              author_id: 201,
+              author_login: "coderabbitai[bot]",
+              created_at: oldHeadMarkerAt,
+              updated_at: oldHeadMarkerAt,
+            },
+          ]);
+        }
+      };
+      await pump(monitored.job, (item) => item.expected_head !== first.head);
+      controls.review = undefined;
+      const repaired = supervisor.publication.repository.target(
+        monitored.job.id,
+      );
+      const repairMonitor = monitor.repository.get(monitored.job.id);
+      assert(oldHeadMarkerAt);
+      assert(repairMonitor.head_published_at > Date.parse(oldHeadMarkerAt));
+      const remoteAfterRepair = await new OctokitReader(
+        "owner/repo",
+        new Octokit({ auth: remote.state.token, baseUrl: remote.url }),
+      ).monitor(first.pull.number, AbortSignal.timeout(10000));
+      for (const reviewer of config.pr_monitor.automated_reviewers) {
+        const decision = evaluateReadiness(
+          remoteAfterRepair,
+          {
+            ...config.pr_monitor,
+            required_checks: [],
+            local_checks_only: true,
+            automated_reviewers: [reviewer],
+          },
+          repairMonitor.head_published_at,
+        );
+        assert.equal(decision.clean, false);
+        assert(decision.pending.includes(`review:${reviewer.login}`));
+      }
+      assert.equal(store.ownedPull(first.pull.number).head_sha, repaired.head);
+      assert.equal(store.jobById(monitored.job.id).revision, originalRevision);
+      assert.equal(remote.git(["rev-parse", `${repaired.head}^`]), first.head);
+      assert(remote.git(["show", `${first.head}:bug.mjs`]).includes("99"));
+      assert(!remote.git(["show", `${repaired.head}:bug.mjs`]).includes("99"));
+      assert(
+        remote
+          .git(["show", `${repaired.head}:regression.mjs`])
+          .includes("increment(2)"),
+      );
+      for (const [sha, expected] of [
+        [first.head, 1],
+        [repaired.head, 0],
+      ]) {
+        const code = remote.git(["show", `${sha}:bug.mjs`]);
+        const actual = spawnSync(
+          "/opt/orm-runtime/bin/node",
+          [
+            "--input-type=module",
+            "-e",
+            `import assert from 'node:assert/strict'; ${code}; assert.equal(increment(2),3);`,
+          ],
+          {
+            uid: 10002,
+            gid: 10002,
+            cwd: "/",
+            env: { PATH: "/opt/orm-runtime/bin:/usr/bin:/bin" },
+            encoding: "utf8",
+          },
+        );
+        assert.equal(actual.status, expected, actual.stderr);
+      }
+      await pump(
+        monitored.job,
+        () => remote.state.threads.get(first.pull.number)[0].isResolved,
+      );
+      assert.notEqual(monitor.repository.get(monitored.job.id).stage, "ready");
+      assert(
+        !supervisor.notifications.repository
+          .receipts()
+          .some(
+            (item) =>
+              supervisor.notifications.repository.event(item.event_id)?.prepared
+                .event.job_id === monitored.job.id,
+          ),
+      );
+      const repairRecord = record(monitored.job);
+      assert.equal(
+        repairRecord.tests.filter((item) => item.state === "passed").length,
+        2,
+      );
+      assert.equal(
+        JSON.parse(store.jobById(monitored.job.id).budget_json).repair_cycles,
+        1,
+      );
+      certify(monitored.job);
+      const directReady = await pump(
+        monitored.job,
+        (item) => item.stage === "ready",
+      );
+      assert(directReady.notification_id);
+      assert.equal(store.ownedPull(first.pull.number).head_sha, repaired.head);
+      remote.state.checks.set(repaired.head, [
+        makeCheck(repaired.head, {
+          id: 602,
+          status: "queued",
+          conclusion: null,
+        }),
+      ]);
+      await monitor.reconcile();
+      assert.notEqual(monitor.repository.get(monitored.job.id).stage, "ready");
+      const beforeRestart = remote.state.mutations.length;
+      await closeRuntime();
+      await start();
+      attachMonitor();
+      await monitor.reconcile();
+      assert.notEqual(monitor.repository.get(monitored.job.id).stage, "ready");
+      assert.equal(remote.state.mutations.length, beforeRestart);
+      certify(monitored.job);
+      let clean = await pump(monitored.job, (item) => item.stage === "ready");
+      await monitor.validateReadiness(
+        clean.readiness_id,
+        new globalThis.AbortController().signal,
+      );
+      await delay(50);
+      assert(
+        supervisor.notifications.repository
+          .receipts()
+          .some((item) => item.event_id === clean.notification_id),
+      );
+      assert.equal(
+        remote.state.comments.get(monitored.job.issue_number).length,
+        1,
+      );
+      assert(
+        remote.state.comments
+          .get(monitored.job.issue_number)[0]
+          .body.includes("Automation clean; awaiting human review"),
+      );
+      proof.push({
+        sdk,
+        monitor_real_review_repair_and_regression: "passed",
+        monitor_new_head_invalidates_ci_and_reviews: "passed",
+        monitor_wait_restart_and_slot_release: "passed",
+        old_head_markers_during_output_review_rejected: "passed",
+        repaired_head_ready_without_intake_refresh: "passed",
+      });
+
+      const concurrent = await run("source_only"),
+        concurrentTarget = supervisor.publication.repository.target(
+          concurrent.job.id,
+        );
+      certify(concurrent.job);
+      remote.state.threads.set(concurrentTarget.pull.number, [
+        makeThread(
+          33000 + concurrent.job.id,
+          concurrentTarget.head,
+          "SCOPE_EXPANSION: add a new feature",
+        ),
+      ]);
+      await monitor.reconcile();
+      let releaseAssessment,
+        assessmentStarted,
+        releaseObservation,
+        observationHeld;
+      const assessing = new Promise((resolve) => {
+        assessmentStarted = resolve;
+      });
+      const assessmentGate = new Promise((resolve) => {
+        releaseAssessment = resolve;
+      });
+      const observationGate = new Promise((resolve) => {
+        releaseObservation = resolve;
+      });
+      const held = new Promise((resolve) => {
+        observationHeld = resolve;
+      });
+      controls.implementation = async (task, value) => {
+        if (
+          task === "implementation_review_feedback" &&
+          value.job.id === concurrent.job.id
+        ) {
+          assessmentStarted();
+          await assessmentGate;
+        }
+      };
+      const advancing = monitor.advance(
+        store.jobById(concurrent.job.id),
+        AbortSignal.timeout(30000),
+      );
+      await assessing;
+      remote.state.beforeRequest = async (method, path) => {
+        if (
+          method === "GET" &&
+          path === `/repos/owner/repo/pulls/${concurrentTarget.pull.number}`
+        ) {
+          observationHeld();
+          await observationGate;
+        }
+      };
+      const observing = monitor.reconcile();
+      await Promise.race([observing, held]);
+      remote.state.beforeRequest = undefined;
+      releaseAssessment();
+      await advancing;
+      const committedFindings = monitor.repository.get(
+        concurrent.job.id,
+      ).findings;
+      assert(committedFindings.some((item) => item.publication_id));
+      releaseObservation();
+      await observing;
+      assert.deepEqual(
+        monitor.repository.get(concurrent.job.id).findings,
+        committedFindings,
+      );
+      controls.implementation = undefined;
+      await pump(concurrent.job, (item) => item.stage === "ready");
+      assert.equal(
+        remote.state.threads.get(concurrentTarget.pull.number)[0].comments
+          .length,
+        2,
+      );
+      const scopeReceipt = monitor.repository.get(
+        concurrent.job.id,
+      ).readiness_id;
+      remote.state.issues.get(concurrent.job.issue_number).body =
+        "Scope changed without a webhook";
+      await assert.rejects(
+        () =>
+          monitor.validateReadiness(scopeReceipt, AbortSignal.timeout(10000)),
+        /pr_scope_changed/,
+      );
+      assert.equal(
+        monitor.repository.get(concurrent.job.id).readiness_id,
+        null,
+      );
+      proof.push({
+        sdk,
+        concurrent_observation_preserves_confirmed_disposition: "passed",
+        readiness_rechecks_scope_without_webhook: "passed",
+      });
+
+      const scopeEdit = await run("monitor_scope_edit"),
+        scopeTarget = supervisor.publication.repository.target(
+          scopeEdit.job.id,
+        );
+      certify(scopeEdit.job);
+      remote.state.threads.set(scopeTarget.pull.number, [
+        makeThread(34000 + scopeEdit.job.id, scopeTarget.head),
+      ]);
+      await pump(scopeEdit.job, (item) => item.stage === "repairing");
+      controls.implementation = async (task, value) => {
+        if (
+          task === "implementation_change" &&
+          value.job.id === scopeEdit.job.id
+        ) {
+          remote.state.issues.get(scopeEdit.job.issue_number).body =
+            "A different scope while repairing";
+          await intake.refresh(
+            scopeEdit.job.issue_number,
+            AbortSignal.timeout(10000),
+          );
+        }
+      };
+      await investigation.reconcile();
+      controls.implementation = undefined;
+      await monitor.reconcile();
+      assert.equal(
+        supervisor.publication.repository.target(scopeEdit.job.id).head,
+        scopeTarget.head,
+      );
+      assert.equal(monitor.repository.get(scopeEdit.job.id).stage, "blocked");
+      assert.equal(
+        monitor.repository.get(scopeEdit.job.id).failure,
+        "pr_scope_changed",
+      );
+      assert.equal(
+        store.jobById(scopeEdit.job.id).revision,
+        scopeEdit.job.revision,
+      );
+      proof.push({
+        sdk,
+        issue_scope_edit_during_repair_blocks_publication: "passed",
+      });
+
+      await closeRuntime();
+      const regularPolicy = globalThis.structuredClone(config.pr_monitor);
+      config.pr_monitor = {
+        enabled: true,
+        requirements_source: "operator",
+        required_checks: [],
+        automated_reviewers: [],
+        local_checks_only: true,
+      };
+      configure(false);
+      await start();
+      attachMonitor();
+      const localOnly = await run("monitor_local_only"),
+        localTarget = supervisor.publication.repository.target(
+          localOnly.job.id,
+        );
+      remote.state.threads.set(localTarget.pull.number, [
+        makeThread(35000 + localOnly.job.id, localTarget.head),
+      ]);
+      const localReady = await pump(
+        localOnly.job,
+        (item) => item.stage === "ready",
+      );
+      assert.notEqual(localReady.expected_head, localTarget.head);
+      assert(localReady.notification_id);
+      assert.equal(
+        store.ownedPull(localTarget.pull.number).head_sha,
+        localReady.expected_head,
+      );
+      assert.equal(remote.state.checks.has(localReady.expected_head), false);
+      proof.push({
+        sdk,
+        local_checks_only_repair_notifies_without_intake_refresh: "passed",
+      });
+      await closeRuntime();
+      config.pr_monitor = regularPolicy;
+      configure(false);
+      await start();
+      attachMonitor();
+
+      const disabledRepair = await run("monitor_disabled"),
+        disabledTarget = supervisor.publication.repository.target(
+          disabledRepair.job.id,
+        );
+      certify(disabledRepair.job);
+      remote.state.threads.set(disabledTarget.pull.number, [
+        makeThread(36000 + disabledRepair.job.id, disabledTarget.head),
+      ]);
+      await pump(disabledRepair.job, (item) => item.stage === "repairing");
+      const disabledRuns = store
+        .runs()
+        .filter((item) => item.job_id === disabledRepair.job.id).length;
+      const disabledBudget = JSON.parse(
+        store.jobById(disabledRepair.job.id).budget_json,
+      ).repair_cycles;
+      await closeRuntime();
+      config.pr_monitor.enabled = false;
+      configure(false);
+      await start();
+      attachMonitor();
+      await monitor.reconcile();
+      await investigation.reconcile();
+      assert.equal(
+        supervisor.publication.repository.target(disabledRepair.job.id).head,
+        disabledTarget.head,
+      );
+      assert.equal(record(disabledRepair.job).stage, "implementing");
+      assert.equal(
+        store.runs().filter((item) => item.job_id === disabledRepair.job.id)
+          .length,
+        disabledRuns,
+      );
+      assert.equal(
+        JSON.parse(store.jobById(disabledRepair.job.id).budget_json)
+          .repair_cycles,
+        disabledBudget,
+      );
+      await closeRuntime();
+      config.pr_monitor.enabled = true;
+      configure(false);
+      await start();
+      attachMonitor();
+      await pump(
+        disabledRepair.job,
+        (item) => item.expected_head !== disabledTarget.head,
+      );
+      certify(disabledRepair.job);
+      await pump(disabledRepair.job, (item) => item.stage === "ready");
+      assert.equal(
+        JSON.parse(store.jobById(disabledRepair.job.id).budget_json)
+          .repair_cycles,
+        disabledBudget,
+      );
+      proof.push({
+        sdk,
+        disabled_monitor_preserves_queued_repair_across_restart: "passed",
+      });
+
+      const frozenSnapshot = store.jobById(monitored.job.id).snapshot_digest;
+      await closeRuntime();
+      config.pr_monitor.required_checks.push("Additional CI");
+      configure(false);
+      await start();
+      attachMonitor();
+      await monitor.reconcile();
+      assert.notEqual(monitor.repository.get(monitored.job.id).stage, "ready");
+      assert.equal(
+        store.jobById(monitored.job.id).snapshot_digest,
+        frozenSnapshot,
+      );
+      remote.state.checks
+        .get(repaired.head)
+        .push(makeCheck(repaired.head, { id: 601, name: "Additional CI" }));
+      await pump(monitored.job, (item) => item.stage === "ready");
+      await closeRuntime();
+      config.pr_monitor.required_checks = ["Fixture CI"];
+      configure(false);
+      await start();
+      attachMonitor();
+      clean = await pump(monitored.job, (item) => item.stage === "ready");
+      assert.equal(
+        store.jobById(monitored.job.id).snapshot_digest,
+        frozenSnapshot,
+      );
+      proof.push({
+        sdk,
+        readiness_policy_reload_keeps_coding_snapshot: "passed",
+      });
+
+      for (const boundary of ["thread_reply", "thread_resolution"]) {
+        const candidate = await run("source_only"),
+          target = supervisor.publication.repository.target(candidate.job.id);
+        certify(candidate.job);
+        remote.state.threads.set(target.pull.number, [
+          makeThread(
+            31000 + candidate.job.id,
+            target.head,
+            "SCOPE_EXPANSION: add a new feature",
+          ),
+        ]);
+        await monitor.reconcile();
+        const stop = new globalThis.AbortController();
+        remote.state.afterMutation = (kind) => {
+          if (kind === boundary)
+            stop.abort(new Error("planned feedback shutdown"));
+        };
+        await monitor.advance(store.jobById(candidate.job.id), stop.signal);
+        remote.state.afterMutation = undefined;
+        await closeRuntime();
+        await start();
+        attachMonitor();
+        await pump(candidate.job, (item) => item.stage === "ready");
+        const thread = remote.state.threads.get(target.pull.number)[0];
+        assert.equal(thread.comments.length, 2);
+        assert.equal(thread.isResolved, true);
+        assert.equal(
+          remote.state.pulls.filter(
+            (item) => item.number === target.pull.number,
+          ).length,
+          1,
+        );
+      }
+      proof.push({
+        sdk,
+        feedback_reply_and_resolution_restart_no_duplicate: "passed",
+      });
+
+      const budgetCase = await run("monitor_pipeline");
+      const budgetTarget = supervisor.publication.repository.target(
+        budgetCase.job.id,
+      );
+      certify(budgetCase.job);
+      remote.state.threads.set(budgetTarget.pull.number, [
+        makeThread(32000 + budgetCase.job.id, budgetTarget.head),
+      ]);
+      store.db
+        .prepare(
+          "UPDATE jobs SET budget_json=json_set(budget_json,'$.repair_cycles',?) WHERE id=?",
+        )
+        .run(snapshot.settings.limits.repair_cycles, budgetCase.job.id);
+      await pump(budgetCase.job, (item) => item.stage === "blocked");
+      assert.equal(
+        monitor.repository.get(budgetCase.job.id).failure,
+        "repair_budget_exhausted",
+      );
+      assert.equal(
+        supervisor.publication.repository.target(budgetCase.job.id).head,
+        budgetTarget.head,
+      );
+      const failedCI = await run("source_only");
+      certify(failedCI.job);
+      const failedTarget = supervisor.publication.repository.target(
+        failedCI.job.id,
+      );
+      remote.state.checks.set(failedTarget.head, [
+        makeCheck(failedTarget.head, {
+          conclusion: "failure",
+          output: {
+            title: "External CI failure",
+            summary:
+              "No supported source cause is established by this transport receipt",
+            text: null,
+          },
+        }),
+      ]);
+      await pump(failedCI.job, (item) => item.stage === "blocked");
+      assert.equal(
+        monitor.repository.get(failedCI.job.id).failure,
+        "pr_checks_failed",
+      );
+      proof.push({
+        sdk,
+        repair_budget_and_unproved_ci_failure_handoffs: "passed",
+      });
+
+      const stale = await run("source_only");
+      certify(stale.job);
+      controls.loseReady = true;
+      const staleClean = await pump(
+        stale.job,
+        (item) => item.stage === "ready",
+      );
+      await until(
+        () =>
+          supervisor.notifications
+            .receipt(staleClean.notification_id)
+            .some(
+              (item) => item.attempts.length === 1 && item.state === "pending",
+            ),
+        "Ready delivery did not record its ambiguous first attempt",
+      );
+      const staleTarget = supervisor.publication.repository.target(
+          stale.job.id,
+        ),
+        staleHuman = remote.commit(sourceFiles, staleTarget.head);
+      remote.git([
+        "update-ref",
+        `refs/heads/${staleTarget.branch}`,
+        staleHuman.sha,
+      ]);
+      await monitor.reconcile();
+      await until(
+        () =>
+          supervisor.notifications
+            .receipt(staleClean.notification_id)
+            .every((item) => item.state === "held"),
+        "Stale ready notification was not held",
+      );
+      controls.loseReady = false;
+      assert.equal(
+        notifications.filter(
+          (item) => item.event_id === staleClean.notification_id,
+        ).length,
+        1,
+      );
+      proof.push({
+        sdk,
+        stale_ready_retry_suppressed_after_human_head_change: "passed",
+      });
+
+      const timeoutJob = await run("source_only");
+      await monitor.reconcile();
+      store.db
+        .prepare(
+          "UPDATE jobs SET budget_json=json_set(budget_json,'$.wait_ms',?) WHERE id=?",
+        )
+        .run(
+          snapshot.settings.limits.wait_hours * 3_600_000,
+          timeoutJob.job.id,
+        );
+      await monitor.reconcile();
+      assert.equal(
+        monitor.repository.get(timeoutJob.job.id).failure,
+        "pr_wait_budget_exhausted",
+      );
+      const delayedBudget = await run("source_only");
+      await monitor.reconcile();
+      certify(delayedBudget.job);
+      const delayedTarget = supervisor.publication.repository.target(
+        delayedBudget.job.id,
+      );
+      remote.state.beforeRequest = async (method, path) => {
+        if (
+          method === "GET" &&
+          path === `/repos/owner/repo/pulls/${delayedTarget.pull.number}`
+        )
+          store.db
+            .prepare(
+              "UPDATE jobs SET budget_json=json_set(budget_json,'$.wait_ms',?) WHERE id=?",
+            )
+            .run(
+              snapshot.settings.limits.wait_hours * 3_600_000,
+              delayedBudget.job.id,
+            );
+      };
+      await monitor.reconcile();
+      remote.state.beforeRequest = undefined;
+      assert.equal(
+        monitor.repository.get(delayedBudget.job.id).failure,
+        "pr_wait_budget_exhausted",
+      );
+      assert.equal(
+        monitor.repository.get(delayedBudget.job.id).readiness_id,
+        null,
+      );
+      const legacy = await run("source_only");
+      const legacyImplementation = record(legacy.job),
+        savedScope = legacyImplementation.scope;
+      legacyImplementation.scope = null;
+      implementation.repository.save(legacyImplementation);
+      await monitor.reconcile();
+      assert.equal(monitor.repository.get(legacy.job.id), undefined);
+      assert.equal(monitor.status().reason, "pr_handoff_invalid");
+      const handoff = supervisor.notifications.repository.event(
+        `pr-handoff-${legacyImplementation.id}`,
+      );
+      assert.equal(handoff.prepared.event.outcome, "needs_attention");
+      assert.equal(record(legacy.job).scope, null);
+      legacyImplementation.scope = savedScope;
+      implementation.repository.save(legacyImplementation);
+      proof.push({
+        sdk,
+        wait_budget_rechecked_after_remote_read: "passed",
+        legacy_missing_receipts_visible_handoff: "passed",
+      });
+      const human = remote.commit(
+        {
+          ...sourceFiles,
+          "bug.mjs": "export const increment=value=>value+1;\n",
+        },
+        repaired.head,
+      );
+      remote.git(["update-ref", `refs/heads/${repaired.branch}`, human.sha]);
+      const mutationsBeforeHuman = remote.state.mutations.filter(
+        (item) => item === "branch",
+      ).length;
+      await monitor.reconcile();
+      assert.equal(
+        monitor.repository.get(monitored.job.id).failure,
+        "pr_head_changed",
+      );
+      assert.equal(
+        remote.state.mutations.filter((item) => item === "branch").length,
+        mutationsBeforeHuman,
+      );
+      await assert.rejects(() =>
+        monitor.validateReadiness(
+          clean.readiness_id,
+          new globalThis.AbortController().signal,
+        ),
+      );
+      proof.push({ sdk, monitor_timeout_and_human_head_handoff: "passed" });
+
+      for (const denseMem of [false, true]) {
+        const tools = await contextServer({ denseMem });
+        try {
+          await closeRuntime();
+          const readTool = denseMem ? "recall_memory" : "lookup_record",
+            writeTool = denseMem ? "remember" : "store_record",
+            key = denseMem ? "idempotency_key" : "key";
+          tools.state.expectedAuthorization =
+            "Bearer monitor-project-scope-canary";
+          config.mcp.credentials = {
+            project: {
+              headers: { Authorization: tools.state.expectedAuthorization },
+            },
+          };
+          config.mcp.servers = {
+            context: {
+              transport: "streamable_http",
+              url: tools.url,
+              allow_plain_http: true,
+              credential_ref: "project",
+              review_required_tools: [writeTool],
+              tools: {
+                [readTool]: { effect: "read" },
+                [writeTool]: { effect: "write", idempotency_argument: key },
+              },
+            },
+          };
+          config.roles.implementation.mcp = {
+            context: { tools: [readTool, writeTool] },
+          };
+          const separated = separateSecrets(config);
+          secrets = separated.secrets;
+          snapshot = createRunSnapshot(
+            separated.settings,
+            bundlesWithCanaries(loaded),
+            secrets,
+          );
+          await start();
+          attachMonitor();
+          const noteHandler = async (task, { run, text }) => {
+            if (task !== "implementation_review_readiness") return;
+            const input = taskInput(text),
+              calls = store.mcpCalls().filter((item) => item.run_id === run.id);
+            if (!calls.some((item) => item.tool === readTool))
+              return {
+                tool: `mcp__context__${readTool}`,
+                arguments: { query: "Current PR readiness evidence" },
+              };
+            const write = supervisor.mcpWrites.repository
+              .all()
+              .find((item) => item.binding.run_id === run.id);
+            if (!write)
+              return {
+                tool: `mcp__context__${writeTool}`,
+                arguments: {
+                  arguments: denseMem
+                    ? {
+                        target_space: "team_shared",
+                        evidence: [
+                          {
+                            content: `Current-head readiness ${input.receipt.head_sha}; human review required.`,
+                          },
+                        ],
+                        relationships: [],
+                      }
+                    : {
+                        text: `Current-head readiness ${input.receipt.head_sha}; human review required.`,
+                      },
+                  purpose:
+                    "Record only the controller-proven current-head readiness milestone.",
+                  evidence: [
+                    { kind: "pr_monitor_evidence", id: input.readiness_id },
+                  ],
+                },
+              };
+            return {
+              result: {
+                summary: `Read outcome and write receipt ${write.state} are retained; a recorded provider response does not prove persistence.`,
+              },
+            };
+          };
+          controls.implementation = noteHandler;
+          let reviewed = 0;
+          controls.review = async (text) => {
+            if (
+              text.includes('"type":"mcp_write"') &&
+              text.includes('"kind":"pr_monitor_evidence"')
+            )
+              reviewed++;
+          };
+          const notes = await run("source_only", noteHandler);
+          controls.implementation = noteHandler;
+          certify(notes.job);
+          const noted = await pump(notes.job, (item) => item.stage === "ready");
+          assert.equal(tools.effects.size, 1);
+          assert(reviewed > 0);
+          const written = supervisor.mcpWrites.repository
+            .all()
+            .find((item) => item.job_id === notes.job.id);
+          assert.equal(written.state, "response_recorded");
+          assert.equal(written.review, "required");
+          assert.equal(
+            written.evidence[0].receipt.head_sha,
+            noted.expected_head,
+          );
+          tools.state.denyRead = true;
+          controls.rejectWrite = true;
+          const denied = await run("source_only", noteHandler);
+          controls.implementation = noteHandler;
+          certify(denied.job);
+          await pump(denied.job, (item) => item.stage === "ready");
+          assert.equal(
+            supervisor.mcpWrites.repository
+              .all()
+              .find((item) => item.job_id === denied.job.id).state,
+            "rejected",
+          );
+          assert.equal(tools.effects.size, 1);
+          controls.rejectWrite = false;
+          tools.state.denyRead = false;
+          const ambiguousHandler = async (task, context) => {
+            if (task !== "implementation_review_readiness") return;
+            const input = taskInput(context.text),
+              write = supervisor.mcpWrites.repository
+                .all()
+                .find((item) => item.binding.run_id === context.run.id);
+            if (!write)
+              return {
+                tool: `mcp__context__${writeTool}`,
+                arguments: {
+                  arguments: denseMem
+                    ? {
+                        target_space: "team_shared",
+                        evidence: [
+                          {
+                            content: `Current head ${input.receipt.head_sha}, human review pending.`,
+                          },
+                        ],
+                        relationships: [],
+                      }
+                    : {
+                        text: `Current head ${input.receipt.head_sha}, human review pending.`,
+                      },
+                  purpose: "Record the actual readiness receipt once.",
+                  evidence: [
+                    { kind: "pr_monitor_evidence", id: input.readiness_id },
+                  ],
+                },
+              };
+            return {
+              result: {
+                summary:
+                  "The actual write response is retained; persistence is not inferred from transport success.",
+              },
+            };
+          };
+          controls.implementation = ambiguousHandler;
+          const uncertain = await run("source_only", ambiguousHandler);
+          controls.implementation = ambiguousHandler;
+          certify(uncertain.job);
+          await monitor.reconcile();
+          const effectsBefore = tools.effects.size;
+          tools.state.hold = true;
+          const stop = new globalThis.AbortController(),
+            advancing = monitor.advance(
+              store.jobById(uncertain.job.id),
+              stop.signal,
+            );
+          const deadline = Date.now() + 30000;
+          while (tools.effects.size === effectsBefore) {
+            assert(Date.now() < deadline, "readiness write was not dispatched");
+            await delay(20);
+          }
+          stop.abort(new Error("planned readiness cancellation"));
+          await advancing;
+          tools.state.hold = false;
+          tools.state.release?.();
+          await closeRuntime();
+          await start();
+          attachMonitor();
+          const recovered = await pump(
+            uncertain.job,
+            (item) => item.stage === "ready",
+          );
+          assert.equal(tools.effects.size, effectsBefore + 1);
+          assert.equal(
+            supervisor.publication.repository.target(uncertain.job.id).head,
+            recovered.expected_head,
+          );
+          assert.equal(
+            record(uncertain.job).tests.filter(
+              (item) => item.state === "passed",
+            ).length,
+            1,
+          );
+          proof.push({
+            sdk,
+            provider: denseMem ? "Dense-Mem example" : "generic MCP",
+            readiness_reviewed_write: "passed",
+            read_denial_and_write_rejection: "passed",
+            cancelled_ambiguous_write_recovery_preserves_github: "passed",
+          });
+        } finally {
+          controls.implementation = undefined;
+          controls.review = undefined;
+          controls.rejectWrite = false;
+          await closeRuntime();
+          await tools.close();
+        }
+      }
       await closeRuntime();
       await remote.close();
       remote = undefined;

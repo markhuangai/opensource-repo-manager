@@ -861,9 +861,11 @@ try {
   assert.equal(live.status, 200);
   assert.deepEqual(live.body, { status: "ok" });
   const ready = request("/readyz");
-  assert.equal(ready.status, 503);
-  assert.equal(ready.body.status, "not_ready");
-  assert.equal(ready.body.reason, "automation_not_implemented");
+  assert.equal(ready.status, 200);
+  assert.equal(ready.body.status, "ready");
+  assert.equal(ready.body.reason, null);
+  assert.equal(ready.body.implementation.runtime.state, "ready");
+  assert.equal(ready.body.pr_monitor.state, "running");
   assert.equal(ready.body.intake.state, "ready");
   assert(
     !logs(runtime).includes(canary),
@@ -1162,9 +1164,31 @@ try {
       config.roles[role].mcp = {};
     }
     config.mcp = { credentials: {}, servers: {} };
+    config.pr_monitor = {
+      enabled: true,
+      requirements_source: "github",
+      required_checks: ["Fixture CI"],
+      automated_reviewers: [
+        { login: "chatgpt-codex-connector[bot]", signal: "codex" },
+        { login: "coderabbitai[bot]", signal: "coderabbit" },
+      ],
+      local_checks_only: false,
+    };
     config.notifications = {
-      discord: { enabled: false },
-      smtp: { enabled: false },
+      discord: {
+        enabled: true,
+        webhook_url: "http://investigation-fixture:8317/discord",
+      },
+      smtp: {
+        enabled: true,
+        host: "api.github.com",
+        port: 8465,
+        secure: true,
+        username: "fixture-smtp-user",
+        password: "fixture-smtp-password",
+        from: "manager@example.invalid",
+        to: ["first@example.invalid"],
+      },
       webhook: {
         enabled: true,
         url: "http://investigation-fixture:8317/notify",
@@ -1285,6 +1309,118 @@ try {
       "Production entrypoint did not automatically implement a backfilled maintenance issue",
       300000,
     );
+    await waitUntil(() => {
+      const readiness = request("/readyz", {}, manager);
+      return (
+        readiness.status === 200 && readiness.body.pr_monitor.waiting === 1
+      );
+    }, "Waiting for PR CI incorrectly made the service unavailable");
+    const firstHead = JSON.parse(
+      docker([
+        "exec",
+        manager,
+        "/opt/orm-runtime/bin/node",
+        "-e",
+        "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x.heads[0])))",
+      ]),
+    );
+    docker([
+      "exec",
+      manager,
+      "/opt/orm-runtime/bin/node",
+      "--input-type=module",
+      "-e",
+      `
+      import {readFileSync} from 'node:fs'; import {createHmac} from 'node:crypto'; import {parse} from '/opt/orm/app/node_modules/yaml/dist/index.js';
+      const state=await fetch('http://investigation-fixture:8317/review',{method:'POST'}).then(r=>r.json());
+      const config=parse(readFileSync('/config/config.yml','utf8'));
+      const body=JSON.stringify({repository:{id:42},pull_request:{id:state.pull_id,number:state.pull_number},review:{id:20000}});
+      const response=await fetch('http://localhost:8080/webhooks/github',{method:'POST',body,headers:{'content-type':'application/json','x-github-delivery':'monitor-review-feedback','x-github-event':'pull_request_review','x-hub-signature-256':'sha256='+createHmac('sha256',config.github.webhook_secret).update(body).digest('hex')}});
+      if(response.status!==202)throw Error('review webhook rejected');
+    `,
+    ]);
+    await waitUntil(
+      () => {
+        const proof = JSON.parse(
+          docker([
+            "exec",
+            manager,
+            "/opt/orm-runtime/bin/node",
+            "-e",
+            "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+          ]),
+        );
+        return (
+          proof.heads[0].head !== firstHead.head &&
+          proof.threads[0]?.[1][0].isResolved
+        );
+      },
+      "Production review feedback did not publish and reconcile the tested repair",
+      300000,
+    );
+    const beforeChecks = JSON.parse(
+      docker([
+        "exec",
+        manager,
+        "/opt/orm-runtime/bin/node",
+        "-e",
+        "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+      ]),
+    );
+    assert(
+      !beforeChecks.notifications.some(
+        (event) => event.outcome === "ready_for_review",
+      ),
+    );
+    assert(
+      beforeChecks.monitors.some(
+        (record) => record.expected_head !== firstHead.head,
+      ),
+    );
+    stopCleanly(manager);
+    docker(["container", "start", manager]);
+    await waitForHealth(manager);
+    docker([
+      "exec",
+      manager,
+      "/opt/orm-runtime/bin/node",
+      "--input-type=module",
+      "-e",
+      `
+      import {readFileSync} from 'node:fs'; import {createHmac} from 'node:crypto'; import {parse} from '/opt/orm/app/node_modules/yaml/dist/index.js';
+      const state=await fetch('http://investigation-fixture:8317/checks',{method:'POST'}).then(r=>r.json());
+      const config=parse(readFileSync('/config/config.yml','utf8'));
+      const body=JSON.stringify({repository:{id:42},check_run:{head_sha:state.head,pull_requests:[{id:state.pull_id,number:state.pull_number}]}});
+      const response=await fetch('http://localhost:8080/webhooks/github',{method:'POST',body,headers:{'content-type':'application/json','x-github-delivery':'monitor-new-head-checks','x-github-event':'check_run','x-hub-signature-256':'sha256='+createHmac('sha256',config.github.webhook_secret).update(body).digest('hex')}});
+      if(response.status!==202)throw Error('check webhook rejected');
+    `,
+    ]);
+    await waitUntil(
+      () => {
+        const proof = JSON.parse(
+          docker([
+            "exec",
+            manager,
+            "/opt/orm-runtime/bin/node",
+            "-e",
+            "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+          ]),
+        );
+        return (
+          proof.notifications.some(
+            (event) => event.outcome === "ready_for_review",
+          ) &&
+          proof.discord.some((event) =>
+            event.content.includes("ready for human review"),
+          ) &&
+          proof.smtp.some((event) =>
+            event.raw.includes("ready for human review"),
+          )
+        );
+      },
+      "Production pipeline did not deliver all ready notification channels",
+      120000,
+    );
     docker([
       "exec",
       manager,
@@ -1339,12 +1475,31 @@ try {
         evidence.requests.includes("implementation_change") &&
         evidence.requests.includes("implementation_audit"),
     );
-    assert.equal(request("/readyz", {}, manager).status, 503);
+    assert.equal(request("/readyz", {}, manager).status, 200);
+    assert.equal(
+      evidence.notifications.filter(
+        (event) => event.outcome === "ready_for_review",
+      ).length,
+      1,
+    );
+    assert.equal(
+      evidence.notifications.find(
+        (event) => event.outcome === "ready_for_review",
+      ).pull.head_sha,
+      evidence.heads[0].head,
+    );
+    assert.equal(
+      evidence.mutations.filter((kind) => kind === "branch").length,
+      2,
+    );
     stopCleanly(manager);
     investigationStartupProof.push({
       sdk,
       production_entrypoint_backfill_and_webhook: "passed",
       one_comment_per_issue: "passed",
+      reviewed_repair_and_new_head_gates: "passed",
+      readiness_notifications_all_channels: "passed",
+      restart_while_waiting: "passed",
     });
   }
 
@@ -1384,7 +1539,7 @@ try {
   assert.equal(bootstrapProof.cleanup, "passed");
   assert.equal(
     request("/readyz", {}, bootstrapContainer).body.reason,
-    "automation_not_implemented",
+    "service_unavailable",
   );
   stopCleanly(bootstrapContainer);
 

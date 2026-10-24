@@ -214,7 +214,7 @@ describe("durable maintenance implementation", () => {
     expect(restarted.job(1)!.budget_json).toBe(budget);
   });
 
-  it("keeps owned PR work in remote waiting after issue and source changes", async () => {
+  it("preserves the published coding revision after issue and source changes", async () => {
     const f = await fixture();
     f.handoff();
     f.store.recordPublication({
@@ -227,13 +227,12 @@ describe("durable maintenance implementation", () => {
       head_sha: "d".repeat(40),
       receipt_json: "{}",
     });
+    const before = f.store.job(1)!;
     f.context.body = "New human information";
     f.context.source.sha = "e".repeat(40);
     f.apply();
-    expect(f.store.job(1)).toMatchObject({
-      phase: "remote_review",
-      revision: 2,
-    });
+    expect(f.store.job(1)).toEqual(before);
+    expect(() => f.store.assertPublishedScope(1)).toThrow("pr_scope_changed");
     expect(f.store.ownedPull(77)?.object_id).toBe("77");
   });
 
@@ -242,11 +241,13 @@ describe("durable maintenance implementation", () => {
     f.handoff();
     const jobs = f.store.jobs(),
       instance = f.publications.instance();
-    f.store.db.exec("DROP TABLE implementations; PRAGMA user_version=8");
+    f.store.db.exec(
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; PRAGMA user_version=8",
+    );
     f.store.close();
     const upgraded = new Store(f.path);
     cleanup.push(() => upgraded.close());
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(9);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(10);
     expect(upgraded.jobs()).toEqual(jobs);
     expect(new PublicationRepository(upgraded).instance()).toBe(instance);
     expect(new ImplementationRepository(upgraded).all()).toEqual([]);
@@ -256,7 +257,7 @@ describe("durable maintenance implementation", () => {
     const f = await fixture();
     const jobs = f.store.jobs();
     f.store.db.exec(
-      "DROP TABLE implementations; CREATE TABLE implementations(marker TEXT); INSERT INTO implementations VALUES('preserve'); PRAGMA user_version=8",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; CREATE TABLE implementations(marker TEXT); INSERT INTO implementations VALUES('preserve'); PRAGMA user_version=8",
     );
     f.store.close();
     expect(() => new Store(f.path)).toThrow();

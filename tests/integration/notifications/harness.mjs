@@ -11,10 +11,13 @@ import {
 } from "/opt/orm/app/dist/config/load.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
 
-async function until(check, timeout = 10000) {
+async function until(check, timeout = 10000, diagnostics) {
   const deadline = Date.now() + timeout;
   while (!check()) {
-    assert(Date.now() < deadline, "notification production proof timed out");
+    assert(
+      Date.now() < deadline,
+      `notification production proof timed out${diagnostics ? `: ${JSON.stringify(diagnostics())}` : ""}`,
+    );
     await delay(20);
   }
 }
@@ -247,6 +250,12 @@ export async function runNotificationTests() {
         supervisor.notifications
           .receipt(mixed.id)
           .find((r) => r.channel === "smtp").state === "failed",
+      10000,
+      () => ({
+        receipts: supervisor.notifications.receipt(mixed.id),
+        state: supervisor.notifications.status(),
+        messages: fixture.messages.length,
+      }),
     );
     const mixedFinal = supervisor.notifications
       .receipt(mixed.id)

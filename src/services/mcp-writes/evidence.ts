@@ -6,6 +6,7 @@ import { digest, RuntimeError } from "../../domain/agents.ts";
 import type { Store } from "../../repositories/store.ts";
 import { PublicationRepository } from "../../repositories/publication.ts";
 import { InvestigationRepository } from "../../repositories/investigation.ts";
+import { PrMonitorRepository } from "../../repositories/pr-monitor.ts";
 import { rootDirectory } from "../workspaces/files.ts";
 import { publicationText } from "../publication/scanner.ts";
 import type { ReviewedWriteInput, WriteBinding } from "./contracts.ts";
@@ -66,6 +67,23 @@ export async function resolveWriteEvidence(
           job.revision,
         );
         if (digest(artifact.source) !== digest(binding.source))
+          throw new RuntimeError("mcp_write_evidence_mismatch");
+        result.push({
+          kind: reference.kind,
+          id: reference.id,
+          receipt: evidence,
+        });
+      } else if (reference.kind === "pr_monitor_evidence") {
+        const monitors = new PrMonitorRepository(store),
+          evidence = monitors.readiness(reference.id);
+        const record = monitors.get(job.id);
+        if (
+          evidence.job_id !== job.id ||
+          evidence.revision !== job.revision ||
+          !record ||
+          monitors.implementation(record).artifact_digest !==
+            binding.artifact_digest
+        )
           throw new RuntimeError("mcp_write_evidence_mismatch");
         result.push({
           kind: reference.kind,

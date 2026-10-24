@@ -240,6 +240,7 @@ export async function respond(req, res, fixture) {
         "mcp_write",
         "investigation_plan",
         "implementation_milestone",
+        "implementation_review_readiness",
       ].includes(scenario)
     )
       assert(

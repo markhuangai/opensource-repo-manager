@@ -120,6 +120,7 @@ export class Supervisor implements AgentRunner {
   private readonly controller = new AbortController();
   private readonly active = new Map<string, ActiveRun>();
   private readonly tasks = new Set<Promise<void>>();
+  private runtimeFailure: string | null = null;
   readonly workspaces: WorkspaceService;
   readonly bootstrap: BootstrapService;
   readonly publication: PublicationService;
@@ -202,6 +203,17 @@ export class Supervisor implements AgentRunner {
       await supervisor.relay.close();
       throw error;
     }
+  }
+
+  status() {
+    return {
+      state: this.runtimeFailure
+        ? "unavailable"
+        : this.controller.signal.aborted
+          ? "stopped"
+          : "ready",
+      reason: this.runtimeFailure,
+    };
   }
 
   request(
@@ -382,7 +394,14 @@ export class Supervisor implements AgentRunner {
             }),
           };
       }
-      if (failure) throw failure.error;
+      if (failure) {
+        if (
+          failure.error instanceof RuntimeError &&
+          failure.error.code === "cleanup_failed"
+        )
+          this.runtimeFailure = "cleanup_failed";
+        throw failure.error;
+      }
       return result!;
     })();
     const tracked = operationTask.then(
@@ -548,10 +567,12 @@ export class Supervisor implements AgentRunner {
           cause,
         });
       }
-      if (cleanupFailure)
+      if (cleanupFailure) {
+        this.runtimeFailure = "cleanup_failed";
         failure = {
           error: new RuntimeError("cleanup_failed", { cause: cleanupFailure }),
         };
+      }
       if (!cleanupFailure && this.store.run(id))
         this.store.finishRun(
           id,
@@ -719,6 +740,7 @@ export class Supervisor implements AgentRunner {
         } catch (error) {
           failure = error;
           parent.reviewCleanupFailed = true;
+          this.runtimeFailure = "cleanup_failed";
           parent.controller.abort(new RuntimeError("cleanup_failed"));
         }
         parent.reviewTask = undefined;
@@ -1367,11 +1389,13 @@ export class Supervisor implements AgentRunner {
           cleanupFailure = new RuntimeError("cleanup_failed");
       }
     }
-    if (cleanupFailure)
+    if (cleanupFailure) {
+      this.runtimeFailure = "cleanup_failed";
       throw new RuntimeError("cleanup_failed", {
         cause:
           cleanupFailure instanceof RuntimeError ? cleanupFailure : undefined,
       });
+    }
     queue.push(terminal!);
     queue.end();
   }

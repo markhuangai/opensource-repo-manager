@@ -107,6 +107,7 @@ export class ImplementationRepository {
       throw new RuntimeError("revision_stale");
     if (record.scope && digest(record.scope) !== record.scope_digest)
       throw new RuntimeError("implementation_scope_changed");
+    this.store.assertPublishedScope(job.id);
     if (this.store.hasUncertainMcpWrite(job.id))
       throw new RuntimeError("mcp_write_uncertain");
     return job;
@@ -133,6 +134,23 @@ export class ImplementationRepository {
         record.candidate_bootstrap = null;
         record.milestone_done = false;
         this.save(record);
+      })
+      .immediate();
+  }
+
+  repairPublished(record: Implementation, findings: string[]) {
+    this.store.db
+      .transaction(() => {
+        if (record.stage !== "remote_review" || !record.publication_id)
+          throw new RuntimeError("pr_repair_state_invalid");
+        this.repair(record, findings);
+        record.publication_id = null;
+        record.status_operation = null;
+        record.status_generation++;
+        this.save(record);
+        this.store.db
+          .prepare("UPDATE jobs SET phase='implementation' WHERE id=?")
+          .run(record.job_id);
       })
       .immediate();
   }

@@ -229,6 +229,13 @@ export class InvestigationService {
     for (const job of this.store.jobs()) {
       if (this.controller.signal.aborted) break;
       if (job.status !== "pending") continue;
+      if (job.phase === "remote_review") {
+        await this.implementation?.monitor?.advance(
+          job,
+          this.controller.signal,
+        );
+        continue;
+      }
       if (job.phase === "implementation") {
         await this.implementation?.advance(job, this.controller.signal);
         continue;

@@ -180,11 +180,27 @@ export class PublicationRepository {
       .run(deadline);
   }
 
-  finishStep(receipt: PublicationReceipt, kind: "comment" | "branch" | "pull") {
+  finishStep(
+    receipt: PublicationReceipt,
+    kind: PublicationReceipt["steps"][number]["kind"],
+  ) {
     this.store.db
       .transaction(() => {
+        const step = receipt.steps.find((item) => item.kind === kind);
+        if (step?.state === "confirmed")
+          step.confirmed_at ??= new Date().toISOString();
         this.saveTarget(receipt.target);
         this.save(receipt);
+        if ((kind === "branch" || kind === "pull") && receipt.target.pull)
+          this.store.db
+            .prepare(
+              "UPDATE publications SET head_sha=? WHERE job_id=? AND kind='pull_request' AND object_id=?",
+            )
+            .run(
+              receipt.target.head,
+              receipt.job_id,
+              String(receipt.target.pull.id),
+            );
         const object =
           kind === "comment"
             ? receipt.target.comment
@@ -215,6 +231,37 @@ export class PublicationRepository {
         }
       })
       .immediate();
+  }
+
+  publishedAt(receipt: PublicationReceipt): number | null {
+    const branch = receipt.steps.find(
+      (step) => step.kind === "branch" && step.state === "confirmed",
+    );
+    const time = Date.parse(branch?.confirmed_at ?? "");
+    return Number.isFinite(time) ? time : null;
+  }
+
+  feedbackObject(
+    receipt: PublicationReceipt,
+    kind: "issue_comment" | "review_comment",
+    id: number,
+  ) {
+    this.store.db
+      .prepare(
+        `INSERT OR IGNORE INTO publications
+      (operation_key,job_id,revision,kind,object_id,number,head_sha,receipt_json)
+      VALUES(?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        `${receipt.id}:feedback`,
+        receipt.job_id,
+        receipt.revision,
+        kind,
+        String(id),
+        receipt.target.pull!.number,
+        receipt.target.head,
+        JSON.stringify({ operation_id: receipt.id }),
+      );
   }
 
   private read<T>(

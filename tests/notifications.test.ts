@@ -170,17 +170,16 @@ describe("durable notifications", () => {
     expect(f.fixture.requests).toHaveLength(2);
   });
 
-  it("delivers ready-for-review notifications for the exact owned PR head", async () => {
+  it("rejects a ready claim without authoritative monitor evidence", async () => {
     const f = await setup();
-    const head = "b".repeat(40);
     const event: NotificationEvent = {
       ...f.event,
       outcome: "ready_for_review",
       reason: "automation_clean",
       pull_number: 77,
-      head_sha: head,
+      head_sha: "b".repeat(40),
     };
-    expect(() => f.service.prepare(event)).toThrow("event_stale");
+    expect(() => f.service.prepare(event)).toThrow("event_invalid");
     f.store.recordPublication({
       operation_key: "ready-pull",
       job_id: f.job.id,
@@ -188,32 +187,13 @@ describe("durable notifications", () => {
       kind: "pull_request",
       object_id: "77",
       number: 77,
-      head_sha: head,
+      head_sha: event.head_sha!,
       receipt_json: "{}",
     });
     expect(() =>
-      f.service.prepare({ ...event, head_sha: "c".repeat(40) }),
-    ).toThrow("event_stale");
-    await f.enqueue(event);
-    f.service.start();
-    await until(() =>
-      f.service.receipt(event.id).every((row) => row.state === "confirmed"),
-    );
-    expect(f.fixture.requests).toHaveLength(2);
-    const webhook = f.fixture.requests.find((row) => row.path === "/webhook")!;
-    expect(webhook.body).toMatchObject({
-      outcome: "ready_for_review",
-      reason: "automation_clean",
-      pull: {
-        number: 77,
-        url: "https://github.com/owner/repo/pull/77",
-        head_sha: head,
-      },
-    });
-    const discord = f.fixture.requests.find((row) => row.path === "/discord")!;
-    const lines = String(discord.body.content).split("\n");
-    expect(lines).toContain("Repository maintenance: ready for human review");
-    expect(lines).toContain("https://github.com/owner/repo/pull/77");
+      f.service.prepare({ ...event, readiness_id: "a".repeat(64) }),
+    ).toThrow("pr_evidence_missing");
+    expect(f.fixture.requests).toHaveLength(0);
   });
 
   it("retries lost responses twice across restart without resending the confirmed channel", async () => {
@@ -517,7 +497,12 @@ describe("real SMTP and TLS", () => {
         { ...event, recipients: [0, 2] },
         AbortSignal.timeout(5000),
       ),
-    ).toMatchObject({ outcome: "confirmed", accepted: [0, 2], rejected: [] });
+    ).toMatchObject({
+      outcome: "confirmed",
+      code: "accepted",
+      accepted: [0, 2],
+      rejected: [],
+    });
     expect(f.fixture.messages[1].to).toEqual(["Case@example.invalid"]);
     expect(
       await adapter.deliver(

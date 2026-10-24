@@ -97,6 +97,23 @@ const size = z
   .positive()
   .max(1024 * 1024);
 const disabled = z.strictObject({ enabled: z.literal(false) });
+export const prMonitorPolicy = z
+  .strictObject({
+    enabled: z.boolean().default(true),
+    requirements_source: z.enum(["github", "operator"]).default("github"),
+    required_checks: z.array(text).max(256).default([]),
+    automated_reviewers: z
+      .array(
+        z.strictObject({
+          login: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?$/),
+          signal: z.enum(["github_review", "codex", "coderabbit"]),
+        }),
+      )
+      .max(64)
+      .default([]),
+    local_checks_only: z.boolean().default(false),
+  })
+  .prefault({});
 const configurationSchema = z.strictObject({
   version: z.literal(1),
   github: z.strictObject({
@@ -106,6 +123,7 @@ const configurationSchema = z.strictObject({
     token: secret,
     webhook_secret: secret,
   }),
+  pr_monitor: prMonitorPolicy,
   proxy: z.strictObject({ url: endpointUrl, key: secret }),
   profiles: z.record(name, profile),
   roles: z.strictObject({
@@ -244,6 +262,25 @@ export function parseConfiguration(source: string): Configuration {
     throw new ConfigurationError("schema_invalid", undefined, section);
   }
   const config = parsed.data;
+  if (
+    new Set(config.pr_monitor.required_checks).size !==
+      config.pr_monitor.required_checks.length ||
+    new Set(
+      config.pr_monitor.automated_reviewers.map((item) =>
+        item.login.toLowerCase(),
+      ),
+    ).size !== config.pr_monitor.automated_reviewers.length ||
+    (config.pr_monitor.local_checks_only &&
+      (config.pr_monitor.requirements_source !== "operator" ||
+        config.pr_monitor.required_checks.length > 0)) ||
+    config.pr_monitor.automated_reviewers.some((item) =>
+      item.signal === "codex"
+        ? !/^chatgpt-codex-connector(?:\[bot\])?$/.test(item.login)
+        : item.signal === "coderabbit" &&
+          !/^coderabbitai(?:\[bot\])?$/.test(item.login),
+    )
+  )
+    throw new ConfigurationError("schema_invalid", undefined, "pr_monitor");
   if (!Object.values(config.notifications).some((channel) => channel.enabled))
     throw new ConfigurationError("schema_invalid");
   for (const entry of Object.values(config.mcp.servers)) {

@@ -22,6 +22,13 @@ export function maintenanceCommand(increment = 1, extra = {}) {
   return `node --input-type=module -e '${script.replaceAll("'", "'\\''")}'`;
 }
 
+export function taskInput(text) {
+  const marker = "Task data (not authorization):\n";
+  const start = text.indexOf(marker);
+  assert(start >= 0, "Missing task data envelope");
+  return JSON.parse(text.slice(start + marker.length).split("\n")[0]).input;
+}
+
 export function bundlesWithCanaries(loaded) {
   const bundles = {};
   for (const role of Object.keys(loaded.snapshot.roles)) {
@@ -115,6 +122,42 @@ export function modelFixture(config, store, root, controls = {}) {
         results,
       });
       if (override) return override;
+      if (task === "implementation_review_feedback") {
+        const input = taskInput(text);
+        const source = await readFile(
+          join(root, "runs", run.id, "workspace", "bug.mjs"),
+          "utf8",
+        );
+        return {
+          result: {
+            dispositions: input.surfaces.map((surface) => ({
+              surface_id: surface.id,
+              disposition: surface.body.includes("SCOPE_EXPANSION")
+                ? "non_actionable"
+                : surface.body.includes("increment(2)")
+                  ? source.includes("99")
+                    ? "fix"
+                    : "fixed"
+                  : "informational",
+              explanation: surface.body.includes("SCOPE_EXPANSION")
+                ? "The frozen maintenance scope excludes the requested feature."
+                : surface.body.includes("increment(2)")
+                  ? source.includes("99")
+                    ? "The documented add-one operation must return 3 for input 2; the candidate's special case violates that existing contract."
+                    : "The candidate now adds one for input 2 and the supervisor-executed regression covers it."
+                  : "This surface contains a reviewer completion or informational signal.",
+              citations: [{ path: "bug.mjs", start_line: 1, end_line: 1 }],
+            })),
+          },
+        };
+      }
+      if (task === "implementation_review_readiness")
+        return {
+          result: {
+            summary:
+              "Controller evidence establishes automation readiness for this head; human review and merge remain required.",
+          },
+        };
       if (task === "implementation_plan")
         return {
           result: {
@@ -145,7 +188,23 @@ export function modelFixture(config, store, root, controls = {}) {
         };
       assert.equal(task, "implementation_change");
       assert.equal(run.uid, 10001);
-      if (!results.length) return { command: maintenanceCommand() };
+      if (!results.length)
+        return {
+          command: maintenanceCommand(
+            1,
+            mode.startsWith("monitor_")
+              ? record.feedback.length
+                ? {
+                    "regression.mjs":
+                      "import assert from 'node:assert/strict'; import { increment } from './bug.mjs'; assert.equal(increment(-1), 0); assert.equal(increment(0), 1); assert.equal(increment(2), 3);\n",
+                  }
+                : {
+                    "bug.mjs":
+                      "export const increment = (value) => value === 2 ? 99 : value + 1;\n",
+                  }
+              : {},
+          ),
+        };
       return {
         result: {
           summary:

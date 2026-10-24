@@ -3,6 +3,15 @@ github:
   repository: markhuangai/opensource-repo-manager
   token: REPLACE_GITHUB_FINE_GRAINED_PAT
   webhook_secret: REPLACE_GITHUB_WEBHOOK_SECRET
+pr_monitor:
+  enabled: true
+  requirements_source: operator
+  required_checks:
+    [Repository CI, CodeQL analysis, CodeQL, "AI PR review / PR #{pr}"]
+  automated_reviewers:
+    - { login: "chatgpt-codex-connector[bot]", signal: codex }
+    - { login: "coderabbitai[bot]", signal: coderabbit }
+  local_checks_only: false
 proxy:
   url: http://cpa:8317/v1
   key: REPLACE_CPA_KEY
@@ -28,7 +37,7 @@ roles:
   implementation:
     profile: coding
     prompts: { system: system.md, user: user.md }
-    skills: [example, implement]
+    skills: [example, implement, review-feedback]
   audit:
     profile: review
     prompts: { system: system.md, user: user.md }

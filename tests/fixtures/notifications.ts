@@ -11,6 +11,8 @@ export async function notificationFixture(
     noStartTls?: boolean;
     key?: string;
     cert?: string;
+    listenHost?: string;
+    smtpPort?: number;
   } = {},
 ) {
   if (!options.key)
@@ -73,7 +75,9 @@ export async function notificationFixture(
     response.writeHead(mode.status ?? 204, mode.headers);
     response.end(mode.body);
   });
-  await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) =>
+    http.listen(0, options.listenHost ?? "127.0.0.1", resolve),
+  );
   const auth: Array<{
     username: string | undefined;
     password: string | null | undefined;
@@ -132,7 +136,13 @@ export async function notificationFixture(
     },
   });
   smtp.on("error", () => {});
-  await new Promise<void>((resolve) => smtp.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) =>
+    smtp.listen(
+      options.smtpPort ?? 0,
+      options.listenHost ?? "127.0.0.1",
+      resolve,
+    ),
+  );
   const address = http.address(),
     smtpAddress = smtp.server.address();
   if (
