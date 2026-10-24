@@ -84,7 +84,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].includes(version as number))
+      if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].includes(version as number))
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -287,6 +287,26 @@ export class Store {
             UNIQUE(job_id,revision)
           );
           PRAGMA user_version = 9;
+        `),
+          )
+          .immediate();
+      if ((version as number) < 10)
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE pr_monitors (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id),
+            state TEXT NOT NULL, content TEXT NOT NULL
+          );
+          CREATE TABLE pr_monitor_evidence (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), content TEXT NOT NULL
+          );
+          CREATE TABLE pr_observations (
+            job_id INTEGER NOT NULL REFERENCES jobs(id), kind TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 1, content TEXT NOT NULL,
+            PRIMARY KEY(job_id,kind)
+          );
+          PRAGMA user_version = 10;
         `),
           )
           .immediate();
@@ -591,6 +611,20 @@ export class Store {
         const previous = this.job(context.number);
         if (previous && previous.issue_id !== context.id)
           throw new IntakeError("issue_identity_changed");
+        if (
+          previous &&
+          previous.status === "pending" &&
+          context.state === "open" &&
+          this.db
+            .prepare(
+              "SELECT 1 FROM publications WHERE job_id=? AND kind='pull_request'",
+            )
+            .get(previous.id)
+        ) {
+          this.observePullJob(previous.id, "issue", context);
+          this.complete(target);
+          return true;
+        }
         const reopened = Boolean(
           context.state === "open" &&
           this.db
@@ -667,14 +701,45 @@ export class Store {
               "UPDATE publications SET head_sha=?,context_json=? WHERE operation_key=?",
             )
             .run(context.head_sha, input, previous.operation_key);
-          this.db
-            .prepare("UPDATE jobs SET revision=revision+1 WHERE id=?")
-            .run(previous.job_id);
+          this.observePullJob(previous.job_id, "pull", context);
         }
         this.complete(target);
         return true;
       })
       .immediate();
+  }
+
+  private observePullJob(
+    jobId: number,
+    kind: "issue" | "pull",
+    context: IssueContext | PullContext,
+  ) {
+    this.db
+      .prepare(
+        `INSERT INTO pr_observations(job_id,kind,content) VALUES(?,?,?)
+      ON CONFLICT(job_id,kind) DO UPDATE SET generation=pr_observations.generation+1,content=excluded.content
+      WHERE pr_observations.content<>excluded.content`,
+      )
+      .run(jobId, kind, inputJson(context));
+  }
+
+  assertPublishedScope(jobId: number) {
+    const job = this.jobById(jobId);
+    if (!job) throw new RuntimeError("revision_stale");
+    const observation = this.db
+      .prepare(
+        "SELECT content FROM pr_observations WHERE job_id=? AND kind='issue'",
+      )
+      .get(jobId) as { content: string } | undefined;
+    if (!observation) return;
+    const latest = JSON.parse(observation.content) as IssueContext;
+    const original = JSON.parse(job.input_json) as IssueContext;
+    if (
+      latest.id !== original.id ||
+      latest.title !== original.title ||
+      latest.body !== original.body
+    )
+      throw new RuntimeError("pr_scope_changed");
   }
 
   jobs(): Job[] {

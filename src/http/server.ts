@@ -29,6 +29,7 @@ export async function startHttpService(
   );
   app.addHook("onClose", async () => {
     try {
+      await dependencies?.investigation?.implementation?.monitor?.stop();
       await dependencies?.investigation?.stop();
       await dependencies?.intake.stop();
     } finally {
@@ -57,12 +58,11 @@ export async function startHttpService(
   process.once("SIGTERM", () => void shutdown());
   try {
     await app.listen({ host: "0.0.0.0", port: 8080 });
-    logger.info(
-      "HTTP listening on port 8080; maintenance automation is unavailable.",
-    );
+    logger.info("HTTP listening on port 8080.");
     dependencies?.intake.start();
     dependencies?.notifications?.start();
     dependencies?.investigation?.start();
+    dependencies?.investigation?.implementation?.monitor?.start();
   } catch {
     logger.error("HTTP startup failed.");
     process.exitCode = 1;

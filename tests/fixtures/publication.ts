@@ -2,6 +2,63 @@ import { createServer } from "node:http";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type {
+  PrSnapshot,
+  PrThread,
+} from "../../src/services/pr-monitor/contracts.ts";
+
+export function makeCheck(
+  head: string,
+  overrides: Partial<PrSnapshot["checks"][number]> = {},
+): PrSnapshot["checks"][number] {
+  return {
+    id: 501,
+    name: "Fixture CI",
+    head_sha: head,
+    app: { id: 15368, slug: "github-actions" },
+    status: "completed",
+    conclusion: "success",
+    started_at: new Date(Date.now() - 1000).toISOString(),
+    completed_at: new Date().toISOString(),
+    details_url: "https://github.com/owner/repo/actions/runs/1",
+    output: {
+      title: "Fixture check",
+      summary: "Fixture transport receipt",
+      text: null,
+    },
+    ...overrides,
+  };
+}
+
+export function makeThread(
+  id: number,
+  head: string,
+  body = "increment(2) must return 3",
+  author = "reviewer",
+): PrThread {
+  const timestamp = new Date().toISOString();
+  return {
+    id: `PRRT_${id}`,
+    isResolved: false,
+    isOutdated: false,
+    comments: [
+      {
+        id: `RC_${id}`,
+        databaseId: id,
+        body,
+        author: { login: author },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        path: "bug.mjs",
+        line: 1,
+        originalLine: 1,
+        commit: { oid: head },
+        originalCommit: { oid: head },
+        pullRequestReview: { databaseId: id + 10000, commit: { oid: head } },
+      },
+    ],
+  };
+}
 
 export async function createPublicationFixture(root: string) {
   const repository = join(root, "owner", "repo.git");
@@ -113,9 +170,19 @@ export async function createPublicationFixture(root: string) {
         body: string;
         author_id: number | null;
         author_login?: string;
+        created_at?: string;
+        updated_at?: string;
       }>
     >(),
     pulls: [] as Pull[],
+    reviews: new Map<number, PrSnapshot["reviews"]>(),
+    threads: new Map<number, PrThread[]>(),
+    reactions: new Map<number, PrSnapshot["reactions"]>(),
+    checks: new Map<string, PrSnapshot["checks"]>(),
+    statuses: new Map<string, PrSnapshot["statuses"]>(),
+    protection: null as Record<string, unknown> | null,
+    protectionUnavailable: false,
+    rules: [] as Record<string, unknown>[],
     mutations: [] as string[],
     dropAfter: "",
     rejectBefore: "",
@@ -140,11 +207,14 @@ export async function createPublicationFixture(root: string) {
   };
   const pull = (row: Pull) => ({
     id: row.id,
+    node_id: `PR_${row.id}`,
     number: row.number,
     title: row.title,
     body: row.body,
     state: row.state,
     draft: row.draft,
+    merged: false,
+    updated_at: "2026-10-21T00:00:00Z",
     user:
       row.author === null
         ? null
@@ -154,7 +224,11 @@ export async function createPublicationFixture(root: string) {
       ref: row.branch,
       repo: { id: state.repository_id },
     },
-    base: { ref: row.base, repo: { id: state.repository_id } },
+    base: {
+      ref: row.base,
+      sha: head(row.base),
+      repo: { id: state.repository_id },
+    },
   });
   const backends = new Map<ReturnType<typeof spawn>, Promise<void>>();
   const stop = (child: ReturnType<typeof spawn>) => {
@@ -278,6 +352,112 @@ export async function createPublicationFixture(root: string) {
       return;
     }
     const base = "/repos/owner/repo";
+    if (path === "/graphql" && req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const { query, variables } = JSON.parse(body) as {
+        query: string;
+        variables: Record<string, unknown>;
+      };
+      const thread = [...state.threads.values()]
+        .flat()
+        .find((item) => item.id === variables.id);
+      const owner = state.pulls.find((item) =>
+        state.threads
+          .get(item.number)
+          ?.some((entry) => entry.id === variables.id),
+      );
+      const page = <T>(items: T[]) => {
+        const start = variables.cursor ? Number(variables.cursor) : 0;
+        const nodes = items.slice(start, start + 100);
+        return {
+          nodes,
+          pageInfo: {
+            hasNextPage: start + nodes.length < items.length,
+            endCursor: nodes.length ? String(start + nodes.length) : null,
+          },
+        };
+      };
+      if (query.includes("addPullRequestReviewThreadReply")) {
+        if (!thread || !owner) {
+          send({ data: null, errors: [{ message: "thread missing" }] });
+          return;
+        }
+        if (!(await mutate("thread_reply"))) return;
+        const rootComment = thread.comments[0];
+        const comment = {
+          ...rootComment,
+          id: `RC_${++nextId}`,
+          databaseId: nextId,
+          body: String(variables.body),
+          author: { login: state.actor.login },
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          pullRequestReview: null,
+        };
+        thread.comments.push(comment);
+        complete("thread_reply", {
+          data: {
+            addPullRequestReviewThreadReply: { comment: { id: comment.id } },
+          },
+        });
+      } else if (query.includes("resolveReviewThread")) {
+        if (!thread) {
+          send({ data: null, errors: [{ message: "thread missing" }] });
+          return;
+        }
+        if (!(await mutate("thread_resolution"))) return;
+        thread.isResolved = true;
+        complete("thread_resolution", {
+          data: {
+            resolveReviewThread: {
+              thread: { id: thread.id, isResolved: true },
+            },
+          },
+        });
+      } else if (query.includes("reviewThreads")) {
+        const rows = state.threads.get(Number(variables.number)) ?? [];
+        const connection = page(rows);
+        send({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  ...connection,
+                  nodes: connection.nodes.map((item) => ({
+                    ...item,
+                    comments: {
+                      nodes: item.comments.slice(0, 100),
+                      pageInfo: {
+                        hasNextPage: item.comments.length > 100,
+                        endCursor: item.comments.length
+                          ? String(Math.min(100, item.comments.length))
+                          : null,
+                      },
+                    },
+                  })),
+                },
+              },
+            },
+          },
+        });
+      } else if (thread && owner) {
+        send({
+          data: {
+            node: {
+              ...thread,
+              pullRequest: {
+                databaseId: owner.id,
+                number: owner.number,
+                repository: { databaseId: state.repository_id },
+              },
+              comments: page(thread.comments),
+            },
+          },
+        });
+      } else send({ data: { node: null } });
+      return;
+    }
     if (path === "/user") {
       send(state.actor);
       return;
@@ -311,7 +491,75 @@ export async function createPublicationFixture(root: string) {
     }
     const rules = path.match(/^\/repos\/owner\/repo\/rules\/branches\/(.+)$/);
     if (rules) {
-      send(state.protected.has(rules[1]) ? [{ type: "deletion" }] : []);
+      send(
+        state.protected.has(rules[1])
+          ? [{ type: "deletion" }, ...state.rules]
+          : state.rules,
+      );
+      return;
+    }
+    if (path.endsWith("/protection")) {
+      if (state.protection) send(state.protection);
+      else
+        send(
+          {
+            message: state.protectionUnavailable
+              ? "Not Found"
+              : "Branch not protected",
+          },
+          404,
+        );
+      return;
+    }
+    const checks = path.match(
+      /^\/repos\/owner\/repo\/commits\/([a-f0-9]{40})\/(check-runs|statuses)$/,
+    );
+    if (checks) {
+      const start = (Number(url.searchParams.get("page") ?? 1) - 1) * 100;
+      if (checks[2] === "check-runs")
+        send({
+          check_runs: (state.checks.get(checks[1]) ?? []).slice(
+            start,
+            start + 100,
+          ),
+        });
+      else
+        send((state.statuses.get(checks[1]) ?? []).slice(start, start + 100));
+      return;
+    }
+    const review = path.match(
+      /^\/repos\/owner\/repo\/pulls\/(\d+)\/(reviews|comments)$/,
+    );
+    if (review) {
+      const number = Number(review[1]),
+        start = (Number(url.searchParams.get("page") ?? 1) - 1) * 100;
+      if (review[2] === "reviews")
+        send((state.reviews.get(number) ?? []).slice(start, start + 100));
+      else
+        send(
+          (state.threads.get(number) ?? [])
+            .flatMap((item) => item.comments)
+            .slice(start, start + 100)
+            .map((item) => ({
+              id: item.databaseId,
+              body: item.body,
+              updated_at: item.updatedAt,
+              user: item.author ? { id: 8, login: item.author.login } : null,
+            })),
+        );
+      return;
+    }
+    const reactions = path.match(
+      /^\/repos\/owner\/repo\/issues\/(\d+)\/reactions$/,
+    );
+    if (reactions) {
+      const start = (Number(url.searchParams.get("page") ?? 1) - 1) * 100;
+      send(
+        (state.reactions.get(Number(reactions[1])) ?? []).slice(
+          start,
+          start + 100,
+        ),
+      );
       return;
     }
     const branch = path.match(/^\/repos\/owner\/repo\/branches\/(.+)$/);
@@ -348,7 +596,9 @@ export async function createPublicationFixture(root: string) {
         send(
           comments.slice((page - 1) * 100, page * 100).map((row) => ({
             ...row,
-            updated_at: "2026-10-21T00:00:00Z",
+            node_id: `IC_${row.id}`,
+            created_at: row.created_at ?? "2026-10-21T00:00:00Z",
+            updated_at: row.updated_at ?? "2026-10-21T00:00:00Z",
             user:
               row.author_id === null
                 ? null

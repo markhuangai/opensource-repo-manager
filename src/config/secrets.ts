@@ -76,6 +76,7 @@ export function separateSecrets(config: Configuration) {
   const settings = {
     version: config.version,
     github: { repository: config.github.repository },
+    pr_monitor: config.pr_monitor,
     proxy: { url: config.proxy.url },
     profiles: config.profiles,
     roles: config.roles,

@@ -25,6 +25,13 @@ import {
 } from "/opt/orm/app/dist/config/load.js";
 import { Store } from "/opt/orm/app/dist/repositories/store.js";
 import { Supervisor } from "/opt/orm/app/dist/runtime/supervisor.js";
+import { Octokit } from "/opt/orm/app/node_modules/@octokit/rest/dist-src/index.js";
+import { OctokitReader } from "/opt/orm/app/dist/adapters/github/reader.js";
+import { IntakeService } from "/opt/orm/app/dist/services/intake.js";
+import { InvestigationService } from "/opt/orm/app/dist/services/investigation/index.js";
+import { ImplementationService } from "/opt/orm/app/dist/services/implementation/index.js";
+import { PrMonitorService } from "/opt/orm/app/dist/services/pr-monitor/index.js";
+import { createApp } from "/opt/orm/app/dist/http/app.js";
 import {
   cleanEnvironment,
   cleanSource,
@@ -1192,8 +1199,98 @@ int main(int count, char **values) {
     assert(!store.runs().some((run) => run.finished_at === null));
     tests++;
 
-    const cleanupFailure = seed({ mcp: true }),
-      failureParent = iterate(
+    const cleanupFailure = seed({ mcp: true });
+    const healthPhases = store
+      .jobs()
+      .map((job) => ({ id: job.id, phase: job.phase }));
+    store.db.prepare("UPDATE jobs SET phase='remote_review'").run();
+    let healthSource = { sha, tree_sha: tree };
+    const healthServer = createServer((req, res) => {
+      const path = new URL(req.url, "http://fixture").pathname;
+      const prefix = `/repos/${snapshot.settings.github.repository}`;
+      const number = Number(path.slice(`${prefix}/issues/`.length));
+      const value =
+        path === prefix
+          ? {
+              id: 42,
+              full_name: snapshot.settings.github.repository,
+              default_branch: "main",
+              private: false,
+            }
+          : path === `${prefix}/commits/main`
+            ? {
+                sha: healthSource.sha,
+                commit: { tree: { sha: healthSource.tree_sha } },
+              }
+            : path === `${prefix}/issues` || path.endsWith("/comments")
+              ? []
+              : store.job(number)
+                ? {
+                    ...JSON.parse(store.job(number).input_json),
+                    updated_at: "2026-10-15T00:00:00Z",
+                  }
+                : null;
+      if (value?.source) healthSource = value.source;
+      res.setHeader("content-type", "application/json");
+      res.statusCode = value === null ? 404 : 200;
+      res.end(JSON.stringify(value));
+    });
+    const healthUrl = await listen(healthServer),
+      healthReader = new OctokitReader(
+        snapshot.settings.github.repository,
+        new Octokit({ baseUrl: healthUrl }),
+      ),
+      healthLog = { info() {}, error() {} },
+      healthIntake = new IntakeService(
+        store,
+        healthReader,
+        snapshot,
+        loaded.secrets,
+        healthLog,
+      ),
+      healthImplementation = new ImplementationService(
+        store,
+        healthIntake,
+        supervisor,
+        loaded.secrets,
+        healthLog,
+      ),
+      healthMonitor = new PrMonitorService(
+        store,
+        healthIntake,
+        healthReader,
+        healthImplementation,
+        supervisor,
+        snapshot,
+        loaded.secrets,
+        healthLog,
+      ),
+      healthCoordinator = new InvestigationService(
+        store,
+        healthIntake,
+        supervisor,
+        loaded.secrets,
+        healthLog,
+        undefined,
+        healthImplementation,
+      ),
+      healthApp = createApp(
+        healthIntake,
+        undefined,
+        supervisor.notifications,
+        supervisor.mcpWrites,
+        healthCoordinator,
+      );
+    await healthIntake.reconcile();
+    supervisor.notifications.start();
+    healthCoordinator.start();
+    healthMonitor.start();
+    await healthCoordinator.reconcile();
+    await healthMonitor.reconcile();
+    try {
+      const healthy = await healthApp.inject("/readyz");
+      assert.equal(healthy.statusCode, 200, healthy.body);
+      const failureParent = iterate(
         supervisor.run(
           supervisor.request(cleanupFailure.job.id, "implementation", {
             mode: "nested",
@@ -1201,39 +1298,60 @@ int main(int count, char **values) {
           new globalThis.AbortController().signal,
         ),
       );
-    await failureParent.next();
-    const failureRun = store.runs().find((run) => run.finished_at === null),
-      failureAbort = new globalThis.AbortController(),
-      failureReview = iterate(
-        supervisor.runReview(
-          failureRun.id,
-          supervisor.request(cleanupFailure.job.id, "audit", {
-            mode: "mcp-hang",
-          }),
-          failureAbort.signal,
+      await failureParent.next();
+      const failureRun = store.runs().find((run) => run.finished_at === null),
+        failureAbort = new globalThis.AbortController(),
+        failureReview = iterate(
+          supervisor.runReview(
+            failureRun.id,
+            supervisor.request(cleanupFailure.job.id, "audit", {
+              mode: "mcp-hang",
+            }),
+            failureAbort.signal,
+          ),
+        );
+      let failureEvent;
+      do {
+        failureEvent = (await failureReview.next()).value;
+      } while (failureEvent?.type !== "progress");
+      closeFault = true;
+      const rejectedParent = assert.rejects(
+          remaining(failureParent),
+          /cleanup_failed/,
         ),
+        rejectedReview = assert.rejects(
+          remaining(failureReview),
+          /cleanup_failed/,
+        );
+      failureAbort.abort();
+      await Promise.all([rejectedParent, rejectedReview]);
+      assert.equal(store.leases().length, 1);
+      assert.equal(
+        store.acquireLease(blocked.job.id, blocked.job.revision),
+        undefined,
       );
-    let failureEvent;
-    do {
-      failureEvent = (await failureReview.next()).value;
-    } while (failureEvent?.type !== "progress");
-    closeFault = true;
-    const rejectedParent = assert.rejects(
-        remaining(failureParent),
-        /cleanup_failed/,
-      ),
-      rejectedReview = assert.rejects(
-        remaining(failureReview),
-        /cleanup_failed/,
+      assert.equal((await userProcesses(10001)).length, 0);
+      assert.deepEqual(supervisor.status(), {
+        state: "unavailable",
+        reason: "cleanup_failed",
+      });
+      const unhealthy = await healthApp.inject("/readyz");
+      assert.equal(unhealthy.statusCode, 503);
+      assert.equal(
+        unhealthy.json().implementation.runtime.reason,
+        "cleanup_failed",
       );
-    failureAbort.abort();
-    await Promise.all([rejectedParent, rejectedReview]);
-    assert.equal(store.leases().length, 1);
-    assert.equal(
-      store.acquireLease(blocked.job.id, blocked.job.revision),
-      undefined,
-    );
-    assert.equal((await userProcesses(10001)).length, 0);
+    } finally {
+      await healthMonitor.stop();
+      await healthCoordinator.stop();
+      await healthIntake.stop();
+      await healthApp.close();
+      await close(healthServer);
+      for (const job of healthPhases)
+        store.db
+          .prepare("UPDATE jobs SET phase=? WHERE id=?")
+          .run(job.phase, job.id);
+    }
     await assert.rejects(supervisor.close(), /cleanup_failed/);
     closeFault = false;
     supervisor = await Supervisor.create(
@@ -1243,6 +1361,7 @@ int main(int count, char **values) {
       options,
     );
     assert.equal(store.leases().length, 0);
+    assert.deepEqual(supervisor.status(), { state: "ready", reason: null });
     assert.equal((await userProcesses(10002)).length, 0);
     assert(!store.runs().some((run) => run.finished_at === null));
     tests++;

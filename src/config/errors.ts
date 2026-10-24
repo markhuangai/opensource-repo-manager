@@ -12,6 +12,7 @@ export type ConfigurationErrorCode =
 export const configurationSections = [
   "version",
   "github",
+  "pr_monitor",
   "proxy",
   "profiles",
   "roles",

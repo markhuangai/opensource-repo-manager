@@ -83,20 +83,18 @@ export async function runPublicationTests() {
   const seed = () => {
     store.saveSnapshot(snapshot);
     store.discover([++number], 1, true);
-    store.applyIssue(
-      store.nextDirty(),
-      {
-        id: number + 10000,
-        number,
-        state: "open",
-        title: "Publication fixture",
-        body: "maintenance",
-        updated_at: "2026-10-19T00:00:00Z",
-        comments: [],
-        source: remote.source,
-      },
-      snapshot,
-    );
+    const context = {
+      id: number + 10000,
+      number,
+      state: "open",
+      title: "Publication fixture",
+      body: "maintenance",
+      updated_at: "2026-10-19T00:00:00Z",
+      comments: [],
+      source: remote.source,
+    };
+    remote.state.issues.set(number, context);
+    store.applyIssue(store.nextDirty(), context, snapshot);
     return store.job(number);
   };
   const candidate = async (job, label, binary = false, structured) => {

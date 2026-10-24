@@ -4,6 +4,7 @@ import { immutable } from "../../config/bundles.ts";
 import { digest, RuntimeError } from "../../domain/agents.ts";
 import type { Store } from "../../repositories/store.ts";
 import { NotificationRepository } from "../../repositories/notifications.ts";
+import { PrMonitorRepository } from "../../repositories/pr-monitor.ts";
 import type { ExternalOutputReview } from "../publication/review.ts";
 import { HttpNotificationChannel } from "../../adapters/notifications/http.ts";
 import { SmtpNotificationChannel } from "../../adapters/notifications/smtp.ts";
@@ -33,6 +34,10 @@ export class NotificationService {
   private readonly snapshot: RunSnapshot;
   private readonly secrets: SecretAccessor;
   private readonly outputReview: Pick<ExternalOutputReview, "verify">;
+  private readinessValidator?: (
+    id: string,
+    signal: AbortSignal,
+  ) => Promise<void>;
 
   constructor(
     store: Store,
@@ -82,6 +87,7 @@ export class NotificationService {
       reasons[event.reason],
       issue,
       ...(pull ? [pull] : []),
+      ...(event.head_sha ? [`Head: ${event.head_sha}`] : []),
       ...(event.narrative ? [event.narrative] : []),
       `Event: ${event.id}`,
     ].join("\n");
@@ -158,6 +164,12 @@ export class NotificationService {
     return immutable({ event, channels, review });
   }
 
+  setReadinessValidator(
+    validate: (id: string, signal: AbortSignal) => Promise<void>,
+  ) {
+    this.readinessValidator = validate;
+  }
+
   async enqueue(
     prepared: PreparedNotification,
     options: { review_id?: string },
@@ -169,6 +181,11 @@ export class NotificationService {
     const canonical = this.prepare(prepared.event);
     if (digest(canonical) !== digest(prepared))
       throw new NotificationError("prepared_mismatch");
+    if (prepared.event.outcome === "ready_for_review") {
+      if (!this.readinessValidator)
+        throw new NotificationError("readiness_unavailable");
+      await this.readinessValidator(prepared.event.readiness_id!, signal);
+    }
     if (prepared.event.narrative) {
       if (!options.review_id) throw new NotificationError("review_missing");
       this.outputReview.verify(options.review_id, prepared.review);
@@ -240,7 +257,21 @@ export class NotificationService {
       if (
         !pull ||
         pull.job_id !== job.id ||
-        (event.head_sha && pull.head_sha !== event.head_sha)
+        (event.outcome !== "ready_for_review" &&
+          event.head_sha &&
+          pull.head_sha !== event.head_sha)
+      )
+        throw new NotificationError("event_stale");
+    }
+    if (event.outcome === "ready_for_review") {
+      if (!event.readiness_id) throw new NotificationError("event_stale");
+      const readiness = new PrMonitorRepository(this.store).readiness(
+        event.readiness_id,
+      );
+      if (
+        readiness.head_sha !== event.head_sha ||
+        readiness.job_id !== event.job_id ||
+        readiness.snapshot.number !== event.pull_number
       )
         throw new NotificationError("event_stale");
     }
@@ -322,6 +353,36 @@ export class NotificationService {
   private async deliver(receipt: DeliveryReceipt) {
     const stored = this.repository.event(receipt.event_id)!;
     const channel = stored.prepared.channels[receipt.channel]!;
+    if (stored.prepared.event.outcome === "ready_for_review") {
+      try {
+        if (!this.readinessValidator)
+          throw new NotificationError("readiness_unavailable");
+        await this.readinessValidator(
+          stored.prepared.event.readiness_id!,
+          this.controller.signal,
+        );
+      } catch (error) {
+        if (this.controller.signal.aborted) return;
+        if (
+          error instanceof RuntimeError &&
+          [
+            "pr_readiness_stale",
+            "revision_stale",
+            "pr_head_changed",
+            "mcp_write_uncertain",
+            "pr_scope_changed",
+          ].includes(error.code)
+        ) {
+          receipt.state = "held";
+          receipt.reason = "event_stale";
+        } else {
+          receipt.reason = "readiness_unavailable";
+          receipt.retry_at = Date.now() + 30_000;
+        }
+        this.repository.save(receipt);
+        return;
+      }
+    }
     receipt.state = "dispatching";
     receipt.attempts.push({
       started_at: Date.now(),

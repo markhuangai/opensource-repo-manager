@@ -61,12 +61,12 @@ describe("durable SQLite repositories", () => {
     const jobs = store.jobs();
     const instance = new PublicationRepository(store).instance();
     store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; PRAGMA user_version=5",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; PRAGMA user_version=5",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(9);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(10);
     expect(upgraded.jobs()).toEqual(jobs);
     expect(upgraded.snapshot(snapshot.digest)).toEqual(snapshot);
     expect(new PublicationRepository(upgraded).instance()).toBe(instance);
@@ -88,7 +88,7 @@ describe("durable SQLite repositories", () => {
     seed(store, snapshot);
     const jobs = store.jobs();
     store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; CREATE TABLE notification_deliveries(marker TEXT); INSERT INTO notification_deliveries VALUES('preserve'); PRAGMA user_version=5",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; CREATE TABLE notification_deliveries(marker TEXT); INSERT INTO notification_deliveries VALUES('preserve'); PRAGMA user_version=5",
     );
     store.close();
     expect(() => new Store(path)).toThrow();
@@ -131,12 +131,12 @@ describe("durable SQLite repositories", () => {
         publications: store.db.prepare("SELECT * FROM publications").all(),
       };
       store.db.exec(
-        "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; PRAGMA user_version=4",
+        "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; PRAGMA user_version=4",
       );
       store.close();
       const upgraded = new Store(path);
       stores.push(upgraded);
-      expect(upgraded.db.pragma("user_version", { simple: true })).toBe(9);
+      expect(upgraded.db.pragma("user_version", { simple: true })).toBe(10);
       expect({
         jobs: upgraded.jobs(),
         snapshots: upgraded.snapshot(snapshot.digest),
@@ -159,7 +159,7 @@ describe("durable SQLite repositories", () => {
     seed(store, snapshot);
     const before = store.jobs();
     store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; CREATE TABLE publication_evidence(marker TEXT); INSERT INTO publication_evidence VALUES('preserve'); PRAGMA user_version=4",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; CREATE TABLE publication_evidence(marker TEXT); INSERT INTO publication_evidence VALUES('preserve'); PRAGMA user_version=4",
     );
     store.close();
     expect(() => new Store(path)).toThrow();
@@ -253,7 +253,7 @@ describe("durable SQLite repositories", () => {
         private: false,
       }),
     ).toThrow("repository_changed");
-    store.db.pragma("user_version = 10");
+    store.db.pragma("user_version = 11");
     store.close();
     expect(() => new Store(path)).toThrow("schema_unsupported");
   });
@@ -454,12 +454,12 @@ describe("durable SQLite repositories", () => {
     const before = JSON.stringify(store.snapshot(legacy.digest));
     const budget = store.job(1)!.budget_json;
     store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; DROP TABLE artifacts; DROP TABLE agent_runs; DROP TABLE runtime_leases; PRAGMA user_version=1",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(9);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(10);
     expect(JSON.stringify(upgraded.snapshot(legacy.digest))).toBe(before);
     expect(upgraded.job(1)!.budget_json).toBe(budget);
     expect(upgraded.leases()).toMatchObject([{ token }]);
@@ -488,12 +488,12 @@ describe("durable SQLite repositories", () => {
       snapshot: store.snapshot(snapshot.digest),
     };
     store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; PRAGMA user_version=2",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; PRAGMA user_version=2",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(9);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(10);
     expect({
       jobs: upgraded.jobs(),
       runs: upgraded.runs(),
@@ -540,7 +540,7 @@ describe("durable SQLite repositories", () => {
     seed(store, snapshot);
     const jobs = store.jobs();
     store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; CREATE TABLE mcp_calls(marker TEXT); INSERT INTO mcp_calls VALUES('preserve'); PRAGMA user_version=2",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; DROP TABLE mcp_calls; CREATE TABLE mcp_calls(marker TEXT); INSERT INTO mcp_calls VALUES('preserve'); PRAGMA user_version=2",
     );
     store.close();
     expect(() => new Store(path)).toThrow();
@@ -594,12 +594,12 @@ describe("durable SQLite repositories", () => {
       snapshot: store.snapshot(snapshot.digest),
     };
     store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; PRAGMA user_version=3",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; PRAGMA user_version=3",
     );
     store.close();
     const upgraded = new Store(path);
     stores.push(upgraded);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(9);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(10);
     expect({
       jobs: upgraded.jobs(),
       runs: upgraded.runs(),
@@ -616,7 +616,7 @@ describe("durable SQLite repositories", () => {
     seed(store, snapshot);
     const before = store.jobs();
     store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; CREATE TABLE bootstrap_attempts(marker TEXT); INSERT INTO bootstrap_attempts VALUES('preserve'); PRAGMA user_version=3",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; DROP TABLE notification_backoff; DROP TABLE notification_deliveries; DROP TABLE notification_events; DROP TABLE publication_operations; DROP TABLE publication_targets; DROP TABLE output_reviews; DROP TABLE publication_evidence; DROP TABLE publication_instance; DROP TABLE bootstrap_commands; DROP TABLE bootstrap_attempts; CREATE TABLE bootstrap_attempts(marker TEXT); INSERT INTO bootstrap_attempts VALUES('preserve'); PRAGMA user_version=3",
     );
     store.close();
     expect(() => new Store(path)).toThrow();

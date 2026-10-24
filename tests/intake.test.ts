@@ -19,7 +19,10 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function setup(enroll = true) {
+async function setup(
+  enroll = true,
+  hooks: ConstructorParameters<typeof IntakeService>[5] = {},
+) {
   const root = await mkdtemp(join(tmpdir(), "orm-intake-"));
   const github = await fixtureGitHub();
   const loaded = await fixtureSnapshot();
@@ -36,6 +39,7 @@ async function setup(enroll = true) {
     loaded.snapshot,
     loaded.secrets,
     logger,
+    hooks,
   );
   const services = [service],
     stores = [store];
@@ -95,6 +99,30 @@ const issueEvent = (number = 1) => ({
 });
 
 describe("durable GitHub intake", () => {
+  it("refreshes validation scope and reconciles pending writes without waking itself", async () => {
+    let wakeups = 0,
+      reconciliations = 0;
+    const f = await setup(true, {
+      changed: () => {
+        wakeups++;
+      },
+      beforeIssue: async () => {
+        reconciliations++;
+      },
+    });
+    wakeups = 0;
+    reconciliations = 0;
+    f.github.state.issues[1].body = "Edited while a notification was queued";
+    await f.service.refresh(1, new AbortController().signal, false);
+    expect(f.store.job(1)!.input_json).toContain(
+      "Edited while a notification was queued",
+    );
+    expect(reconciliations).toBe(1);
+    expect(wakeups).toBe(0);
+    await f.service.refresh(1, new AbortController().signal);
+    expect(wakeups).toBe(1);
+  });
+
   it("revalidates an unchanged backlog and still observes changed comments", async () => {
     const { github, store, service } = await setup(false);
     for (let number = 2; number <= 141; number++)
@@ -420,7 +448,7 @@ describe("durable GitHub intake", () => {
       "issue_comment",
     );
     await service.reconcile();
-    expect(store.job(1)!.revision).toBe(revision + 1);
+    expect(store.job(1)!.revision).toBe(revision);
     expect(store.ownedPull(5)!.context_json).toContain("Human PR comment");
     github.state.pulls[5].head.sha = "d".repeat(40);
     await send(

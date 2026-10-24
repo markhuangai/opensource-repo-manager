@@ -659,17 +659,17 @@ describe("durable MCP writes", () => {
         snapshot: JSON.stringify(f.store.snapshot(f.loaded.snapshot.digest)),
       };
     f.store.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; PRAGMA user_version=6",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; PRAGMA user_version=6",
     );
     f.store.close();
     const upgraded = new Store(f.path);
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(9);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(10);
     expect({
       jobs: upgraded.jobs(),
       snapshot: JSON.stringify(upgraded.snapshot(f.loaded.snapshot.digest)),
     }).toEqual(before);
     upgraded.db.exec(
-      "DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; CREATE TABLE mcp_write_attempts(marker TEXT); INSERT INTO mcp_write_attempts VALUES('preserve'); PRAGMA user_version=6",
+      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; DROP TABLE mcp_write_recovery_leases; DROP TABLE mcp_write_attempts; DROP TABLE mcp_write_operations; CREATE TABLE mcp_write_attempts(marker TEXT); INSERT INTO mcp_write_attempts VALUES('preserve'); PRAGMA user_version=6",
     );
     upgraded.close();
     expect(() => new Store(f.path)).toThrow();

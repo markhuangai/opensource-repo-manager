@@ -21,6 +21,21 @@ export const proposalSchema = z.discriminatedUnion("kind", [
   z.strictObject({ ...job, kind: z.literal("status"), body: text.min(1) }),
   z.strictObject({
     ...job,
+    kind: z.literal("pr_stage"),
+    stage: z.enum(["waiting", "blocked", "ready"]),
+    expected_head: sha,
+    previous_operation: hash,
+    readiness_id: hash.nullable(),
+    generation: githubId,
+  }),
+  z.strictObject({
+    ...job,
+    kind: z.literal("feedback"),
+    expected_head: sha,
+    finding_id: hash,
+  }),
+  z.strictObject({
+    ...job,
     kind: z.literal("notice"),
     reason: z.enum([
       "model_unavailable",
@@ -95,10 +110,11 @@ export type PublicationTarget = {
   pull: OwnedPull | null;
 };
 export type MutationStep = {
-  kind: "comment" | "branch" | "pull";
+  kind: "comment" | "branch" | "pull" | "feedback_reply" | "thread_resolution";
   before: unknown;
   after: unknown;
   state: "prepared" | "dispatching" | "confirmed" | "uncertain";
+  confirmed_at?: string;
 };
 export type PublicationReceipt = {
   id: string;

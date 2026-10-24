@@ -7,6 +7,7 @@ import {
   sha,
   IntakeError,
   type RepositoryIdentity,
+  type IssueContext,
 } from "../../domain/jobs.ts";
 import type {
   OwnedComment,
@@ -36,10 +37,27 @@ export type RemotePull = OwnedPull & {
   repository_id: number;
   base_repository_id: number;
 };
+export type RemoteThread = {
+  id: string;
+  pull_id: number;
+  pull_number: number;
+  repository_id: number;
+  resolved: boolean;
+  comments: {
+    id: number;
+    node_id: string;
+    body: string;
+    author_login: string | null;
+  }[];
+};
 export interface GitHubWriter {
   repository(signal: AbortSignal): Promise<RepositoryIdentity>;
   actor(signal: AbortSignal): Promise<{ id: number; login: string }>;
-  issueOpen(number: number, signal: AbortSignal): Promise<boolean>;
+  issueOpen(
+    number: number,
+    signal: AbortSignal,
+    expected?: Pick<IssueContext, "id" | "title" | "body">,
+  ): Promise<boolean>;
   branch(
     name: string,
     signal: AbortSignal,
@@ -47,6 +65,9 @@ export interface GitHubWriter {
   comments(issue: number, signal: AbortSignal): Promise<OwnedComment[]>;
   pulls(branch: string, signal: AbortSignal): Promise<RemotePull[]>;
   pull(number: number, signal: AbortSignal): Promise<RemotePull>;
+  thread(id: string, signal: AbortSignal): Promise<RemoteThread>;
+  replyThread(id: string, body: string, signal: AbortSignal): Promise<void>;
+  resolveThread(id: string, signal: AbortSignal): Promise<void>;
   comment(
     issue: number,
     id: number | null,
@@ -98,7 +119,7 @@ export class OctokitWriter implements GitHubWriter {
     try {
       return (
         await this.client.request(route, {
-          ...this.coordinates,
+          ...(route === "POST /graphql" ? {} : this.coordinates),
           ...parameters,
           request: {
             signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
@@ -179,12 +200,19 @@ export class OctokitWriter implements GitHubWriter {
   async actor(signal: AbortSignal) {
     return user.parse(await this.request("GET /user", {}, signal));
   }
-  async issueOpen(number: number, signal: AbortSignal) {
+  async issueOpen(
+    number: number,
+    signal: AbortSignal,
+    expected?: Pick<IssueContext, "id" | "title" | "body">,
+  ) {
     const issue = z
       .object({
         number: githubId,
         state: z.enum(["open", "closed"]),
         pull_request: z.unknown().optional(),
+        id: githubId.optional(),
+        title: z.string().optional(),
+        body: z.string().nullable().optional(),
       })
       .parse(
         await this.request(
@@ -194,7 +222,13 @@ export class OctokitWriter implements GitHubWriter {
         ),
       );
     return (
-      issue.number === number && !issue.pull_request && issue.state === "open"
+      issue.number === number &&
+      !issue.pull_request &&
+      issue.state === "open" &&
+      (!expected ||
+        (issue.id === expected.id &&
+          issue.title === expected.title &&
+          issue.body === expected.body))
     );
   }
   async branch(name: string, signal: AbortSignal) {
@@ -279,6 +313,116 @@ export class OctokitWriter implements GitHubWriter {
         signal,
       ),
     );
+  }
+
+  private async graphql(
+    query: string,
+    variables: Record<string, unknown>,
+    signal: AbortSignal,
+  ) {
+    const response = z
+      .object({
+        data: z.record(z.string(), z.unknown()).nullable().optional(),
+        errors: z.array(z.unknown()).optional(),
+      })
+      .parse(await this.request("POST /graphql", { query, variables }, signal));
+    if (!response.data || response.errors?.length)
+      throw new IntakeError("github_publication_failed");
+    return response.data;
+  }
+
+  async thread(id: string, signal: AbortSignal): Promise<RemoteThread> {
+    const pageInfo = z.object({
+      hasNextPage: z.boolean(),
+      endCursor: z.string().nullable(),
+    });
+    const comment = z.object({
+      id: z.string(),
+      databaseId: githubId,
+      body: z.string(),
+      author: z.object({ login: z.string() }).nullable(),
+    });
+    const schema = z.object({
+      node: z.object({
+        id: z.string(),
+        isResolved: z.boolean(),
+        pullRequest: z.object({
+          databaseId: githubId,
+          number: githubId,
+          repository: z.object({ databaseId: githubId }),
+        }),
+        comments: z.object({ nodes: z.array(comment), pageInfo }),
+      }),
+    });
+    const comments: RemoteThread["comments"] = [],
+      seen = new Set<string>();
+    let cursor: string | null = null;
+    let result: RemoteThread | undefined;
+    for (;;) {
+      const data = await this.graphql(
+        "query($id:ID!,$cursor:String){node(id:$id){...on PullRequestReviewThread{id isResolved pullRequest{databaseId number repository{databaseId}}comments(first:100,after:$cursor){nodes{id databaseId body author{login}}pageInfo{hasNextPage endCursor}}}}}",
+        { id, cursor },
+        signal,
+      );
+      const value = schema.parse(data).node;
+      if (value.id !== id) throw new IntakeError("github_thread_invalid");
+      const identity = {
+        id,
+        pull_id: value.pullRequest.databaseId,
+        pull_number: value.pullRequest.number,
+        repository_id: value.pullRequest.repository.databaseId,
+      };
+      if (
+        result &&
+        (result.pull_id !== identity.pull_id ||
+          result.resolved !== value.isResolved)
+      )
+        throw new IntakeError("github_thread_changed");
+      result = { ...identity, resolved: value.isResolved, comments };
+      comments.push(
+        ...value.comments.nodes.map((item) => ({
+          id: item.databaseId,
+          node_id: item.id,
+          body: item.body,
+          author_login: item.author?.login ?? null,
+        })),
+      );
+      if (!value.comments.pageInfo.hasNextPage) return result;
+      cursor = value.comments.pageInfo.endCursor;
+      if (!cursor || seen.has(cursor))
+        throw new IntakeError("github_pagination_invalid");
+      seen.add(cursor);
+    }
+  }
+
+  async replyThread(id: string, body: string, signal: AbortSignal) {
+    const data = await this.graphql(
+      "mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}",
+      { id, body },
+      signal,
+    );
+    z.object({
+      addPullRequestReviewThreadReply: z.object({
+        comment: z.object({ id: z.string() }),
+      }),
+    }).parse(data);
+  }
+
+  async resolveThread(id: string, signal: AbortSignal) {
+    const data = await this.graphql(
+      "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}",
+      { id },
+      signal,
+    );
+    const result = z
+      .object({
+        resolveReviewThread: z.object({
+          thread: z.object({ id: z.string(), isResolved: z.literal(true) }),
+        }),
+      })
+      .parse(data);
+    if (result.resolveReviewThread.thread.id !== id)
+      throw new IntakeError("github_thread_invalid");
   }
   async comment(
     issue: number,

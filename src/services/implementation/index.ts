@@ -7,6 +7,9 @@ import type { SafeLogger } from "../../logging/redact.ts";
 import type { Store } from "../../repositories/store.ts";
 import { ImplementationRepository } from "../../repositories/implementation.ts";
 import { InvestigationRepository } from "../../repositories/investigation.ts";
+import { PrMonitorRepository } from "../../repositories/pr-monitor.ts";
+import { feedbackAssessment } from "../pr-monitor/contracts.ts";
+import type { PrMonitorService } from "../pr-monitor/index.ts";
 import type { Supervisor } from "../../runtime/supervisor.ts";
 import type { IntakeService } from "../intake.ts";
 import type { PublicationProposal } from "../publication/contracts.ts";
@@ -48,6 +51,7 @@ const safeFailures = new Set([
   "repair_budget_exhausted",
   "implementation_interrupted_after_write",
   "implementation_scope_changed",
+  "pr_scope_changed",
   "implementation_handoff_invalid",
   "implementation_out_of_scope",
   "implementation_no_change",
@@ -80,6 +84,7 @@ const safeFailures = new Set([
 
 export class ImplementationService {
   readonly repository: ImplementationRepository;
+  monitor?: PrMonitorService;
   private active: number | null = null;
   private failure: string | null = null;
   private readonly store: Store;
@@ -111,6 +116,7 @@ export class ImplementationService {
           item.stage === "remote_review",
       );
     return {
+      runtime: this.supervisor.status(),
       active: this.active === null ? 0 : 1,
       queued: this.store
         .jobs()
@@ -141,8 +147,11 @@ export class ImplementationService {
           )
         : undefined;
       if (operation?.status === "confirmed") {
-        this.repository.finish(record);
-        await this.report(record, signal);
+        const transitioned = record.stage !== "remote_review";
+        if (transitioned) this.repository.finish(record);
+        if (!new PrMonitorRepository(this.store).get(record.job_id))
+          await this.report(record, signal);
+        if (transitioned) this.monitor?.wake();
         continue;
       }
       const job = this.store.jobById(record.job_id);
@@ -159,6 +168,12 @@ export class ImplementationService {
   }
 
   async advance(job: Job, signal: AbortSignal) {
+    if (
+      this.monitor &&
+      !this.monitor.enabled() &&
+      this.monitor.repository.get(job.id)
+    )
+      return;
     const record = this.repository.ensure(job);
     if (
       record.stage === "cancelled" ||
@@ -185,6 +200,85 @@ export class ImplementationService {
     } finally {
       this.active = null;
     }
+  }
+
+  async assessFeedback(
+    record: Implementation,
+    input: unknown,
+    signal: AbortSignal,
+  ) {
+    await this.refresh(record, signal);
+    const artifact = record.artifact_digest!;
+    const terminal = await this.agent(
+      record,
+      "implementation",
+      "implementation_review_feedback",
+      feedbackAssessment,
+      {
+        ...(input as Record<string, unknown>),
+        scope: record.scope,
+        scope_digest: record.scope_digest,
+        artifact_digest: artifact,
+        policy: `${policy} Assess every supplied review surface against the frozen scope and actual candidate. Validate claims using supported code paths and real existing audit/test receipts. Group duplicate claims. Reject scope expansion and unsupported claims with evidence. Resolved/outdated threads still require assessment. Classify a correction as fix only when a reachable in-scope defect is proven. Use blocked when evidence is insufficient for a potentially material claim. Return citations for technical dispositions. Do not change files or publish.`,
+      },
+      signal,
+    );
+    await this.refresh(record, signal);
+    this.assertReadOnlyArtifact(record, artifact, terminal.artifact);
+    record.agent_pending = null;
+    this.repository.save(record);
+    return {
+      result: feedbackAssessment.parse(terminal.result),
+      run_id: this.store.artifact(
+        terminal.artifact!,
+        record.job_id,
+        record.revision,
+      ).run_id,
+    };
+  }
+
+  async recordReadiness(
+    record: Implementation,
+    readinessId: string,
+    input: unknown,
+    signal: AbortSignal,
+  ) {
+    await this.refresh(record, signal);
+    const artifact = record.artifact_digest!;
+    const terminal = await this.agent(
+      record,
+      "implementation",
+      "implementation_review_readiness",
+      z.strictObject({ summary: z.string().min(1).max(4096) }),
+      {
+        ...(input as Record<string, unknown>),
+        readiness_id: readinessId,
+        artifact_digest: artifact,
+        policy: `${policy} The supplied controller readiness receipt describes this PR head only. Use configured context tools and useful reviewed writes with pr_monitor_evidence references. Human review and merge remain required. Provider responses are not independent proof of persistence; describe rejection and uncertainty accurately. Do not change source or publish GitHub output.`,
+      },
+      signal,
+    );
+    await this.refresh(record, signal);
+    this.assertReadOnlyArtifact(record, artifact, terminal.artifact);
+    record.agent_pending = null;
+    this.repository.save(record);
+  }
+
+  private assertReadOnlyArtifact(
+    record: Implementation,
+    before: string,
+    after: string | undefined,
+  ) {
+    if (
+      !after ||
+      artifactFiles(
+        this.store.artifact(before, record.job_id, record.revision),
+      ) !==
+        artifactFiles(
+          this.store.artifact(after, record.job_id, record.revision),
+        )
+    )
+      throw new RuntimeError("implementation_source_mutated");
   }
 
   private async refresh(record: Implementation, signal: AbortSignal) {
@@ -617,6 +711,7 @@ export class ImplementationService {
     await this.confirm(proposal, signal);
     this.repository.finish(record);
     await this.report(record, signal);
+    this.monitor?.wake();
   }
 
   private evidenceIds(record: Implementation) {

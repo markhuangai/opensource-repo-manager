@@ -314,16 +314,21 @@ export class IntakeService {
     }
   }
 
-  async refresh(number: number, signal: AbortSignal) {
+  async refresh(number: number, signal: AbortSignal, notify = true) {
     if (!this.verified || Date.now() < this.retryAt)
       throw new IntakeError("enrollment_pending", this.retryAt);
     await this.readIssue(
       this.store.refreshIssue(number),
       AbortSignal.any([signal, this.controller.signal]),
+      notify,
     );
   }
 
-  private async readIssue(target: DirtyTarget, signal: AbortSignal) {
+  private async readIssue(
+    target: DirtyTarget,
+    signal: AbortSignal,
+    notify = true,
+  ) {
     const context = await this.reader.issue(
       target.number,
       this.store.repository()!,
@@ -336,7 +341,7 @@ export class IntakeService {
     if (this.secrets.containsCredentials(context))
       throw new IntakeError("secret_in_input");
     this.store.applyIssue(target, context, this.snapshot);
-    this.hooks.changed?.();
+    if (notify) this.hooks.changed?.();
   }
 
   enrolled() {

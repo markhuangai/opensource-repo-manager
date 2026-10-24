@@ -29,10 +29,23 @@ export function createApp(
   });
 
   app.get("/healthz", () => ({ status: "ok" }));
-  app.get("/readyz", (_request, reply) =>
-    reply.code(503).send({
-      status: "not_ready",
-      reason: "automation_not_implemented",
+  app.get("/readyz", (_request, reply) => {
+    const monitor = investigation?.implementation?.monitor;
+    const operational =
+      intake?.status().state === "ready" &&
+      investigation?.status().state === "running" &&
+      investigation.implementation?.status().runtime.state === "ready" &&
+      notifications?.status().state === "running" &&
+      monitor?.status().state === "running";
+    return reply.code(operational ? 200 : 503).send({
+      status: operational ? "ready" : "not_ready",
+      reason: operational
+        ? null
+        : !monitor
+          ? "automation_not_implemented"
+          : monitor.status().state === "disabled"
+            ? "pr_monitor_disabled"
+            : "service_unavailable",
       ...(intake ? { intake: intake.status() } : {}),
       ...(notifications ? { notifications: notifications.status() } : {}),
       ...(mcpWrites ? { mcp_writes: mcpWrites.status() } : {}),
@@ -40,8 +53,9 @@ export function createApp(
       ...(investigation?.implementation
         ? { implementation: investigation.implementation.status() }
         : {}),
-    }),
-  );
+      ...(monitor ? { pr_monitor: monitor.status() } : {}),
+    });
+  });
 
   if (intake && webhookSecret)
     app.register(async (scope) =>
