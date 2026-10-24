@@ -491,11 +491,12 @@ export async function createPublicationFixture(root: string) {
     }
     const rules = path.match(/^\/repos\/owner\/repo\/rules\/branches\/(.+)$/);
     if (rules) {
-      send(
-        state.protected.has(rules[1])
+      const page = Number(url.searchParams.get("page") ?? 1),
+        perPage = Number(url.searchParams.get("per_page") ?? 30),
+        applicable = state.protected.has(rules[1])
           ? [{ type: "deletion" }, ...state.rules]
-          : state.rules,
-      );
+          : state.rules;
+      send(applicable.slice((page - 1) * perPage, page * perPage));
       return;
     }
     if (path.endsWith("/protection")) {

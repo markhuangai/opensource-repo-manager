@@ -208,27 +208,113 @@ describe("current-head PR readiness policy", () => {
     ]);
   });
 
-  it("requires a current-SHA submitted review from the configured identity", () => {
-    const input = snapshot(),
-      settings = policy({
-        automated_reviewers: [{ login: "review-bot", signal: "github_review" }],
-      });
-    const review = {
-      id: 1,
-      node_id: "R1",
-      user: { id: 8, login: "review-bot" },
-      commit_id: "c".repeat(40),
-      state: "APPROVED",
-      body: null,
-      submitted_at: new Date().toISOString(),
-    };
-    input.reviews = [review];
-    expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(false);
-    review.commit_id = head;
-    expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(true);
-    review.state = "PENDING";
-    expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(false);
-  });
+  it.each(["review-bot", "review-bot[bot]"])(
+    "requires a current-SHA submitted review from exact identity %s",
+    (login) => {
+      const input = snapshot(),
+        settings = policy({
+          automated_reviewers: [{ login, signal: "github_review" }],
+        });
+      const review = {
+        id: 1,
+        node_id: "R1",
+        user: {
+          id: 8,
+          login: login.endsWith("[bot]") ? "review-bot" : "review-bot[bot]",
+        },
+        commit_id: "c".repeat(40),
+        state: "APPROVED",
+        body: null,
+        submitted_at: new Date().toISOString(),
+      };
+      input.reviews = [review];
+      expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(false);
+      review.commit_id = head;
+      expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(false);
+      review.user.login = login.toUpperCase();
+      expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(true);
+      review.state = "PENDING";
+      expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(false);
+    },
+  );
+
+  it.each([
+    { signal: "codex", login: "chatgpt-codex-connector" },
+    { signal: "coderabbit", login: "coderabbitai" },
+  ] as const)(
+    "keeps $signal REST identities exact with configured aliases",
+    ({ signal, login }) => {
+      for (const configured of [login, `${login}[bot]`]) {
+        const input = snapshot(),
+          settings = policy({
+            automated_reviewers: [{ login: configured, signal }],
+          }),
+          user = { id: 8, login: login.toLowerCase() },
+          time = new Date(Date.now() - 100).toISOString();
+        input.reviews = [
+          {
+            id: 1,
+            node_id: "R1",
+            user,
+            commit_id: head,
+            state: "COMMENTED",
+            body: "Completed review",
+            submitted_at: time,
+          },
+        ];
+        expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(
+          false,
+        );
+        user.login = `${login}[bot]`.toUpperCase();
+        expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(
+          true,
+        );
+        input.reviews = [];
+        user.login = login;
+        if (signal === "codex") {
+          input.reactions = [{ id: 1, content: "+1", user, created_at: time }];
+        } else {
+          input.comments = [
+            {
+              id: 1,
+              node_id: "IC1",
+              user,
+              body: "No actionable comments were generated in the recent review",
+              created_at: time,
+              updated_at: time,
+            },
+          ];
+        }
+        expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(
+          false,
+        );
+        user.login = `${login}[bot]`;
+        expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(
+          true,
+        );
+        input.reactions.push({
+          id: 2,
+          content: "eyes",
+          user: { id: 9, login },
+          created_at: new Date().toISOString(),
+        });
+        expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(
+          true,
+        );
+        input.comments.push({
+          id: 2,
+          node_id: "IC2",
+          user: { id: 9, login },
+          body: "Review unavailable",
+          created_at: time,
+          updated_at: new Date().toISOString(),
+        });
+        expect(evaluateReadiness(input, settings, publishedAt).clean).toBe(
+          true,
+        );
+      }
+    },
+  );
 
   it("binds Codex signals to the current cycle and waits for newer eyes", () => {
     const input = snapshot(),
@@ -464,7 +550,7 @@ describe("complete GitHub monitor reads and scoped thread mutations", () => {
     expect(await f.writer.issueOpen(1, signal())).toBe(true);
   });
 
-  it("paginates threads, nested replies, reviews and checks through actual HTTP/GraphQL", async () => {
+  it("paginates threads, nested replies, reviews, checks and branch rules through actual HTTP/GraphQL", async () => {
     const f = await transport(),
       head = f.remote.source.sha;
     const threads = Array.from({ length: 101 }, (_, i) =>
@@ -494,12 +580,53 @@ describe("complete GitHub monitor reads and scoped thread mutations", () => {
         makeCheck(head, { id: i + 1, name: `Check ${i}` }),
       ),
     );
+    f.remote.state.rules = [
+      {
+        type: "required_status_checks",
+        parameters: { required_status_checks: [{ context: "Check 0" }] },
+      },
+      ...Array.from({ length: 99 }, () => ({ type: "deletion" })),
+      {
+        type: "required_status_checks",
+        parameters: {
+          required_status_checks: [
+            { context: "Late CI", integration_id: 15368 },
+          ],
+        },
+      },
+      {
+        type: "pull_request",
+        parameters: { required_approving_review_count: 2 },
+      },
+    ];
     const result = await f.reader.monitor(77, signal());
+    expect(
+      evaluateReadiness(result, policy({ required_checks: [] }), publishedAt),
+    ).toMatchObject({
+      clean: false,
+      reason: "pr_waiting",
+      pending: ["Late CI"],
+    });
     expect(result.threads).toHaveLength(101);
     expect(result.threads[0].comments).toHaveLength(102);
     expect(result.reviews).toHaveLength(101);
     expect(result.checks).toHaveLength(101);
     expect(result.requirements.unknown).toEqual([]);
+    expect(result.requirements.checks).toEqual([
+      { name: "Check 0", app_id: null },
+      { name: "Late CI", app_id: 15368 },
+    ]);
+    expect(result.requirements.human_approvals).toBe(2);
+    f.remote.state.rules.push({ type: "code_quality" });
+    const unsupported = await f.reader.monitor(77, signal());
+    expect(unsupported.requirements.unknown).toEqual(["code_quality"]);
+    expect(
+      evaluateReadiness(
+        unsupported,
+        policy({ required_checks: [] }),
+        publishedAt,
+      ).reason,
+    ).toBe("pr_requirements_unknown");
     expect(
       (await f.writer.thread(threads[0].id, signal())).comments,
     ).toHaveLength(102);

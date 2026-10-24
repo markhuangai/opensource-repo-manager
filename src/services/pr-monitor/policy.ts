@@ -16,7 +16,7 @@ export function observationDigest(snapshot: PrSnapshot) {
 }
 
 function login(value: string) {
-  return value.toLowerCase().replace(/\[bot\]$/, "");
+  return value.toLowerCase();
 }
 
 export function reviewSurfaces(
@@ -203,8 +203,12 @@ export function evaluateReadiness(
   const unavailableNotice =
     /review limit reached|rate limited by coderabbit\.ai|rate limit exceeded by coderabbit\.ai|review skipped|couldn.t start this review|too many files|quota exceeded|review unavailable/i;
   for (const required of policy.automated_reviewers) {
+    const expectedLogin =
+      required.signal === "github_review"
+        ? login(required.login)
+        : `${login(required.login).replace(/\[bot\]$/, "")}[bot]`;
     const authored = snapshot.reviews.filter(
-      (item) => item.user && login(item.user.login) === login(required.login),
+      (item) => item.user && login(item.user.login) === expectedLogin,
     );
     const current = authored.filter(
       (item) =>
@@ -226,7 +230,7 @@ export function evaluateReadiness(
         if (
           reaction.user &&
           cycleStart !== null &&
-          login(reaction.user.login) === login(required.login) &&
+          login(reaction.user.login) === expectedLogin &&
           time >= cycleStart &&
           time <= Date.now() &&
           required.signal === "codex" &&
@@ -240,7 +244,7 @@ export function evaluateReadiness(
           if (
             !comment.user ||
             cycleStart === null ||
-            login(comment.user.login) !== login(required.login) ||
+            login(comment.user.login) !== expectedLogin ||
             time < cycleStart ||
             time > Date.now()
           )
@@ -264,7 +268,7 @@ export function evaluateReadiness(
       snapshot.comments.some((comment) => {
         if (
           !comment.user ||
-          login(comment.user.login) !== login(required.login) ||
+          login(comment.user.login) !== expectedLogin ||
           !unavailableNotice.test(comment.body ?? "")
         )
           return false;
@@ -280,7 +284,7 @@ export function evaluateReadiness(
       .filter(
         (item) =>
           item.user &&
-          login(item.user.login) === login(required.login) &&
+          login(item.user.login) === expectedLogin &&
           item.content === "eyes",
       )
       .map((item) => Date.parse(item.created_at))

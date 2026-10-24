@@ -465,20 +465,15 @@ export class OctokitReader implements GitHubReader {
         result.unknown.push("branch_protection");
     }
     try {
-      const rules = z
-        .array(
-          z.object({
-            type: z.string(),
-            parameters: z.record(z.string(), z.unknown()).optional(),
-          }),
-        )
-        .parse(
-          await this.read(
-            "GET /repos/{owner}/{repo}/rules/branches/{branch}",
-            { branch },
-            signal,
-          ),
-        );
+      const rules = await this.pages(
+        "GET /repos/{owner}/{repo}/rules/branches/{branch}",
+        { branch },
+        z.object({
+          type: z.string(),
+          parameters: z.record(z.string(), z.unknown()).optional(),
+        }),
+        signal,
+      );
       for (const rule of rules) {
         if (rule.type === "required_status_checks") {
           const parameters = z
