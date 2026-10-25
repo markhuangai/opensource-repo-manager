@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
+  appendFile,
   cp,
   mkdir,
   mkdtemp,
@@ -12,29 +13,81 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { performance } from "node:perf_hooks";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { githubFixtureState, makeIssue } from "../tests/fixtures/github.ts";
+import {
+  selectContainerSuites,
+  implementationScenarios,
+  implementationSdks,
+  verifyImplementationReceipts,
+} from "./container-suites.mjs";
 
-const args = process.argv.slice(2);
-assert(
-  args.length === 0 || (args.length === 2 && args[0] === "--platform"),
-  "Usage: npm run test:container -- --platform linux/amd64|linux/arm64",
-);
-const platform =
-  args[1] ?? `linux/${process.arch === "x64" ? "amd64" : process.arch}`;
-assert(
-  ["linux/amd64", "linux/arm64"].includes(platform),
-  "Unsupported test platform",
-);
-
+const { platform, suites } = selectContainerSuites(process.argv.slice(2));
 const root = fileURLToPath(new URL("../", import.meta.url));
+if (suites.length > 1) {
+  for (const suite of suites) {
+    const child = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(import.meta.url),
+        "--platform",
+        platform,
+        "--suite",
+        suite,
+      ],
+      {
+        cwd: root,
+        stdio: "inherit",
+      },
+    );
+    if (child.error) throw child.error;
+    assert.equal(child.status, 0, `Container suite ${suite} failed`);
+  }
+  process.exit(0);
+}
+const [suite] = suites;
+const sourceSha = execFileSync(
+  "git",
+  ["--no-optional-locks", "rev-parse", "HEAD"],
+  { cwd: root, encoding: "utf8" },
+).trim();
+const dirtyWorktree =
+  execFileSync(
+    "git",
+    ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"],
+    { cwd: root, encoding: "utf8" },
+  ).trim() !== "";
+const prHeadSha = process.env.TEST_PR_HEAD_SHA || null;
+assert(
+  prHeadSha === null || /^[a-f0-9]{40}$/.test(prHeadSha),
+  "Invalid PR head SHA",
+);
+
+const timings = [];
+let activePhase;
+function phase(name) {
+  const now = performance.now();
+  if (activePhase)
+    timings.push({
+      phase: activePhase.name,
+      started_at: activePhase.started_at,
+      duration_ms: now - activePhase.start,
+    });
+  activePhase = name
+    ? { name, start: now, started_at: new Date().toISOString() }
+    : undefined;
+  if (name) console.log(`[${suite}] ${name}`);
+}
+phase("setup");
 const temporary = await mkdtemp(join(tmpdir(), "orm-container-"));
 const context = join(temporary, "context");
 const config = join(temporary, "docker-client");
 const fixtures = join(temporary, "fixtures");
+const testInputs = join(temporary, "test-inputs");
 const id = `orm-test-${randomUUID()}`;
 const label = "org.opensource-repo-manager.test-run";
 const image = `${id}:app`;
@@ -52,6 +105,14 @@ const resources = [];
 const cleanupErrors = [];
 let failure;
 let receipt;
+let runtimeProof,
+  publicationProof,
+  mcpWriteProof,
+  notificationProof,
+  investigationProof,
+  implementationProof,
+  bootstrapProof;
+const investigationStartupProof = [];
 let protectedFixtures = false;
 
 let daemon;
@@ -215,6 +276,11 @@ try {
   assert(buildx?.Path, "Docker Buildx is required");
   await symlink(buildx.Path, join(config, "cli-plugins", "docker-buildx"));
   await mkdir(context);
+  await cp(join(root, "tests"), join(testInputs, "tests"), { recursive: true });
+  await cp(
+    join(root, "scripts", "container-suites.mjs"),
+    join(testInputs, "container-suites.mjs"),
+  );
   for (const file of [
     "Dockerfile",
     ".dockerignore",
@@ -234,6 +300,7 @@ try {
   const probeDockerfile = join(temporary, "context-probe.Dockerfile");
   await writeFile(probeDockerfile, "FROM scratch\nCOPY . /\n");
 
+  phase("context-exclusion");
   console.log(`Verifying Docker context exclusion for ${platform}`);
   register("image", probeImage);
   docker(
@@ -272,6 +339,7 @@ try {
     "A secret canary entered the Docker build context",
   );
 
+  phase("image-build");
   console.log(`Building the production image for ${platform}`);
   register("image", image);
   docker(
@@ -292,6 +360,8 @@ try {
     { inherit: true, timeout: 1_200_000 },
   );
 
+  phase("production-startup");
+  await mkdir(join(fixtures, "investigations"), { recursive: true });
   const upstream = join(fixtures, "github");
   await mkdir(upstream, { recursive: true });
   await cp(
@@ -659,23 +729,25 @@ try {
   ]);
   mounts.push(
     "--mount",
+    `type=bind,src=${join(testInputs, "container-suites.mjs")},dst=/container-suites.mjs,readonly`,
+    "--mount",
     `type=bind,src=${notificationFixtures},dst=/notification-fixtures,readonly`,
     "--mount",
-    `type=bind,src=${join(root, "tests", "fixtures", "runtime")},dst=/runtime-fixtures,readonly`,
+    `type=bind,src=${join(testInputs, "tests", "fixtures", "runtime")},dst=/runtime-fixtures,readonly`,
     "--mount",
-    `type=bind,src=${join(root, "tests", "integration", "agents")},dst=/agent-fixtures,readonly`,
+    `type=bind,src=${join(testInputs, "tests", "integration", "agents")},dst=/agent-fixtures,readonly`,
     "--mount",
-    `type=bind,src=${join(root, "tests", "integration", "bootstrap")},dst=/bootstrap-fixtures,readonly`,
+    `type=bind,src=${join(testInputs, "tests", "integration", "bootstrap")},dst=/bootstrap-fixtures,readonly`,
     "--mount",
-    `type=bind,src=${join(root, "tests", "integration", "publication")},dst=/publication-fixtures,readonly`,
+    `type=bind,src=${join(testInputs, "tests", "integration", "publication")},dst=/publication-fixtures,readonly`,
     "--mount",
-    `type=bind,src=${join(root, "tests", "integration", "mcp-writes")},dst=/mcp-write-fixtures,readonly`,
+    `type=bind,src=${join(testInputs, "tests", "integration", "mcp-writes")},dst=/mcp-write-fixtures,readonly`,
     "--mount",
-    `type=bind,src=${join(root, "tests", "integration", "investigation")},dst=/investigation-fixtures,readonly`,
+    `type=bind,src=${join(testInputs, "tests", "integration", "investigation")},dst=/investigation-fixtures,readonly`,
     "--mount",
-    `type=bind,src=${join(root, "tests", "integration", "implementation")},dst=/implementation-fixtures,readonly`,
+    `type=bind,src=${join(testInputs, "tests", "integration", "implementation")},dst=/implementation-fixtures,readonly`,
     "--mount",
-    `type=bind,src=${join(root, "tests", "fixtures", "publication.ts")},dst=/publication-fixture.ts,readonly`,
+    `type=bind,src=${join(testInputs, "tests", "fixtures", "publication.ts")},dst=/publication-fixture.ts,readonly`,
   );
   const connection = [
     "--network",
@@ -956,381 +1028,407 @@ try {
   assert.notEqual(deniedWrite.status, 0);
   assert(deniedWrite.stderr.includes("Read-only file system"));
 
-  console.log("Verifying supervised runtime workers");
-  const runtimeProof = JSON.parse(
-    docker(
-      [
-        "exec",
-        runtime,
-        "/opt/orm-runtime/bin/node",
-        "--input-type=module",
-        "-e",
-        "import {runRuntimeTests} from '/runtime-fixtures/harness.mjs'; await runRuntimeTests();",
-      ],
-      { timeout: 600_000 },
-    ),
-  );
-  assert.equal(runtimeProof.runtime, "passed");
-  assert.equal(runtimeProof.cleanup, "passed");
-  assert.equal(runtimeProof.mcp_gateway?.protocol, "streamable_http");
-  assert.equal(runtimeProof.mcp_gateway?.cleanup, "passed");
-  assert.equal(runtimeProof.claude_sdk?.sdk, "0.3.296");
-  assert.equal(runtimeProof.claude_sdk?.cleanup, "passed");
-  assert.equal(runtimeProof.codex_sdk?.sdk, "0.162.1");
-  assert.equal(runtimeProof.codex_sdk?.protocol, "responses_http_sse");
-  assert.equal(runtimeProof.codex_sdk?.cleanup, "passed");
-
-  console.log("Verifying reviewed GitHub publication");
-  const publicationProof = JSON.parse(
-    docker(
-      [
-        "exec",
-        runtime,
-        "/opt/orm-runtime/bin/node",
-        "--input-type=module",
-        "-e",
-        "import {runPublicationTests} from '/publication-fixtures/harness.mjs'; console.log(JSON.stringify(await runPublicationTests()));",
-      ],
-      { timeout: 600_000 },
-    ),
-  );
-  assert.equal(publicationProof.publication, "passed");
-  assert.equal(publicationProof.cleanup, "passed");
-
-  console.log("Verifying scoped MCP writes");
-  const mcpWriteProof = JSON.parse(
-    docker(
-      [
-        "exec",
-        runtime,
-        "/opt/orm-runtime/bin/node",
-        "--input-type=module",
-        "-e",
-        "import {runMcpWriteTests} from '/mcp-write-fixtures/harness.mjs'; console.log(JSON.stringify(await runMcpWriteTests()));",
-      ],
-      { timeout: 900_000 },
-    ),
-  );
-  assert.equal(mcpWriteProof.mcp_writes, "passed");
-  assert.equal(mcpWriteProof.cleanup, "passed");
-  assert.equal(request("/readyz").body.mcp_writes.uncertain, 0);
-
-  console.log("Verifying durable notifications");
-  const notificationProof = JSON.parse(
-    docker(
-      [
-        "exec",
-        runtime,
-        "/opt/orm-runtime/bin/node",
-        "--input-type=module",
-        "-e",
-        "import {runNotificationTests} from '/notification-fixtures/harness.mjs'; console.log(JSON.stringify(await runNotificationTests()));",
-      ],
-      { timeout: 120000 },
-    ),
-  );
-  assert.equal(notificationProof.notifications, "passed");
-  assert.equal(notificationProof.cleanup, "passed");
-  assert.equal(request("/readyz").body.notifications.state, "running");
-
-  console.log("Verifying issue investigation");
-  const investigationProof = JSON.parse(
-    docker(
-      [
-        "exec",
-        runtime,
-        "/opt/orm-runtime/bin/node",
-        "--input-type=module",
-        "-e",
-        "import {runInvestigationTests} from '/investigation-fixtures/harness.mjs'; console.log(JSON.stringify(await runInvestigationTests()));",
-      ],
-      { timeout: 2400000 },
-    ),
-  );
-  assert.equal(investigationProof.investigation, "passed");
-  assert.equal(investigationProof.cleanup, "passed");
-
-  console.log("Verifying maintenance implementation through both SDKs");
-  const implementationContainers = ["codex", "claude"].map((sdk) => {
-    const name = `${id}-implementation-${sdk}`,
-      data = `${name}-data`;
-    register("volume", data);
-    docker(["volume", "create", "--label", `${label}=${id}`, data]);
-    register("container", name);
-    docker([
-      "run",
-      "--detach",
-      "--name",
-      name,
-      "--label",
-      `${label}=${id}`,
-      "--platform",
-      platform,
-      "--mount",
-      `type=volume,src=${data},dst=/data`,
-      ...mounts,
-      "--entrypoint",
-      "/usr/bin/tini",
-      image,
-      "--",
-      "/opt/orm-runtime/bin/node",
-      "--input-type=module",
-      "-e",
-      `import {runImplementationTests} from '/implementation-fixtures/harness.mjs'; console.log(JSON.stringify(await runImplementationTests([${JSON.stringify(sdk)}])));`,
-    ]);
-    return { sdk, name };
-  });
-  const implementationDeadline = Date.now() + 90 * 60000;
-  for (;;) {
-    const states = JSON.parse(
-      docker([
-        "container",
-        "inspect",
-        ...implementationContainers.map(({ name }) => name),
-      ]),
-    );
-    for (const state of states) {
-      assert.equal(state.Config.Labels[label], id);
-      assert(["", "private"].includes(state.HostConfig.PidMode));
-      if (!state.State.Running && state.State.ExitCode !== 0)
-        assert.fail(`${state.Name.slice(1)}: ${logs(state.Name.slice(1))}`);
-    }
-    if (states.every((state) => !state.State.Running)) break;
-    assert(
-      Date.now() < implementationDeadline,
-      "Maintenance SDK tests timed out",
-    );
-    await delay(1000);
-  }
-  const implementationReceipts = implementationContainers.map(
-    ({ sdk, name }) => {
-      const output = result(["container", "logs", name]);
-      assert.equal(output.status, 0, output.stderr);
-      const proof = JSON.parse(output.stdout);
-      assert.equal(proof.implementation, "passed");
-      assert.equal(proof.cleanup, "passed");
-      assert(proof.scenarios.length > 0);
-      assert(proof.scenarios.every((scenario) => scenario.sdk === sdk));
-      return proof;
-    },
-  );
-  const implementationProof = {
-    implementation: "passed",
-    scenarios: implementationReceipts.flatMap((proof) => proof.scenarios),
-    cleanup: "passed",
-  };
-
-  const investigationStartupProof = [];
-  for (const sdk of ["codex", "claude"]) {
-    console.log(`Verifying production startup through ${sdk}`);
-    const prefix = `${id}-investigation-${sdk}`,
-      data = `${prefix}-data`,
-      net = `${prefix}-network`,
-      upstreamName = `${prefix}-upstream`,
-      manager = `${prefix}-manager`;
-    const directory = join(fixtures, "investigations", sdk);
-    await mkdir(join(directory, "config"), { recursive: true });
-    for (const name of ["skills", "prompts"])
-      await cp(join(fixtures, name), join(directory, name), {
-        recursive: true,
-      });
-    const prompts = join(directory, "prompts");
-    for (const name of ["system.md", "user.md", "investigation.md"])
-      await writeFile(
-        join(prompts, name),
-        (await readFile(join(prompts, name), "utf8")) +
-          `\n${name === "system.md" ? "OPERATOR_SYSTEM_CANARY" : "OPERATOR_USER_CANARY"}\n`,
-      );
-    const skill = join(directory, "skills", "example", "SKILL.md");
-    await writeFile(
-      skill,
-      (await readFile(skill, "utf8")) + "\nOPERATOR_SKILL_CANARY\n",
-    );
-    const config = globalThis.structuredClone(validConfig);
-    config.proxy.url = "http://investigation-fixture:8317/v1";
-    config.profiles = {
-      worker:
-        sdk === "codex"
-          ? { sdk, model: "gpt-5.5", effort: "xhigh" }
-          : {
-              sdk,
-              model: "auto",
-              behaves_as: "claude-opus-4-8",
-              effort: "xhigh",
-            },
-    };
-    for (const role of Object.keys(config.roles)) {
-      config.roles[role].profile = "worker";
-      config.roles[role].mcp = {};
-    }
-    config.mcp = { credentials: {}, servers: {} };
-    config.pr_monitor = {
-      enabled: true,
-      requirements_source: "github",
-      required_checks: ["Fixture CI"],
-      automated_reviewers: [
-        { login: "chatgpt-codex-connector[bot]", signal: "codex" },
-        { login: "coderabbitai[bot]", signal: "coderabbit" },
-      ],
-      local_checks_only: false,
-    };
-    config.notifications = {
-      discord: {
-        enabled: true,
-        webhook_url: "http://investigation-fixture:8317/discord",
-      },
-      smtp: {
-        enabled: true,
-        host: "api.github.com",
-        port: 8465,
-        secure: true,
-        username: "fixture-smtp-user",
-        password: "fixture-smtp-password",
-        from: "manager@example.invalid",
-        to: ["first@example.invalid"],
-      },
-      webhook: {
-        enabled: true,
-        url: "http://investigation-fixture:8317/notify",
-        headers: {},
-      },
-    };
-    await writeFile(
-      join(directory, "config", "config.yml"),
-      stringifyYaml(config),
-    );
-    await writeFile(
-      join(directory, "configuration.json"),
-      JSON.stringify(config),
-    );
-    const caBundle = docker([
-      "run",
-      "--rm",
-      "--name",
-      setup,
-      "--label",
-      `${label}=${id}`,
-      "--entrypoint",
-      "/bin/cat",
-      image,
-      "/etc/ssl/certs/ca-certificates.crt",
-    ]);
-    await writeFile(
-      join(directory, "ca-bundle.pem"),
-      caBundle + "\n" + (await readFile(join(upstream, "ca.pem"), "utf8")),
-    );
-    docker([
-      "run",
-      "--rm",
-      "--name",
-      setup,
-      "--label",
-      `${label}=${id}`,
-      "--mount",
-      `type=bind,src=${directory},dst=/fixture`,
-      "--entrypoint",
-      "/bin/sh",
-      image,
-      "-c",
-      "chown -R 0:0 /fixture && chmod 700 /fixture/config && chmod 600 /fixture/config/config.yml",
-    ]);
-    register("network", net);
-    docker(["network", "create", "--label", `${label}=${id}`, net]);
-    register("volume", data);
-    docker(["volume", "create", "--label", `${label}=${id}`, data]);
-    register("container", upstreamName);
-    docker([
-      "run",
-      "--detach",
-      "--name",
-      upstreamName,
-      "--label",
-      `${label}=${id}`,
-      "--network",
-      net,
-      "--network-alias",
-      "api.github.com",
-      "--network-alias",
-      "github.com",
-      "--network-alias",
-      "investigation-fixture",
-      "--mount",
-      `type=volume,src=${data},dst=/data,readonly`,
-      "--mount",
-      `type=bind,src=${directory},dst=/fixture`,
-      "--mount",
-      `type=bind,src=${join(upstream, "key.pem")},dst=/fixture-key.pem,readonly`,
-      "--mount",
-      `type=bind,src=${join(upstream, "ca.pem")},dst=/fixture-ca.pem,readonly`,
-      ...mounts,
-      "--entrypoint",
-      "/opt/orm-runtime/bin/node",
-      image,
-      "/investigation-fixtures/server.mjs",
-    ]);
-    await waitUntil(
-      () =>
-        result([
+  if (suite === "core") {
+    console.log("Verifying supervised runtime workers");
+    phase("supervised-workers");
+    runtimeProof = JSON.parse(
+      docker(
+        [
           "exec",
-          upstreamName,
+          runtime,
+          "/opt/orm-runtime/bin/node",
+          "--input-type=module",
+          "-e",
+          "import {runRuntimeTests} from '/runtime-fixtures/harness.mjs'; await runRuntimeTests();",
+        ],
+        { timeout: 600_000 },
+      ),
+    );
+    assert.equal(runtimeProof.runtime, "passed");
+    assert.equal(runtimeProof.cleanup, "passed");
+    assert.equal(runtimeProof.mcp_gateway?.protocol, "streamable_http");
+    assert.equal(runtimeProof.mcp_gateway?.cleanup, "passed");
+    assert.equal(runtimeProof.claude_sdk?.sdk, "0.3.296");
+    assert.equal(runtimeProof.claude_sdk?.cleanup, "passed");
+    assert.equal(runtimeProof.codex_sdk?.sdk, "0.162.1");
+    assert.equal(runtimeProof.codex_sdk?.protocol, "responses_http_sse");
+    assert.equal(runtimeProof.codex_sdk?.cleanup, "passed");
+
+    console.log("Verifying reviewed GitHub publication");
+    phase("publication");
+    publicationProof = JSON.parse(
+      docker(
+        [
+          "exec",
+          runtime,
+          "/opt/orm-runtime/bin/node",
+          "--input-type=module",
+          "-e",
+          "import {runPublicationTests} from '/publication-fixtures/harness.mjs'; console.log(JSON.stringify(await runPublicationTests()));",
+        ],
+        { timeout: 600_000 },
+      ),
+    );
+    assert.equal(publicationProof.publication, "passed");
+    assert.equal(publicationProof.cleanup, "passed");
+
+    console.log("Verifying scoped MCP writes");
+    phase("mcp-writes");
+    mcpWriteProof = JSON.parse(
+      docker(
+        [
+          "exec",
+          runtime,
+          "/opt/orm-runtime/bin/node",
+          "--input-type=module",
+          "-e",
+          "import {runMcpWriteTests} from '/mcp-write-fixtures/harness.mjs'; console.log(JSON.stringify(await runMcpWriteTests()));",
+        ],
+        { timeout: 900_000 },
+      ),
+    );
+    assert.equal(mcpWriteProof.mcp_writes, "passed");
+    assert.equal(mcpWriteProof.cleanup, "passed");
+    assert.equal(request("/readyz").body.mcp_writes.uncertain, 0);
+
+    console.log("Verifying durable notifications");
+    phase("notifications");
+    notificationProof = JSON.parse(
+      docker(
+        [
+          "exec",
+          runtime,
+          "/opt/orm-runtime/bin/node",
+          "--input-type=module",
+          "-e",
+          "import {runNotificationTests} from '/notification-fixtures/harness.mjs'; console.log(JSON.stringify(await runNotificationTests()));",
+        ],
+        { timeout: 120000 },
+      ),
+    );
+    assert.equal(notificationProof.notifications, "passed");
+    assert.equal(notificationProof.cleanup, "passed");
+    assert.equal(request("/readyz").body.notifications.state, "running");
+  }
+  if (suite === "investigation") {
+    console.log("Verifying issue investigation");
+    phase("investigation");
+    investigationProof = JSON.parse(
+      docker(
+        [
+          "exec",
+          runtime,
+          "/opt/orm-runtime/bin/node",
+          "--input-type=module",
+          "-e",
+          "import {runInvestigationTests} from '/investigation-fixtures/harness.mjs'; console.log(JSON.stringify(await runInvestigationTests()));",
+        ],
+        { timeout: 2400000 },
+      ),
+    );
+    assert.equal(investigationProof.investigation, "passed");
+    assert.equal(investigationProof.cleanup, "passed");
+  }
+  if (Object.hasOwn(implementationScenarios, suite)) {
+    console.log("Verifying maintenance implementation through both SDKs");
+    phase("implementation");
+    const implementationContainers = implementationSdks.map((sdk) => {
+      const started = performance.now();
+      const started_at = new Date().toISOString();
+      const name = `${id}-implementation-${sdk}`,
+        data = `${name}-data`;
+      register("volume", data);
+      docker(["volume", "create", "--label", `${label}=${id}`, data]);
+      register("container", name);
+      docker([
+        "run",
+        "--detach",
+        "--name",
+        name,
+        "--label",
+        `${label}=${id}`,
+        "--platform",
+        platform,
+        "--mount",
+        `type=volume,src=${data},dst=/data`,
+        ...mounts,
+        "--entrypoint",
+        "/usr/bin/tini",
+        image,
+        "--",
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        `import {runImplementationTests} from '/implementation-fixtures/harness.mjs'; console.log(JSON.stringify(await runImplementationTests([${JSON.stringify(sdk)}], ${JSON.stringify(suite)})));`,
+      ]);
+      return { sdk, name, started, started_at };
+    });
+    const finishedSdks = new Set();
+    const implementationDeadline = Date.now() + 90 * 60000;
+    for (;;) {
+      const states = JSON.parse(
+        docker([
+          "container",
+          "inspect",
+          ...implementationContainers.map(({ name }) => name),
+        ]),
+      );
+      for (const state of states) {
+        assert.equal(state.Config.Labels[label], id);
+        assert(["", "private"].includes(state.HostConfig.PidMode));
+        const execution = implementationContainers.find(
+          ({ name }) => state.Name === `/${name}`,
+        );
+        if (!state.State.Running && !finishedSdks.has(execution.sdk)) {
+          timings.push({
+            phase: `implementation-${execution.sdk}`,
+            started_at: execution.started_at,
+            duration_ms: performance.now() - execution.started,
+          });
+          finishedSdks.add(execution.sdk);
+        }
+        if (!state.State.Running && state.State.ExitCode !== 0)
+          assert.fail(`${state.Name.slice(1)}: ${logs(state.Name.slice(1))}`);
+      }
+      if (states.every((state) => !state.State.Running)) break;
+      assert(
+        Date.now() < implementationDeadline,
+        "Maintenance SDK tests timed out",
+      );
+      await delay(1000);
+    }
+    const implementationReceipts = implementationContainers.map(
+      ({ sdk, name }) => {
+        const output = result(["container", "logs", name]);
+        assert.equal(output.status, 0, output.stderr);
+        const proof = JSON.parse(output.stdout);
+        assert.equal(proof.implementation, "passed");
+        assert.equal(proof.cleanup, "passed");
+        assert(proof.scenarios.length > 0);
+        assert(proof.scenarios.every((scenario) => scenario.sdk === sdk));
+        return proof;
+      },
+    );
+    verifyImplementationReceipts(suite, implementationReceipts);
+    implementationProof = {
+      implementation: "passed",
+      receipts: implementationReceipts,
+      scenarios: implementationReceipts.flatMap((proof) => proof.scenarios),
+      cleanup: "passed",
+    };
+  }
+  if (suite === "investigation") {
+    for (const sdk of ["codex", "claude"]) {
+      phase(`production-startup-${sdk}`);
+      console.log(`Verifying production startup through ${sdk}`);
+      const prefix = `${id}-investigation-${sdk}`,
+        data = `${prefix}-data`,
+        net = `${prefix}-network`,
+        upstreamName = `${prefix}-upstream`,
+        manager = `${prefix}-manager`;
+      const directory = join(fixtures, "investigations", sdk);
+      await mkdir(join(directory, "config"), { recursive: true });
+      for (const name of ["skills", "prompts"])
+        await cp(join(fixtures, name), join(directory, name), {
+          recursive: true,
+        });
+      const prompts = join(directory, "prompts");
+      for (const name of ["system.md", "user.md", "investigation.md"])
+        await writeFile(
+          join(prompts, name),
+          (await readFile(join(prompts, name), "utf8")) +
+            `\n${name === "system.md" ? "OPERATOR_SYSTEM_CANARY" : "OPERATOR_USER_CANARY"}\n`,
+        );
+      const skill = join(directory, "skills", "example", "SKILL.md");
+      await writeFile(
+        skill,
+        (await readFile(skill, "utf8")) + "\nOPERATOR_SKILL_CANARY\n",
+      );
+      const config = globalThis.structuredClone(validConfig);
+      config.proxy.url = "http://investigation-fixture:8317/v1";
+      config.profiles = {
+        worker:
+          sdk === "codex"
+            ? { sdk, model: "gpt-5.5", effort: "xhigh" }
+            : {
+                sdk,
+                model: "auto",
+                behaves_as: "claude-opus-4-8",
+                effort: "xhigh",
+              },
+      };
+      for (const role of Object.keys(config.roles)) {
+        config.roles[role].profile = "worker";
+        config.roles[role].mcp = {};
+      }
+      config.mcp = { credentials: {}, servers: {} };
+      config.pr_monitor = {
+        enabled: true,
+        requirements_source: "github",
+        required_checks: ["Fixture CI"],
+        automated_reviewers: [
+          { login: "chatgpt-codex-connector[bot]", signal: "codex" },
+          { login: "coderabbitai[bot]", signal: "coderabbit" },
+        ],
+        local_checks_only: false,
+      };
+      config.notifications = {
+        discord: {
+          enabled: true,
+          webhook_url: "http://investigation-fixture:8317/discord",
+        },
+        smtp: {
+          enabled: true,
+          host: "api.github.com",
+          port: 8465,
+          secure: true,
+          username: "fixture-smtp-user",
+          password: "fixture-smtp-password",
+          from: "manager@example.invalid",
+          to: ["first@example.invalid"],
+        },
+        webhook: {
+          enabled: true,
+          url: "http://investigation-fixture:8317/notify",
+          headers: {},
+        },
+      };
+      await writeFile(
+        join(directory, "config", "config.yml"),
+        stringifyYaml(config),
+      );
+      await writeFile(
+        join(directory, "configuration.json"),
+        JSON.stringify(config),
+      );
+      const caBundle = docker([
+        "run",
+        "--rm",
+        "--name",
+        setup,
+        "--label",
+        `${label}=${id}`,
+        "--entrypoint",
+        "/bin/cat",
+        image,
+        "/etc/ssl/certs/ca-certificates.crt",
+      ]);
+      await writeFile(
+        join(directory, "ca-bundle.pem"),
+        caBundle + "\n" + (await readFile(join(upstream, "ca.pem"), "utf8")),
+      );
+      docker([
+        "run",
+        "--rm",
+        "--name",
+        setup,
+        "--label",
+        `${label}=${id}`,
+        "--mount",
+        `type=bind,src=${directory},dst=/fixture`,
+        "--entrypoint",
+        "/bin/sh",
+        image,
+        "-c",
+        "chown -R 0:0 /fixture && chmod 700 /fixture/config && chmod 600 /fixture/config/config.yml",
+      ]);
+      register("network", net);
+      docker(["network", "create", "--label", `${label}=${id}`, net]);
+      register("volume", data);
+      docker(["volume", "create", "--label", `${label}=${id}`, data]);
+      register("container", upstreamName);
+      docker([
+        "run",
+        "--detach",
+        "--name",
+        upstreamName,
+        "--label",
+        `${label}=${id}`,
+        "--network",
+        net,
+        "--network-alias",
+        "api.github.com",
+        "--network-alias",
+        "github.com",
+        "--network-alias",
+        "investigation-fixture",
+        "--mount",
+        `type=volume,src=${data},dst=/data,readonly`,
+        "--mount",
+        `type=bind,src=${directory},dst=/fixture`,
+        "--mount",
+        `type=bind,src=${join(upstream, "key.pem")},dst=/fixture-key.pem,readonly`,
+        "--mount",
+        `type=bind,src=${join(upstream, "ca.pem")},dst=/fixture-ca.pem,readonly`,
+        ...mounts,
+        "--entrypoint",
+        "/opt/orm-runtime/bin/node",
+        image,
+        "/investigation-fixtures/server.mjs",
+      ]);
+      await waitUntil(
+        () =>
+          result([
+            "exec",
+            upstreamName,
+            "/opt/orm-runtime/bin/node",
+            "-e",
+            "fetch('http://localhost:8317/proof').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+          ]).status === 0,
+        "Investigation upstream fixture did not start",
+      );
+      register("container", manager);
+      docker([
+        "run",
+        "--detach",
+        "--name",
+        manager,
+        "--label",
+        `${label}=${id}`,
+        "--network",
+        net,
+        "--mount",
+        `type=volume,src=${data},dst=/data`,
+        "--mount",
+        `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
+        "--env",
+        "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+        ...["config", "skills", "prompts"].flatMap((name) => [
+          "--mount",
+          `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
+        ]),
+        image,
+      ]);
+      await waitForHealth(manager);
+      await waitUntil(
+        () =>
+          request("/readyz", {}, manager).body.implementation
+            .awaiting_remote_validation === 1,
+        "Production entrypoint did not automatically implement a backfilled maintenance issue",
+        300000,
+      );
+      await waitUntil(() => {
+        const readiness = request("/readyz", {}, manager);
+        return (
+          readiness.status === 200 && readiness.body.pr_monitor.waiting === 1
+        );
+      }, "Waiting for PR CI incorrectly made the service unavailable");
+      const firstHead = JSON.parse(
+        docker([
+          "exec",
+          manager,
           "/opt/orm-runtime/bin/node",
           "-e",
-          "fetch('http://localhost:8317/proof').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
-        ]).status === 0,
-      "Investigation upstream fixture did not start",
-    );
-    register("container", manager);
-    docker([
-      "run",
-      "--detach",
-      "--name",
-      manager,
-      "--label",
-      `${label}=${id}`,
-      "--network",
-      net,
-      "--mount",
-      `type=volume,src=${data},dst=/data`,
-      "--mount",
-      `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
-      "--env",
-      "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
-      ...["config", "skills", "prompts"].flatMap((name) => [
-        "--mount",
-        `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
-      ]),
-      image,
-    ]);
-    await waitForHealth(manager);
-    await waitUntil(
-      () =>
-        request("/readyz", {}, manager).body.implementation
-          .awaiting_remote_validation === 1,
-      "Production entrypoint did not automatically implement a backfilled maintenance issue",
-      300000,
-    );
-    await waitUntil(() => {
-      const readiness = request("/readyz", {}, manager);
-      return (
-        readiness.status === 200 && readiness.body.pr_monitor.waiting === 1
+          "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x.heads[0])))",
+        ]),
       );
-    }, "Waiting for PR CI incorrectly made the service unavailable");
-    const firstHead = JSON.parse(
       docker([
         "exec",
         manager,
         "/opt/orm-runtime/bin/node",
+        "--input-type=module",
         "-e",
-        "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x.heads[0])))",
-      ]),
-    );
-    docker([
-      "exec",
-      manager,
-      "/opt/orm-runtime/bin/node",
-      "--input-type=module",
-      "-e",
-      `
+        `
       import {readFileSync} from 'node:fs'; import {createHmac} from 'node:crypto'; import {parse} from '/opt/orm/app/node_modules/yaml/dist/index.js';
       const state=await fetch('http://investigation-fixture:8317/review',{method:'POST'}).then(r=>r.json());
       const config=parse(readFileSync('/config/config.yml','utf8'));
@@ -1338,55 +1436,55 @@ try {
       const response=await fetch('http://localhost:8080/webhooks/github',{method:'POST',body,headers:{'content-type':'application/json','x-github-delivery':'monitor-review-feedback','x-github-event':'pull_request_review','x-hub-signature-256':'sha256='+createHmac('sha256',config.github.webhook_secret).update(body).digest('hex')}});
       if(response.status!==202)throw Error('review webhook rejected');
     `,
-    ]);
-    await waitUntil(
-      () => {
-        const proof = JSON.parse(
-          docker([
-            "exec",
-            manager,
-            "/opt/orm-runtime/bin/node",
-            "-e",
-            "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
-          ]),
-        );
-        return (
-          proof.heads[0].head !== firstHead.head &&
-          proof.threads[0]?.[1][0].isResolved
-        );
-      },
-      "Production review feedback did not publish and reconcile the tested repair",
-      300000,
-    );
-    const beforeChecks = JSON.parse(
+      ]);
+      await waitUntil(
+        () => {
+          const proof = JSON.parse(
+            docker([
+              "exec",
+              manager,
+              "/opt/orm-runtime/bin/node",
+              "-e",
+              "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+            ]),
+          );
+          return (
+            proof.heads[0].head !== firstHead.head &&
+            proof.threads[0]?.[1][0].isResolved
+          );
+        },
+        "Production review feedback did not publish and reconcile the tested repair",
+        300000,
+      );
+      const beforeChecks = JSON.parse(
+        docker([
+          "exec",
+          manager,
+          "/opt/orm-runtime/bin/node",
+          "-e",
+          "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+        ]),
+      );
+      assert(
+        !beforeChecks.notifications.some(
+          (event) => event.outcome === "ready_for_review",
+        ),
+      );
+      assert(
+        beforeChecks.monitors.some(
+          (record) => record.expected_head !== firstHead.head,
+        ),
+      );
+      stopCleanly(manager);
+      docker(["container", "start", manager]);
+      await waitForHealth(manager);
       docker([
         "exec",
         manager,
         "/opt/orm-runtime/bin/node",
+        "--input-type=module",
         "-e",
-        "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
-      ]),
-    );
-    assert(
-      !beforeChecks.notifications.some(
-        (event) => event.outcome === "ready_for_review",
-      ),
-    );
-    assert(
-      beforeChecks.monitors.some(
-        (record) => record.expected_head !== firstHead.head,
-      ),
-    );
-    stopCleanly(manager);
-    docker(["container", "start", manager]);
-    await waitForHealth(manager);
-    docker([
-      "exec",
-      manager,
-      "/opt/orm-runtime/bin/node",
-      "--input-type=module",
-      "-e",
-      `
+        `
       import {readFileSync} from 'node:fs'; import {createHmac} from 'node:crypto'; import {parse} from '/opt/orm/app/node_modules/yaml/dist/index.js';
       const state=await fetch('http://investigation-fixture:8317/checks',{method:'POST'}).then(r=>r.json());
       const config=parse(readFileSync('/config/config.yml','utf8'));
@@ -1394,40 +1492,40 @@ try {
       const response=await fetch('http://localhost:8080/webhooks/github',{method:'POST',body,headers:{'content-type':'application/json','x-github-delivery':'monitor-new-head-checks','x-github-event':'check_run','x-hub-signature-256':'sha256='+createHmac('sha256',config.github.webhook_secret).update(body).digest('hex')}});
       if(response.status!==202)throw Error('check webhook rejected');
     `,
-    ]);
-    await waitUntil(
-      () => {
-        const proof = JSON.parse(
-          docker([
-            "exec",
-            manager,
-            "/opt/orm-runtime/bin/node",
-            "-e",
-            "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
-          ]),
-        );
-        return (
-          proof.notifications.some(
-            (event) => event.outcome === "ready_for_review",
-          ) &&
-          proof.discord.some((event) =>
-            event.content.includes("ready for human review"),
-          ) &&
-          proof.smtp.some((event) =>
-            event.raw.includes("ready for human review"),
-          )
-        );
-      },
-      "Production pipeline did not deliver all ready notification channels",
-      120000,
-    );
-    docker([
-      "exec",
-      manager,
-      "/opt/orm-runtime/bin/node",
-      "--input-type=module",
-      "-e",
-      `
+      ]);
+      await waitUntil(
+        () => {
+          const proof = JSON.parse(
+            docker([
+              "exec",
+              manager,
+              "/opt/orm-runtime/bin/node",
+              "-e",
+              "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+            ]),
+          );
+          return (
+            proof.notifications.some(
+              (event) => event.outcome === "ready_for_review",
+            ) &&
+            proof.discord.some((event) =>
+              event.content.includes("ready for human review"),
+            ) &&
+            proof.smtp.some((event) =>
+              event.raw.includes("ready for human review"),
+            )
+          );
+        },
+        "Production pipeline did not deliver all ready notification channels",
+        120000,
+      );
+      docker([
+        "exec",
+        manager,
+        "/opt/orm-runtime/bin/node",
+        "--input-type=module",
+        "-e",
+        `
       import {readFileSync} from 'node:fs'; import {createHmac} from 'node:crypto'; import {parse} from '/opt/orm/app/node_modules/yaml/dist/index.js';
       await fetch('http://investigation-fixture:8317/new',{method:'POST'});
       const config=parse(readFileSync('/config/config.yml','utf8'));
@@ -1435,114 +1533,117 @@ try {
       const response=await fetch('http://localhost:8080/webhooks/github',{method:'POST',body,headers:{'content-type':'application/json','x-github-delivery':'investigation-new-issue','x-github-event':'issues','x-hub-signature-256':'sha256='+createHmac('sha256',config.github.webhook_secret).update(body).digest('hex')}});
       if(response.status!==202)throw Error('webhook rejected');
     `,
-    ]);
-    await waitUntil(
-      () =>
-        JSON.parse(
-          docker([
-            "exec",
-            manager,
-            "/opt/orm-runtime/bin/node",
-            "-e",
-            "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
-          ]),
-        ).comments.some(
-          ([number, comments]) =>
-            number === 2 &&
-            comments[0]?.body.includes("Feature request investigated"),
-        ),
-      "Production webhook did not trigger investigation",
-      180000,
-    );
-    const evidence = JSON.parse(
-      docker([
-        "exec",
-        manager,
-        "/opt/orm-runtime/bin/node",
-        "-e",
-        "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
-      ]),
-    );
-    assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
-    assert.equal(evidence.comments.length, 2);
-    assert.equal(evidence.pulls.length, 1);
-    assert.equal(evidence.pulls[0].draft, false);
-    assert(evidence.comments.every(([, comments]) => comments.length === 1));
-    assert(
-      evidence.requests.includes("investigation_plan") &&
-        evidence.requests.includes("investigation_result") &&
-        evidence.requests.includes("external_output_review") &&
-        evidence.requests.includes("implementation_change") &&
-        evidence.requests.includes("implementation_audit"),
-    );
-    assert.equal(request("/readyz", {}, manager).status, 200);
-    assert.equal(
-      evidence.notifications.filter(
-        (event) => event.outcome === "ready_for_review",
-      ).length,
-      1,
-    );
-    assert.equal(
-      evidence.notifications.find(
-        (event) => event.outcome === "ready_for_review",
-      ).pull.head_sha,
-      evidence.heads[0].head,
-    );
-    assert.equal(
-      evidence.mutations.filter((kind) => kind === "branch").length,
-      2,
-    );
-    stopCleanly(manager);
-    investigationStartupProof.push({
-      sdk,
-      production_entrypoint_backfill_and_webhook: "passed",
-      one_comment_per_issue: "passed",
-      reviewed_repair_and_new_head_gates: "passed",
-      readiness_notifications_all_channels: "passed",
-      restart_while_waiting: "passed",
-    });
+      ]);
+      await waitUntil(
+        () =>
+          JSON.parse(
+            docker([
+              "exec",
+              manager,
+              "/opt/orm-runtime/bin/node",
+              "-e",
+              "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+            ]),
+          ).comments.some(
+            ([number, comments]) =>
+              number === 2 &&
+              comments[0]?.body.includes("Feature request investigated"),
+          ),
+        "Production webhook did not trigger investigation",
+        180000,
+      );
+      const evidence = JSON.parse(
+        docker([
+          "exec",
+          manager,
+          "/opt/orm-runtime/bin/node",
+          "-e",
+          "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
+        ]),
+      );
+      assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
+      assert.equal(evidence.comments.length, 2);
+      assert.equal(evidence.pulls.length, 1);
+      assert.equal(evidence.pulls[0].draft, false);
+      assert(evidence.comments.every(([, comments]) => comments.length === 1));
+      assert(
+        evidence.requests.includes("investigation_plan") &&
+          evidence.requests.includes("investigation_result") &&
+          evidence.requests.includes("external_output_review") &&
+          evidence.requests.includes("implementation_change") &&
+          evidence.requests.includes("implementation_audit"),
+      );
+      assert.equal(request("/readyz", {}, manager).status, 200);
+      assert.equal(
+        evidence.notifications.filter(
+          (event) => event.outcome === "ready_for_review",
+        ).length,
+        1,
+      );
+      assert.equal(
+        evidence.notifications.find(
+          (event) => event.outcome === "ready_for_review",
+        ).pull.head_sha,
+        evidence.heads[0].head,
+      );
+      assert.equal(
+        evidence.mutations.filter((kind) => kind === "branch").length,
+        2,
+      );
+      stopCleanly(manager);
+      investigationStartupProof.push({
+        sdk,
+        production_entrypoint_backfill_and_webhook: "passed",
+        one_comment_per_issue: "passed",
+        reviewed_repair_and_new_head_gates: "passed",
+        readiness_notifications_all_channels: "passed",
+        restart_while_waiting: "passed",
+      });
+    }
   }
-
-  console.log("Verifying repository bootstrap");
-  register("volume", bootstrapVolume);
-  docker(["volume", "create", "--label", `${label}=${id}`, bootstrapVolume]);
-  register("container", bootstrapContainer);
-  docker([
-    "run",
-    "--detach",
-    "--name",
-    bootstrapContainer,
-    "--label",
-    `${label}=${id}`,
-    "--platform",
-    platform,
-    "--mount",
-    `type=volume,src=${bootstrapVolume},dst=/data`,
-    ...mounts,
-    image,
-  ]);
-  await waitForHealth(bootstrapContainer);
-  const bootstrapProof = JSON.parse(
-    docker(
-      [
-        "exec",
-        bootstrapContainer,
-        "/opt/orm-runtime/bin/node",
-        "--input-type=module",
-        "-e",
-        "import {runBootstrapTests} from '/bootstrap-fixtures/harness.mjs'; console.log(JSON.stringify(await runBootstrapTests()));",
-      ],
-      { timeout: 2_400_000 },
-    ),
-  );
-  assert.equal(bootstrapProof.bootstrap, "passed");
-  assert.equal(bootstrapProof.cleanup, "passed");
-  assert.equal(
-    request("/readyz", {}, bootstrapContainer).body.reason,
-    "service_unavailable",
-  );
-  stopCleanly(bootstrapContainer);
-
+  if (suite === "bootstrap") {
+    console.log("Verifying repository bootstrap");
+    register("volume", bootstrapVolume);
+    docker(["volume", "create", "--label", `${label}=${id}`, bootstrapVolume]);
+    register("container", bootstrapContainer);
+    docker([
+      "run",
+      "--detach",
+      "--name",
+      bootstrapContainer,
+      "--label",
+      `${label}=${id}`,
+      "--platform",
+      platform,
+      "--mount",
+      `type=volume,src=${bootstrapVolume},dst=/data`,
+      ...mounts,
+      image,
+    ]);
+    await waitForHealth(bootstrapContainer);
+    phase("bootstrap");
+    bootstrapProof = JSON.parse(
+      docker(
+        [
+          "exec",
+          bootstrapContainer,
+          "/opt/orm-runtime/bin/node",
+          "--input-type=module",
+          "-e",
+          "import {runBootstrapTests} from '/bootstrap-fixtures/harness.mjs'; console.log(JSON.stringify(await runBootstrapTests()));",
+        ],
+        { timeout: 2_400_000 },
+      ),
+    );
+    assert.equal(bootstrapProof.bootstrap, "passed");
+    assert.equal(bootstrapProof.cleanup, "passed");
+    assert.equal(
+      request("/readyz", {}, bootstrapContainer).body.reason,
+      "service_unavailable",
+    );
+    stopCleanly(bootstrapContainer);
+  }
+  phase("shutdown-and-persistence");
   console.log("Verifying shutdown and persistence");
   const healthyDeadline = Date.now() + 30_000;
   while (
@@ -1566,13 +1667,12 @@ try {
     "durable",
   );
   stopCleanly();
-  const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: root,
-    encoding: "utf8",
-  }).trim();
   const imageId = docker(["image", "inspect", "--format", "{{.Id}}", image]);
   receipt = {
+    suite,
     platform,
+    pr_head_sha: prHeadSha,
+    dirty_worktree: dirtyWorktree,
     source_sha: sourceSha,
     image_id: imageId,
     http: "passed",
@@ -1587,13 +1687,15 @@ try {
     selective_mcp_writes: mcpWriteProof,
     issue_investigation: investigationProof,
     maintenance_implementation: implementationProof,
-    investigation_startup: investigationStartupProof,
+    investigation_startup:
+      suite === "investigation" ? investigationStartupProof : undefined,
     durable_notifications: notificationProof,
     repository_bootstrap: bootstrapProof,
   };
 } catch (error) {
   failure = error;
 } finally {
+  phase("cleanup");
   console.log("Cleaning owned test resources");
   if (protectedFixtures) {
     try {
@@ -1645,15 +1747,29 @@ try {
   }
 }
 
+phase();
 if (failure || cleanupErrors.length)
   throw new AggregateError(
     [...(failure ? [failure] : []), ...cleanupErrors],
     "Container verification or scoped cleanup failed",
   );
-console.log(
-  JSON.stringify({
-    ...receipt,
-    cleanup: "passed",
-    resources_removed: resources.map(({ type, name }) => ({ type, name })),
-  }),
-);
+receipt = {
+  ...receipt,
+  timings,
+  cleanup: "passed",
+  resources_removed: resources.map(({ type, name }) => ({ type, name })),
+};
+console.log(JSON.stringify(receipt));
+if (process.env.GITHUB_STEP_SUMMARY) {
+  await appendFile(
+    process.env.GITHUB_STEP_SUMMARY,
+    `### ${suite} (${platform})\n\nPR head: ${receipt.pr_head_sha ?? "not applicable"}; tested commit: ${receipt.source_sha}; dirty: ${receipt.dirty_worktree}.\n\nImage: ${receipt.image_id}; cleanup: ${receipt.cleanup}.\n\n| Phase | Seconds |\n| --- | ---: |\n` +
+      receipt.timings
+        .map(
+          (item) =>
+            `| ${item.phase} | ${(item.duration_ms / 1000).toFixed(2)} |`,
+        )
+        .join("\n") +
+      "\n\n",
+  );
+}
