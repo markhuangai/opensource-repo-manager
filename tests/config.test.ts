@@ -73,6 +73,26 @@ describe("strict protected configuration contract", () => {
         ).toBe(effort);
       });
   }
+  it.each([
+    "smtp .example.invalid",
+    "smtp/example.invalid",
+    "smtp\0.example.invalid",
+  ])("rejects malformed SMTP host %j", (host) => {
+    const config = fixtureConfiguration();
+    config.notifications.smtp = {
+      enabled: true,
+      host,
+      port: 465,
+      secure: true,
+      username: "smtp-user-canary",
+      password: "smtp-password-canary",
+      from: "orm@example.invalid",
+      to: ["maintainer@example.invalid"],
+    };
+    expect(() => parseConfiguration(stringify(config))).toThrow(
+      "schema_invalid",
+    );
+  });
   it("accepts all enabled notification channel types and configurable budgets", () => {
     const config = fixtureConfiguration();
     config.notifications.discord = {
@@ -92,9 +112,9 @@ describe("strict protected configuration contract", () => {
     };
     config.limits.active_minutes = 30;
     config.limits.repair_cycles = 0;
-    expect(parseConfiguration(stringify(config)).limits.active_minutes).toBe(
-      30,
-    );
+    const parsed = parseConfiguration(stringify(config));
+    expect(parsed.notifications.smtp).toEqual(config.notifications.smtp);
+    expect(parsed.limits.active_minutes).toBe(30);
     const { settings, secrets } = separateSecrets(config);
     expect(JSON.stringify(settings)).not.toMatch(
       /notification-secret|smtp-password-canary|maintainer@example/,

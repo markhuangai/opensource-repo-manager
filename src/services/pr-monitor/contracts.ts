@@ -3,6 +3,12 @@ import { githubId, sha } from "../../domain/jobs.ts";
 import type { Configuration } from "../../config/schema.ts";
 
 export type PrMonitorPolicy = Configuration["pr_monitor"];
+export const readinessReadFailures = new Set([
+  "github_read_failed",
+  "github_graphql_failed",
+  "github_rate_limited",
+  "enrollment_pending",
+]);
 const actor = z.object({ id: githubId, login: z.string() });
 export const prReview = z.object({
   id: githubId,

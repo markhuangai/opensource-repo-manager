@@ -57,7 +57,8 @@ export async function runMcpWriteTests() {
     activeResponses = new Map(),
     errors = [],
     requests = [],
-    noticeRequests = [];
+    noticeRequests = [],
+    reviewFailures = [];
   let sdk,
     fixture,
     store,
@@ -283,6 +284,20 @@ export async function runMcpWriteTests() {
     };
     options.mcp = gateway;
     supervisor = await Supervisor.create(store, snapshot, secrets, options);
+    const runReview = supervisor.runReview.bind(supervisor);
+    supervisor.runReview = async function* (...args) {
+      for await (const event of runReview(...args)) {
+        if (
+          event.type === "progress" &&
+          /^(claude|codex)_[a-z_]{1,40}$/.test(event.message) &&
+          !secrets.containsCredentials(event.message)
+        ) {
+          reviewFailures.push({ job_id: args[1].job_id, code: event.message });
+          if (reviewFailures.length > 16) reviewFailures.shift();
+        }
+        yield event;
+      }
+    };
     gateway.setWriteDispatcher({
       assertAvailable: (reviewed) =>
         supervisor.mcpWrites.assertAvailable(reviewed),
@@ -315,6 +330,7 @@ export async function runMcpWriteTests() {
     gateway = undefined;
   };
   const proof = [];
+  let failure, result;
   try {
     for (sdk of ["codex", "claude"]) {
       config = parseConfiguration(await readFile("/config/config.yml", "utf8"));
@@ -578,6 +594,9 @@ export async function runMcpWriteTests() {
                 .filter((run) => run.job_id === job.id)
                 .map((run) => ({ role: run.role, status: run.status })),
               model_errors: errors.map((error) => error.name),
+              review_failures: reviewFailures.filter(
+                (failure) => failure.job_id === job.id,
+              ),
             }),
           );
           assert.equal(operation(job).state, "response_recorded");
@@ -882,6 +901,77 @@ export async function runMcpWriteTests() {
           fixture.store = store;
           await boot();
           assert.equal(calls.length, before, "Startup transmitted a write");
+          const competing = seed(),
+            attemptsBefore = supervisor.mcpWrites.receipt(
+              uncertain.id,
+            ).attempts,
+            budgetBefore = store.jobById(job.id).budget_json;
+          let releaseLease;
+          const held = new Promise((resolve) => {
+            releaseLease = resolve;
+          });
+          const holder = supervisor.withJobLease(
+            supervisor.request(competing.id, "implementation"),
+            signal(),
+            () => held,
+          );
+          try {
+            await until(() =>
+              store.leases().some((lease) => lease.job_id === competing.id),
+            );
+            await assert.rejects(
+              () => supervisor.mcpWrites.recover(uncertain.id, signal()),
+              (error) =>
+                error.code === "lease_busy" &&
+                error.message === "Worker unavailable (lease_busy).",
+            );
+            assert.equal(
+              supervisor.mcpWrites.receipt(uncertain.id).failure,
+              "lease_busy",
+            );
+            assert.equal(
+              supervisor.mcpWrites.receipt(uncertain.id).state,
+              "uncertain",
+            );
+            assert.deepEqual(
+              supervisor.mcpWrites.receipt(uncertain.id).attempts,
+              attemptsBefore,
+            );
+            assert.equal(store.jobById(job.id).budget_json, budgetBefore);
+            assert.equal(calls.length, before);
+            assert.equal(effects.size, effectCount);
+          } finally {
+            releaseLease();
+            await holder;
+          }
+          store.db.exec(`CREATE TEMP TRIGGER fixture_recovery_failure
+            BEFORE INSERT ON mcp_write_recovery_leases
+            BEGIN SELECT RAISE(ABORT,'unsafe recovery diagnostic'); END`);
+          try {
+            await assert.rejects(
+              () => supervisor.mcpWrites.recover(uncertain.id, signal()),
+              (error) =>
+                error.code === "mcp_write_failed" &&
+                error.message === "Worker unavailable (mcp_write_failed).",
+            );
+            const receipt = supervisor.mcpWrites.receipt(uncertain.id);
+            assert.equal(receipt.failure, "mcp_write_failed");
+            assert.equal(receipt.state, "uncertain");
+            assert.deepEqual(receipt.attempts, attemptsBefore);
+            assert(
+              !JSON.stringify(receipt).includes("unsafe recovery diagnostic"),
+            );
+            assert.equal(store.jobById(job.id).budget_json, budgetBefore);
+            assert.equal(calls.length, before);
+            assert.equal(effects.size, effectCount);
+          } finally {
+            store.db.exec("DROP TRIGGER fixture_recovery_failure");
+          }
+          proof.push({
+            sdk,
+            recovery_lease_busy_safe_receipt: "passed",
+            recovery_unknown_error_redacted: "passed",
+          });
           const result = await supervisor.mcpWrites.recover(
             uncertain.id,
             signal(),
@@ -1149,9 +1239,23 @@ export async function runMcpWriteTests() {
         cleanup: "passed",
       });
     }
-    return { mcp_writes: "passed", scenarios: proof, cleanup: "passed" };
+    result = { mcp_writes: "passed", scenarios: proof, cleanup: "passed" };
+  } catch (error) {
+    failure = { error };
   } finally {
-    await shutdown();
+    try {
+      await shutdown();
+    } catch (error) {
+      failure = {
+        error: failure
+          ? new AggregateError(
+              [failure.error, error],
+              "MCP verification and shutdown failed",
+              { cause: error },
+            )
+          : error,
+      };
+    }
     if (store.db.open) store.close();
     await Promise.all([...servers].map((server) => server.close()));
     upstream.closeAllConnections();
@@ -1162,4 +1266,6 @@ export async function runMcpWriteTests() {
     await new Promise((resolve) => notifications.close(resolve));
     await remote.close();
   }
+  if (failure) throw failure.error;
+  return result;
 }

@@ -50,6 +50,7 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
   const loaded = await loadProtectedConfiguration(),
     context = await contextServer();
   const notifications = [],
+    discordRequests = [],
     logs = [],
     errors = [],
     proof = [];
@@ -72,7 +73,17 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
     let body = "";
     for await (const chunk of req) body += chunk;
     const event = JSON.parse(body);
+    if (req.url === "/discord") {
+      discordRequests.push(event);
+      res.end("accepted");
+      return;
+    }
     notifications.push(event);
+    if (controls.deferReady && event.outcome === "ready_for_review") {
+      res.writeHead(429, { "retry-after": "1" });
+      res.end("deferred");
+      return;
+    }
     if (controls.loseReady && event.outcome === "ready_for_review") {
       res.destroy();
       return;
@@ -335,9 +346,68 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
           .body.includes("awaiting remote validation"),
       );
       const effects = remote.state.mutations.length;
-      await investigation.reconcile();
-      await investigation.reconcile();
+      const changes = () =>
+        store.db.prepare("SELECT total_changes() AS total").get().total;
+      const idleChanges = changes();
+      await implementation.reconcile(new globalThis.AbortController().signal);
+      await implementation.reconcile(new globalThis.AbortController().signal);
+      await implementation.reconcile(new globalThis.AbortController().signal);
+      assert.equal(
+        changes(),
+        idleChanges,
+        "Completed maintenance reconciliation wrote unchanged SQLite state",
+      );
       assert.equal(remote.state.mutations.length, effects);
+      const completed = record(passed.job);
+      completed.stage = "publishing";
+      implementation.repository.save(completed);
+      store.db
+        .prepare("UPDATE jobs SET phase='implementation' WHERE id=?")
+        .run(passed.job.id);
+      await implementation.reconcile(new globalThis.AbortController().signal);
+      assert.equal(record(passed.job).stage, "remote_review");
+      assert.equal(store.jobById(passed.job.id).phase, "remote_review");
+      assert.equal(remote.state.mutations.length, effects);
+      const nextStatus = record(passed.job);
+      nextStatus.status_generation++;
+      implementation.repository.save(nextStatus);
+      await implementation.reconcile(new globalThis.AbortController().signal);
+      const status = supervisor.publication.repository.operation(
+        record(passed.job).status_operation,
+      );
+      assert.equal(status.status, "confirmed");
+      assert.equal(
+        remote.state.mutations.length,
+        effects + 1,
+        "A changed status operation was skipped",
+      );
+      status.status = "uncertain";
+      status.steps.find((step) => step.kind === "comment").state = "uncertain";
+      supervisor.publication.repository.save(status);
+      await implementation.reconcile(new globalThis.AbortController().signal);
+      assert.equal(
+        supervisor.publication.repository.operation(status.id).status,
+        "confirmed",
+      );
+      assert.equal(
+        remote.state.mutations.length,
+        effects + 1,
+        "Confirmed remote status was sent again during recovery",
+      );
+      const recoveredIdleChanges = changes();
+      await implementation.reconcile(new globalThis.AbortController().signal);
+      await implementation.reconcile(new globalThis.AbortController().signal);
+      assert.equal(changes(), recoveredIdleChanges);
+      proof.push({
+        sdk,
+        idle_implementation_sqlite_unchanged: "passed",
+        confirmed_change_handoff_recovery: "passed",
+        unconfirmed_status_recovery: "passed",
+      });
+      const reconciledEffects = remote.state.mutations.length;
+      await investigation.reconcile();
+      await investigation.reconcile();
+      assert.equal(remote.state.mutations.length, reconciledEffects);
       assert.equal(
         remote.state.comments.get(passed.job.issue_number).length,
         1,
@@ -1065,6 +1135,323 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
         repaired_head_ready_without_intake_refresh: "passed",
       });
 
+      {
+        await closeRuntime();
+        config.notifications.discord = {
+          enabled: true,
+          webhook_url: `http://127.0.0.1:${notifier.address().port}/discord`,
+        };
+        configure(false);
+        await start();
+        attachMonitor();
+        const transientReady = await run("source_only");
+        certify(transientReady.job);
+        controls.deferReady = true;
+        const readyEvent = await pump(
+          transientReady.job,
+          (item) => item.stage === "ready",
+        );
+        const eventId = readyEvent.notification_id,
+          readinessId = readyEvent.readiness_id,
+          verificationGeneration = readyEvent.policy_generation,
+          receipt = (channel) =>
+            supervisor.notifications
+              .receipt(eventId)
+              .find((item) => item.channel === channel),
+          wakeNotifications = async () => {
+            const event = supervisor.notifications.prepare({
+              id: `wake-${readyEvent.id}`,
+              job_id: transientReady.job.id,
+              revision: transientReady.job.revision,
+              repository_id: 42,
+              issue_number: transientReady.job.issue_number,
+              occurred_at: readyEvent.started_at,
+              outcome: "needs_attention",
+              reason: "workflow_blocked",
+            });
+            await supervisor.notifications.enqueue(
+              event,
+              {},
+              new globalThis.AbortController().signal,
+            );
+          },
+          expediteWebhook = () => {
+            const pending = globalThis.structuredClone(receipt("webhook"));
+            pending.retry_at = 0;
+            supervisor.notifications.repository.save(pending);
+          },
+          releaseObservation = () => {
+            const current = monitor.repository.get(transientReady.job.id);
+            current.retry_at = 0;
+            monitor.repository.save(current);
+          };
+        await until(
+          () =>
+            receipt("discord")?.state === "confirmed" &&
+            receipt("webhook")?.state === "pending" &&
+            receipt("webhook")?.attempts.length === 1,
+          "Two-channel ready delivery did not reach its partial checkpoint",
+        );
+        controls.deferReady = false;
+        const confirmedDiscord = globalThis.structuredClone(receipt("discord")),
+          discordCount = () =>
+            discordRequests.filter((event) =>
+              event.content.includes(`Event: ${eventId}`),
+            ).length,
+          webhookCount = () =>
+            notifications.filter((event) => event.event_id === eventId).length,
+          originalBudget = store.jobById(transientReady.job.id).budget_json;
+        assert.equal(discordCount(), 1);
+        assert.equal(webhookCount(), 1);
+        remote.state.rateLimit = {
+          method: "GET",
+          path: `/repos/owner/repo/issues/${transientReady.job.issue_number}`,
+          seconds: 60,
+        };
+        expediteWebhook();
+        await wakeNotifications();
+        await until(
+          () => receipt("webhook")?.reason === "readiness_unavailable",
+          "Delivery-time readiness outage was not retained as pending",
+        );
+        const suspended = monitor.repository.get(transientReady.job.id);
+        assert.equal(suspended.stage, "waiting");
+        assert.equal(suspended.failure, "github_rate_limited");
+        assert(suspended.retry_at > Date.now() + 55_000);
+        assert.equal(suspended.readiness_id, readinessId);
+        assert.equal(suspended.notification_id, eventId);
+        assert.equal(suspended.policy_generation, verificationGeneration);
+        assert.throws(
+          () => monitor.repository.readiness(readinessId),
+          /pr_readiness_unavailable/,
+        );
+        assert.deepEqual(receipt("discord"), confirmedDiscord);
+        assert.equal(receipt("webhook").attempts.length, 1);
+        assert.equal(
+          store.jobById(transientReady.job.id).budget_json,
+          originalBudget,
+        );
+        const requestsBeforeRetry = remote.state.requests.length;
+        expediteWebhook();
+        await wakeNotifications();
+        await until(
+          () => receipt("webhook").retry_at > Date.now() + 29_000,
+          "Suspended validation did not defer its retry",
+        );
+        assert.equal(
+          remote.state.requests.length,
+          requestsBeforeRetry,
+          "Readiness retry ignored the retained GitHub backoff",
+        );
+        assert.equal(receipt("webhook").state, "pending");
+        assert.equal(receipt("webhook").attempts.length, 1);
+        assert.equal(webhookCount(), 1);
+        assert.equal(discordCount(), 1);
+        const deferredWebhook = globalThis.structuredClone(receipt("webhook"));
+        deferredWebhook.retry_at = Date.now() + 3_600_000;
+        supervisor.notifications.repository.save(deferredWebhook);
+        await closeRuntime();
+        await start();
+        attachMonitor();
+        assert.deepEqual(receipt("discord"), confirmedDiscord);
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).readiness_id,
+          readinessId,
+        );
+        releaseObservation();
+        await monitor.reconcile();
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).stage,
+          "ready",
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).readiness_id,
+          readinessId,
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).notification_id,
+          eventId,
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).policy_generation,
+          verificationGeneration,
+        );
+        const target = supervisor.publication.repository.target(
+            transientReady.job.id,
+          ),
+          retriesBefore = JSON.parse(
+            store.jobById(transientReady.job.id).budget_json,
+          ).infrastructure_retries;
+        remote.state.readFailure = {
+          path: `/repos/owner/repo/pulls/${target.pull.number}`,
+          status: 503,
+        };
+        await monitor.reconcile();
+        const periodicallySuspended = monitor.repository.get(
+          transientReady.job.id,
+        );
+        assert.equal(periodicallySuspended.stage, "waiting");
+        assert.equal(periodicallySuspended.failure, "github_read_failed");
+        assert.equal(periodicallySuspended.readiness_id, readinessId);
+        assert.equal(
+          periodicallySuspended.policy_generation,
+          verificationGeneration,
+        );
+        assert.equal(
+          JSON.parse(store.jobById(transientReady.job.id).budget_json)
+            .infrastructure_retries,
+          retriesBefore + 1,
+        );
+        assert.deepEqual(receipt("discord"), confirmedDiscord);
+        assert.equal(discordCount(), 1);
+        assert.equal(webhookCount(), 1);
+        releaseObservation();
+        await monitor.reconcile();
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).stage,
+          "ready",
+        );
+        const cancellation = new globalThis.AbortController();
+        cancellation.abort(new Error("fixture validation cancellation"));
+        await assert.rejects(() =>
+          monitor.validateReadiness(readinessId, cancellation.signal),
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).readiness_id,
+          readinessId,
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).policy_generation,
+          verificationGeneration,
+        );
+        expediteWebhook();
+        await wakeNotifications();
+        await until(
+          () => receipt("webhook").state === "confirmed",
+          "Recovered readiness did not resume the pending channel",
+        );
+        assert.deepEqual(receipt("discord"), confirmedDiscord);
+        assert.equal(discordCount(), 1);
+        assert.equal(webhookCount(), 2);
+        assert.equal(receipt("webhook").attempts.length, 2);
+        assert.equal(
+          new Set(
+            supervisor.notifications.repository
+              .receipts()
+              .filter(
+                (item) =>
+                  supervisor.notifications.repository.event(item.event_id)
+                    ?.prepared.event.job_id === transientReady.job.id &&
+                  supervisor.notifications.repository.event(item.event_id)
+                    ?.prepared.event.outcome === "ready_for_review",
+              )
+              .map((item) => item.event_id),
+          ).size,
+          1,
+        );
+        remote.state.readFailure = {
+          path: `/repos/owner/repo/pulls/${target.pull.number}`,
+          status: 200,
+          body: {},
+        };
+        await assert.rejects(() =>
+          monitor.validateReadiness(
+            readinessId,
+            new globalThis.AbortController().signal,
+          ),
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).readiness_id,
+          null,
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).policy_generation,
+          verificationGeneration + 1,
+        );
+        controls.deferReady = true;
+        const replacement = await pump(
+          transientReady.job,
+          (item) => item.stage === "ready",
+        );
+        const replacementId = replacement.notification_id,
+          replacementReceipt = (channel) =>
+            supervisor.notifications
+              .receipt(replacementId)
+              .find((item) => item.channel === channel);
+        await until(
+          () =>
+            replacementReceipt("discord")?.state === "confirmed" &&
+            replacementReceipt("webhook")?.state === "pending" &&
+            replacementReceipt("webhook")?.attempts.length === 1,
+          "Replacement ready event did not reach its partial checkpoint",
+        );
+        controls.deferReady = false;
+        remote.state.readFailure = {
+          path: `/repos/owner/repo/issues/${transientReady.job.issue_number}`,
+          status: 503,
+        };
+        await assert.rejects(
+          () =>
+            monitor.validateReadiness(
+              replacement.readiness_id,
+              new globalThis.AbortController().signal,
+            ),
+          /github_read_failed/,
+        );
+        const originalWebhookUrl = config.notifications.webhook.url;
+        await closeRuntime();
+        config.notifications.webhook.url = originalWebhookUrl + "/changed";
+        configure(false);
+        await start();
+        attachMonitor();
+        assert.equal(replacementReceipt("webhook").state, "held");
+        assert.equal(
+          replacementReceipt("webhook").reason,
+          "destination_changed",
+        );
+        assert.equal(replacementReceipt("discord").state, "confirmed");
+        store.db
+          .prepare(
+            "UPDATE jobs SET budget_json=json_set(budget_json,'$.infrastructure_retries',?) WHERE id=?",
+          )
+          .run(
+            snapshot.settings.limits.infrastructure_retries,
+            transientReady.job.id,
+          );
+        releaseObservation();
+        remote.state.readFailure = {
+          path: `/repos/owner/repo/pulls/${target.pull.number}`,
+          status: 503,
+        };
+        await monitor.reconcile();
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).stage,
+          "blocked",
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).failure,
+          "github_read_failed",
+        );
+        assert.equal(
+          monitor.repository.get(transientReady.job.id).readiness_id,
+          null,
+        );
+        proof.push({
+          sdk,
+          readiness_partial_channels_transient_delivery_and_periodic_reads:
+            "passed",
+          readiness_transient_restart_same_event: "passed",
+          readiness_cancellation_preserves_identity: "passed",
+          readiness_unknown_response_invalidates: "passed",
+        });
+        await closeRuntime();
+        config.notifications.webhook.url = originalWebhookUrl;
+        config.notifications.discord = { enabled: false };
+        configure(false);
+        await start();
+        attachMonitor();
+      }
+
       const concurrent = await run("source_only"),
         concurrentTarget = supervisor.publication.repository.target(
           concurrent.job.id,
@@ -1103,36 +1490,71 @@ export async function runImplementationTests(sdks = ["codex", "claude"]) {
           await assessmentGate;
         }
       };
-      const advancing = monitor.advance(
-        store.jobById(concurrent.job.id),
-        AbortSignal.timeout(30000),
-      );
-      await assessing;
-      remote.state.beforeRequest = async (method, path) => {
-        if (
-          method === "GET" &&
-          path === `/repos/owner/repo/pulls/${concurrentTarget.pull.number}`
-        ) {
-          observationHeld();
-          await observationGate;
+      const advancingSignal = AbortSignal.timeout(30000),
+        started = Date.now(),
+        advancing = monitor.advance(
+          store.jobById(concurrent.job.id),
+          advancingSignal,
+        ),
+        deferredMonitors = [];
+      try {
+        await assessing;
+        for (const item of monitor.repository.all()) {
+          if (item.job_id === concurrent.job.id) continue;
+          deferredMonitors.push({
+            job_id: item.job_id,
+            retry_at: item.retry_at,
+          });
+          item.retry_at = Date.now() + 60_000;
+          monitor.repository.save(item);
         }
-      };
-      const observing = monitor.reconcile();
-      await Promise.race([observing, held]);
-      remote.state.beforeRequest = undefined;
-      releaseAssessment();
-      await advancing;
-      const committedFindings = monitor.repository.get(
-        concurrent.job.id,
-      ).findings;
-      assert(committedFindings.some((item) => item.publication_id));
-      releaseObservation();
-      await observing;
-      assert.deepEqual(
-        monitor.repository.get(concurrent.job.id).findings,
-        committedFindings,
-      );
-      controls.implementation = undefined;
+        remote.state.beforeRequest = async (method, path) => {
+          if (
+            method === "GET" &&
+            path === `/repos/owner/repo/pulls/${concurrentTarget.pull.number}`
+          ) {
+            observationHeld();
+            await observationGate;
+          }
+        };
+        const observing = monitor.reconcile();
+        await Promise.race([observing, held]);
+        remote.state.beforeRequest = undefined;
+        releaseAssessment();
+        await advancing;
+        const committed = monitor.repository.get(concurrent.job.id),
+          committedFindings = committed.findings;
+        assert(
+          committedFindings.some((item) => item.publication_id),
+          JSON.stringify({
+            aborted: advancingSignal.aborted,
+            elapsed_ms: Date.now() - started,
+            stage: committed.stage,
+            failure: committed.failure,
+            recent_runs: store
+              .runs()
+              .filter((item) => item.job_id === concurrent.job.id)
+              .slice(-3)
+              .map(({ role, status }) => ({ role, status })),
+          }),
+        );
+        releaseObservation();
+        await observing;
+        assert.deepEqual(
+          monitor.repository.get(concurrent.job.id).findings,
+          committedFindings,
+        );
+      } finally {
+        releaseAssessment();
+        releaseObservation();
+        remote.state.beforeRequest = undefined;
+        controls.implementation = undefined;
+        for (const item of deferredMonitors) {
+          const current = monitor.repository.get(item.job_id);
+          current.retry_at = item.retry_at;
+          monitor.repository.save(current);
+        }
+      }
       await pump(concurrent.job, (item) => item.stage === "ready");
       assert.equal(
         remote.state.threads.get(concurrentTarget.pull.number)[0].comments
