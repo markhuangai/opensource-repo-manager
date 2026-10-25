@@ -281,7 +281,15 @@ export class NotificationService {
     const stored = this.repository.event(receipt.event_id)!;
     const expected = stored.prepared.channels[receipt.channel]!;
     try {
-      this.current(stored.prepared.event);
+      try {
+        this.current(stored.prepared.event);
+      } catch (error) {
+        if (
+          !(error instanceof RuntimeError) ||
+          error.code !== "pr_readiness_unavailable"
+        )
+          throw error;
+      }
       if (this.channels[receipt.channel]?.binding !== expected.binding)
         throw new NotificationError("destination_changed");
       if (this.secrets.containsCredentials(stored.prepared))

@@ -21,6 +21,7 @@ import type {
   PrSnapshot,
   ReviewSurface,
 } from "./contracts.ts";
+import { readinessReadFailures } from "./contracts.ts";
 import {
   evaluateReadiness,
   findingIdentity,
@@ -846,6 +847,7 @@ export class PrMonitorService {
     const evidence =
       this.repository.read<import("./contracts.ts").PrReadiness>(id);
     try {
+      this.repository.readiness(id);
       const job = this.store.jobById(evidence.job_id);
       if (!job) throw new RuntimeError("revision_stale");
       await this.intake.refresh(job.issue_number, signal, false);
@@ -872,10 +874,11 @@ export class PrMonitorService {
       )
         throw new RuntimeError("pr_readiness_stale");
     } catch (error) {
+      if (signal.aborted) throw error;
       if (!this.busy.has(evidence.job_id)) {
         const current = this.repository.get(evidence.job_id);
         if (current?.readiness_id === id) {
-          this.invalidate(current);
+          if (!this.suspendReadiness(current, error)) this.invalidate(current);
           this.repository.save(current);
         }
       }
@@ -999,7 +1002,7 @@ export class PrMonitorService {
     const job = this.store.jobById(record.job_id);
     if (!job || job.status !== "pending" || job.revision !== record.revision)
       return;
-    const id = `pr-${record.id}-${ready ? record.expected_head.slice(0, 12) : "blocked"}-${record.policy_generation}`;
+    const id = this.notificationId(record, ready);
     if (this.supervisor.notifications.repository.event(id)) return;
     if (ready) await this.validateReadiness(record.readiness_id!, signal);
     const event = this.supervisor.notifications.prepare({
@@ -1031,6 +1034,40 @@ export class PrMonitorService {
     }
   }
 
+  private notificationId(record: PrMonitor, ready: boolean) {
+    return `pr-${record.id}-${ready ? record.expected_head.slice(0, 12) : "blocked"}-${record.policy_generation}`;
+  }
+
+  private suspendReadiness(record: PrMonitor, error: unknown) {
+    const code = this.code(error);
+    if (
+      !readinessReadFailures.has(code) &&
+      !(
+        code === "pr_readiness_unavailable" &&
+        readinessReadFailures.has(record.failure ?? "")
+      )
+    )
+      return false;
+    const event = this.supervisor.notifications.repository.event(
+      this.notificationId(record, true),
+    )?.prepared.event;
+    if (
+      !record.readiness_id ||
+      event?.readiness_id !== record.readiness_id ||
+      event.head_sha !== record.expected_head
+    )
+      return false;
+    record.stage = "waiting";
+    if (code !== "pr_readiness_unavailable") record.failure = code;
+    record.wait_accounted_at ??= Date.now();
+    record.retry_at = Math.max(
+      record.retry_at,
+      Date.now() + 1000,
+      error instanceof IntakeError ? error.retryAt : 0,
+    );
+    return true;
+  }
+
   private code(error: unknown) {
     return error instanceof RuntimeError || error instanceof IntakeError
       ? error.code
@@ -1053,10 +1090,11 @@ export class PrMonitorService {
       this.repository.save(record);
       return;
     }
-    this.invalidate(record);
+    const suspended = this.suspendReadiness(record, error);
+    if (!suspended) this.invalidate(record);
     this.repository.accountWait(record);
     if (
-      transient.has(code) &&
+      (transient.has(code) || suspended) &&
       this.store.reserveInfrastructureRetry(record.job_id)
     ) {
       record.stage = "waiting";
@@ -1065,10 +1103,11 @@ export class PrMonitorService {
         Date.now() + 1000,
         error instanceof IntakeError ? error.retryAt : 0,
       );
-      record.failure = null;
+      if (!suspended) record.failure = null;
       this.repository.save(record);
       return;
     }
+    if (suspended) this.invalidate(record);
     record.stage = "blocked";
     record.failure = this.store.hasUncertainMcpWrite(record.job_id)
       ? "mcp_write_uncertain"

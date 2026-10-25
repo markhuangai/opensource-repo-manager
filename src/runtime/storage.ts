@@ -99,11 +99,17 @@ for (const pid of await readdir("/proc")) {
           )
             break;
           retryDeadline ??= performance.now() + 250;
+          const processStat = await readFile(`${path}/stat`, "utf8"),
+            nameEnd = processStat.lastIndexOf(") "),
+            flags = processStat.slice(nameEnd + 2).split(/\s+/)[6];
+          if (nameEnd < 0 || !flags || !/^\d+$/.test(flags)) throw error;
           const threads = Number(current.match(/^Threads:\s+(\d+)$/m)?.[1]),
+            // Linux PF_EXITING can precede the zombie state while memory is released.
             exitingGroup =
-              /^State:\s+[ZX]\b/m.test(current) &&
-              Number.isSafeInteger(threads) &&
-              threads > 1,
+              (BigInt(flags) & 0x4n) !== 0n ||
+              (/^State:\s+[ZX]\b/m.test(current) &&
+                Number.isSafeInteger(threads) &&
+                threads > 1),
             deadline = exitingGroup
               ? (teardownDeadline ??= performance.now() + 1000)
               : retryDeadline,

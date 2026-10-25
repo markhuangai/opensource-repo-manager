@@ -10,6 +10,7 @@ import type {
   PrReadiness,
   PrSnapshot,
 } from "../services/pr-monitor/contracts.ts";
+import { readinessReadFailures } from "../services/pr-monitor/contracts.ts";
 
 export class PrMonitorRepository {
   private readonly store: Store;
@@ -164,8 +165,6 @@ export class PrMonitorRepository {
     if (
       !record ||
       record.readiness_id !== id ||
-      !["ready", "queued"].includes(record.stage) ||
-      record.failure ||
       evidence.monitor_id !== record.id ||
       evidence.head_sha !== record.expected_head ||
       evidence.head_sha !== record.observed_head ||
@@ -174,6 +173,13 @@ export class PrMonitorRepository {
     )
       throw new RuntimeError("pr_readiness_stale");
     this.current(record);
+    if (
+      ["waiting", "queued"].includes(record.stage) &&
+      readinessReadFailures.has(record.failure ?? "")
+    )
+      throw new RuntimeError("pr_readiness_unavailable");
+    if (!["ready", "queued"].includes(record.stage) || record.failure)
+      throw new RuntimeError("pr_readiness_stale");
     return evidence;
   }
 }

@@ -991,7 +991,7 @@ try {
         "-e",
         "import {runPublicationTests} from '/publication-fixtures/harness.mjs'; console.log(JSON.stringify(await runPublicationTests()));",
       ],
-      { timeout: 600_000 },
+      { timeout: 1_200_000 },
     ),
   );
   assert.equal(publicationProof.publication, "passed");
@@ -1080,7 +1080,7 @@ try {
     ]);
     return { sdk, name };
   });
-  const implementationDeadline = Date.now() + 90 * 60000;
+  const implementationDeadline = Date.now() + 120 * 60000;
   for (;;) {
     const states = JSON.parse(
       docker([

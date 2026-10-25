@@ -466,6 +466,7 @@ export class McpWriteService implements McpWriteDispatcher {
       "mcp_secret_in_response",
       "mcp_response_limit",
       "mcp_write_limit",
+      "lease_busy",
     ]);
     return error instanceof RuntimeError && allowed.has(error.code)
       ? error.code

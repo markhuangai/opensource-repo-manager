@@ -408,12 +408,14 @@ export async function runRuntimeTests() {
   let tests = 0,
     mcpProof,
     claudeProof,
-    codexProof;
+    codexProof,
+    storageProbe;
   const errors = [],
     probeOutcomes = [],
     probes = tracingChannel("child_process.spawn").start;
   const observeProbe = ({ process: child }) => {
     if (!child.spawnargs?.[1]?.endsWith("/runtime/storage.js")) return;
+    storageProbe = child;
     const started = performance.now();
     let stderr = "";
     child.once("spawn", () =>
@@ -436,7 +438,7 @@ export async function runRuntimeTests() {
     const storageControl = join(base, "storage-control");
     await writeFile(
       `${storageControl}.c`,
-      '#include <sys/prctl.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <stdlib.h>\nint main(int c,char **v){int f=open(v[1],O_CREAT|O_RDWR,0600);if(f<0||ftruncate(f,307200)||unlink(v[1])||dup(f)<0||prctl(PR_SET_DUMPABLE,0))return 1;puts("ready");fflush(stdout);char b;if(read(0,&b,1)!=1)return 2;int ms=atoi(v[2]);if(ms>=0){usleep(ms*1000);if(prctl(PR_SET_DUMPABLE,1))return 3;}for(;;)pause();}',
+      '#include <sys/prctl.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <stdlib.h>\nint main(int c,char **v){int f=open(v[1],O_CREAT|O_RDWR,0600);if(f<0||ftruncate(f,307200)||unlink(v[1])||dup(f)<0||prctl(PR_SET_DUMPABLE,0)||prctl(PR_SET_NAME,"storage ) name"))return 1;puts("ready");fflush(stdout);char b;if(read(0,&b,1)!=1)return 2;int ms=atoi(v[2]);if(ms>=0){usleep(ms*1000);if(prctl(PR_SET_DUMPABLE,1))return 3;}for(;;)pause();}',
     );
     execFileSync("/usr/bin/cc", [`${storageControl}.c`, "-o", storageControl]);
     await chmod(storageControl, 0o555);
@@ -467,7 +469,8 @@ int main(int count, char **values) {
   if (count != 3) return 1;
   descriptor = open(values[1], O_CREAT | O_RDWR, 0600);
   if (descriptor < 0 || ftruncate(descriptor, 307200) ||
-      unlink(values[1]) || prctl(PR_SET_DUMPABLE, 0)) return 1;
+      unlink(values[1]) || prctl(PR_SET_DUMPABLE, 0) ||
+      prctl(PR_SET_NAME, "teardown ) name")) return 1;
   pthread_t thread;
   if (pthread_create(&thread, NULL, retain, values[2])) return 1;
   puts("ready");
@@ -528,9 +531,23 @@ int main(int count, char **values) {
               );
             });
         }
-        const started = Date.now(),
+        const previousProbe = storageProbe,
+          started = Date.now(),
           monotonicStarted = performance.now(),
           probe = deletedFileBytes(10001, 1024 ** 2);
+        if (!teardown && waits.length > 1)
+          await Promise.race([
+            until(async () => {
+              if (storageProbe === previousProbe || !storageProbe?.pid)
+                return false;
+              return /^Uid:\s+0\s+10001\s+0\s+10001$/m.test(
+                await readFile(`/proc/${storageProbe.pid}/status`, "utf8"),
+              );
+            }),
+            probe.then(() => {
+              throw new Error("Storage probe ended before control release");
+            }),
+          ]);
         for (const { child } of controls) child.stdin.end("go");
         if (teardown && waits.length === 1 && waits[0] >= 0) {
           assert.equal(await probe, 0);
@@ -556,6 +573,10 @@ int main(int count, char **values) {
         } else {
           await assert.rejects(probe, { code: "monitor_failed" });
           assert(Date.now() - started >= 250);
+          assert(
+            performance.now() - monotonicStarted < 1000,
+            "A live unreadable worker used the teardown retry window",
+          );
         }
       } finally {
         await cleanUser(10001);
@@ -564,7 +585,7 @@ int main(int count, char **values) {
       assert.deepEqual(await userProcesses(10001), []);
       tests++;
     }
-    const churnDeadline = Date.now() + 3000,
+    const churnDeadline = Date.now() + 30000,
       churn = Array.from({ length: 4 }, async () => {
         do {
           const child = spawnAsRole(
@@ -572,7 +593,7 @@ int main(int count, char **values) {
               "/opt/orm-runtime/bin/node",
               [
                 "-e",
-                'const memory=Array.from({length:128},()=>Buffer.alloc(1024*1024,1));console.log("ready");setInterval(()=>{},1000)',
+                'process.title="storage ) churn";const memory=Array.from({length:128},()=>Buffer.alloc(1024*1024,1));console.log("ready");setInterval(()=>{},1000)',
               ],
               {
                 cwd: "/",
