@@ -39,6 +39,7 @@ export const implementationScenarios = {
     "human-head-handoff",
   ],
   "implementation-monitor-state": [
+    "readiness-transient-recovery",
     "concurrent-observation",
     "restart-thread_reply",
     "restart-thread_resolution",

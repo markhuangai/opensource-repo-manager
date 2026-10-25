@@ -841,6 +841,12 @@ export class ImplementationService {
     const operation = this.supervisor.publication.operationId(proposal),
       pending = this.supervisor.publication.repository.pending(job.id);
     if (pending && pending.id !== operation) return;
+    if (
+      record.status_operation === operation &&
+      this.supervisor.publication.repository.operation(operation)?.status ===
+        "confirmed"
+    )
+      return;
     record.status_operation = operation;
     this.repository.save(record);
     try {

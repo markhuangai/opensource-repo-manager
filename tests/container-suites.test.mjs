@@ -80,7 +80,7 @@ describe("implementation coverage receipts", () => {
       "implementation-candidates": 17,
       "implementation-recovery": 6,
       "implementation-monitor-repair": 6,
-      "implementation-monitor-state": 6,
+      "implementation-monitor-state": 7,
       "implementation-monitor-mcp": 2,
     });
     for (const ids of Object.values(implementationScenarios))

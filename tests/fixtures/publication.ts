@@ -191,6 +191,11 @@ export async function createPublicationFixture(root: string) {
     beforeRequest: undefined as
       undefined | ((method: string, path: string) => Promise<void>),
     requests: [] as Array<{ method: string; path: string }>,
+    readFailure: null as null | {
+      path: string;
+      status: number;
+      body?: unknown;
+    },
     rateLimit: null as null | {
       method: string;
       path: string;
@@ -249,6 +254,15 @@ export async function createPublicationFixture(root: string) {
     };
     state.requests.push({ method: req.method!, path });
     await state.beforeRequest?.(req.method!, path);
+    if (req.method === "GET" && state.readFailure?.path === path) {
+      const failure = state.readFailure;
+      state.readFailure = null;
+      send(
+        failure.body ?? { message: "fixture read unavailable" },
+        failure.status,
+      );
+      return;
+    }
     if (
       state.rateLimit &&
       state.rateLimit.method === req.method &&
