@@ -1,5 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { lstat, readFile, readdir, readlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readFile, readdir, readlink } from "node:fs/promises";
 import type { Role } from "../config/schema.ts";
 import { checkPath } from "../config/files.ts";
 import { roleUsers, RuntimeError } from "../domain/agents.ts";
@@ -121,19 +122,43 @@ export async function sourceProcesses(
   const result: number[] = [];
   for (const name of await readdir("/proc")) {
     if (!/^\d+$/.test(name)) continue;
+    let directory;
     try {
-      const status = await readFile(`/proc/${name}/status`, "utf8");
+      directory = await open(
+        `/proc/${name}`,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      const path = `/proc/self/fd/${directory.fd}`;
+      const status = await readFile(`${path}/status`, "utf8");
       if (!/^Uid:\s+0\s+0\s+0\s+0$/m.test(status)) continue;
       // Docker bootstrap helpers have protected /proc entries and cannot belong to the fixed Git launcher chain.
       if (/^Name:\s+runc(?::|$)/m.test(status)) continue;
-      const cwd = await readlink(`/proc/${name}/cwd`),
-        environment = await readFile(`/proc/${name}/environ`, "utf8");
-      if (
-        cwd === stage ||
-        cwd.startsWith(stage + "/") ||
-        environment.split("\0").includes(`ORM_SOURCE_RUN=${id}`)
-      )
-        result.push(Number(name));
+      try {
+        const cwd = await readlink(`${path}/cwd`),
+          environment = await readFile(`${path}/environ`, "utf8");
+        if (
+          cwd === stage ||
+          cwd.startsWith(stage + "/") ||
+          environment.split("\0").includes(`ORM_SOURCE_RUN=${id}`)
+        )
+          result.push(Number(name));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EACCES") {
+          const current = await readFile(`${path}/status`, "utf8"),
+            probeGid = current.match(
+              /^Gid:\s+0\s+(10001|10002|10003)\s+0\s+\1$/m,
+            )?.[1];
+          // Protected storage probes lower their effective GID before their effective UID.
+          if (
+            probeGid &&
+            new RegExp(`^Uid:\\s+0\\s+(0|${probeGid})\\s+0\\s+\\1$`, "m").test(
+              current,
+            )
+          )
+            continue;
+        }
+        throw error;
+      }
     } catch (error) {
       if (
         !["ENOENT", "ESRCH"].includes(
@@ -141,6 +166,8 @@ export async function sourceProcesses(
         )
       )
         throw error;
+    } finally {
+      await directory?.close();
     }
   }
   return result;

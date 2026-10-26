@@ -669,34 +669,65 @@ int main(int count, char **values) {
         bootstrap.kill("SIGKILL");
       await bootstrapExited;
     }
-    const probe = spawn(
-      process.execPath,
-      [
-        "-e",
-        'process.setgroups([]);process.setegid(10001);process.seteuid(10001);console.log("ready");setInterval(()=>{},1000)',
-      ],
-      { env: { PATH: "/usr/bin:/bin" }, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    const probeExited = once(probe, "exit");
-    probe.stderr.resume();
-    try {
-      await Promise.race([
-        once(probe.stdout, "data", { signal: AbortSignal.timeout(2000) }),
-        probeExited.then(() => {
-          throw new Error("trusted probe exited");
-        }),
-      ]);
-      assert.match(
-        await readFile(`/proc/${probe.pid}/status`, "utf8"),
-        /^Uid:\s+0\s+10001\s+0\s+10001$/m,
+    for (const uid of [10001, 10002, 10003]) {
+      const probe = spawn(
+        process.execPath,
+        [
+          "-e",
+          'const uid=Number(process.argv[1]);process.setgroups([]);process.setegid(uid);console.log("gid-ready");process.stdin.once("data",()=>{process.seteuid(uid);console.log("uid-ready")});setInterval(()=>{},1000)',
+          String(uid),
+        ],
+        { env: { PATH: "/usr/bin:/bin" }, stdio: ["pipe", "pipe", "pipe"] },
       );
-      assert.deepEqual(await userProcesses(10001), []);
-    } finally {
-      if (probe.exitCode === null && probe.signalCode === null)
-        probe.kill("SIGKILL");
-      await probeExited;
+      const probeExited = once(probe, "exit"),
+        probeStage = join(root, "private", "sources", `protected-probe-${uid}`);
+      probe.stderr.resume();
+      try {
+        await Promise.race([
+          once(probe.stdout, "data", { signal: AbortSignal.timeout(2000) }),
+          probeExited.then(() => {
+            throw new Error("trusted probe exited");
+          }),
+        ]);
+        const status = await readFile(`/proc/${probe.pid}/status`, "utf8");
+        assert.match(status, /^Uid:\s+0\s+0\s+0\s+0$/m);
+        assert.match(
+          status,
+          new RegExp(`^Gid:\\s+0\\s+${uid}\\s+0\\s+${uid}$`, "m"),
+        );
+        await assert.rejects(readlink(`/proc/${probe.pid}/cwd`), {
+          code: "EACCES",
+        });
+        assert.deepEqual(
+          await sourceProcesses("protected-probe", probeStage),
+          [],
+        );
+        const uidReady = once(probe.stdout, "data", {
+          signal: AbortSignal.timeout(2000),
+        });
+        probe.stdin.end("continue");
+        await Promise.race([
+          uidReady,
+          probeExited.then(() => {
+            throw new Error("trusted probe exited before its UID transition");
+          }),
+        ]);
+        assert.match(
+          await readFile(`/proc/${probe.pid}/status`, "utf8"),
+          new RegExp(`^Uid:\\s+0\\s+${uid}\\s+0\\s+${uid}$`, "m"),
+        );
+        assert.deepEqual(await userProcesses(uid), []);
+        assert.deepEqual(
+          await sourceProcesses("protected-probe", probeStage),
+          [],
+        );
+      } finally {
+        if (probe.exitCode === null && probe.signalCode === null)
+          probe.kill("SIGKILL");
+        await probeExited;
+      }
+      tests++;
     }
-    tests++;
     const cleanupId = "source-cleanup-deadline",
       cleanupStage = join(root, "private", "sources", cleanupId),
       now = performance.now;
@@ -759,6 +790,44 @@ int main(int count, char **values) {
       if (sourceProbe.exitCode === null && sourceProbe.signalCode === null)
         sourceProbe.kill("SIGKILL");
       await sourceExited;
+    }
+    tests++;
+    const unreadableSource = spawn(
+        process.execPath,
+        ["-e", 'console.log("ready");setInterval(()=>{},1000)'],
+        {
+          gid: 1,
+          env: { PATH: "/usr/bin:/bin", ORM_SOURCE_RUN: cleanupId },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      ),
+      unreadableExited = once(unreadableSource, "exit");
+    unreadableSource.stderr.resume();
+    try {
+      await Promise.race([
+        once(unreadableSource.stdout, "data", {
+          signal: AbortSignal.timeout(2000),
+        }),
+        unreadableExited.then(() => {
+          throw new Error("unreadable source exited before inspection");
+        }),
+      ]);
+      await assert.rejects(readlink(`/proc/${unreadableSource.pid}/cwd`), {
+        code: "EACCES",
+      });
+      await assert.rejects(sourceProcesses(cleanupId, cleanupStage), {
+        code: "EACCES",
+      });
+      await assert.rejects(cleanSource(cleanupId, cleanupStage), {
+        code: "EACCES",
+      });
+    } finally {
+      if (
+        unreadableSource.exitCode === null &&
+        unreadableSource.signalCode === null
+      )
+        unreadableSource.kill("SIGKILL");
+      await unreadableExited;
     }
     tests++;
     const fixture = seed();

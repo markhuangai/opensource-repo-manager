@@ -66,6 +66,7 @@ export async function runImplementationTests(sdks, suite) {
     discordRequests = [],
     logs = [],
     errors = [],
+    cleanupFailures = [],
     proof = [];
   let fixture,
     sdk,
@@ -224,6 +225,37 @@ export async function runImplementationTests(sdks, suite) {
             new OctokitWriter("owner/repo", client, ready),
           mcp: gateway,
         });
+        for (const [method, requestIndex] of [
+          ["run", 0],
+          ["runReview", 1],
+        ]) {
+          const run = supervisor[method].bind(supervisor);
+          supervisor[method] = async function* (...args) {
+            try {
+              yield* run(...args);
+            } catch (error) {
+              if (
+                error.code === "cleanup_failed" &&
+                cleanupFailures.length < 16
+              )
+                cleanupFailures.push({
+                  job: args[requestIndex].job_id,
+                  role: args[requestIndex].role,
+                  codes: [
+                    error.code,
+                    error.cause?.code,
+                    error.cause?.cause?.code,
+                  ].filter(
+                    (code) =>
+                      typeof code === "string" &&
+                      /^[A-Za-z_]{1,64}$/.test(code) &&
+                      !secrets.containsCredentials(code),
+                  ),
+                });
+              throw error;
+            }
+          };
+        }
         gateway.setWriteDispatcher(supervisor.mcpWrites);
         gateway.setReadResultScanner(
           supervisor.publication.outputReview.scanner,
@@ -2368,6 +2400,12 @@ export async function runImplementationTests(sdks, suite) {
     verifyImplementationReceipts(suite, [receipt], sdks);
   } catch (error) {
     errors.push(error);
+    if (cleanupFailures.length)
+      errors.push(
+        new Error(
+          `Runtime cleanup cause codes: ${JSON.stringify(cleanupFailures)}`,
+        ),
+      );
     try {
       const pending = [];
       for (const run of store?.db.open ? store.runs() : []) {
