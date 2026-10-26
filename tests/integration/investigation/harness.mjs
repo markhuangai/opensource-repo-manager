@@ -818,7 +818,14 @@ export async function runInvestigationTests() {
       assert.equal(
         reproduced.record.stage,
         "completed",
-        JSON.stringify(reproduced.record),
+        JSON.stringify({
+          sdk,
+          record: reproduced.record,
+          events: workerEvents.filter(
+            (event) => event.job === reproduced.job.id,
+          ),
+          requests: fixture.requests.length,
+        }),
       );
       const command = reproduced.record.evidence_ids
         .map((id) =>

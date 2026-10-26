@@ -51,12 +51,22 @@ jobs:
           "$tool_dir/actionlint"
 
   containers:
-    name: Container smoke (${{ matrix.architecture }})
+    name: Container tests (${{ matrix.architecture }}, ${{ matrix.suite }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
+        architecture: [amd64, arm64]
+        suite:
+          - core
+          - investigation
+          - bootstrap
+          - implementation-candidates
+          - implementation-recovery
+          - implementation-monitor-repair
+          - implementation-monitor-state
+          - implementation-monitor-mcp
         include:
           - architecture: amd64
             platform: linux/amd64
@@ -77,11 +87,62 @@ jobs:
       - name: Build and test the native image
         env:
           TEST_PLATFORM: ${{ matrix.platform }}
-        run: npm run test:container -- --platform "$TEST_PLATFORM"
+          TEST_SUITE: ${{ matrix.suite }}
+          TEST_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: npm run test:container -- --platform "$TEST_PLATFORM" --suite "$TEST_SUITE"
+
+  container_results:
+    name: Container smoke (${{ matrix.architecture }})
+    needs: containers
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Require every native suite
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          TEST_ARCHITECTURE: ${{ matrix.architecture }}
+        with:
+          script: |
+            const { containerSuites } = require(`${process.env.GITHUB_WORKSPACE}/scripts/container-suites.mjs`);
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              ...context.repo,
+              run_id: context.runId,
+              filter: "all",
+              per_page: 100,
+            });
+            for (const suite of containerSuites) {
+              const name = `Container tests (${process.env.TEST_ARCHITECTURE}, ${suite})`;
+              const executions = jobs.filter(job => job.name === name &&
+                job.run_attempt <= Number(process.env.GITHUB_RUN_ATTEMPT));
+              const latestAttempt = Math.max(...executions.map(job => job.run_attempt));
+              const matches = executions.filter(job => job.run_attempt === latestAttempt);
+              if (matches.length !== 1 || matches[0].status !== "completed" || matches[0].conclusion !== "success") {
+                core.setFailed(`${name} has no successful latest execution.`);
+                continue;
+              }
+              const job = matches[0];
+              core.info(JSON.stringify({
+                suite,
+                architecture: process.env.TEST_ARCHITECTURE,
+                queue_ms: Date.parse(job.started_at) - Date.parse(job.created_at),
+                execution_ms: Date.parse(job.completed_at) - Date.parse(job.started_at),
+                job_url: job.html_url,
+              }));
+            }
 
   result:
     name: Repository CI
-    needs: [checks, containers]
+    needs: [checks, containers, container_results]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -89,7 +150,9 @@ jobs:
         env:
           CHECKS_RESULT: ${{ needs.checks.result }}
           CONTAINERS_RESULT: ${{ needs.containers.result }}
+          ARCHITECTURES_RESULT: ${{ needs.container_results.result }}
         run: |
           printf 'Repository checks: %s; container matrix: %s\n' "$CHECKS_RESULT" "$CONTAINERS_RESULT"
           test "$CHECKS_RESULT" = success
           test "$CONTAINERS_RESULT" = success
+          test "$ARCHITECTURES_RESULT" = success

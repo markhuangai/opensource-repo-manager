@@ -1,6 +1,9 @@
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
+import { containerSuites } from "../scripts/container-suites.mjs";
 
 async function workflow(name) {
   return parse(
@@ -68,7 +71,14 @@ async function run(
     setFailed: (message) => failures.push(message),
     info: (message) => notices.push(message),
   };
-  await new AsyncFunction("github", "context", "core", "process", script)(
+  await new AsyncFunction(
+    "github",
+    "context",
+    "core",
+    "process",
+    "require",
+    script,
+  )(
     github,
     {
       eventName: "pull_request_target",
@@ -84,9 +94,12 @@ async function run(
       env: {
         TRIGGERING_ACTOR: "Z-M-Huang",
         REVIEW_STATUS_CONTEXT_PREFIX: "AI PR review",
+        GITHUB_WORKSPACE: fileURLToPath(new URL("../", import.meta.url)),
+        GITHUB_RUN_ATTEMPT: "1",
         ...env,
       },
     },
+    createRequire(import.meta.url),
   );
   return { outputs, notices, failures, writes };
 }
@@ -434,6 +447,12 @@ describe("release and CI boundaries", () => {
   });
 
   it("requires native smoke tests for both architectures", () => {
+    expect(ci.jobs.containers.strategy["fail-fast"]).toBe(false);
+    expect(ci.jobs.containers.strategy.matrix.architecture).toEqual([
+      "amd64",
+      "arm64",
+    ]);
+    expect(ci.jobs.containers.strategy.matrix.suite).toEqual(containerSuites);
     expect(ci.jobs.containers.strategy.matrix.include).toEqual([
       {
         architecture: "amd64",
@@ -446,7 +465,26 @@ describe("release and CI boundaries", () => {
         runner: "ubuntu-24.04-arm",
       },
     ]);
-    expect(ci.jobs.result.needs).toEqual(["checks", "containers"]);
+    expect(ci.jobs.container_results.strategy.matrix.architecture).toEqual([
+      "amd64",
+      "arm64",
+    ]);
+    expect(ci.jobs.container_results.needs).toBe("containers");
+    expect(ci.jobs.container_results.if).toBe("always()");
+    expect(ci.jobs.container_results.name).toBe(
+      "Container smoke (${{ matrix.architecture }})",
+    );
+    expect(ci.jobs.result.needs).toEqual([
+      "checks",
+      "containers",
+      "container_results",
+    ]);
+    const build = step(ci.jobs.containers, "Build and test the native image");
+    expect(build.run).toContain('--suite "$TEST_SUITE"');
+    expect(build.env.TEST_SUITE).toBe("${{ matrix.suite }}");
+    expect(build.env.TEST_PR_HEAD_SHA).toBe(
+      "${{ github.event.pull_request.head.sha }}",
+    );
     expect(codeql.jobs.analyze.strategy.matrix.language).toEqual([
       "actions",
       "javascript-typescript",
@@ -508,4 +546,88 @@ describe("release and CI boundaries", () => {
       ),
     ).toBe(false);
   });
+});
+
+describe("native suite aggregation", () => {
+  const script = step(ci.jobs.container_results, "Require every native suite")
+    .with.script;
+  const jobs = () =>
+    ["amd64", "arm64"].flatMap((architecture) =>
+      containerSuites.map((suite) => ({
+        name: `Container tests (${architecture}, ${suite})`,
+        run_attempt: 1,
+        status: "completed",
+        conclusion: "success",
+        created_at: "2026-10-25T00:00:00Z",
+        started_at: "2026-10-25T00:00:10Z",
+        completed_at: "2026-10-25T00:15:10Z",
+        html_url: "https://example.invalid/job",
+      })),
+    );
+
+  for (const architecture of ["amd64", "arm64"]) {
+    const env = { TEST_ARCHITECTURE: architecture, GITHUB_RUN_ATTEMPT: "2" };
+    const selected = (list) =>
+      list.findIndex(
+        (job) =>
+          job.name ===
+          `Container tests (${architecture}, implementation-monitor-mcp)`,
+      );
+    it(`requires all eight ${architecture} suites and reports queue time separately`, async () => {
+      const result = await run(script, { env, jobs: jobs() });
+      expect(result.failures).toEqual([]);
+      expect(result.notices.map((value) => JSON.parse(value))).toEqual(
+        containerSuites.map((suite) => ({
+          suite,
+          architecture,
+          queue_ms: 10000,
+          execution_ms: 900000,
+          job_url: "https://example.invalid/job",
+        })),
+      );
+    });
+    for (const conclusion of [
+      "failure",
+      "skipped",
+      "cancelled",
+      "timed_out",
+      null,
+    ]) {
+      it(`rejects a ${conclusion} latest ${architecture} suite despite an older success`, async () => {
+        const list = jobs();
+        list.push({ ...list[selected(list)], run_attempt: 2, conclusion });
+        expect((await run(script, { env, jobs: list })).failures).toHaveLength(
+          1,
+        );
+      });
+    }
+    for (const status of ["queued", "in_progress"]) {
+      it(`rejects a ${status} latest ${architecture} suite`, async () => {
+        const list = jobs();
+        list.push({ ...list[selected(list)], run_attempt: 2, status });
+        expect((await run(script, { env, jobs: list })).failures).toHaveLength(
+          1,
+        );
+      });
+    }
+    it(`rejects missing and duplicate ${architecture} executions`, async () => {
+      const missing = jobs();
+      missing.splice(selected(missing), 1);
+      expect((await run(script, { env, jobs: missing })).failures).toHaveLength(
+        1,
+      );
+      const duplicate = jobs();
+      duplicate.push({ ...duplicate[selected(duplicate)] });
+      expect(
+        (await run(script, { env, jobs: duplicate })).failures,
+      ).toHaveLength(1);
+    });
+    it(`accepts a successful latest ${architecture} attempt after an earlier failure`, async () => {
+      const list = jobs(),
+        index = selected(list);
+      list.push({ ...list[index], run_attempt: 2 });
+      list[index].conclusion = "failure";
+      expect((await run(script, { env, jobs: list })).failures).toEqual([]);
+    });
+  }
 });
