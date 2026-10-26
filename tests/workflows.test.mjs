@@ -1,4 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -43,20 +45,24 @@ async function run(
     pulls,
     statuses = [],
     jobs = [],
+    transport = {},
+    executor = {},
   } = {},
 ) {
   const outputs = {};
   const notices = [];
   const failures = [];
   const writes = [];
+  const summaries = [];
   const github = {
     rest: {
       pulls: { get: async () => ({ data: current }), list: "pulls" },
       repos: {
         listCommitStatusesForRef: "statuses",
         createCommitStatus: async (value) => writes.push(value),
+        ...transport.repos,
       },
-      actions: { listJobsForWorkflowRun: "jobs" },
+      actions: { listJobsForWorkflowRun: "jobs", ...transport.actions },
     },
     paginate: async (kind) => {
       if (kind === "pulls") return pulls ?? [current];
@@ -65,7 +71,16 @@ async function run(
       throw new Error(`Unexpected API transport ${kind}`);
     },
   };
+  const summary = {
+    addHeading: () => summary,
+    addCodeBlock: (value) => {
+      summaries.push(JSON.parse(value));
+      return summary;
+    },
+    write: async () => {},
+  };
   const core = {
+    summary,
     notice: (message) => notices.push(message),
     setOutput: (key, value) => (outputs[key] = value),
     setFailed: (message) => failures.push(message),
@@ -77,6 +92,7 @@ async function run(
     "core",
     "process",
     "require",
+    "exec",
     script,
   )(
     github,
@@ -100,8 +116,9 @@ async function run(
       },
     },
     createRequire(import.meta.url),
+    executor,
   );
-  return { outputs, notices, failures, writes };
+  return { outputs, notices, failures, writes, summaries };
 }
 
 const resolve = step(review.jobs.resolve, "Resolve and fence pull request head")
@@ -109,7 +126,7 @@ const resolve = step(review.jobs.resolve, "Resolve and fence pull request head")
 const finalize = step(review.jobs.review, "Publish final review status").with
   .script;
 const validate = step(
-  release.jobs.publish,
+  release.jobs.resolve,
   "Validate release source and version",
 ).with.script;
 
@@ -393,57 +410,43 @@ describe("AI review routing and exact-head policy", () => {
 });
 
 describe("release and CI boundaries", () => {
-  it("binds a main-only manual release to its exact source SHA", async () => {
-    const result = await run(validate, {
-      context: { eventName: "workflow_dispatch", ref: "refs/heads/main", sha },
-      env: { RELEASE_VERSION: "0.1.0-rc.1" },
-    });
-    expect(result.outputs).toEqual({ version: "0.1.0-rc.1", source_sha: sha });
-  });
-
-  for (const context of [
-    { eventName: "pull_request", ref: "refs/heads/main", sha },
-    { eventName: "workflow_dispatch", ref: "refs/heads/feature", sha },
-    {
-      eventName: "workflow_dispatch",
-      ref: "refs/heads/main",
-      sha: "moving-branch",
-    },
-  ]) {
-    it("rejects an untrusted release source", async () => {
-      await expect(
-        run(validate, { context, env: { RELEASE_VERSION: "0.1.0" } }),
-      ).rejects.toThrow();
-    });
-  }
-
-  for (const version of ["latest", "v0.1.0", "0.1.0; echo unsafe", "0.1.0\n"]) {
-    it("rejects malformed or shell-bearing release versions", async () => {
-      await expect(
-        run(validate, {
-          context: {
-            eventName: "workflow_dispatch",
-            ref: "refs/heads/main",
-            sha,
-          },
-          env: { RELEASE_VERSION: version },
-        }),
-      ).rejects.toThrow();
-    });
-  }
-
-  it("keeps registry credentials out of PR CI and image publication main-only", () => {
+  it("publishes only release events after both native jobs succeed", () => {
+    expect(release.on).toEqual({ release: { types: ["published"] } });
     expect(ci.permissions).toEqual({ contents: "read" });
     expect(JSON.stringify(ci)).not.toContain("secrets.");
     expect(JSON.stringify(ci)).not.toContain("packages");
-    expect(release.jobs.publish.if).toBe("github.ref == 'refs/heads/main'");
+    expect(release.jobs.resolve.permissions).toEqual({
+      contents: "read",
+      actions: "read",
+    });
+    expect(release.jobs.build.needs).toBe("resolve");
+    expect(release.jobs.publish.needs).toEqual(["resolve", "build"]);
+    expect(release.jobs.publish.if).toBeUndefined();
+    expect(release.jobs.build.permissions).toEqual({
+      contents: "read",
+      packages: "write",
+    });
     expect(release.jobs.publish.permissions).toEqual({
       contents: "read",
       packages: "write",
     });
-    expect(
-      step(release.jobs.publish, "Publish both architectures").with.platforms,
-    ).toBe("linux/amd64,linux/arm64");
+    expect(release.jobs.build.strategy.matrix.include).toEqual(
+      ci.jobs.containers.strategy.matrix.include,
+    );
+    expect(JSON.stringify(release)).not.toContain("setup-qemu");
+    const build = step(release.jobs.build, "Build and push by digest");
+    expect(build.with.outputs).toContain("push-by-digest=true");
+    expect(build.with.tags).toBeUndefined();
+    const upload = release.jobs.build.steps.find((entry) =>
+      entry.uses?.startsWith("actions/upload-artifact@"),
+    );
+    expect(upload.with["retention-days"]).toBe(1);
+    expect(release.jobs.build.steps.indexOf(upload)).toBeGreaterThan(
+      release.jobs.build.steps.indexOf(
+        step(release.jobs.build, "Smoke-test the published native image"),
+      ),
+    );
+    expect(release.concurrency["cancel-in-progress"]).toBe(false);
   });
 
   it("requires native smoke tests for both architectures", () => {
@@ -629,5 +632,565 @@ describe("native suite aggregation", () => {
       list[index].conclusion = "failure";
       expect((await run(script, { env, jobs: list })).failures).toEqual([]);
     });
+  }
+});
+
+const image = "ghcr.io/markhuangai/opensource-repo-manager";
+const publishedRelease = {
+  id: 42,
+  tag_name: "v0.1.0",
+  draft: false,
+  prerelease: false,
+  published_at: "2026-10-26T00:00:00Z",
+};
+function releaseContext(releaseData = publishedRelease, overrides = {}) {
+  return {
+    eventName: "release",
+    ref: `refs/tags/${releaseData.tag_name}`,
+    sha,
+    payload: { action: "published", release: releaseData },
+    ...overrides,
+  };
+}
+function releaseTransport({
+  commit = sha,
+  comparison = "ahead",
+  runs = {},
+  current = publishedRelease,
+  latest = publishedRelease,
+} = {}) {
+  return {
+    repos: {
+      getCommit: async () => ({ data: { sha: commit } }),
+      getBranch: async () => ({ data: { commit: { sha: "b".repeat(40) } } }),
+      compareCommits: async () => ({ data: { status: comparison } }),
+      getRelease: async () => ({ data: current }),
+      getLatestRelease: async () => ({ data: latest }),
+    },
+    actions: {
+      listWorkflowRuns: async (args) => {
+        expect(args).toMatchObject({
+          head_sha: sha,
+          branch: "main",
+          event: "push",
+          per_page: 1,
+        });
+        return {
+          data: {
+            workflow_runs: runs[args.workflow_id] ?? [
+              {
+                head_sha: sha,
+                head_branch: "main",
+                event: "push",
+                status: "completed",
+                conclusion: "success",
+                html_url: "https://example.invalid/run",
+              },
+            ],
+          },
+        };
+      },
+    },
+  };
+}
+
+describe("release source policy", () => {
+  for (const [tag, prerelease, expected] of [
+    ["v0.1.0", false, "false"],
+    ["v0.1.0-rc.1", true, "true"],
+    ["v0.1.0-rc.1", false, "true"],
+    ["v0.1.0", true, "true"],
+  ]) {
+    it(`resolves ${tag} with prerelease=${prerelease}`, async () => {
+      const result = await run(validate, {
+        context: releaseContext({
+          ...publishedRelease,
+          tag_name: tag,
+          prerelease,
+        }),
+        transport: releaseTransport(),
+      });
+      expect(result.outputs).toEqual({
+        version: tag.slice(1),
+        source_sha: sha,
+        prerelease: expected,
+      });
+    });
+  }
+  for (const tag_name of [
+    "0.1.0",
+    "latest",
+    "v01.1.0",
+    "v0.1.0-rc.01",
+    "v0.1.0+build",
+    "v0.1.0; echo unsafe",
+    "v0.1.0\n",
+    `v0.1.0-${"x".repeat(128)}`,
+  ]) {
+    it(`rejects malformed tag ${JSON.stringify(tag_name)}`, async () => {
+      await expect(
+        run(validate, {
+          context: releaseContext({ ...publishedRelease, tag_name }),
+          transport: releaseTransport(),
+        }),
+      ).rejects.toThrow();
+    });
+  }
+  for (const context of [
+    releaseContext(publishedRelease, { eventName: "pull_request" }),
+    releaseContext(publishedRelease, { eventName: "workflow_dispatch" }),
+    releaseContext(publishedRelease, { ref: "refs/heads/main" }),
+    releaseContext(publishedRelease, { sha: "moving-branch" }),
+    releaseContext(publishedRelease, {
+      payload: { action: "edited", release: publishedRelease },
+    }),
+    releaseContext({ ...publishedRelease, draft: true }),
+    releaseContext({ ...publishedRelease, published_at: null }),
+  ]) {
+    it("rejects nonpublication events and invalid release sources", async () => {
+      await expect(
+        run(validate, { context, transport: releaseTransport() }),
+      ).rejects.toThrow();
+    });
+  }
+  for (const overrides of [
+    { commit: "c".repeat(40) },
+    { comparison: "behind" },
+    { comparison: "diverged" },
+  ]) {
+    it("rejects moved tags and commits outside main", async () => {
+      await expect(
+        run(validate, {
+          context: releaseContext(),
+          transport: releaseTransport(overrides),
+        }),
+      ).rejects.toThrow();
+    });
+  }
+  for (const workflow of ["ci.yml", "codeql.yml"]) {
+    for (const change of [
+      null,
+      { conclusion: "failure" },
+      { conclusion: "cancelled" },
+      { conclusion: "skipped" },
+      { status: "in_progress", conclusion: null },
+      { head_sha: "c".repeat(40) },
+      { head_branch: "feature" },
+      { event: "pull_request" },
+    ]) {
+      it(`requires successful exact-source ${workflow}: ${JSON.stringify(change)}`, async () => {
+        const runs =
+          change === null
+            ? []
+            : [
+                {
+                  head_sha: sha,
+                  head_branch: "main",
+                  event: "push",
+                  status: "completed",
+                  conclusion: "success",
+                  ...change,
+                },
+              ];
+        await expect(
+          run(validate, {
+            context: releaseContext(),
+            transport: releaseTransport({ runs: { [workflow]: runs } }),
+          }),
+        ).rejects.toThrow("successful main-push run");
+      });
+    }
+  }
+});
+
+const digest = (letter) => `sha256:${letter.repeat(64)}`;
+const nativeReceipts = ["amd64", "arm64"].map((architecture, index) => ({
+  source_sha: sha,
+  version: "0.1.0",
+  platform: `linux/${architecture}`,
+  digest: digest(index ? "b" : "a"),
+  platform_digest: digest(index ? "d" : "c"),
+  smoke: "passed",
+}));
+const descriptor = (receipt) => ({
+  digest: receipt.platform_digest,
+  platform: { os: "linux", architecture: receipt.platform.split("/")[1] },
+});
+const combinedManifest = {
+  digest: digest("e"),
+  manifests: nativeReceipts.map(descriptor),
+};
+const publishScript = step(
+  release.jobs.publish,
+  "Verify manifests and publish release tags",
+).with.script;
+const smokeScript = step(
+  release.jobs.build,
+  "Smoke-test the published native image",
+).with.script;
+
+async function withReceipts(callback, receipts = nativeReceipts) {
+  const directory = await mkdtemp(join(tmpdir(), "orm-release-policy-"));
+  try {
+    for (const receipt of receipts) {
+      await writeFile(
+        join(directory, `image-${receipt.platform.split("/")[1]}.json`),
+        JSON.stringify(receipt),
+      );
+    }
+    return await callback(directory);
+  } finally {
+    await rm(directory, { recursive: true });
+  }
+}
+
+function registryTransport(overrides = {}) {
+  const publications = [];
+  const manifests = Object.fromEntries(
+    nativeReceipts.map((receipt) => [
+      `${image}@${receipt.digest}`,
+      { digest: receipt.digest, manifests: [descriptor(receipt)] },
+    ]),
+  );
+  return {
+    publications,
+    executor: {
+      exec: async (command, args) => {
+        expect(command).toBe("docker");
+        expect(args.slice(0, 3)).toEqual(["buildx", "imagetools", "create"]);
+        publications.push(args);
+      },
+      getExecOutput: async (command, args) => {
+        expect(command).toBe("docker");
+        expect(args.slice(0, 3)).toEqual(["buildx", "imagetools", "inspect"]);
+        expect(args.slice(4)).toEqual(["--format", "{{json .Manifest}}"]);
+        return {
+          stdout: JSON.stringify(
+            overrides[args[3]] ?? manifests[args[3]] ?? combinedManifest,
+          ),
+        };
+      },
+    },
+  };
+}
+const publicationEnv = (directory) => ({
+  IMAGE: image,
+  SOURCE_SHA: sha,
+  VERSION: "0.1.0",
+  IS_PRERELEASE: "false",
+  RECEIPTS: directory,
+});
+
+describe("release manifest promotion", () => {
+  it("combines the tested digests and promotes only the verified combined digest", async () => {
+    await withReceipts(async (directory) => {
+      const registry = registryTransport();
+      const result = await run(publishScript, {
+        context: releaseContext(),
+        env: publicationEnv(directory),
+        transport: releaseTransport(),
+        executor: registry.executor,
+      });
+      expect(registry.publications).toEqual([
+        [
+          "buildx",
+          "imagetools",
+          "create",
+          "--tag",
+          `${image}:0.1.0`,
+          "--tag",
+          `${image}:sha-${sha}`,
+          ...nativeReceipts.map((receipt) => `${image}@${receipt.digest}`),
+        ],
+        [
+          "buildx",
+          "imagetools",
+          "create",
+          "--tag",
+          `${image}:latest`,
+          `${image}@${digest("e")}`,
+        ],
+      ]);
+      expect(result.summaries).toEqual([
+        {
+          repository: image,
+          version: "0.1.0",
+          source_sha: sha,
+          digest: digest("e"),
+          tags: [`${image}:0.1.0`, `${image}:sha-${sha}`, `${image}:latest`],
+          platforms: nativeReceipts.map(
+            ({ platform, digest, platform_digest }) => ({
+              platform,
+              digest,
+              platform_digest,
+            }),
+          ),
+          run_url:
+            "https://github.com/markhuangai/opensource-repo-manager/actions/runs/123",
+        },
+      ]);
+    });
+  });
+  for (const scenario of [
+    "older release",
+    "initial prerelease",
+    "became prerelease",
+    "suffix without prerelease flag",
+  ]) {
+    it(`does not promote latest for ${scenario}`, async () => {
+      const version = scenario.startsWith("suffix") ? "0.1.0-rc.1" : "0.1.0";
+      const current = {
+        ...publishedRelease,
+        tag_name: `v${version}`,
+        prerelease: scenario === "became prerelease",
+      };
+      await withReceipts(
+        async (directory) => {
+          const registry = registryTransport();
+          await run(publishScript, {
+            context: releaseContext(current),
+            env: {
+              ...publicationEnv(directory),
+              VERSION: version,
+              IS_PRERELEASE:
+                scenario === "initial prerelease" ? "true" : "false",
+            },
+            transport: releaseTransport({
+              current,
+              latest:
+                scenario === "older release"
+                  ? { ...publishedRelease, id: 43 }
+                  : current,
+            }),
+            executor: registry.executor,
+          });
+          expect(registry.publications).toHaveLength(1);
+        },
+        nativeReceipts.map((receipt) => ({ ...receipt, version })),
+      );
+    });
+  }
+  for (const changes of [
+    { source_sha: "f".repeat(40) },
+    { version: "0.2.0" },
+    { smoke: "failed" },
+    { digest: "invalid" },
+    { platform_digest: "invalid" },
+  ]) {
+    it(`rejects mismatched architecture receipt ${JSON.stringify(changes)}`, async () => {
+      await withReceipts(
+        async (directory) => {
+          const registry = registryTransport();
+          await expect(
+            run(publishScript, {
+              context: releaseContext(),
+              env: publicationEnv(directory),
+              transport: releaseTransport(),
+              executor: registry.executor,
+            }),
+          ).rejects.toThrow();
+          expect(registry.publications).toEqual([]);
+        },
+        [{ ...nativeReceipts[0], ...changes }, nativeReceipts[1]],
+      );
+    });
+  }
+  it("does not publish with a missing or duplicate architecture", async () => {
+    for (const receipts of [
+      nativeReceipts.slice(0, 1),
+      [nativeReceipts[0], nativeReceipts[0]],
+    ]) {
+      await withReceipts(async (directory) => {
+        const registry = registryTransport();
+        await expect(
+          run(publishScript, {
+            context: releaseContext(),
+            env: publicationEnv(directory),
+            transport: releaseTransport(),
+            executor: registry.executor,
+          }),
+        ).rejects.toThrow("Both architecture receipts");
+        expect(registry.publications).toEqual([]);
+      }, receipts);
+    }
+  });
+  for (const overrides of [
+    { commit: "f".repeat(40) },
+    { current: { ...publishedRelease, draft: true } },
+    { current: { ...publishedRelease, tag_name: "v0.2.0" } },
+  ]) {
+    it("rechecks live release identity before publishing", async () => {
+      await withReceipts(async (directory) => {
+        const registry = registryTransport();
+        await expect(
+          run(publishScript, {
+            context: releaseContext(),
+            env: publicationEnv(directory),
+            transport: releaseTransport(overrides),
+            executor: registry.executor,
+          }),
+        ).rejects.toThrow();
+        expect(registry.publications).toEqual([]);
+      });
+    });
+  }
+  it("rechecks the tag again before latest promotion", async () => {
+    await withReceipts(async (directory) => {
+      const registry = registryTransport();
+      const transport = releaseTransport();
+      let reads = 0;
+      transport.repos.getCommit = async () => ({
+        data: { sha: ++reads === 1 ? sha : "f".repeat(40) },
+      });
+      await expect(
+        run(publishScript, {
+          context: releaseContext(),
+          env: publicationEnv(directory),
+          transport,
+          executor: registry.executor,
+        }),
+      ).rejects.toThrow("tag moved");
+      expect(registry.publications).toHaveLength(1);
+    });
+  });
+  it("rejects a native registry manifest that differs from its smoke receipt", async () => {
+    await withReceipts(async (directory) => {
+      const registry = registryTransport({
+        [`${image}@${nativeReceipts[0].digest}`]: {
+          digest: nativeReceipts[0].digest,
+          manifests: [descriptor(nativeReceipts[1])],
+        },
+      });
+      await expect(
+        run(publishScript, {
+          context: releaseContext(),
+          env: publicationEnv(directory),
+          transport: releaseTransport(),
+          executor: registry.executor,
+        }),
+      ).rejects.toThrow("smoke-tested platforms");
+      expect(registry.publications).toEqual([]);
+    });
+  });
+  for (const manifests of [
+    [],
+    [descriptor(nativeReceipts[0])],
+    [descriptor(nativeReceipts[0]), descriptor(nativeReceipts[0])],
+  ]) {
+    it("never promotes a combined manifest missing either tested platform", async () => {
+      await withReceipts(async (directory) => {
+        const registry = registryTransport({
+          [`${image}:0.1.0`]: { digest: digest("e"), manifests },
+        });
+        await expect(
+          run(publishScript, {
+            context: releaseContext(),
+            env: publicationEnv(directory),
+            transport: releaseTransport(),
+            executor: registry.executor,
+          }),
+        ).rejects.toThrow("smoke-tested platforms");
+        expect(registry.publications).toHaveLength(1);
+      });
+    });
+  }
+  it("accepts provenance attestations alongside both runnable platforms", async () => {
+    await withReceipts(async (directory) => {
+      const registry = registryTransport({
+        [`${image}:0.1.0`]: {
+          ...combinedManifest,
+          manifests: [
+            ...combinedManifest.manifests,
+            {
+              digest: digest("f"),
+              platform: { os: "unknown", architecture: "unknown" },
+              annotations: {
+                "vnd.docker.reference.type": "attestation-manifest",
+              },
+            },
+          ],
+        },
+      });
+      await run(publishScript, {
+        context: releaseContext(),
+        env: publicationEnv(directory),
+        transport: releaseTransport(),
+        executor: registry.executor,
+      });
+      expect(registry.publications).toHaveLength(2);
+    });
+  });
+});
+
+describe("native image smoke receipts", () => {
+  for (const receipt of nativeReceipts) {
+    for (const failBinary of [null, "node", "mise", "gitleaks"]) {
+      it(`${receipt.platform} requires every native executable before issuing a receipt (${failBinary})`, async () => {
+        await withReceipts(async (directory) => {
+          const commands = [];
+          const executor = {
+            exec: async (command, args) => {
+              expect(command).toBe("docker");
+              commands.push(args);
+              if (args.includes(`/opt/orm-runtime/bin/${failBinary}`))
+                throw new Error("Native binary failed");
+            },
+            getExecOutput: async (command, args) => ({
+              stdout: JSON.stringify(
+                args[0] === "image"
+                  ? [
+                      {
+                        Os: "linux",
+                        Architecture: receipt.platform.split("/")[1],
+                        Config: {
+                          Labels: {
+                            "org.opencontainers.image.revision": sha,
+                            "org.opencontainers.image.version": "0.1.0",
+                          },
+                        },
+                      },
+                    ]
+                  : {
+                      digest: receipt.digest,
+                      manifests: [descriptor(receipt)],
+                    },
+              ),
+            }),
+          };
+          const invocation = run(smokeScript, {
+            env: {
+              IMAGE: image,
+              IMAGE_DIGEST: receipt.digest,
+              PLATFORM: receipt.platform,
+              SOURCE_SHA: sha,
+              VERSION: "0.1.0",
+              RUNNER_TEMP: directory,
+            },
+            executor,
+          });
+          if (failBinary) {
+            await expect(invocation).rejects.toThrow("Native binary failed");
+            expect(await readdir(directory)).toEqual([]);
+          } else {
+            await invocation;
+            expect(
+              JSON.parse(
+                await readFile(
+                  join(
+                    directory,
+                    `image-${receipt.platform.split("/")[1]}.json`,
+                  ),
+                  "utf8",
+                ),
+              ),
+            ).toEqual(receipt);
+            expect(commands.filter((args) => args[0] === "run")).toHaveLength(
+              3,
+            );
+            expect(commands[1].at(-1)).toContain("better-sqlite3");
+          }
+        }, []);
+      });
+    }
   }
 });

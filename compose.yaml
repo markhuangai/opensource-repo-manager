@@ -1,7 +1,6 @@
 services:
   manager:
-    build: .
-    image: opensource-repo-manager:local
+    image: ${ORM_IMAGE:-ghcr.io/markhuangai/opensource-repo-manager:latest}
     ports:
       - "127.0.0.1:8080:8080"
     stop_grace_period: 15s

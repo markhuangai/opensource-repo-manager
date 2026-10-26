@@ -1,12 +1,8 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Image version (for example 0.1.0 or 0.1.0-rc.1)
-        required: true
-        type: string
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -15,81 +11,244 @@ concurrency:
   group: release-${{ github.repository }}
   cancel-in-progress: false
 
+env:
+  IMAGE: ghcr.io/markhuangai/opensource-repo-manager
+
 jobs:
-  publish:
-    if: github.ref == 'refs/heads/main'
+  resolve:
+    if: github.event_name == 'release' && github.event.action == 'published'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
     permissions:
       contents: read
-      packages: write
+      actions: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
     steps:
       - name: Validate release source and version
         id: release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          RELEASE_VERSION: ${{ inputs.version }}
         with:
           script: |
-            if (context.eventName !== "workflow_dispatch" || context.ref !== "refs/heads/main") {
-              throw new Error("Release requires an explicit dispatch from main.");
-            }
-            const version = process.env.RELEASE_VERSION;
-            if (typeof version !== "string" || version !== version.trim() ||
-                !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$/.test(version)) {
-              throw new Error("Image version must be a numeric semantic version with an optional prerelease suffix.");
-            }
-            if (!/^[0-9a-f]{40}$/.test(context.sha)) {
-              throw new Error("Release source SHA is invalid.");
+            const assert = require("node:assert/strict");
+            const release = context.payload.release;
+            assert(context.eventName === "release" && context.payload.action === "published" &&
+              release && !release.draft && release.published_at, "A published GitHub Release is required.");
+            const tag = release.tag_name;
+            const match = typeof tag === "string" && tag.match(/^v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?)$/);
+            assert(match && tag === tag.trim() && match[1].length <= 128,
+              "Release tag must be vMAJOR.MINOR.PATCH with an optional prerelease suffix.");
+            const version = match[1];
+            const suffix = version.indexOf("-");
+            assert(suffix < 0 || version.slice(suffix + 1).split(".").every(part =>
+              !/^[0-9]+$/.test(part) || part === "0" || !part.startsWith("0")), "Invalid numeric prerelease identifier.");
+            assert(context.ref === `refs/tags/${tag}` && /^[0-9a-f]{40}$/.test(context.sha), "Invalid release source.");
+            const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${tag}` });
+            assert.equal(commit.sha, context.sha, "Release tag moved.");
+            const { data: main } = await github.rest.repos.getBranch({ ...context.repo, branch: "main" });
+            const { data: comparison } = await github.rest.repos.compareCommits({
+              ...context.repo, base: context.sha, head: main.commit.sha,
+            });
+            assert(["ahead", "identical"].includes(comparison.status), "Release commit must belong to main.");
+            for (const workflow_id of ["ci.yml", "codeql.yml"]) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                ...context.repo, workflow_id, head_sha: context.sha, branch: "main", event: "push", per_page: 1,
+              });
+              const run = data.workflow_runs[0];
+              assert(run && run.head_sha === context.sha && run.head_branch === "main" && run.event === "push" &&
+                run.status === "completed" && run.conclusion === "success",
+                `${workflow_id} must have a successful main-push run for the release SHA; rerun this release after CI passes.`);
+              core.info(JSON.stringify({ workflow: workflow_id, source_sha: context.sha, run_url: run.html_url }));
             }
             core.setOutput("version", version);
             core.setOutput("source_sha", context.sha);
+            core.setOutput("prerelease", String(release.prerelease || suffix >= 0));
+
+  build:
+    name: Release image (${{ matrix.architecture }})
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ steps.release.outputs.source_sha }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           persist-credentials: false
       - name: Verify the immutable checkout
         env:
-          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
         run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Publish both architectures
+      - name: Build and push by digest
         id: image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/markhuangai/opensource-repo-manager:${{ steps.release.outputs.version }}
-            ghcr.io/markhuangai/opensource-repo-manager:sha-${{ steps.release.outputs.source_sha }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.source=https://github.com/markhuangai/opensource-repo-manager
-            org.opencontainers.image.revision=${{ steps.release.outputs.source_sha }}
-            org.opencontainers.image.version=${{ steps.release.outputs.version }}
-      - name: Record publication identity
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+      - name: Smoke-test the published native image
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
-          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
         with:
           script: |
-            if (!/^sha256:[0-9a-f]{64}$/.test(process.env.IMAGE_DIGEST || "")) {
-              throw new Error("Image publication did not return a valid digest.");
+            const assert = require("node:assert/strict");
+            const { writeFile } = require("node:fs/promises");
+            const { join } = require("node:path");
+            const { IMAGE, IMAGE_DIGEST, PLATFORM, SOURCE_SHA, VERSION, RUNNER_TEMP } = process.env;
+            assert(/^sha256:[0-9a-f]{64}$/.test(IMAGE_DIGEST), "Invalid build digest.");
+            const architecture = PLATFORM.split("/")[1];
+            const reference = `${IMAGE}@${IMAGE_DIGEST}`;
+            await exec.exec("docker", ["pull", "--platform", PLATFORM, reference]);
+            const inspected = JSON.parse((await exec.getExecOutput("docker", ["image", "inspect", reference], { silent: true })).stdout)[0];
+            assert.equal(`${inspected.Os}/${inspected.Architecture}`, PLATFORM);
+            assert.equal(inspected.Config.Labels["org.opencontainers.image.revision"], SOURCE_SHA);
+            assert.equal(inspected.Config.Labels["org.opencontainers.image.version"], VERSION);
+            await exec.exec("docker", ["run", "--rm", "--network", "none", "--platform", PLATFORM,
+              "--entrypoint", "/opt/orm-runtime/bin/node", reference, "-e",
+              `const assert = require('node:assert/strict'); assert.equal(process.arch, '${architecture === "amd64" ? "x64" : "arm64"}'); const db = require('better-sqlite3')(':memory:'); assert.equal(db.prepare('SELECT 1 AS value').get().value, 1); db.close();`]);
+            for (const binary of ["mise", "gitleaks"]) {
+              await exec.exec("docker", ["run", "--rm", "--network", "none", "--platform", PLATFORM,
+                "--entrypoint", `/opt/orm-runtime/bin/${binary}`, reference, "--version"]);
+            }
+            const manifest = JSON.parse((await exec.getExecOutput("docker",
+              ["buildx", "imagetools", "inspect", reference, "--format", "{{json .Manifest}}"], { silent: true })).stdout);
+            const candidates = manifest.manifests?.filter(item => item.platform?.os === "linux" && item.platform?.architecture === architecture);
+            assert(!candidates || candidates.length === 1, "Missing or duplicate native manifest.");
+            const platformDigest = candidates ? candidates[0].digest : manifest.digest;
+            assert(/^sha256:[0-9a-f]{64}$/.test(platformDigest), "Invalid native manifest digest.");
+            await writeFile(join(RUNNER_TEMP, `image-${architecture}.json`), JSON.stringify({
+              source_sha: SOURCE_SHA, version: VERSION, platform: PLATFORM,
+              digest: IMAGE_DIGEST, platform_digest: platformDigest, smoke: "passed",
+            }));
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/image-${{ matrix.architecture }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - name: Verify manifests and publish release tags
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          IS_PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+          RECEIPTS: ${{ runner.temp }}/digests
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            const { readdir, readFile } = require("node:fs/promises");
+            const { join } = require("node:path");
+            const { IMAGE, SOURCE_SHA, VERSION, IS_PRERELEASE, RECEIPTS } = process.env;
+            const architectures = ["amd64", "arm64"];
+            assert.deepEqual((await readdir(RECEIPTS)).sort(), architectures.map(arch => `image-${arch}.json`),
+              "Both architecture receipts are required.");
+            const receipts = await Promise.all(architectures.map(async architecture => {
+              const receipt = JSON.parse(await readFile(join(RECEIPTS, `image-${architecture}.json`), "utf8"));
+              assert.equal(receipt.source_sha, SOURCE_SHA);
+              assert.equal(receipt.version, VERSION);
+              assert.equal(receipt.platform, `linux/${architecture}`);
+              assert.equal(receipt.smoke, "passed");
+              for (const digest of [receipt.digest, receipt.platform_digest]) {
+                assert(/^sha256:[0-9a-f]{64}$/.test(digest), "Invalid architecture digest.");
+              }
+              return receipt;
+            }));
+            async function inspect(reference) {
+              return JSON.parse((await exec.getExecOutput("docker", ["buildx", "imagetools", "inspect",
+                reference, "--format", "{{json .Manifest}}"], { silent: true })).stdout);
+            }
+            function verifyPlatforms(manifest, expected) {
+              const runnable = manifest.manifests.filter(item => item.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest");
+              assert.deepEqual(runnable.map(item => ({
+                platform: `${item.platform?.os}/${item.platform?.architecture}`, digest: item.digest,
+              })).sort((a, b) => a.platform.localeCompare(b.platform)), expected.map(receipt => ({
+                platform: receipt.platform, digest: receipt.platform_digest,
+              })), "Published manifest does not match the smoke-tested platforms.");
+            }
+            for (const receipt of receipts) {
+              const manifest = await inspect(`${IMAGE}@${receipt.digest}`);
+              assert.equal(manifest.digest, receipt.digest);
+              if (manifest.manifests) verifyPlatforms(manifest, [receipt]);
+              else assert.equal(manifest.digest, receipt.platform_digest);
+            }
+            async function recheckSource() {
+              const { data: release } = await github.rest.repos.getRelease({ ...context.repo, release_id: context.payload.release.id });
+              assert(!release.draft && release.published_at && release.tag_name === `v${VERSION}`, "Release changed before publication.");
+              const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${release.tag_name}` });
+              assert.equal(commit.sha, SOURCE_SHA, "Release tag moved before publication.");
+              return release;
+            }
+            await recheckSource();
+            const tags = [`${IMAGE}:${VERSION}`, `${IMAGE}:sha-${SOURCE_SHA}`];
+            await exec.exec("docker", ["buildx", "imagetools", "create", ...tags.flatMap(tag => ["--tag", tag]),
+              ...receipts.map(receipt => `${IMAGE}@${receipt.digest}`)]);
+            const combined = await inspect(tags[0]);
+            assert(/^sha256:[0-9a-f]{64}$/.test(combined.digest), "Invalid combined digest.");
+            verifyPlatforms(combined, receipts);
+            assert.equal((await inspect(tags[1])).digest, combined.digest);
+            const release = await recheckSource();
+            if (IS_PRERELEASE === "false" && !release.prerelease && !VERSION.includes("-")) {
+              const { data: latest } = await github.rest.repos.getLatestRelease(context.repo);
+              if (latest.id === release.id && !latest.prerelease && !latest.draft) {
+                const tag = `${IMAGE}:latest`;
+                await exec.exec("docker", ["buildx", "imagetools", "create", "--tag", tag, `${IMAGE}@${combined.digest}`]);
+                assert.equal((await inspect(tag)).digest, combined.digest);
+                tags.push(tag);
+              }
             }
             const receipt = {
-              repository: "ghcr.io/markhuangai/opensource-repo-manager",
-              version: process.env.VERSION,
-              source_sha: process.env.SOURCE_SHA,
-              digest: process.env.IMAGE_DIGEST,
-              platforms: ["linux/amd64", "linux/arm64"],
+              repository: IMAGE, version: VERSION, source_sha: SOURCE_SHA, digest: combined.digest, tags,
+              platforms: receipts.map(({ platform, digest, platform_digest }) => ({ platform, digest, platform_digest })),
               run_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             };
             core.info(JSON.stringify(receipt));
