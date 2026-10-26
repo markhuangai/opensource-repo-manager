@@ -6,14 +6,9 @@ A self-hosted GitHub maintenance service for repositories whose maintainers cann
 
 ## Run the service
 
-Use Node 24.18.0 and npm 12.0.2:
+Use Docker Compose on a Linux AMD64 or ARM64 host. Compose selects the native image from `ghcr.io/markhuangai/opensource-repo-manager:latest`; users do not need Node or a local build. The first release and public-package activation described below must be completed before anonymous pulls work.
 
-```sh
-npm ci
-npm run check
-```
-
-`npm run dev` runs the source with Node's watch mode; `npm start` runs the production build. Both require valid protected configuration and bundles before opening HTTP. The fixed paths are `/config/config.yml`, `/prompts`, and `/skills`; use the container setup below to provide them. The service listens on port 8080. `GET /healthz` returns HTTP 200 with `{"status":"ok"}`. `GET /readyz` returns HTTP 200 with `status: ready` once intake, the coordinator, notifications and PR monitoring are running; startup, unavailable infrastructure or disabled monitoring returns HTTP 503 with a fixed safe reason and aggregate counts. Docker uses liveness for its healthcheck; a healthy container does not mean maintenance automation is ready.
+The service listens on port 8080. `GET /healthz` returns HTTP 200 with `{"status":"ok"}`. `GET /readyz` returns HTTP 200 with `status: ready` once intake, the coordinator, notifications and PR monitoring are running; startup, unavailable infrastructure or disabled monitoring returns HTTP 503 with a fixed safe reason and aggregate counts. Docker uses liveness for its healthcheck; a healthy container does not mean maintenance automation is ready.
 
 For Compose, install the sample bundles and protected configuration, then replace the placeholder repository, credentials, proxy endpoint, model IDs, and notification settings:
 
@@ -24,10 +19,21 @@ cp -R examples/workflow/prompts/. operator/prompts/
 sudo install -d -o root -g root -m 0700 operator/config
 sudo install -o root -g root -m 0600 config.example.yml operator/config/config.yml
 sudoedit operator/config/config.yml
-docker compose up --build
+docker compose pull
+docker compose up -d
 ```
 
 Compose exposes port 8080 on localhost, persists `/data`, and mounts configuration, skills, and prompts read-only. The root supervisor validates and snapshots those files, recovers interrupted worker leases, and starts a loopback model relay before starting HTTP. Its fixed `/opt/orm-runtime/bin/node` executable stays separate from future repository toolchains. The image includes Git, certificates, C build tools, process supervision, and distinct `coding`, `audit`, and `output-review` users.
+
+Set `ORM_IMAGE` in the shell or a Compose `.env` file to pin a published version, for example `ghcr.io/markhuangai/opensource-repo-manager:0.1.0`, or an immutable `ghcr.io/markhuangai/opensource-repo-manager@sha256:<digest>`. This override belongs to Compose; it does not interpolate application configuration. Public images need no registry login. Updating requires an explicit `docker compose pull` followed by `docker compose up -d`; the service does not update itself.
+
+### Publishing images
+
+Publish a GitHub Release with a tag such as `v0.1.0` or `v0.1.0-rc.1` pointing to a commit on `main`. Wait for Repository CI and CodeQL to pass on that exact main-push commit first. The Release workflow rejects unmerged commits, moved tags, malformed versions, and missing or unsuccessful validation. Version tags exclude SemVer build metadata (`+...`), which Docker tags cannot represent. A blocked or interrupted release run can be rerun after its cause is resolved; publishing a tag alone does not start the workflow.
+
+Native builds use the standard GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners, which are free for public repositories. Each image is pushed by digest and checked for its source, platform, Node/SQLite execution, and bundled native tools. Only after both succeed does the workflow publish the combined `0.1.0` (or `0.1.0-rc.1`) and `sha-<full-commit-sha>` tags. Prereleases never update `latest`; a stable release updates it only if GitHub still designates that release as latest. The workflow summary records source SHA, platform digests, combined digest, tags, and run URL. Pin the digest for reproducible deployments, including across release reruns.
+
+After the workflow change is merged, a maintainer must publish the first stable release and set the GHCR package's visibility to **Public** in its package settings. GitHub creates packages as private by default. Verify anonymous pulls for both `linux/amd64` and `linux/arm64` using a Docker client configuration without credentials before announcing public availability. This change does not perform that first release, change package settings, or deploy the service. Architecture receipt artifacts expire after one day; interrupted builds can leave untagged image digests without promoting release tags. Release runs are serialized without cancelling the active run; GitHub's concurrency queue can replace an older pending run, which must then be rerun if still wanted.
 
 ## Protected configuration and workflow bundles
 
@@ -204,6 +210,20 @@ The optional `McpSessionProvider` supplies only scoped loopback connection descr
 Disk usage is checked every second, including source staging, workspace/home/temp folders, role-owned shared temporary files and open deleted files. Verified Git objects move into the fresh checkout without duplication. A credential-free trusted probe uses the worker's effective identity to inspect deleted files while retaining protected root real/saved identities; workers cannot signal or inspect the probe. Deleted mappings without a measurable descriptor and other monitoring errors cancel the run. Exceeding a configured threshold also cancels the run. These are soft limits on ordinary disk storage, with no tmpfs requirement or hard filesystem quota. A rapid writer can exceed a threshold before detection and fill shared storage. Installer storage accounting bounds growth during each operation; operators size retained toolchain and download storage separately. Preserve space for state and artifacts when sizing the data volume. Stop workers and revoke authorization before rollback; retain the schema-10 database and call/runtime/bootstrap/publication receipts rather than downgrading persisted state.
 
 ## Development and validation
+
+Use Node 24.18.0 and npm 12.0.2:
+
+```sh
+npm ci
+npm run check
+```
+
+`npm run dev` runs the source with Node's watch mode; `npm start` runs the production build. Both require protected configuration and bundles at `/config/config.yml`, `/prompts`, and `/skills` before opening HTTP. To build and run locally with the same Compose mounts:
+
+```sh
+docker build -t opensource-repo-manager:local .
+ORM_IMAGE=opensource-repo-manager:local docker compose up -d --pull never
+```
 
 `npm run check` checks formatting, lint, types, tests, and the production build. `npm run test:container -- --platform linux/amd64` builds and exercises the real image with HTTP, readiness, users, permissions, mounts, persistence, secret-canary exclusion, signed webhooks, interrupted backfill recovery, and graceful shutdown checks. Use `linux/arm64` on an ARM64 host. Container tests require Docker with Buildx and a local Unix-socket daemon. They create an isolated Docker client configuration for public pulls and remove only their labeled test resources, preserving host credentials, other builders, and shared caches.
 
