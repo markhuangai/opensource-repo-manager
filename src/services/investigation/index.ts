@@ -176,6 +176,8 @@ export class InvestigationService {
     if (context.state === "closed") return;
     const job = this.store.job(context.number);
     if (!job) return;
+    if (job.issue_id !== context.id)
+      throw new IntakeError("issue_identity_changed");
     const pending = this.supervisor.publication.repository.pending(job.id);
     if (
       !pending?.steps.some((step) =>
@@ -183,6 +185,8 @@ export class InvestigationService {
       )
     )
       return;
+    if (Date.now() < pending.retry_at)
+      throw new IntakeError("publication_pending", pending.retry_at);
     try {
       const receipt = await this.supervisor.publication.reconcile(
         pending.id,

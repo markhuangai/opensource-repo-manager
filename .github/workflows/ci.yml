@@ -62,6 +62,7 @@ jobs:
           - core
           - investigation
           - bootstrap
+          - actions
           - implementation-candidates
           - implementation-recovery
           - implementation-monitor-repair

@@ -576,7 +576,7 @@ describe("native suite aggregation", () => {
           job.name ===
           `Container tests (${architecture}, implementation-monitor-mcp)`,
       );
-    it(`requires all eight ${architecture} suites and reports queue time separately`, async () => {
+    it(`requires all nine ${architecture} suites and reports queue time separately`, async () => {
       const result = await run(script, { env, jobs: jobs() });
       expect(result.failures).toEqual([]);
       expect(result.notices.map((value) => JSON.parse(value))).toEqual(

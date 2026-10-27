@@ -7,7 +7,12 @@ import {
 } from "./bundles.ts";
 import { ConfigurationError } from "./errors.ts";
 import { readRegularFile } from "./files.ts";
-import { parseConfiguration, roleNames, type Role } from "./schema.ts";
+import {
+  parseActionsConfiguration,
+  parseConfiguration,
+  roleNames,
+  type Role,
+} from "./schema.ts";
 import {
   separateSecrets,
   type SecretAccessor,
@@ -62,7 +67,10 @@ export function createRunSnapshot(
 
 export type RunSnapshot = ReturnType<typeof createRunSnapshot>;
 
-export async function loadProtectedConfiguration(path = "/config/config.yml") {
+async function loadConfiguration(
+  path: string,
+  parse: typeof parseConfiguration | typeof parseActionsConfiguration,
+) {
   const bytes = await readRegularFile(path, true);
   let source: string;
   try {
@@ -70,10 +78,20 @@ export async function loadProtectedConfiguration(path = "/config/config.yml") {
   } catch {
     throw new ConfigurationError("yaml_invalid");
   }
-  const { settings, secrets } = separateSecrets(parseConfiguration(source));
+  const { settings, secrets } = separateSecrets(parse(source));
   const bundles = await loadWorkflowBundles(settings, secrets);
   return Object.freeze({
     snapshot: createRunSnapshot(settings, bundles, secrets),
     secrets,
   });
+}
+
+export function loadProtectedConfiguration(path = "/config/config.yml") {
+  return loadConfiguration(path, parseConfiguration);
+}
+
+export function loadProtectedActionsConfiguration(
+  path = "/config/actions.yml",
+) {
+  return loadConfiguration(path, parseActionsConfiguration);
 }

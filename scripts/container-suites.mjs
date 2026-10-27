@@ -57,6 +57,7 @@ export const containerSuites = [
   "core",
   "investigation",
   "bootstrap",
+  "actions",
   ...Object.keys(implementationScenarios),
 ];
 export const implementationSdks = ["codex", "claude"];

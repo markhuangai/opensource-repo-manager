@@ -317,11 +317,22 @@ export class IntakeService {
   async refresh(number: number, signal: AbortSignal, notify = true) {
     if (!this.verified || Date.now() < this.retryAt)
       throw new IntakeError("enrollment_pending", this.retryAt);
-    await this.readIssue(
+    return this.readIssue(
       this.store.refreshIssue(number),
       AbortSignal.any([signal, this.controller.signal]),
       notify,
     );
+  }
+
+  async enrollIssue(number: number, signal: AbortSignal) {
+    githubId.parse(number);
+    const abort = AbortSignal.any([signal, this.controller.signal]);
+    const repository = await this.reader.repository(abort);
+    this.store.enroll(repository);
+    this.verified = true;
+    const context = await this.refresh(number, abort, false);
+    this.state = "ready";
+    return context;
   }
 
   private async readIssue(
@@ -342,6 +353,7 @@ export class IntakeService {
       throw new IntakeError("secret_in_input");
     this.store.applyIssue(target, context, this.snapshot);
     if (notify) this.hooks.changed?.();
+    return context;
   }
 
   enrolled() {

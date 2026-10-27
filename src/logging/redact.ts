@@ -85,10 +85,12 @@ export function createKnownSecretChecker(values: readonly string[]) {
 
 export type KnownSecretChecker = ReturnType<typeof createKnownSecretChecker>;
 
-export function createSafeLogger(checker: KnownSecretChecker) {
+export function createSafeLogger(checker: KnownSecretChecker, stderr = false) {
   return Object.freeze({
     info: (message: string) =>
-      console.log(checker.redact(message).slice(0, 2048)),
+      (stderr ? console.error : console.log)(
+        checker.redact(message).slice(0, 2048),
+      ),
     error: (message: string) =>
       console.error(checker.redact(message).slice(0, 2048)),
   });
