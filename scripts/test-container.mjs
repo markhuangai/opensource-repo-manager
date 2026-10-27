@@ -1,3 +1,4 @@
+import { runActionsTests } from "../tests/integration/actions/harness.mjs";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -113,6 +114,7 @@ let runtimeProof,
   implementationProof,
   bootstrapProof;
 const investigationStartupProof = [];
+const actionsProof = [];
 let protectedFixtures = false;
 
 let daemon;
@@ -1217,7 +1219,7 @@ try {
       cleanup: "passed",
     };
   }
-  if (suite === "investigation") {
+  if (suite === "investigation" || suite === "actions") {
     for (const sdk of ["codex", "claude"]) {
       phase(`production-startup-${sdk}`);
       console.log(`Verifying production startup through ${sdk}`);
@@ -1293,8 +1295,15 @@ try {
           headers: {},
         },
       };
+      const configName = suite === "actions" ? "actions.yml" : "config.yml";
+      if (suite === "actions") {
+        delete config.github.webhook_secret;
+        delete config.notifications;
+        delete config.mcp;
+        for (const role of Object.values(config.roles)) delete role.mcp;
+      }
       await writeFile(
-        join(directory, "config", "config.yml"),
+        join(directory, "config", configName),
         stringifyYaml(config),
       );
       await writeFile(
@@ -1330,7 +1339,7 @@ try {
         "/bin/sh",
         image,
         "-c",
-        "chown -R 0:0 /fixture && chmod 700 /fixture/config && chmod 600 /fixture/config/config.yml",
+        `chown -R 0:0 /fixture && chmod 700 /fixture/config && chmod 600 /fixture/config/${configName}`,
       ]);
       register("network", net);
       docker(["network", "create", "--label", `${label}=${id}`, net]);
@@ -1365,6 +1374,7 @@ try {
         "/opt/orm-runtime/bin/node",
         image,
         "/investigation-fixtures/server.mjs",
+        ...(suite === "actions" ? ["--actions"] : []),
       ]);
       await waitUntil(
         () =>
@@ -1377,6 +1387,26 @@ try {
           ]).status === 0,
         "Investigation upstream fixture did not start",
       );
+      if (suite === "actions") {
+        actionsProof.push(
+          await runActionsTests({
+            sdk,
+            manager,
+            upstreamName,
+            data,
+            directory,
+            image,
+            net,
+            label,
+            id,
+            docker,
+            result,
+            register,
+            waitUntil,
+          }),
+        );
+        continue;
+      }
       register("container", manager);
       docker([
         "run",
@@ -1689,6 +1719,7 @@ try {
     maintenance_implementation: implementationProof,
     investigation_startup:
       suite === "investigation" ? investigationStartupProof : undefined,
+    bounded_actions: suite === "actions" ? actionsProof : undefined,
     durable_notifications: notificationProof,
     repository_bootstrap: bootstrapProof,
   };

@@ -21,8 +21,8 @@ describe("container suite selection", () => {
         selectContainerSuites(["--platform", platform, "--suite", "all"], arch),
       ).toEqual({ platform, suites: containerSuites });
     }
-    expect(containerSuites).toHaveLength(8);
-    expect(new Set(containerSuites).size).toBe(8);
+    expect(containerSuites).toHaveLength(9);
+    expect(new Set(containerSuites).size).toBe(9);
     expect(implementationSdks).toEqual(["codex", "claude"]);
   });
 
@@ -33,7 +33,7 @@ describe("container suite selection", () => {
       ).toEqual({ platform: "linux/arm64", suites: [suite] });
       const selected = selectContainerSuites([]);
       selected.suites.pop();
-      expect(containerSuites).toHaveLength(8);
+      expect(containerSuites).toHaveLength(9);
     });
   }
 

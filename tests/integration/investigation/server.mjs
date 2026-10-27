@@ -12,6 +12,10 @@ import { respond as claude } from "/agent-fixtures/claude.mjs";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
 import { sourceFiles, modelFixture } from "./protocol.mjs";
 
+const actions = process.argv.includes("--actions");
+let selectedIssue = 1;
+let held = false;
+let releaseHold;
 const config = JSON.parse(readFileSync("/fixture/configuration.json", "utf8"));
 const remote = await createPublicationFixture("/fixture/git");
 mkdirSync("/fixture/notifications", { recursive: true });
@@ -33,13 +37,39 @@ remote.state.issues.set(1, {
   body: "increment returns the wrong value",
   updated_at: "2026-10-21T00:00:00Z",
 });
+if (actions) {
+  for (const [index, mode] of [
+    "source_only",
+    "needs_information",
+    "manual_feature",
+    "no_fix",
+    "closed",
+    "blocked",
+    "cancel",
+    "unrelated",
+  ].entries())
+    remote.state.issues.set(index + 1, {
+      id: 1001 + index,
+      number: index + 1,
+      title: mode,
+      body: "increment returns the wrong value",
+      updated_at: "2026-10-21T00:00:00Z",
+    });
+  remote.state.closed.add(5);
+}
 let database;
+const databases = new Map();
 const store = {
   get db() {
-    return (database ??= new Database("/data/state/manager.sqlite", {
-      readonly: true,
-      fileMustExist: true,
-    }));
+    return (database ??= new Database(
+      actions
+        ? `/data/actions/${selectedIssue}/state/manager.sqlite`
+        : "/data/state/manager.sqlite",
+      {
+        readonly: true,
+        fileMustExist: true,
+      },
+    ));
   },
   runs() {
     return this.db.prepare("SELECT * FROM agent_runs ORDER BY rowid").all();
@@ -54,7 +84,24 @@ const store = {
     );
   },
 };
-const fixture = modelFixture(config, store, "/data/runtime");
+let fixture = makeFixture();
+function makeFixture() {
+  return modelFixture(
+    config,
+    store,
+    actions ? `/data/actions/${selectedIssue}/runtime` : "/data/runtime",
+    {
+      async investigate() {
+        if (actions && selectedIssue === 7) {
+          held = true;
+          await new Promise((resolve) => {
+            releaseHold = resolve;
+          });
+        }
+      },
+    },
+  );
+}
 const tls = httpsServer(
   {
     key: readFileSync("/fixture-key.pem"),
@@ -74,11 +121,41 @@ const tls = httpsServer(
   },
 );
 const http = createServer(async (req, res) => {
-  if (req.url === "/proof") {
+  const url = new URL(req.url, "http://fixture");
+  if (actions && url.pathname === "/select" && req.method === "POST") {
+    if (database) databases.set(selectedIssue, database);
+    selectedIssue = Number(url.searchParams.get("issue"));
+    if (selectedIssue === 999)
+      remote.state.readFailure = {
+        path: "/repos/owner/repo/issues/999",
+        status: 404,
+      };
+    database = databases.get(selectedIssue);
+    held = false;
+    fixture = makeFixture();
+    res.end("selected");
+  } else if (actions && url.pathname === "/release" && req.method === "POST") {
+    releaseHold?.();
+    res.end("released");
+  } else if (req.url === "/proof") {
     res.setHeader("content-type", "application/json");
     res.end(
       JSON.stringify({
         source,
+        held,
+        github_requests: remote.state.requests,
+        runs: database
+          ? store.runs().map(({ role, uid, status, finished_at }) => ({
+              role,
+              uid,
+              status,
+              finished_at,
+            }))
+          : [],
+        leases: database
+          ? store.db.prepare("SELECT count(*) AS count FROM coding_lease").get()
+              .count
+          : 0,
         comments: [...remote.state.comments.entries()],
         pulls: remote.state.pulls,
         mutations: remote.state.mutations,
@@ -157,7 +234,8 @@ process.on("SIGTERM", async () => {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
-  database?.close();
+  if (database) databases.set(selectedIssue, database);
+  for (const connection of databases.values()) connection.close();
   await notificationServer.close();
   await remote.close();
 });

@@ -207,7 +207,31 @@ const configurationSchema = z.strictObject({
 export type Configuration = z.infer<typeof configurationSchema>;
 export type ModelProfile = Configuration["profiles"][string];
 
-export function parseConfiguration(source: string): Configuration {
+const actionsRole = role.omit({ mcp: true }).transform((value) => ({
+  ...value,
+  mcp: {} as Configuration["roles"][Role]["mcp"],
+}));
+const actionsConfigurationSchema = configurationSchema
+  .omit({ notifications: true, mcp: true })
+  .extend({
+    github: configurationSchema.shape.github.omit({ webhook_secret: true }),
+    roles: z.strictObject({
+      bootstrap: actionsRole,
+      investigation: actionsRole,
+      implementation: actionsRole,
+      audit: actionsRole,
+      output_review: actionsRole,
+    }),
+  })
+  .transform((value) => ({
+    ...value,
+    notifications: configurationSchema.shape.notifications.parse({}),
+    mcp: configurationSchema.shape.mcp.parse({}),
+  }));
+
+export type ActionsConfiguration = z.infer<typeof actionsConfigurationSchema>;
+
+function parseSchema<T>(source: string, schema: z.ZodType<T>): T {
   if (Buffer.byteLength(source) > 1024 * 1024)
     throw new ConfigurationError("yaml_invalid");
   const lineCounter = new LineCounter();
@@ -230,7 +254,7 @@ export function parseConfiguration(source: string): Configuration {
     if (error instanceof ConfigurationError) throw error;
     throw new ConfigurationError("yaml_invalid");
   }
-  const parsed = configurationSchema.safeParse(input);
+  const parsed = schema.safeParse(input);
   if (!parsed.success) {
     const legacy = z
       .object({
@@ -261,7 +285,10 @@ export function parseConfiguration(source: string): Configuration {
     const section = configurationSections.find((section) => section === first);
     throw new ConfigurationError("schema_invalid", undefined, section);
   }
-  const config = parsed.data;
+  return parsed.data;
+}
+
+function validateReferences(config: Configuration | ActionsConfiguration) {
   if (
     new Set(config.pr_monitor.required_checks).size !==
       config.pr_monitor.required_checks.length ||
@@ -281,8 +308,6 @@ export function parseConfiguration(source: string): Configuration {
     )
   )
     throw new ConfigurationError("schema_invalid", undefined, "pr_monitor");
-  if (!Object.values(config.notifications).some((channel) => channel.enabled))
-    throw new ConfigurationError("schema_invalid");
   for (const entry of Object.values(config.mcp.servers)) {
     if (
       new Set(entry.review_required_tools).size !==
@@ -316,5 +341,20 @@ export function parseConfiguration(source: string): Configuration {
           throw new ConfigurationError("reference_invalid");
     }
   }
+}
+
+export function parseConfiguration(source: string): Configuration {
+  const config = parseSchema(source, configurationSchema);
+  validateReferences(config);
+  if (!Object.values(config.notifications).some((channel) => channel.enabled))
+    throw new ConfigurationError("schema_invalid");
+  return config;
+}
+
+export function parseActionsConfiguration(
+  source: string,
+): ActionsConfiguration {
+  const config = parseSchema(source, actionsConfigurationSchema);
+  validateReferences(config);
   return config;
 }

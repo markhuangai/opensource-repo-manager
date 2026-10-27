@@ -1,17 +1,10 @@
-import { createGitHubReader } from "./adapters/github/reader.ts";
+import { createApplication } from "./runtime/application.ts";
 import { ConfigurationError } from "./config/errors.ts";
 import { loadProtectedConfiguration } from "./config/load.ts";
 import { startHttpService } from "./http/server.ts";
 import { IntakeError } from "./domain/jobs.ts";
 import { Store } from "./repositories/store.ts";
-import { IntakeService } from "./services/intake.ts";
-import { InvestigationService } from "./services/investigation/index.ts";
-import { ImplementationService } from "./services/implementation/index.ts";
-import { PrMonitorService } from "./services/pr-monitor/index.ts";
 import { RuntimeError } from "./domain/agents.ts";
-import { Supervisor } from "./runtime/supervisor.ts";
-import { McpGateway } from "./services/mcp/index.ts";
-import { fileURLToPath } from "node:url";
 import {
   createKnownSecretChecker,
   createSafeLogger,
@@ -26,102 +19,20 @@ try {
   if (process.getuid?.() !== 0)
     throw new IntakeError("supervisor_requires_root");
   const store = new Store("/data/state/manager.sqlite");
-  const mcp = new McpGateway(store, loaded.snapshot, loaded.secrets);
-  let supervisor: Supervisor | undefined;
+  const application = await createApplication(store, loaded, logger, {
+    mode: "service",
+  });
   try {
-    supervisor = await Supervisor.create(
-      store,
-      loaded.snapshot,
-      loaded.secrets,
-      {
-        mcp,
-        workers: {
-          claude: fileURLToPath(
-            new URL("./adapters/agents/claude.js", import.meta.url),
-          ),
-          codex: fileURLToPath(
-            new URL("./adapters/agents/codex.js", import.meta.url),
-          ),
-        },
-      },
-    );
-    mcp.setWriteDispatcher(supervisor.mcpWrites);
-    mcp.setReadResultScanner(supervisor.publication.outputReview.scanner);
-    await mcp.start();
-    const reader = createGitHubReader(
-      loaded.snapshot.settings.github.repository,
-      loaded.secrets.get("github.token"),
-    );
-    const intake = new IntakeService(
-      store,
-      reader,
-      loaded.snapshot,
-      loaded.secrets,
-      logger,
-      {
-        beforeIssue: async (context, signal) =>
-          investigation?.beforeIssue(context, signal),
-        changed: () => {
-          investigation?.wake();
-          monitor?.wake();
-        },
-      },
-    );
-    const implementation = new ImplementationService(
-      store,
-      intake,
-      supervisor,
-      loaded.secrets,
-      logger,
-    );
-    const monitor = new PrMonitorService(
-      store,
-      intake,
-      reader,
-      implementation,
-      supervisor,
-      loaded.snapshot,
-      loaded.secrets,
-      logger,
-    );
-    const investigation: InvestigationService = new InvestigationService(
-      store,
-      intake,
-      supervisor,
-      loaded.secrets,
-      logger,
-      undefined,
-      implementation,
-    );
-    monitor.setCoordinatorWake(() => investigation.wake());
     await startHttpService(logger, {
-      intake,
-      investigation,
-      notifications: supervisor.notifications,
-      mcpWrites: supervisor.mcpWrites,
+      intake: application.intake,
+      investigation: application.investigation,
+      notifications: application.supervisor.notifications,
+      mcpWrites: application.supervisor.mcpWrites,
       webhookSecret: loaded.secrets.get("github.webhook_secret"),
-      close: async () => {
-        try {
-          await supervisor!.close();
-        } finally {
-          try {
-            await mcp.close();
-          } finally {
-            store.close();
-          }
-        }
-      },
+      close: application.close,
     });
   } catch (error) {
-    try {
-      await supervisor?.close();
-    } finally {
-      try {
-        await mcp.close();
-      } finally {
-        if (store.db.open) store.close();
-      }
-    }
+    await application.close();
     throw error;
   }
 } catch (error) {

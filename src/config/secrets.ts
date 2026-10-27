@@ -1,19 +1,18 @@
 import { createKnownSecretChecker } from "../logging/redact.ts";
 import { ConfigurationError } from "./errors.ts";
-import type { Configuration } from "./schema.ts";
+import type { ActionsConfiguration, Configuration } from "./schema.ts";
 
-export function separateSecrets(config: Configuration) {
+export function separateSecrets(config: Configuration | ActionsConfiguration) {
   const notifications = structuredClone(config.notifications);
   const credentials = new Map<string, string>();
   const identifiers: string[] = [];
-  const sensitive: string[] = [
-    config.github.token,
-    config.github.webhook_secret,
-    config.proxy.key,
-  ];
+  const sensitive: string[] = [config.github.token, config.proxy.key];
   const put = (name: string, value: string) => credentials.set(name, value);
   put("github.token", config.github.token);
-  put("github.webhook_secret", config.github.webhook_secret);
+  if ("webhook_secret" in config.github) {
+    put("github.webhook_secret", config.github.webhook_secret);
+    sensitive.push(config.github.webhook_secret);
+  }
   put("proxy.key", config.proxy.key);
   for (const [name, channel] of Object.entries(config.notifications)) {
     if (!channel.enabled) continue;
