@@ -9,6 +9,7 @@ import { OctokitReader } from "../src/adapters/github/reader.ts";
 import { ActionsState } from "../src/actions/persistence.ts";
 import { StateCodec, stateBytes, commentBytes } from "../src/actions/state.ts";
 import { Store } from "../src/repositories/store.ts";
+import { ActionsRepository } from "../src/repositories/actions.ts";
 import { PublicationRepository } from "../src/repositories/publication.ts";
 import { InvestigationRepository } from "../src/repositories/investigation.ts";
 import { ImplementationRepository } from "../src/repositories/implementation.ts";
@@ -50,8 +51,8 @@ async function setup() {
   const key = randomBytes(32).toString("base64"),
     { secrets } = separateSecrets(config, key),
     codec = new StateCodec(key);
-  const database = () => {
-    const store = new Store(join(root, randomUUID(), "state.sqlite"));
+  const database = (file = join(root, randomUUID(), "state.sqlite")) => {
+    const store = new Store(file);
     cleanups.push(async () => {
       if (store.db.open) store.close();
     });
@@ -135,6 +136,42 @@ describe("authenticated Actions task authority", () => {
       ),
     ).toBe(false);
   });
+
+  it.each(["acknowledge", "reconstructed"])(
+    "rolls back partial restoration at %s and retries from durable authority",
+    async (boundary) => {
+      const f = await setup(),
+        first = await f.open(f.store);
+      f.store.reserveInfrastructureRetry(1);
+      await f.store.checkpoint(signal());
+      const before = f.read(),
+        fresh = f.database(),
+        file = fresh.db.name,
+        repository = new ActionsRepository(fresh),
+        event =
+          boundary === "acknowledge" ? "INSERT" : "UPDATE OF reconstructed";
+      fresh.db.exec(`CREATE TRIGGER interrupt_restore BEFORE ${event}
+        ON actions_checkpoint BEGIN SELECT RAISE(ABORT,'restore_interrupted'); END`);
+      await expect(f.open(fresh)).rejects.toThrow("restore_interrupted");
+      expect(fresh.jobs()).toEqual([]);
+      expect(fresh.repository()).toBeUndefined();
+      expect(repository.local()).toBeUndefined();
+      expect(f.read().body).toBe(before.body);
+      fresh.db.exec("DROP TRIGGER interrupt_restore");
+      fresh.close();
+
+      const reopened = f.database(file),
+        recovered = await f.open(reopened);
+      expect(recovered.identifiers().task_id).toBe(first.identifiers().task_id);
+      expect(recovered.recoveryContext()).toBeDefined();
+      expect(recovered.repository.local()!.reconstructed).toBe(1);
+      expect(JSON.parse(reopened.job(1)!.budget_json)).toEqual(
+        before.state.budget,
+      );
+      expect(f.read().state.budget).toEqual(before.state.budget);
+      expect(f.remote.state.comments.get(1)).toHaveLength(1);
+    },
+  );
 
   it("reconciles lost enrollment, creation and update responses without another comment", async () => {
     const f = await setup();

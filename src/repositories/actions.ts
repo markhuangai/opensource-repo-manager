@@ -255,134 +255,143 @@ export class ActionsRepository {
     snapshot: RunSnapshot,
     pull?: OwnedPull,
   ) {
-    const { state } = comment,
-      prior = this.local(),
-      job = state.job;
-    if (job && job.snapshot_digest !== snapshot.digest)
-      throw new StateError("state_incompatible");
-    if (prior && prior.body !== comment.body && prior.intent !== comment.body)
-      throw new StateError("state_local_conflict");
-    if (!prior && this.store.jobs().length)
-      throw new StateError("state_legacy_unbound");
-    const reconstructed = !prior || prior.reconstructed === 1;
-    this.store.enroll(state.repository);
-    this.store.saveSnapshot(snapshot);
-    this.store.db
-      .prepare("UPDATE publication_instance SET id=?")
-      .run(state.publication_instance);
-    if (job && !this.store.job(state.issue.number)) {
-      const input = JSON.stringify({
-        ...context,
-        source: job.source,
-        updated_at: undefined,
-      });
-      this.store.db
-        .prepare(
-          "INSERT INTO jobs(id,issue_id,issue_number,revision,phase,status,input_digest,input_json,snapshot_digest,budget_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+    return this.store.db
+      .transaction(() => {
+        const { state } = comment,
+          prior = this.local(),
+          job = state.job;
+        if (job && job.snapshot_digest !== snapshot.digest)
+          throw new StateError("state_incompatible");
+        if (
+          prior &&
+          prior.body !== comment.body &&
+          prior.intent !== comment.body
         )
-        .run(
-          job.id,
-          state.issue.id,
-          state.issue.number,
-          job.revision,
-          state.pull ? "remote_review" : "investigation",
-          job.status,
-          job.input_digest,
-          input,
-          job.snapshot_digest,
-          JSON.stringify(state.budget),
-        );
-    }
-    if (job) {
-      const localJob = this.store.job(state.issue.number);
-      if (localJob?.id !== job.id || localJob.issue_id !== state.issue.id)
-        throw new StateError("state_local_conflict");
-      this.store.db
-        .prepare("UPDATE jobs SET budget_json=? WHERE id=?")
-        .run(JSON.stringify(state.budget), job.id);
-      this.store.db
-        .prepare(
-          "UPDATE pr_monitors SET content=json_set(content,'$.wait_accounted_at',?) WHERE job_id=?",
-        )
-        .run(state.wait_accounted_at, job.id);
-      const table =
-        job.phase === "investigation"
-          ? "investigations"
-          : job.phase === "implementation"
-            ? "implementations"
-            : "pr_monitors";
-      this.store.db
-        .prepare(
-          `UPDATE ${table} SET content=json_set(content,'$.retry_at',max(coalesce(json_extract(content,'$.retry_at'),0),?)) WHERE job_id=?`,
-        )
-        .run(state.retry_at, job.id);
-      this.store.db
-        .prepare("UPDATE runtime_leases SET deadline=accounted_at")
-        .run();
-      const publications = new PublicationRepository(this.store),
-        target = publications.target(job.id);
-      target.branch = state.branch;
-      target.head = state.head;
-      target.comment = {
-        id: state.comment_id!,
-        body: comment.narrative,
-        author_id: state.author_id,
-      };
-      if (pull) {
-        const { id, number, title, body, head, base, author_id } = pull;
-        target.pull = { id, number, title, body, head, base, author_id };
-      }
-      publications.saveTarget(target);
-      if (state.pending) {
-        const operation = publications.operation(state.pending.id);
-        if (operation) {
-          if (
-            operation.review_id !== state.pending.review_id ||
-            operation.steps.length !== state.pending.steps.length ||
-            operation.steps.some(
-              (step, index) =>
-                step.kind !== state.pending!.steps[index].kind ||
-                digest(step.after) !== state.pending!.steps[index].after_digest,
+          throw new StateError("state_local_conflict");
+        if (!prior && this.store.jobs().length)
+          throw new StateError("state_legacy_unbound");
+        const reconstructed = !prior || prior.reconstructed === 1;
+        this.store.enroll(state.repository);
+        this.store.saveSnapshot(snapshot);
+        this.store.db
+          .prepare("UPDATE publication_instance SET id=?")
+          .run(state.publication_instance);
+        if (job && !this.store.job(state.issue.number)) {
+          const input = JSON.stringify({
+            ...context,
+            source: job.source,
+            updated_at: undefined,
+          });
+          this.store.db
+            .prepare(
+              "INSERT INTO jobs(id,issue_id,issue_number,revision,phase,status,input_digest,input_json,snapshot_digest,budget_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
             )
-          )
-            throw new StateError("state_local_conflict");
-          operation.status = state.pending.status;
-          operation.retry_at = state.pending.retry_at;
-          operation.retry_pending = state.pending.retry_pending;
-          operation.target = target;
-          for (const [index, step] of operation.steps.entries()) {
-            step.state = state.pending.steps[index].state;
-            if (step.state === "confirmed")
-              publications.finishStep(operation, step.kind);
-          }
-          publications.save(operation);
+            .run(
+              job.id,
+              state.issue.id,
+              state.issue.number,
+              job.revision,
+              state.pull ? "remote_review" : "investigation",
+              job.status,
+              job.input_digest,
+              input,
+              job.snapshot_digest,
+              JSON.stringify(state.budget),
+            );
         }
-      }
-      this.own(
-        "issue_comment",
-        state.comment_id!,
-        job.id,
-        job.revision,
-        null,
-        null,
-      );
-      if (state.pull)
-        this.own(
-          "pull_request",
-          state.pull.id,
-          job.id,
-          job.revision,
-          state.pull.number,
-          state.head,
-        );
-    }
-    this.acknowledge(comment.body);
-    this.store.db
-      .prepare(
-        "UPDATE actions_checkpoint SET reconstructed=? WHERE singleton=1",
-      )
-      .run(Number(reconstructed));
-    return reconstructed;
+        if (job) {
+          const localJob = this.store.job(state.issue.number);
+          if (localJob?.id !== job.id || localJob.issue_id !== state.issue.id)
+            throw new StateError("state_local_conflict");
+          this.store.db
+            .prepare("UPDATE jobs SET budget_json=? WHERE id=?")
+            .run(JSON.stringify(state.budget), job.id);
+          this.store.db
+            .prepare(
+              "UPDATE pr_monitors SET content=json_set(content,'$.wait_accounted_at',?) WHERE job_id=?",
+            )
+            .run(state.wait_accounted_at, job.id);
+          const table =
+            job.phase === "investigation"
+              ? "investigations"
+              : job.phase === "implementation"
+                ? "implementations"
+                : "pr_monitors";
+          this.store.db
+            .prepare(
+              `UPDATE ${table} SET content=json_set(content,'$.retry_at',max(coalesce(json_extract(content,'$.retry_at'),0),?)) WHERE job_id=?`,
+            )
+            .run(state.retry_at, job.id);
+          this.store.db
+            .prepare("UPDATE runtime_leases SET deadline=accounted_at")
+            .run();
+          const publications = new PublicationRepository(this.store),
+            target = publications.target(job.id);
+          target.branch = state.branch;
+          target.head = state.head;
+          target.comment = {
+            id: state.comment_id!,
+            body: comment.narrative,
+            author_id: state.author_id,
+          };
+          if (pull) {
+            const { id, number, title, body, head, base, author_id } = pull;
+            target.pull = { id, number, title, body, head, base, author_id };
+          }
+          publications.saveTarget(target);
+          if (state.pending) {
+            const operation = publications.operation(state.pending.id);
+            if (operation) {
+              if (
+                operation.review_id !== state.pending.review_id ||
+                operation.steps.length !== state.pending.steps.length ||
+                operation.steps.some(
+                  (step, index) =>
+                    step.kind !== state.pending!.steps[index].kind ||
+                    digest(step.after) !==
+                      state.pending!.steps[index].after_digest,
+                )
+              )
+                throw new StateError("state_local_conflict");
+              operation.status = state.pending.status;
+              operation.retry_at = state.pending.retry_at;
+              operation.retry_pending = state.pending.retry_pending;
+              operation.target = target;
+              for (const [index, step] of operation.steps.entries()) {
+                step.state = state.pending.steps[index].state;
+                if (step.state === "confirmed")
+                  publications.finishStep(operation, step.kind);
+              }
+              publications.save(operation);
+            }
+          }
+          this.own(
+            "issue_comment",
+            state.comment_id!,
+            job.id,
+            job.revision,
+            null,
+            null,
+          );
+          if (state.pull)
+            this.own(
+              "pull_request",
+              state.pull.id,
+              job.id,
+              job.revision,
+              state.pull.number,
+              state.head,
+            );
+        }
+        this.acknowledge(comment.body);
+        this.store.db
+          .prepare(
+            "UPDATE actions_checkpoint SET reconstructed=? WHERE singleton=1",
+          )
+          .run(Number(reconstructed));
+        return reconstructed;
+      })
+      .immediate();
   }
 
   own(
