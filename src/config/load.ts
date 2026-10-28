@@ -70,6 +70,7 @@ export type RunSnapshot = ReturnType<typeof createRunSnapshot>;
 async function loadConfiguration(
   path: string,
   parse: typeof parseConfiguration | typeof parseActionsConfiguration,
+  sessionKey?: string,
 ) {
   const bytes = await readRegularFile(path, true);
   let source: string;
@@ -78,7 +79,7 @@ async function loadConfiguration(
   } catch {
     throw new ConfigurationError("yaml_invalid");
   }
-  const { settings, secrets } = separateSecrets(parse(source));
+  const { settings, secrets } = separateSecrets(parse(source), sessionKey);
   const bundles = await loadWorkflowBundles(settings, secrets);
   return Object.freeze({
     snapshot: createRunSnapshot(settings, bundles, secrets),
@@ -93,5 +94,14 @@ export function loadProtectedConfiguration(path = "/config/config.yml") {
 export function loadProtectedActionsConfiguration(
   path = "/config/actions.yml",
 ) {
-  return loadConfiguration(path, parseActionsConfiguration);
+  const key = process.env.ORM_SESSION_KEY;
+  if (
+    !key ||
+    !/^[A-Za-z0-9+/]{43}=$/.test(key) ||
+    Buffer.from(key, "base64").length !== 32 ||
+    Buffer.from(key, "base64").toString("base64") !== key
+  )
+    throw new ConfigurationError("session_key_invalid");
+  delete process.env.ORM_SESSION_KEY;
+  return loadConfiguration(path, parseActionsConfiguration, key);
 }

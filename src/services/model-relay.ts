@@ -196,6 +196,17 @@ export class ModelRelay {
         return;
       }
       const destination = new URL(this.endpoint);
+      await this.store.checkpoint(
+        AbortSignal.any([
+          controller.signal,
+          grant.signal,
+          grant.controller.signal,
+        ]),
+      );
+      if (!grant.current() || Date.now() >= grant.deadline) {
+        this.fail(res, 429);
+        return;
+      }
       destination.pathname = destination.pathname.replace(/\/+$/, "");
       if (!destination.pathname.endsWith("/v1")) destination.pathname += "/v1";
       destination.pathname += route.pathname.slice(3);

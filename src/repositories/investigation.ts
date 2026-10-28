@@ -52,7 +52,9 @@ export class InvestigationRepository {
       )
       .at(-1);
     const record: Investigation = {
-      id: randomUUID(),
+      id:
+        this.store.durability?.recoveryContext()?.scope?.investigation_id ??
+        randomUUID(),
       job_id: job.id,
       revision: job.revision,
       source: (JSON.parse(job.input_json) as IssueContext).source,

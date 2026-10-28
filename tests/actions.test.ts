@@ -8,6 +8,7 @@ import {
   parseConfiguration,
 } from "../src/config/schema.ts";
 import { separateSecrets } from "../src/config/secrets.ts";
+import { loadProtectedActionsConfiguration } from "../src/config/load.ts";
 import {
   assertTaskStore,
   parseTaskRequest,
@@ -44,6 +45,40 @@ function actionsConfig() {
 }
 
 describe("protected Actions configuration", () => {
+  it("requires a canonical 32-byte session key before loading protected Actions files", () => {
+    const saved = process.env.ORM_SESSION_KEY;
+    try {
+      for (const value of [
+        undefined,
+        "",
+        "short",
+        Buffer.alloc(31).toString("base64"),
+        Buffer.alloc(32).toString("base64") + "\n",
+      ]) {
+        if (value === undefined) delete process.env.ORM_SESSION_KEY;
+        else process.env.ORM_SESSION_KEY = value;
+        expect(() => loadProtectedActionsConfiguration("/not-read")).toThrow(
+          "session_key_invalid",
+        );
+      }
+    } finally {
+      if (saved === undefined) delete process.env.ORM_SESSION_KEY;
+      else process.env.ORM_SESSION_KEY = saved;
+    }
+  });
+  it("keeps the session key and its encodings outside snapshots", () => {
+    const config = parseActionsConfiguration(stringify(actionsConfig())),
+      key = Buffer.alloc(32, 19).toString("base64");
+    const { settings, secrets } = separateSecrets(config, key);
+    expect(secrets.get("actions.session_key")).toBe(key);
+    expect(secrets.containsCredentials(settings)).toBe(false);
+    for (const encoding of [
+      key,
+      Buffer.from(key, "base64").toString("hex"),
+      Buffer.from(key, "base64").toString("base64url"),
+    ])
+      expect(secrets.redact(encoding)).toBe("[redacted]");
+  });
   it("reuses core settings without inventing service credentials", () => {
     const input = actionsConfig();
     const config = parseActionsConfiguration(stringify(input));

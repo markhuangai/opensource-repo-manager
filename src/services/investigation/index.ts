@@ -512,6 +512,9 @@ export class InvestigationService {
         task,
         policy,
         ...(input as Record<string, unknown>),
+        ...(this.store.durability?.recoveryContext()
+          ? { recovered_context: this.store.durability.recoveryContext() }
+          : {}),
       }),
       output_schema: z.toJSONSchema(schema, {
         target: "draft-7",

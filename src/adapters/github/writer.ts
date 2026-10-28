@@ -200,6 +200,73 @@ export class OctokitWriter implements GitHubWriter {
   async actor(signal: AbortSignal) {
     return user.parse(await this.request("GET /user", {}, signal));
   }
+  async taskIssue(number: number, signal: AbortSignal) {
+    const issue = z
+      .object({
+        id: githubId,
+        number: githubId,
+        state: z.enum(["open", "closed"]),
+        pull_request: z.unknown().optional(),
+        labels: z.array(z.object({ name: z.string() })),
+      })
+      .parse(
+        await this.request(
+          "GET /repos/{owner}/{repo}/issues/{issue_number}",
+          { issue_number: number },
+          signal,
+        ),
+      );
+    if (issue.number !== number || issue.pull_request)
+      throw new IntakeError("issue_identity_changed");
+    return {
+      id: issue.id,
+      number,
+      state: issue.state,
+      managed: issue.labels.some((label) => label.name === "orm:managed"),
+    };
+  }
+  async enrollManaged(number: number, signal: AbortSignal) {
+    const label = { name: "orm:managed" };
+    try {
+      await this.request(
+        "GET /repos/{owner}/{repo}/labels/{name}",
+        label,
+        signal,
+      );
+    } catch (error) {
+      if (!(error instanceof IntakeError) || error.code !== "github_not_found")
+        throw error;
+      try {
+        await this.request(
+          "POST /repos/{owner}/{repo}/labels",
+          {
+            ...label,
+            color: "57606a",
+            description:
+              "Durable ORM task; preserve its authenticated state comment.",
+          },
+          signal,
+        );
+      } catch {
+        await this.request(
+          "GET /repos/{owner}/{repo}/labels/{name}",
+          label,
+          signal,
+        );
+      }
+    }
+    try {
+      await this.request(
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/labels",
+        { issue_number: number, labels: [label.name] },
+        signal,
+      );
+    } catch (error) {
+      if (!(await this.taskIssue(number, signal)).managed) throw error;
+    }
+    if (!(await this.taskIssue(number, signal)).managed)
+      throw new IntakeError("state_enrollment_failed");
+  }
   async issueOpen(
     number: number,
     signal: AbortSignal,

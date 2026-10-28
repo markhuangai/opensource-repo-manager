@@ -41,11 +41,14 @@ The separate Actions entrypoint processes one explicitly selected issue inside t
 
 Prepare the same protected configuration directory and prompt/skill mounts described above. Create `operator/config/actions.yml` from `config.example.yml`, removing `github.webhook_secret`, the top-level `notifications` and `mcp` sections, and any role's `mcp` field. Those fields are rejected in Actions configuration. Keep `version: 1`, `github.repository/token`, `proxy.url/key`, profiles, role bundles, PR policy, and limits; their core validation and defaults are unchanged. Set an HTTPS proxy endpoint reachable from the temporary container. Configuration and credentials remain root-only; workers receive neither the PAT nor proxy key. External MCP and notification channels are disabled in this mode.
 
-For a locally built image, run issue 41 with:
+Provide `ORM_SESSION_KEY` through the container environment. Generate it once as 32 random bytes encoded in canonical base64, and preserve the same key for every invocation of these tasks. It authenticates task state; losing or changing it blocks recovery. Keep it with the PAT and proxy credentials, outside worker environments. Service mode does not require this key.
+
+For a locally built image, with `ORM_SESSION_KEY` already set in the calling environment, run issue 41 with:
 
 ```sh
 docker build --tag orm-local .
 docker run --rm --no-healthcheck --entrypoint /usr/bin/tini \
+  --env ORM_SESSION_KEY \
   --mount type=bind,src="$PWD/operator/config",dst=/config,readonly \
   --mount type=bind,src="$PWD/operator/prompts",dst=/prompts,readonly \
   --mount type=bind,src="$PWD/operator/skills",dst=/skills,readonly \
@@ -57,9 +60,13 @@ Use native Linux AMD64 or ARM64 Docker with the image's root supervisor and dedi
 
 Stdout contains one JSON result; diagnostics go to stderr. Results include `version`, `outcome`, a fixed `reason`, verified task identifiers when available, and applicable PR/head or retry identifiers. `waiting` distinguishes `needs_information`, `remote_checks`, `monitor_disabled`, and `retry_scheduled`; `ready` means the existing monitor verified readiness for human review. `out_of_scope`, `no_fix`, and `closed` are separate terminal outcomes. These normal outcomes exit zero, including waiting. `blocked` and `failed` exit nonzero. Exit zero alone is not proof of a completed fix, and human review and merge remain required.
 
-Task state is local: `/data/actions/<issue-number>/state/manager.sqlite` and `/data/actions/<issue-number>/runtime`. Retain this volume between invocations to preserve budgets, publication ownership, and existing native local sessions. A mismatched repository or unrelated stored issue blocks startup. Do not use the service and bounded entrypoint for the same task. Losing this state does not provide safe recovery or authorization to repeat publication. Managed issue-comment persistence, encrypted artifacts, automatic reply routing, and reusable consumer workflows are separate upcoming work.
+Actions task authority lives in one authenticated issue comment, combining reviewed status text and signed controller metadata. The `orm:managed` label is an enrollment sentinel: do not delete it or edit/delete the managed comment. Missing, changed, conflicting, oversized, or incompatible state blocks execution without resetting budgets. The metadata is public, authenticated rather than encrypted, and excludes credentials, raw transcripts, operator configuration, and raw verification logs. State is limited to 32 KiB and the full comment to 60 KiB; exceeding either limit blocks the dependent effect instead of truncating state. The PAT needs issue read/write permission for comments and enrollment labels, in addition to the existing publication permissions.
 
-SIGINT/SIGTERM abort active work and initiate verified worker cleanup, relay shutdown, and database closure. Cancellation exits nonzero; cleanup failure overrides any successful result. Shutdown retains a ten-second deadline. Hard termination can leave only the last locally committed state; future retry deadlines are returned without keeping the container alive.
+SQLite at `/data/actions/<issue-number>/state/manager.sqlite` and its sibling runtime directory remain local working storage. Retaining them preserves native local sessions and verification evidence. An empty runner restores task identity, counters, questions, and publication ownership from GitHub, reconciles uncertain writes, and can restart unpublished work from reviewed findings with fresh verification. An owned PR is preserved; missing local evidence blocks further PR execution until the later session-artifact/continuation work. Unknown legacy local-only databases require operator inspection and are not automatically re-enrolled. No migration, artifact upload, automatic reply routing, or consumer workflow is provided here.
+
+Serialize **all** invocations for the same repository and issue through one caller. The runtime serializes its comment writes and checks generations/readback, but GitHub comments do not provide a transactional distributed lock. Different issues may run independently. Do not run service and Actions ownership for the same task. A publication response loss must be reconciled against the recorded branch/PR and intent; it never permits a second PR. Preserve comments, labels, keys, and published work on rollback, and disable dispatch rather than treating existing tasks as new.
+
+SIGINT/SIGTERM abort active work and initiate verified worker cleanup, relay shutdown, checkpointing, and database closure. Cancellation exits nonzero; cleanup or checkpoint failure cannot produce success. Shutdown retains a ten-second deadline. Hard termination promises only the last acknowledged remote checkpoint. Recovery charges elapsed active time since that checkpoint through its original deadline, so a long outage can exhaust the remaining active allowance. Future retry deadlines are returned without keeping the container alive. State failures have fixed `state_*` reasons; `recovery_evidence_missing` identifies an owned publication whose local continuation evidence is unavailable. Verified results also identify the task UUID, canonical comment ID, and acknowledged generation.
 
 ## Protected configuration and workflow bundles
 

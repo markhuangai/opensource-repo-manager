@@ -1,7 +1,7 @@
 import { runActionsTests } from "../tests/integration/actions/harness.mjs";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   appendFile,
   cp,
@@ -1225,6 +1225,7 @@ try {
       console.log(`Verifying production startup through ${sdk}`);
       const prefix = `${id}-investigation-${sdk}`,
         data = `${prefix}-data`,
+        freshData = `${prefix}-fresh-data`,
         net = `${prefix}-network`,
         upstreamName = `${prefix}-upstream`,
         manager = `${prefix}-manager`;
@@ -1308,7 +1309,12 @@ try {
       );
       await writeFile(
         join(directory, "configuration.json"),
-        JSON.stringify(config),
+        JSON.stringify({
+          ...config,
+          ...(suite === "actions"
+            ? { session_key: randomBytes(32).toString("base64") }
+            : {}),
+        }),
       );
       const caBundle = docker([
         "run",
@@ -1345,6 +1351,10 @@ try {
       docker(["network", "create", "--label", `${label}=${id}`, net]);
       register("volume", data);
       docker(["volume", "create", "--label", `${label}=${id}`, data]);
+      if (suite === "actions") {
+        register("volume", freshData);
+        docker(["volume", "create", "--label", `${label}=${id}`, freshData]);
+      }
       register("container", upstreamName);
       docker([
         "run",
@@ -1363,6 +1373,9 @@ try {
         "investigation-fixture",
         "--mount",
         `type=volume,src=${data},dst=/data,readonly`,
+        ...(suite === "actions"
+          ? ["--mount", `type=volume,src=${freshData},dst=/fresh-data,readonly`]
+          : []),
         "--mount",
         `type=bind,src=${directory},dst=/fixture`,
         "--mount",
@@ -1394,6 +1407,7 @@ try {
             manager,
             upstreamName,
             data,
+            freshData,
             directory,
             image,
             net,

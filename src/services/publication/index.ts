@@ -178,6 +178,7 @@ export class PublicationService {
       let git: PublicationGit | undefined, directory: string | undefined;
       this.repository.retry(receipt);
       try {
+        await this.store.checkpoint(publicationSignal);
         if (
           receipt.steps.some(
             (step) =>
@@ -233,6 +234,7 @@ export class PublicationService {
             ).id;
           receipt.status = "reviewed";
           this.repository.save(receipt);
+          await this.store.checkpoint(publicationSignal);
         }
         for (let index = 0; index < receipt.steps.length; index++) {
           const step = receipt.steps[index];
@@ -247,6 +249,7 @@ export class PublicationService {
           step.state = "dispatching";
           receipt.status = "dispatching";
           this.repository.save(receipt);
+          await this.store.checkpoint(publicationSignal);
           try {
             if (step.kind === "comment")
               await this.writer.comment(
@@ -308,6 +311,7 @@ export class PublicationService {
         receipt.status = "confirmed";
         receipt.failure = null;
         this.repository.save(receipt);
+        await this.store.checkpoint(publicationSignal);
         return receipt;
       } catch (error) {
         const cancelled =
@@ -375,6 +379,7 @@ export class PublicationService {
     }
     this.repository.retry(receipt);
     try {
+      await this.store.checkpoint(signal);
       const job = this.store.jobById(receipt.job_id);
       if (!job || !receipt.actor || !receipt.payload)
         throw new RuntimeError("publication_incomplete");
@@ -473,8 +478,10 @@ export class PublicationService {
         }
         step.state = matched ? "confirmed" : "uncertain";
         receipt.status = matched ? "reviewed" : "uncertain";
-        if (matched) this.repository.finishStep(receipt, step.kind);
-        else {
+        if (matched) {
+          this.repository.finishStep(receipt, step.kind);
+          await this.store.checkpoint(signal);
+        } else {
           receipt.failure = "publication_effect_uncertain";
           receipt.retry_pending = true;
           this.repository.save(receipt);
@@ -849,7 +856,8 @@ export class PublicationService {
   }
 
   private previousNarrative(id: string | null, jobId: number) {
-    if (id === null) return "";
+    if (id === null)
+      return this.store.durability?.recoveryContext()?.findings ?? "";
     const operation = this.repository.operation(id);
     if (
       !operation ||
