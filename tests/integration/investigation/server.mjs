@@ -106,6 +106,10 @@ function makeFixture() {
     store,
     actions ? `${dataRoot}/actions/${selectedIssue}/runtime` : "/data/runtime",
     {
+      investigationObjective:
+        actions && selectedIssue === 9 && dataRoot === "/fresh-data"
+          ? "Restore the documented add-one result for increment."
+          : undefined,
       async implementation(task) {
         if (
           actions &&
@@ -187,6 +191,17 @@ const http = createServer(async (req, res) => {
     res.end("released");
   } else if (
     actions &&
+    url.pathname === "/advance-main" &&
+    req.method === "POST"
+  ) {
+    const next = remote.commit(
+      { ...sourceFiles, "unrelated.md": "Unrelated default-branch change.\n" },
+      remote.head("main"),
+    );
+    remote.git(["update-ref", "refs/heads/main", next.sha]);
+    res.end("advanced");
+  } else if (
+    actions &&
     url.pathname === "/reject-checkpoint" &&
     req.method === "POST"
   ) {
@@ -229,6 +244,30 @@ const http = createServer(async (req, res) => {
         mutations: remote.state.mutations,
         errors: fixture.errors.map((error) => error.message),
         requests: fixture.requests.map((item) => item.scenario),
+        workflow: database
+          ? ["investigations", "implementations", "pr_monitors"].map(
+              (phase) => ({
+                phase,
+                records: store.db
+                  .prepare(
+                    `SELECT job_id, json_extract(content,'$.stage') AS stage,
+                    json_extract(content,'$.failure') AS failure,
+                    json_extract(content,'$.retry_at') AS retry_at FROM ${phase}`,
+                  )
+                  .all()
+                  .slice(-3),
+              }),
+            )
+          : [],
+        deliveries: database
+          ? store.db
+              .prepare(
+                `SELECT channel,state,retry_at,
+                json_extract(content,'$.reason') AS reason
+                FROM notification_deliveries ORDER BY rowid DESC LIMIT 9`,
+              )
+              .all()
+          : [],
         notifications,
         discord,
         smtp: notificationServer.messages,

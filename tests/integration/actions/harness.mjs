@@ -71,12 +71,7 @@ export async function runActionsTests({
     ]);
     assert.deepEqual(inspect(name).Config.Healthcheck.Test, ["NONE"]);
   }
-  async function finished(name, expected, reason) {
-    await waitUntil(
-      () => !inspect(name).State.Running,
-      `Actions ${sdk}/${name} did not exit`,
-      300_000,
-    );
+  function output(name) {
     const logs = result(["logs", name]);
     assert.equal(logs.status, 0);
     for (const secret of [
@@ -91,6 +86,15 @@ export async function runActionsTests({
     const lines = logs.stdout.trim().split("\n");
     assert.equal(lines.length, 1, logs.stdout + logs.stderr);
     const outcome = JSON.parse(lines[0]);
+    return { logs, outcome };
+  }
+  async function finished(name, expected, reason) {
+    await waitUntil(
+      () => !inspect(name).State.Running,
+      `Actions ${sdk}/${name} did not exit`,
+      300_000,
+    );
+    const { logs, outcome } = output(name);
     if (outcome.outcome !== expected) {
       const evidence = proof();
       assert.fail(
@@ -400,11 +404,25 @@ export async function runActionsTests({
 
   const unpublished = `${manager}-unpublished-interruption`;
   launch(unpublished, 9);
-  await waitUntil(
-    () => proof().held,
-    "Unpublished implementation did not reach the held provider",
-    300000,
-  );
+  try {
+    await waitUntil(
+      () => {
+        if (!inspect(unpublished).State.Running)
+          assert.fail(
+            `Unpublished invocation exited: ${JSON.stringify(output(unpublished).outcome)}`,
+          );
+        return proof().held;
+      },
+      "Unpublished implementation did not reach the held provider",
+      300000,
+    );
+  } catch (error) {
+    const { workflow, runs, requests } = proof();
+    throw new Error(
+      `${error.message}; workflow ${JSON.stringify({ workflow, runs, requests })}`,
+      { cause: error },
+    );
+  }
   assert(durable(9).scope, "Frozen scope was not saved before coding");
   docker(["kill", "--signal", "SIGTERM", unpublished]);
   await finished(unpublished, "failed", "cancelled");
@@ -415,6 +433,8 @@ export async function runActionsTests({
   const resumed = durable(9);
   assert.equal(resumed.task_id, interrupted.task_id);
   assert.equal(resumed.scope_digest, interrupted.scope_digest);
+  assert.notEqual(resumed.findings.objective, interrupted.findings.objective);
+  assert.equal(resumed.scope.objective, interrupted.scope.objective);
   assert(resumed.budget.model_requests > interrupted.budget.model_requests);
   assert(resumed.budget.active_ms >= interrupted.budget.active_ms);
   for (const task of ["implementation_audit", "external_output_review"])
@@ -424,6 +444,7 @@ export async function runActionsTests({
     0,
     "Rebuilt evidence must support retained continuation",
   );
+  upstream("/advance-main", "POST");
   upstream("/checks?issue=9", "POST");
   launch(`${manager}-rebuilt-retained-ready`, 9, true);
   await finished(`${manager}-rebuilt-retained-ready`, "ready", "human_review");

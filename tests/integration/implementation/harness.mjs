@@ -111,6 +111,33 @@ export async function runImplementationTests(sdks, suite) {
     info: (message) => logs.push(message),
     error: (message) => logs.push(message),
   };
+  const recordWorkflowFailure = () => {
+    const job = store?.db.open ? store.jobs().at(-1) : undefined;
+    if (!job) return;
+    const phases = [
+      ["investigation", investigation?.repository.current(job)],
+      ["implementation", implementation?.repository.current(job)],
+      ["monitor", monitor?.repository.get(job.id)],
+    ];
+    errors.push(
+      new Error(
+        `Workflow state: ${JSON.stringify({
+          job: {
+            id: job.id,
+            revision: job.revision,
+            phase: job.phase,
+            status: job.status,
+          },
+          phases: phases.map(([phase, record]) => ({
+            phase,
+            stage: record?.stage ?? null,
+            failure: record?.failure ?? null,
+            retry_at: record?.retry_at ?? null,
+          })),
+        })}`,
+      ),
+    );
+  };
   const closeRuntime = async () => {
     await monitor?.stop();
     await investigation?.stop();
@@ -1067,7 +1094,63 @@ export async function runImplementationTests(sdks, suite) {
           const first = supervisor.publication.repository.target(
             monitored.job.id,
           );
+          const statusCancellation = new globalThis.AbortController(),
+            beforeInterruptedStatus = remote.state.mutations.length;
+          let statusEntered = false,
+            releaseStatus;
+          const heldStatus = new Promise((resolve) => {
+            releaseStatus = resolve;
+          });
+          remote.state.beforeRequest = async (method, path) => {
+            if (method === "GET" && path === "/user") {
+              statusEntered = true;
+              await heldStatus;
+            }
+          };
+          const interruptedMonitor = monitor.reconcile(
+            statusCancellation.signal,
+          );
+          try {
+            await until(
+              () => statusEntered,
+              "PR status preparation did not reach the held transport",
+            );
+            statusCancellation.abort();
+          } finally {
+            remote.state.beforeRequest = undefined;
+            releaseStatus();
+          }
+          await interruptedMonitor;
+          const interruptedStatus = supervisor.publication.repository.pending(
+            monitored.job.id,
+          );
+          assert.equal(interruptedStatus.proposal.kind, "pr_stage");
+          assert.equal(interruptedStatus.status, "prepared");
+          assert.equal(interruptedStatus.actor, null);
+          assert.equal(interruptedStatus.payload, null);
+          assert.deepEqual(interruptedStatus.steps, []);
+          assert.equal(remote.state.mutations.length, beforeInterruptedStatus);
+          const retriesBeforeRestart = JSON.parse(
+            store.jobById(monitored.job.id).budget_json,
+          ).infrastructure_retries;
+          await closeRuntime();
+          await start();
+          attachMonitor();
           await monitor.reconcile();
+          assert.equal(
+            supervisor.publication.repository.operation(interruptedStatus.id)
+              .status,
+            "confirmed",
+          );
+          assert.deepEqual(
+            remote.state.mutations.slice(beforeInterruptedStatus),
+            ["comment"],
+          );
+          assert.equal(
+            JSON.parse(store.jobById(monitored.job.id).budget_json)
+              .infrastructure_retries,
+            retriesBeforeRestart + 1,
+          );
           assert.equal(
             monitor.repository.get(monitored.job.id).stage,
             "waiting",
@@ -1262,6 +1345,7 @@ export async function runImplementationTests(sdks, suite) {
             monitor_real_review_repair_and_regression: "passed",
             monitor_new_head_invalidates_ci_and_reviews: "passed",
             monitor_wait_restart_and_slot_release: "passed",
+            monitor_incomplete_status_restart: "passed",
             old_head_markers_during_output_review_rejected: "passed",
             repaired_head_ready_without_intake_refresh: "passed",
           });
@@ -2365,6 +2449,7 @@ export async function runImplementationTests(sdks, suite) {
               complete(`readiness-mcp-${denseMem ? "dense" : "generic"}`);
             } catch (error) {
               errors.push(error);
+              recordWorkflowFailure();
               throw error;
             } finally {
               controls.implementation = undefined;
@@ -2407,6 +2492,7 @@ export async function runImplementationTests(sdks, suite) {
         ),
       );
     try {
+      recordWorkflowFailure();
       const pending = [];
       for (const run of store?.db.open ? store.runs() : []) {
         if (run.finished_at !== null) continue;

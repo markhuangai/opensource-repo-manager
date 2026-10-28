@@ -253,7 +253,7 @@ async function waitUntil(probe, message, timeout = 30_000) {
     if (probe()) return;
     await delay(200);
   }
-  throw new Error(message);
+  throw new Error(typeof message === "function" ? message() : message);
 }
 
 try {
@@ -1537,6 +1537,7 @@ try {
       if(response.status!==202)throw Error('check webhook rejected');
     `,
       ]);
+      let notificationProof;
       await waitUntil(
         () => {
           const proof = JSON.parse(
@@ -1548,6 +1549,17 @@ try {
               "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
             ]),
           );
+          notificationProof = {
+            workflow: proof.workflow,
+            runs: proof.runs.slice(-8),
+            requests: proof.requests.slice(-8),
+            deliveries: proof.deliveries,
+            counts: {
+              webhook: proof.notifications.length,
+              discord: proof.discord.length,
+              smtp: proof.smtp.length,
+            },
+          };
           return (
             proof.notifications.some(
               (event) => event.outcome === "ready_for_review",
@@ -1560,7 +1572,8 @@ try {
             )
           );
         },
-        "Production pipeline did not deliver all ready notification channels",
+        () =>
+          `Production pipeline did not deliver all ready notification channels: ${JSON.stringify(notificationProof)}`,
         120000,
       );
       docker([

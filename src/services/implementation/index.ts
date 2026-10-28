@@ -403,7 +403,7 @@ export class ImplementationService {
       ];
       if (!unique.length)
         throw new RuntimeError("implementation_checks_missing");
-      const scope = {
+      const scope = recoveredScope ?? {
         job_id: job.id,
         revision: job.revision,
         investigation_id: record.investigation_id,

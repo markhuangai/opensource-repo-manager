@@ -287,7 +287,7 @@ export class ActionsState implements TaskDurability {
       context.state !== "closed" &&
       pull?.state !== "closed" &&
       state.scope &&
-      (digest(context.source) !== digest(state.scope.source) ||
+      ((!pull && digest(context.source) !== digest(state.scope.source)) ||
         issueDigest(context) !== state.job?.issue_digest)
     )
       throw new StateError("state_incompatible");
