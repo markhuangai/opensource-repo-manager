@@ -620,7 +620,10 @@ export class ActionsState implements TaskDurability {
       else if (step.kind === "branch") {
         const branch = await this.transport.branch(pending.branch, signal);
         matched = branch.head === pending.commit;
-        if (matched) state.head = branch.head;
+        if (matched) {
+          state.head = branch.head;
+          if (state.pull) state.pull.head = branch.head!;
+        }
       } else if (step.kind === "pull") {
         const matches = (
           await this.transport.pulls(pending.branch, signal)

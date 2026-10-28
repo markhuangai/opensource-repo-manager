@@ -605,4 +605,112 @@ describe("authenticated Actions task authority", () => {
       ).toHaveLength(1);
     },
   );
+
+  it.each(["empty", "retained"])(
+    "reconciles an interrupted repair push with %s local storage and rejects later human edits",
+    async (storage) => {
+      const f = await setup();
+      await f.open(f.store);
+      const repository = new PublicationRepository(f.store),
+        target = repository.target(1),
+        initial = f.remote.commit(
+          { "app.txt": "fixed\n" },
+          f.remote.source.sha,
+        );
+      f.remote.git(["update-ref", `refs/heads/${target.branch}`, initial.sha]);
+      const payload = {
+        title: "Verified fix",
+        body: "Reviewed candidate and checks\n\nclose #1",
+        branch: target.branch,
+        base: "main",
+      };
+      await f.writer.updatePull(null, payload, signal());
+      const pull = await f.writer.pull(
+          f.remote.state.pulls[0].number,
+          signal(),
+        ),
+        { id, number, title, body, head, base, author_id } = pull;
+      target.head = head;
+      target.pull = { id, number, title, body, head, base, author_id };
+      repository.saveTarget(target);
+      await f.store.checkpoint(signal());
+      const repaired = f.remote.commit(
+          { "app.txt": "repaired\n" },
+          initial.sha,
+        ),
+        review = repository.review({
+          id: randomUUID(),
+          job_id: 1,
+          revision: 1,
+          binding: "b".repeat(64),
+          policy_identity: "fixture-review-policy",
+          approved: true,
+          run_id: null,
+          created_at: Date.now(),
+        });
+      repository.begin({
+        id: "c".repeat(64),
+        job_id: 1,
+        revision: 1,
+        status: "dispatching",
+        failure: null,
+        retry_at: 0,
+        retry_pending: false,
+        source: f.remote.source,
+        target,
+        actor: f.remote.state.actor,
+        timestamp: new Date().toISOString(),
+        review_id: review.id,
+        payload: { pull: payload },
+        commit: repaired.sha,
+        proposal: {
+          kind: "change",
+          job_id: 1,
+          revision: 1,
+          artifact_digest: "e".repeat(64),
+          expected_head: initial.sha,
+          evidence_ids: ["f".repeat(64), "a".repeat(64)],
+          title: pull.title,
+          body: pull.body,
+          commit_message: "Repair",
+        },
+        steps: [
+          {
+            kind: "branch",
+            before: initial.sha,
+            after: repaired.sha,
+            state: "dispatching",
+          },
+        ],
+      });
+      f.store.reserveInfrastructureRetry(1);
+      await f.store.checkpoint(signal());
+      const repairBudget = f.read().state.budget;
+      expect(f.read().state.pending?.commit).toBe(repaired.sha);
+      f.remote.git(["update-ref", `refs/heads/${target.branch}`, repaired.sha]);
+      const repairStore = storage === "empty" ? f.database() : f.store;
+      await f.open(repairStore);
+      const afterRepair = f.read().state,
+        repairedTarget = new PublicationRepository(repairStore).target(1);
+      expect(afterRepair.pending?.status).toBe("confirmed");
+      expect(afterRepair.head).toBe(repaired.sha);
+      expect(afterRepair.pull?.head).toBe(repaired.sha);
+      expect(repairedTarget.head).toBe(repaired.sha);
+      expect(repairedTarget.pull?.head).toBe(repaired.sha);
+      expect(afterRepair.budget).toEqual(repairBudget);
+      await f.open(repairStore);
+      expect(f.remote.state.pulls).toHaveLength(1);
+      expect(
+        f.remote.state.mutations.filter((kind) => kind === "pull"),
+      ).toHaveLength(1);
+
+      const human = f.remote.commit(
+        { "app.txt": "human edit\n" },
+        repaired.sha,
+      );
+      f.remote.git(["update-ref", `refs/heads/${target.branch}`, human.sha]);
+      await expect(f.open(repairStore)).rejects.toThrow("state_conflict");
+      expect(f.read().state.budget).toEqual(repairBudget);
+    },
+  );
 });
