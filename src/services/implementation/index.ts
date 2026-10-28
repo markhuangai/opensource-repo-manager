@@ -367,21 +367,23 @@ export class ImplementationService {
       const investigation = new InvestigationRepository(this.store).get(
         record.investigation_id,
       );
+      const recoveredScope = this.store.durability?.recoveryContext()?.scope;
       const plan = implementationPlanSchema.parse(
-        (
-          await this.agent(
-            record,
-            "implementation",
-            "implementation_plan",
-            implementationPlanSchema,
-            {
-              investigation,
-              required_checks: this.store.bootstrap(record.bootstrap_receipt)
-                .plan!.test_commands,
-            },
-            signal,
-          )
-        ).result,
+        recoveredScope?.plan ??
+          (
+            await this.agent(
+              record,
+              "implementation",
+              "implementation_plan",
+              implementationPlanSchema,
+              {
+                investigation,
+                required_checks: this.store.bootstrap(record.bootstrap_receipt)
+                  .plan!.test_commands,
+              },
+              signal,
+            )
+          ).result,
       );
       const discovered = this.store.bootstrap(record.bootstrap_receipt).plan!
         .test_commands;
@@ -401,7 +403,7 @@ export class ImplementationService {
       ];
       if (!unique.length)
         throw new RuntimeError("implementation_checks_missing");
-      const scope = {
+      const scope = recoveredScope ?? {
         job_id: job.id,
         revision: job.revision,
         investigation_id: record.investigation_id,
@@ -418,6 +420,13 @@ export class ImplementationService {
         scope,
         signal,
       );
+      if (this.store.durability) {
+        const review = await this.supervisor.publication.outputReview.review(
+          this.store.durability.scopeRequest(scope),
+          signal,
+        );
+        await this.store.durability.acceptScope(scope, review.id, signal);
+      }
       record.scope = scope;
       record.scope_digest = digest(scope);
       record.agent_pending = null;
@@ -763,7 +772,15 @@ export class ImplementationService {
       ...this.supervisor.request(
         record.job_id,
         role,
-        { task, policy, ...(input as Record<string, unknown>) },
+        {
+          task,
+          policy,
+          ...(input as Record<string, unknown>),
+          ...(role === "implementation" &&
+          this.store.durability?.recoveryContext()
+            ? { recovered_context: this.store.durability.recoveryContext() }
+            : {}),
+        },
         artifact,
       ),
       ...(role === "implementation" ? { bootstrap_receipt: bootstrap! } : {}),

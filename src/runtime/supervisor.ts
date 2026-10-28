@@ -363,6 +363,9 @@ export class Supervisor implements AgentRunner {
           lease,
           snapshot.settings.limits.active_minutes * 60_000,
         );
+        await this.store.checkpoint(
+          AbortSignal.any([signal, controller.signal, this.controller.signal]),
+        );
         session = {
           lease,
           deadline,
@@ -402,6 +405,7 @@ export class Supervisor implements AgentRunner {
           this.runtimeFailure = "cleanup_failed";
         throw failure.error;
       }
+      await this.store.checkpoint(signal);
       return result!;
     })();
     const tracked = operationTask.then(
@@ -961,6 +965,7 @@ export class Supervisor implements AgentRunner {
         });
     }, 1000);
     try {
+      await this.store.checkpoint(signal);
       if ((await userProcesses(identity.uid)).length)
         throw new RuntimeError("worker_user_busy");
       this.store.startRun({

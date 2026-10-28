@@ -162,6 +162,8 @@ export async function createPublicationFixture(root: string) {
     repository_id: 42,
     default_branch: "main",
     closed: new Set<number>(),
+    labels: new Set<string>(),
+    issueLabels: new Map<number, string[]>(),
     protected: new Set<string>(),
     comments: new Map<
       number,
@@ -495,6 +497,40 @@ export async function createPublicationFixture(root: string) {
       );
       return;
     }
+    if (path === `${base}/labels` && req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const value = JSON.parse(body) as { name: string };
+      if (!(await mutate("label"))) return;
+      state.labels.add(value.name);
+      complete("label", value);
+      return;
+    }
+    if (path.startsWith(`${base}/labels/`)) {
+      const name = path.slice(`${base}/labels/`.length);
+      send({ name }, state.labels.has(name) ? 200 : 404);
+      return;
+    }
+    const issueLabels = /^\/repos\/owner\/repo\/issues\/(\d+)\/labels$/.exec(
+      path,
+    );
+    if (issueLabels && req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const value = JSON.parse(body) as { labels: string[] };
+      if (!(await mutate("enrollment"))) return;
+      state.issueLabels.set(Number(issueLabels[1]), [
+        ...new Set([
+          ...(state.issueLabels.get(Number(issueLabels[1])) ?? []),
+          ...value.labels,
+        ]),
+      ]);
+      complete(
+        "enrollment",
+        value.labels.map((name) => ({ name })),
+      );
+      return;
+    }
     if (path === `${base}/commits/${state.default_branch}`) {
       const sha = head(state.default_branch);
       send({
@@ -602,6 +638,9 @@ export async function createPublicationFixture(root: string) {
           ...state.issues.get(number),
           number,
           state: state.closed.has(number) ? "closed" : "open",
+          labels: (state.issueLabels.get(number) ?? []).map((name) => ({
+            name,
+          })),
         });
         return;
       }

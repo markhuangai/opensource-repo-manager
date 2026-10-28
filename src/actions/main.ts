@@ -11,6 +11,8 @@ import { Store } from "../repositories/store.ts";
 import { createApplication, type Application } from "../runtime/application.ts";
 import { assertRuntimeIdentity } from "../runtime/process.ts";
 import { rootDirectory } from "../services/workspaces/files.ts";
+import { ActionsState } from "./persistence.ts";
+import { StateError } from "./state.ts";
 import {
   assertTaskStore,
   executeTask,
@@ -23,6 +25,7 @@ let logger = createSafeLogger(createKnownSecretChecker([]), true);
 let redact = (value: string) => value;
 let application: Application | undefined;
 let store: Store | undefined;
+let state: ActionsState | undefined;
 let result: TaskResult = {
   version: 1,
   outcome: "failed",
@@ -71,12 +74,23 @@ try {
   await rootDirectory(root, 0o711);
   store = new Store(join(root, "state", "manager.sqlite"));
   assertTaskStore(store, request, loaded.snapshot.settings.github.repository);
-  application = await createApplication(store, loaded, logger, {
-    mode: "actions",
-    root: join(root, "runtime"),
-  });
-  controller.signal.throwIfAborted();
-  result = await executeTask(application, request, controller.signal);
+  state = await ActionsState.open(
+    store,
+    loaded.snapshot,
+    loaded.secrets,
+    request.issue_number,
+    controller.signal,
+  );
+  if (state.result()) result = state.result()!;
+  else {
+    application = await createApplication(store, loaded, logger, {
+      mode: "actions",
+      root: join(root, "runtime"),
+      publicationWriter: () => state!.writer,
+    });
+    controller.signal.throwIfAborted();
+    result = await executeTask(application, request, controller.signal);
+  }
 } catch (error) {
   fail(
     controller.signal.aborted
@@ -89,15 +103,26 @@ try {
           ? "intake_failed"
           : error instanceof RuntimeError && error.code === "task_state_invalid"
             ? "task_state_invalid"
-            : "runtime_failed",
+            : error instanceof StateError
+              ? (error.code as TaskResult["reason"])
+              : "runtime_failed",
   );
+  if (error instanceof StateError) result = { ...result, outcome: "blocked" };
   logger.error(`Actions execution stopped (${result.reason}).`);
 } finally {
   startDeadline();
   try {
     await application?.close();
-  } catch {
-    cleanupFailed = true;
+    if (!application && state && store?.db.open)
+      await store.checkpoint(AbortSignal.timeout(9000));
+  } catch (error) {
+    if (error instanceof StateError)
+      result = {
+        ...result,
+        outcome: "blocked",
+        reason: error.code as TaskResult["reason"],
+      };
+    else cleanupFailed = true;
   } finally {
     try {
       if (store?.db.open) store.close();
@@ -108,8 +133,15 @@ try {
     process.removeListener("SIGINT", cancel);
     process.removeListener("SIGTERM", cancel);
   }
+  if (state?.failure())
+    result = {
+      ...result,
+      outcome: "blocked",
+      reason: state.failure()!.code as TaskResult["reason"],
+    };
   if (controller.signal.aborted) fail("cancelled");
   if (cleanupFailed) fail("cleanup_failed");
+  if (state) result = { ...result, ...state.identifiers() };
 }
 emitResult();
 process.exitCode = taskExitCode(result);

@@ -14,6 +14,7 @@ import { sourceFiles, modelFixture } from "./protocol.mjs";
 
 const actions = process.argv.includes("--actions");
 let selectedIssue = 1;
+let dataRoot = "/data";
 let held = false;
 let releaseHold;
 const config = JSON.parse(readFileSync("/fixture/configuration.json", "utf8"));
@@ -56,6 +57,20 @@ if (actions) {
       updated_at: "2026-10-21T00:00:00Z",
     });
   remote.state.closed.add(5);
+  for (const number of [9, 10])
+    remote.state.issues.set(number, {
+      id: 1000 + number,
+      number,
+      title: "source_only",
+      body: "increment returns the wrong value",
+      updated_at: "2026-10-21T00:00:00Z",
+    });
+  remote.state.afterMutation = (kind) => {
+    if (selectedIssue === 10 && dataRoot === "/data" && kind === "pull") {
+      remote.state.dropAfter = "pull";
+      remote.state.rejectBefore = "comment";
+    }
+  };
 }
 let database;
 const databases = new Map();
@@ -63,7 +78,7 @@ const store = {
   get db() {
     return (database ??= new Database(
       actions
-        ? `/data/actions/${selectedIssue}/state/manager.sqlite`
+        ? `${dataRoot}/actions/${selectedIssue}/state/manager.sqlite`
         : "/data/state/manager.sqlite",
       {
         readonly: true,
@@ -89,8 +104,25 @@ function makeFixture() {
   return modelFixture(
     config,
     store,
-    actions ? `/data/actions/${selectedIssue}/runtime` : "/data/runtime",
+    actions ? `${dataRoot}/actions/${selectedIssue}/runtime` : "/data/runtime",
     {
+      investigationObjective:
+        actions && selectedIssue === 9 && dataRoot === "/fresh-data"
+          ? "Restore the documented add-one result for increment."
+          : undefined,
+      async implementation(task) {
+        if (
+          actions &&
+          selectedIssue === 9 &&
+          dataRoot === "/data" &&
+          task === "implementation_change"
+        ) {
+          held = true;
+          await new Promise((resolve) => {
+            releaseHold = resolve;
+          });
+        }
+      },
       async investigate() {
         if (actions && selectedIssue === 7) {
           held = true;
@@ -123,20 +155,71 @@ const tls = httpsServer(
 const http = createServer(async (req, res) => {
   const url = new URL(req.url, "http://fixture");
   if (actions && url.pathname === "/select" && req.method === "POST") {
-    if (database) databases.set(selectedIssue, database);
+    if (database) databases.set(`${dataRoot}:${selectedIssue}`, database);
     selectedIssue = Number(url.searchParams.get("issue"));
+    dataRoot =
+      url.searchParams.get("fresh") === "true" ? "/fresh-data" : "/data";
     if (selectedIssue === 999)
       remote.state.readFailure = {
         path: "/repos/owner/repo/issues/999",
         status: 404,
       };
-    database = databases.get(selectedIssue);
+    database = databases.get(`${dataRoot}:${selectedIssue}`);
     held = false;
     fixture = makeFixture();
     res.end("selected");
+  } else if (
+    actions &&
+    url.pathname === "/corrupt-state" &&
+    req.method === "POST"
+  ) {
+    const number = Number(url.searchParams.get("issue"));
+    const comment = remote.state.comments
+      .get(number)
+      .find((item) => item.body.includes("<!-- orm:task-state:"));
+    if (url.searchParams.get("delete") === "true")
+      remote.state.comments.set(
+        number,
+        remote.state.comments
+          .get(number)
+          .filter((item) => item.id !== comment.id),
+      );
+    else comment.body = "Edited outside the controller\n" + comment.body;
+    res.end("changed");
   } else if (actions && url.pathname === "/release" && req.method === "POST") {
     releaseHold?.();
     res.end("released");
+  } else if (
+    actions &&
+    url.pathname === "/advance-main" &&
+    req.method === "POST"
+  ) {
+    const next = remote.commit(
+      { ...sourceFiles, "unrelated.md": "Unrelated default-branch change.\n" },
+      remote.head("main"),
+    );
+    remote.git(["update-ref", "refs/heads/main", next.sha]);
+    res.end("advanced");
+  } else if (
+    actions &&
+    url.pathname === "/reject-checkpoint" &&
+    req.method === "POST"
+  ) {
+    remote.state.rejectBefore = "comment";
+    res.end("armed");
+  } else if (
+    actions &&
+    url.pathname === "/merge-owned" &&
+    req.method === "POST"
+  ) {
+    const number = Number(url.searchParams.get("issue"));
+    const pull = remote.state.pulls.find((pull) =>
+      pull.branch.endsWith(`/issue-${number}`),
+    );
+    pull.state = "closed";
+    remote.state.closed.add(number);
+    remote.git(["update-ref", "refs/heads/main", remote.head(pull.branch)]);
+    res.end("merged");
   } else if (req.url === "/proof") {
     res.setHeader("content-type", "application/json");
     res.end(
@@ -161,6 +244,30 @@ const http = createServer(async (req, res) => {
         mutations: remote.state.mutations,
         errors: fixture.errors.map((error) => error.message),
         requests: fixture.requests.map((item) => item.scenario),
+        workflow: database
+          ? ["investigations", "implementations", "pr_monitors"].map(
+              (phase) => ({
+                phase,
+                records: store.db
+                  .prepare(
+                    `SELECT job_id, json_extract(content,'$.stage') AS stage,
+                    json_extract(content,'$.failure') AS failure,
+                    json_extract(content,'$.retry_at') AS retry_at FROM ${phase}`,
+                  )
+                  .all()
+                  .slice(-3),
+              }),
+            )
+          : [],
+        deliveries: database
+          ? store.db
+              .prepare(
+                `SELECT channel,state,retry_at,
+                json_extract(content,'$.reason') AS reason
+                FROM notification_deliveries ORDER BY rowid DESC LIMIT 9`,
+              )
+              .all()
+          : [],
         notifications,
         discord,
         smtp: notificationServer.messages,
@@ -176,13 +283,27 @@ const http = createServer(async (req, res) => {
               .all()
               .map((row) => JSON.parse(row.content))
           : [],
+        reconstructed:
+          actions && database
+            ? store.db
+                .prepare(
+                  "SELECT reconstructed FROM actions_checkpoint WHERE singleton=1",
+                )
+                .get()?.reconstructed
+            : null,
       }),
     );
   } else if (
-    (req.url === "/review" || req.url === "/checks") &&
+    (url.pathname === "/review" || url.pathname === "/checks") &&
     req.method === "POST"
   ) {
-    const pull = remote.state.pulls[0],
+    const pull = url.searchParams.has("issue")
+        ? remote.state.pulls.find((pull) =>
+            pull.branch.endsWith(
+              `/issue-${Number(url.searchParams.get("issue"))}`,
+            ),
+          )
+        : remote.state.pulls[0],
       head = remote.head(pull.branch);
     if (req.url === "/review")
       remote.state.threads.set(pull.number, [makeThread(9001, head)]);

@@ -10,12 +10,17 @@ import { ImplementationService } from "../services/implementation/index.ts";
 import { PrMonitorService } from "../services/pr-monitor/index.ts";
 import { McpGateway } from "../services/mcp/index.ts";
 import { Supervisor } from "./supervisor.ts";
+import type { GitHubWriter } from "../adapters/github/writer.ts";
 
 export async function createApplication(
   store: Store,
   loaded: { snapshot: RunSnapshot; secrets: SecretAccessor },
   logger: SafeLogger,
-  options: { mode: "service" | "actions"; root?: string },
+  options: {
+    mode: "service" | "actions";
+    root?: string;
+    publicationWriter?: (ready: () => void) => GitHubWriter;
+  },
 ) {
   const mcp =
     options.mode === "service"
@@ -48,7 +53,14 @@ export async function createApplication(
           try {
             await mcp?.close();
           } finally {
-            if (store.db.open) store.close();
+            if (store.db.open) {
+              try {
+                if (store.durability)
+                  await store.checkpoint(AbortSignal.timeout(9000));
+              } finally {
+                store.close();
+              }
+            }
           }
         }
       }
@@ -60,6 +72,7 @@ export async function createApplication(
       loaded.secrets,
       {
         root: options.root,
+        publicationWriter: options.publicationWriter,
         mcp,
         workers: {
           claude: fileURLToPath(

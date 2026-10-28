@@ -303,7 +303,8 @@ export function modelFixture(config, store, root, controls = {}) {
         outcome,
         objective:
           outcome === "maintenance_candidate"
-            ? "Make increment add one, matching its documentation."
+            ? (controls.investigationObjective ??
+              "Make increment add one, matching its documentation.")
             : "",
         proof:
           outcome !== "maintenance_candidate"

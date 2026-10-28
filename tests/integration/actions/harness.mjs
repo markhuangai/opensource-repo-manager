@@ -7,6 +7,7 @@ export async function runActionsTests({
   manager,
   upstreamName,
   data,
+  freshData,
   directory,
   image,
   net,
@@ -35,8 +36,8 @@ export async function runActionsTests({
   const proof = () => JSON.parse(upstream("/proof"));
   const inspect = (name) =>
     JSON.parse(docker(["container", "inspect", name]))[0];
-  function launch(name, number) {
-    upstream(`/select?issue=${number}`, "POST");
+  function launch(name, number, fresh = false) {
+    upstream(`/select?issue=${number}&fresh=${fresh}`, "POST");
     register("container", name);
     docker([
       "run",
@@ -49,11 +50,13 @@ export async function runActionsTests({
       net,
       "--no-healthcheck",
       "--mount",
-      `type=volume,src=${data},dst=/data`,
+      `type=volume,src=${fresh ? freshData : data},dst=/data`,
       "--mount",
       `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
       "--env",
       "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+      "--env",
+      `ORM_SESSION_KEY=${config.session_key}`,
       ...["config", "skills", "prompts"].flatMap((name) => [
         "--mount",
         `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
@@ -68,15 +71,14 @@ export async function runActionsTests({
     ]);
     assert.deepEqual(inspect(name).Config.Healthcheck.Test, ["NONE"]);
   }
-  async function finished(name, expected, reason) {
-    await waitUntil(
-      () => !inspect(name).State.Running,
-      `Actions ${sdk}/${name} did not exit`,
-      300_000,
-    );
+  function output(name) {
     const logs = result(["logs", name]);
     assert.equal(logs.status, 0);
-    for (const secret of [config.github.token, config.proxy.key])
+    for (const secret of [
+      config.github.token,
+      config.proxy.key,
+      config.session_key,
+    ])
       assert(
         !(logs.stdout + logs.stderr).includes(secret),
         "Credential in Actions output",
@@ -84,6 +86,15 @@ export async function runActionsTests({
     const lines = logs.stdout.trim().split("\n");
     assert.equal(lines.length, 1, logs.stdout + logs.stderr);
     const outcome = JSON.parse(lines[0]);
+    return { logs, outcome };
+  }
+  async function finished(name, expected, reason) {
+    await waitUntil(
+      () => !inspect(name).State.Running,
+      `Actions ${sdk}/${name} did not exit`,
+      300_000,
+    );
+    const { logs, outcome } = output(name);
     if (outcome.outcome !== expected) {
       const evidence = proof();
       assert.fail(
@@ -157,11 +168,14 @@ export async function runActionsTests({
     0,
     "Deferred monitor started model work",
   );
-  assert.equal(proof().mutations.length, beforeMonitorRetry.mutations.length);
+  assert.equal(
+    proof().mutations.filter((kind) => kind !== "comment").length,
+    beforeMonitorRetry.mutations.filter((kind) => kind !== "comment").length,
+  );
   assert(
     !proof()
       .github_requests.slice(beforeMonitorRetry.github_requests.length)
-      .some(({ path }) => path.includes("/pulls/") || path === "/graphql"),
+      .some(({ path }) => /\/pulls\/\d+\//.test(path) || path === "/graphql"),
     "Deferred monitor read remote review state",
   );
   mutateState(
@@ -175,7 +189,9 @@ export async function runActionsTests({
     WHERE json_extract(content,'$.proposal.kind')='change'`,
     1,
   );
-  const mutations = proof().mutations.length;
+  const mutations = proof().mutations.filter(
+    (kind) => kind !== "comment",
+  ).length;
   launch(`${manager}-publication-backoff`, 1);
   const deferred = await finished(
     `${manager}-publication-backoff`,
@@ -185,7 +201,10 @@ export async function runActionsTests({
   assert.equal(deferred.retry_at, retryAt);
   assert.equal(deferred.pull_number, waiting.pull_number);
   assert.equal(deferred.head_sha, waiting.head_sha);
-  assert.equal(proof().mutations.length, mutations);
+  assert.equal(
+    proof().mutations.filter((kind) => kind !== "comment").length,
+    mutations,
+  );
   assert.equal(
     proof().requests.length,
     0,
@@ -260,6 +279,7 @@ export async function runActionsTests({
       }
   `,
   ]);
+  upstream("/reject-checkpoint", "POST");
   docker(["kill", "--signal", "SIGTERM", cancelling]);
   const cancelled = await finished(cancelling, "failed", "cancelled");
   assert.equal(cancelled.repository, "owner/repo");
@@ -275,7 +295,12 @@ export async function runActionsTests({
   );
   assert.equal(evidence.leases, 0);
 
-  function mutateState(sql, number = 2) {
+  assert(
+    durable(7).active,
+    "Failed cancellation checkpoint must retain the conservative active reservation",
+  );
+
+  function mutateState(sql, number = 2, persist = true) {
     const name = `${manager}-seed-${completed.length}`;
     register("container", name);
     docker([
@@ -285,22 +310,35 @@ export async function runActionsTests({
       name,
       "--label",
       `${label}=${id}`,
+      "--network",
+      net,
       "--mount",
       `type=volume,src=${data},dst=/data`,
+      "--mount",
+      `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
+      "--env",
+      "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+      "--env",
+      `ORM_SESSION_KEY=${config.session_key}`,
+      ...["config", "skills", "prompts"].flatMap((name) => [
+        "--mount",
+        `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
+      ]),
       "--entrypoint",
       node,
       image,
       "--input-type=module",
       "-e",
-      "import {Store} from '/opt/orm/app/dist/repositories/store.js'; const store=new Store('/data/actions/'+process.argv[1]+'/state/manager.sqlite'); store.db.exec(process.argv[2]); store.close();",
+      "import {Store} from '/opt/orm/app/dist/repositories/store.js'; import {ActionsState} from '/opt/orm/app/dist/actions/persistence.js'; import {loadProtectedActionsConfiguration} from '/opt/orm/app/dist/config/load.js'; const store=new Store('/data/actions/'+process.argv[1]+'/state/manager.sqlite'); const signal=AbortSignal.timeout(30000); if(process.argv[3]==='true'){const loaded=await loadProtectedActionsConfiguration(); await ActionsState.open(store,loaded.snapshot,loaded.secrets,Number(process.argv[1]),signal);} store.db.exec(process.argv[2]); if(process.argv[3]==='true') await store.checkpoint(signal); store.close();",
       String(number),
       sql,
+      String(persist),
     ]);
   }
-  mutateState("UPDATE jobs SET phase='unrecognized'");
+  mutateState("UPDATE jobs SET phase='unrecognized'", 2, false);
   launch(`${manager}-no-progress`, 2);
-  await finished(`${manager}-no-progress`, "blocked", "no_progress");
-  mutateState("UPDATE jobs SET issue_number=8,issue_id=1008");
+  await finished(`${manager}-no-progress`, "blocked", "state_invalid");
+  mutateState("UPDATE jobs SET issue_number=8,issue_id=1008", 2, false);
   launch(`${manager}-foreign-state`, 2);
   await finished(`${manager}-foreign-state`, "failed", "task_state_invalid");
   for (const [number, reason] of [
@@ -311,6 +349,155 @@ export async function runActionsTests({
     launch(name, number);
     await finished(name, "failed", reason);
   }
+  function durable(number) {
+    const rows = proof().comments.find(([issue]) => issue === number)[1];
+    const canonical = rows.filter((row) =>
+      row.body.includes("<!-- orm:task-state:"),
+    );
+    assert.equal(canonical.length, 1, "Duplicated canonical state");
+    const row = canonical[0];
+    const match = /<!-- orm:task-state:v1:([A-Za-z0-9_-]+):/.exec(row.body);
+    const state = JSON.parse(
+      Buffer.from(match[1], "base64url").toString("utf8"),
+    );
+    assert(Buffer.byteLength(row.body) <= 60 * 1024);
+    assert(Buffer.byteLength(JSON.stringify(state)) <= 32 * 1024);
+    for (const value of [
+      config.github.token,
+      config.proxy.key,
+      config.session_key,
+      "OPERATOR_SYSTEM_CANARY",
+      "OPERATOR_SKILL_CANARY",
+    ])
+      assert(
+        !JSON.stringify(state).includes(value),
+        "Private material entered durable state",
+      );
+    return state;
+  }
+  const readyState = durable(1);
+  assert(readyState.budget.wait_ms > 0, "CI waiting was not accounted");
+  launch(`${manager}-fresh-owned-pr`, 1, true);
+  const owned = await finished(
+    `${manager}-fresh-owned-pr`,
+    "blocked",
+    "recovery_evidence_missing",
+  );
+  assert.equal(owned.pull_number, waiting.pull_number);
+  assert.equal(durable(1).task_id, readyState.task_id);
+  assert.deepEqual(durable(1).budget, readyState.budget);
+  assert.equal(proof().requests.length, 0);
+
+  const noFixState = durable(4);
+  launch(`${manager}-fresh-terminal`, 4, true);
+  await finished(`${manager}-fresh-terminal`, "no_fix", "no_fix");
+  assert.equal(durable(4).task_id, noFixState.task_id);
+  assert.deepEqual(durable(4).budget, noFixState.budget);
+  assert.equal(proof().requests.length, 0);
+
+  const questionState = durable(2);
+  launch(`${manager}-fresh-question`, 2, true);
+  await finished(`${manager}-fresh-question`, "waiting", "needs_information");
+  assert.deepEqual(durable(2).question, questionState.question);
+  assert.deepEqual(durable(2).budget, questionState.budget);
+  assert.equal(proof().requests.length, 0);
+
+  const unpublished = `${manager}-unpublished-interruption`;
+  launch(unpublished, 9);
+  try {
+    await waitUntil(
+      () => {
+        if (!inspect(unpublished).State.Running)
+          assert.fail(
+            `Unpublished invocation exited: ${JSON.stringify(output(unpublished).outcome)}`,
+          );
+        return proof().held;
+      },
+      "Unpublished implementation did not reach the held provider",
+      300000,
+    );
+  } catch (error) {
+    const { workflow, runs, requests } = proof();
+    throw new Error(
+      `${error.message}; workflow ${JSON.stringify({ workflow, runs, requests })}`,
+      { cause: error },
+    );
+  }
+  assert(durable(9).scope, "Frozen scope was not saved before coding");
+  docker(["kill", "--signal", "SIGTERM", unpublished]);
+  await finished(unpublished, "failed", "cancelled");
+  upstream("/release", "POST");
+  const interrupted = durable(9);
+  launch(`${manager}-fresh-unpublished`, 9, true);
+  await finished(`${manager}-fresh-unpublished`, "waiting", "remote_checks");
+  const resumed = durable(9);
+  assert.equal(resumed.task_id, interrupted.task_id);
+  assert.equal(resumed.scope_digest, interrupted.scope_digest);
+  assert.notEqual(resumed.findings.objective, interrupted.findings.objective);
+  assert.equal(resumed.scope.objective, interrupted.scope.objective);
+  assert(resumed.budget.model_requests > interrupted.budget.model_requests);
+  assert(resumed.budget.active_ms >= interrupted.budget.active_ms);
+  for (const task of ["implementation_audit", "external_output_review"])
+    assert(proof().requests.includes(task));
+  assert.equal(
+    proof().reconstructed,
+    0,
+    "Rebuilt evidence must support retained continuation",
+  );
+  upstream("/advance-main", "POST");
+  upstream("/checks?issue=9", "POST");
+  launch(`${manager}-rebuilt-retained-ready`, 9, true);
+  await finished(`${manager}-rebuilt-retained-ready`, "ready", "human_review");
+
+  launch(`${manager}-lost-pull-response`, 10);
+  await finished(
+    `${manager}-lost-pull-response`,
+    "blocked",
+    "state_write_uncertain",
+  );
+  const uncertain = durable(10),
+    count = proof().pulls.length;
+  assert(
+    uncertain.pending.steps.some(
+      (step) => step.kind === "pull" && step.state === "dispatching",
+    ),
+  );
+  launch(`${manager}-fresh-lost-pull`, 10, true);
+  const recovered = await finished(
+    `${manager}-fresh-lost-pull`,
+    "blocked",
+    "recovery_evidence_missing",
+  );
+  assert(recovered.pull_number > 0);
+  assert.equal(proof().pulls.length, count);
+  assert.equal(
+    durable(10).budget.model_requests,
+    uncertain.budget.model_requests,
+  );
+  assert.equal(durable(10).pending.status, "confirmed");
+  assert.equal(proof().requests.length, 0);
+
+  upstream("/merge-owned?issue=9", "POST");
+  launch(`${manager}-retained-closed-after-main-advances`, 9, true);
+  await finished(
+    `${manager}-retained-closed-after-main-advances`,
+    "closed",
+    "issue_closed",
+  );
+  upstream("/merge-owned?issue=1", "POST");
+  launch(`${manager}-closed-after-main-advances`, 1, true);
+  await finished(
+    `${manager}-closed-after-main-advances`,
+    "closed",
+    "issue_closed",
+  );
+
+  upstream("/corrupt-state?issue=3", "POST");
+  launch(`${manager}-edited-comment`, 3, true);
+  await finished(`${manager}-edited-comment`, "blocked", "state_invalid");
+  upstream("/corrupt-state?issue=4&delete=true", "POST");
+  launch(`${manager}-missing-comment`, 4, true);
+  await finished(`${manager}-missing-comment`, "blocked", "state_missing");
   evidence = proof();
   assert(
     !evidence.github_requests.some(
@@ -324,7 +511,7 @@ export async function runActionsTests({
     ),
     "Actions read an unrelated issue",
   );
-  assert.equal(evidence.pulls.length, 1);
+  assert.equal(evidence.pulls.length, 3);
   return {
     sdk,
     actions: "passed",

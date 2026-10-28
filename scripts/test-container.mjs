@@ -1,7 +1,7 @@
 import { runActionsTests } from "../tests/integration/actions/harness.mjs";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   appendFile,
   cp,
@@ -253,7 +253,7 @@ async function waitUntil(probe, message, timeout = 30_000) {
     if (probe()) return;
     await delay(200);
   }
-  throw new Error(message);
+  throw new Error(typeof message === "function" ? message() : message);
 }
 
 try {
@@ -1225,6 +1225,7 @@ try {
       console.log(`Verifying production startup through ${sdk}`);
       const prefix = `${id}-investigation-${sdk}`,
         data = `${prefix}-data`,
+        freshData = `${prefix}-fresh-data`,
         net = `${prefix}-network`,
         upstreamName = `${prefix}-upstream`,
         manager = `${prefix}-manager`;
@@ -1308,7 +1309,12 @@ try {
       );
       await writeFile(
         join(directory, "configuration.json"),
-        JSON.stringify(config),
+        JSON.stringify({
+          ...config,
+          ...(suite === "actions"
+            ? { session_key: randomBytes(32).toString("base64") }
+            : {}),
+        }),
       );
       const caBundle = docker([
         "run",
@@ -1345,6 +1351,10 @@ try {
       docker(["network", "create", "--label", `${label}=${id}`, net]);
       register("volume", data);
       docker(["volume", "create", "--label", `${label}=${id}`, data]);
+      if (suite === "actions") {
+        register("volume", freshData);
+        docker(["volume", "create", "--label", `${label}=${id}`, freshData]);
+      }
       register("container", upstreamName);
       docker([
         "run",
@@ -1363,6 +1373,9 @@ try {
         "investigation-fixture",
         "--mount",
         `type=volume,src=${data},dst=/data,readonly`,
+        ...(suite === "actions"
+          ? ["--mount", `type=volume,src=${freshData},dst=/fresh-data,readonly`]
+          : []),
         "--mount",
         `type=bind,src=${directory},dst=/fixture`,
         "--mount",
@@ -1394,6 +1407,7 @@ try {
             manager,
             upstreamName,
             data,
+            freshData,
             directory,
             image,
             net,
@@ -1523,6 +1537,7 @@ try {
       if(response.status!==202)throw Error('check webhook rejected');
     `,
       ]);
+      let notificationProof;
       await waitUntil(
         () => {
           const proof = JSON.parse(
@@ -1534,6 +1549,17 @@ try {
               "fetch('http://investigation-fixture:8317/proof').then(r=>r.json()).then(x=>console.log(JSON.stringify(x)))",
             ]),
           );
+          notificationProof = {
+            workflow: proof.workflow,
+            runs: proof.runs.slice(-8),
+            requests: proof.requests.slice(-8),
+            deliveries: proof.deliveries,
+            counts: {
+              webhook: proof.notifications.length,
+              discord: proof.discord.length,
+              smtp: proof.smtp.length,
+            },
+          };
           return (
             proof.notifications.some(
               (event) => event.outcome === "ready_for_review",
@@ -1546,7 +1572,8 @@ try {
             )
           );
         },
-        "Production pipeline did not deliver all ready notification channels",
+        () =>
+          `Production pipeline did not deliver all ready notification channels: ${JSON.stringify(notificationProof)}`,
         120000,
       );
       docker([

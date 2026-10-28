@@ -972,10 +972,10 @@ export class PrMonitorService {
       record.job_id,
     );
     if (pending) {
-      const result = await this.supervisor.publication.reconcile(
-        pending.id,
-        signal,
-      );
+      const result =
+        pending.revision === record.revision
+          ? await this.supervisor.publication.publish(pending.proposal, signal)
+          : await this.supervisor.publication.reconcile(pending.id, signal);
       if (result.status !== "confirmed")
         throw new RuntimeError(result.failure ?? "publication_pending");
     }

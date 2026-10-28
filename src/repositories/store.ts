@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { dirname, join, parse, relative, resolve } from "node:path";
 import Database from "better-sqlite3";
+import type { TaskDurability } from "../domain/durability.ts";
 import { immutable } from "../config/bundles.ts";
 import type { RunSnapshot } from "../config/load.ts";
 import type {
@@ -77,6 +78,14 @@ function protectDatabase(path: string) {
 
 export class Store {
   readonly db: Database.Database;
+  durability?: TaskDurability;
+
+  async checkpoint(signal: AbortSignal) {
+    if (!this.durability) return;
+    signal.throwIfAborted();
+    await this.durability.checkpoint(signal);
+    signal.throwIfAborted();
+  }
 
   constructor(path: string) {
     path = resolve(path);

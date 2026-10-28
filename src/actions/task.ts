@@ -39,7 +39,19 @@ export type TaskResult = Readonly<{
     | "intake_failed"
     | "runtime_failed"
     | "cancelled"
-    | "cleanup_failed";
+    | "cleanup_failed"
+    | "state_missing"
+    | "state_invalid"
+    | "state_conflict"
+    | "state_local_conflict"
+    | "state_legacy_unbound"
+    | "state_size_limit"
+    | "state_incompatible"
+    | "state_unavailable"
+    | "state_unreviewed"
+    | "state_secret"
+    | "state_write_uncertain"
+    | "recovery_evidence_missing";
   repository?: string;
   issue_number?: number;
   job_id?: number;
@@ -47,6 +59,9 @@ export type TaskResult = Readonly<{
   pull_number?: number;
   head_sha?: string;
   retry_at?: number;
+  task_id?: string;
+  state_comment_id?: number;
+  state_generation?: number;
 }>;
 
 export function parseTaskRequest(args: string[]): TaskRequest {
@@ -193,6 +208,7 @@ export async function executeTask(
   let context: IssueContext;
   try {
     context = await intake.enrollIssue(request.issue_number, signal);
+    await store.checkpoint(signal);
   } catch (error) {
     if (
       error instanceof IntakeError &&
@@ -227,6 +243,7 @@ export async function executeTask(
       signal.throwIfAborted();
       await monitor.reconcile(signal);
       signal.throwIfAborted();
+      await store.checkpoint(signal);
       const outcome = taskOutcome(store, request, monitor.enabled());
       if (outcome) return outcome;
       if (progress(store, request) === before)

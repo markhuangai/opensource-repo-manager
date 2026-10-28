@@ -2,7 +2,10 @@ import { createKnownSecretChecker } from "../logging/redact.ts";
 import { ConfigurationError } from "./errors.ts";
 import type { ActionsConfiguration, Configuration } from "./schema.ts";
 
-export function separateSecrets(config: Configuration | ActionsConfiguration) {
+export function separateSecrets(
+  config: Configuration | ActionsConfiguration,
+  sessionKey?: string,
+) {
   const notifications = structuredClone(config.notifications);
   const credentials = new Map<string, string>();
   const identifiers: string[] = [];
@@ -14,6 +17,14 @@ export function separateSecrets(config: Configuration | ActionsConfiguration) {
     sensitive.push(config.github.webhook_secret);
   }
   put("proxy.key", config.proxy.key);
+  if (sessionKey !== undefined) {
+    put("actions.session_key", sessionKey);
+    sensitive.push(
+      sessionKey,
+      Buffer.from(sessionKey, "base64").toString("hex"),
+      Buffer.from(sessionKey, "base64").toString("base64url"),
+    );
+  }
   for (const [name, channel] of Object.entries(config.notifications)) {
     if (!channel.enabled) continue;
     for (const [field, value] of Object.entries(channel)) {
