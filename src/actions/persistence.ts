@@ -30,6 +30,7 @@ import {
   type TaskState,
 } from "./state.ts";
 import type { TaskResult } from "./task.ts";
+import type { ActionsArtifacts } from "./artifacts.ts";
 
 export interface TaskStateTransport extends GitHubWriter {
   taskIssue(
@@ -53,11 +54,13 @@ export class ActionsState implements TaskDurability {
   private fault: StateError | undefined;
   private reconstructed = false;
   private restoredResult: TaskResult | undefined;
+  private expired = false;
   private constructor(
     private readonly store: Store,
     private readonly snapshot: RunSnapshot,
     private readonly secrets: SecretAccessor,
     private readonly transport: TaskStateTransport,
+    private readonly artifacts?: ActionsArtifacts,
   ) {
     this.repository = new ActionsRepository(store);
     this.codec = new StateCodec(secrets.get("actions.session_key"));
@@ -117,7 +120,11 @@ export class ActionsState implements TaskDurability {
     secrets: SecretAccessor,
     number: number,
     signal: AbortSignal,
-    options: { writer?: TaskStateTransport; reader?: GitHubReader } = {},
+    options: {
+      writer?: TaskStateTransport;
+      reader?: GitHubReader;
+      artifacts?: ActionsArtifacts;
+    } = {},
   ) {
     const transport =
       options.writer ??
@@ -132,7 +139,13 @@ export class ActionsState implements TaskDurability {
         snapshot.settings.github.repository,
         secrets.get("github.token"),
       );
-    const manager = new ActionsState(store, snapshot, secrets, transport);
+    const manager = new ActionsState(
+      store,
+      snapshot,
+      secrets,
+      transport,
+      options.artifacts,
+    );
     await manager.initialize(number, reader, signal);
     store.durability = manager;
     return manager;
@@ -248,6 +261,23 @@ export class ActionsState implements TaskDurability {
     }
     if (!(await this.transport.taskIssue(number, signal)).managed)
       await this.transport.enrollManaged(number, signal);
+    if (this.comment.state.session_artifact && !this.artifacts)
+      throw new StateError("session_transport_unavailable");
+    let missingEvidence = false;
+    if (this.artifacts) {
+      try {
+        this.expired =
+          (await this.artifacts.restore(this.store, this.comment, signal)) ===
+          "expired";
+      } catch (error) {
+        if (
+          !(error instanceof StateError) ||
+          error.code !== "recovery_evidence_missing"
+        )
+          throw error;
+        missingEvidence = true;
+      }
+    }
     const local = this.repository.local();
     if (
       local &&
@@ -291,6 +321,10 @@ export class ActionsState implements TaskDurability {
         issueDigest(context) !== state.job?.issue_digest)
     )
       throw new StateError("state_incompatible");
+    if (missingEvidence) {
+      state.outcome = "blocked";
+      state.reason = "recovery_evidence_missing";
+    }
     this.reconstructed = this.repository.restore(
       this.comment,
       context,
@@ -335,7 +369,12 @@ export class ActionsState implements TaskDurability {
       this.restoredResult
         ? state
         : this.repository.project(state, this.snapshot),
-      this.comment.narrative,
+      this.expired &&
+        !this.comment.narrative.includes(
+          "Saved session expired or was deleted.",
+        )
+        ? `${this.comment.narrative}\n\nSaved session expired or was deleted. Any further coding starts a fresh conversation from verified durable findings and GitHub state. Task budgets and published work are preserved.`
+        : this.comment.narrative,
       signal,
     );
   }
@@ -363,6 +402,7 @@ export class ActionsState implements TaskDurability {
         reason: context.state === "closed" ? "issue_closed" : "pull_closed",
       };
     if (
+      (!this.expired && state.reason === "recovery_evidence_missing") ||
       state.pull ||
       state.head ||
       state.pending?.steps.some(
@@ -423,6 +463,9 @@ export class ActionsState implements TaskDurability {
       task_id: this.comment.state.task_id,
       state_comment_id: this.comment.state.comment_id!,
       state_generation: this.comment.state.generation,
+      ...(this.expired
+        ? { session_recovery: "expired_or_deleted" as const }
+        : {}),
     };
   }
 
@@ -468,7 +511,7 @@ export class ActionsState implements TaskDurability {
     await this.checkpoint(signal);
   }
 
-  checkpoint(signal: AbortSignal) {
+  checkpoint(signal: AbortSignal, artifacts = false) {
     return this.serial(async () => {
       this.bindComment();
       const state = this.restoredResult
@@ -480,6 +523,19 @@ export class ActionsState implements TaskDurability {
         : this.repository.project(this.comment.state, this.snapshot);
       await this.write(state, this.comment.narrative, signal);
       if (!this.restoredResult) this.repository.confirmReconstruction(state);
+      if (artifacts && this.artifacts && !this.restoredResult) {
+        const reference = await this.artifacts.capture(
+          this.store,
+          this.comment.state,
+          signal,
+        );
+        if (reference)
+          await this.write(
+            { ...this.comment.state, session_artifact: reference },
+            this.comment.narrative,
+            signal,
+          );
+      }
     }, signal);
   }
 

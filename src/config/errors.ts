@@ -8,7 +8,8 @@ export type ConfigurationErrorCode =
   | "secret_in_snapshot"
   | "mcp_write_migration_required"
   | "arguments_invalid"
-  | "session_key_invalid";
+  | "session_key_invalid"
+  | "actions_context_invalid";
 
 export const configurationSections = [
   "version",

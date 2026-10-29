@@ -1,4 +1,5 @@
 import { createServer, request } from "node:http";
+import assert from "node:assert/strict";
 import { createServer as httpsServer } from "node:https";
 import { readFileSync, mkdirSync } from "node:fs";
 import Database from "/opt/orm/app/node_modules/better-sqlite3/lib/index.js";
@@ -11,6 +12,7 @@ import { notificationFixture } from "/notification-fixtures/fixture.mts";
 import { respond as claude } from "/agent-fixtures/claude.mjs";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
 import { sourceFiles, modelFixture } from "./protocol.mjs";
+import { artifactFixture } from "/actions-fixtures/artifact-fixture.mjs";
 
 const actions = process.argv.includes("--actions");
 let selectedIssue = 1;
@@ -18,6 +20,10 @@ let dataRoot = "/data";
 let held = false;
 let releaseHold;
 const config = JSON.parse(readFileSync("/fixture/configuration.json", "utf8"));
+const artifacts = actions ? artifactFixture(config) : undefined;
+let sessionPhase = "seed";
+let loseReferenceResponse = false,
+  lostReferenceResponse = false;
 const remote = await createPublicationFixture("/fixture/git");
 mkdirSync("/fixture/notifications", { recursive: true });
 const notificationServer = await notificationFixture("/fixture/notifications", {
@@ -39,6 +45,7 @@ remote.state.issues.set(1, {
   updated_at: "2026-10-21T00:00:00Z",
 });
 if (actions) {
+  remote.git(["config", "uploadpack.allowReachableSHA1InWant", "true"]);
   for (const [index, mode] of [
     "source_only",
     "needs_information",
@@ -66,6 +73,23 @@ if (actions) {
       updated_at: "2026-10-21T00:00:00Z",
     });
   remote.state.afterMutation = (kind) => {
+    if (selectedIssue === 30 && kind === "comment" && loseReferenceResponse) {
+      const row = remote.state.comments
+        .get(30)
+        ?.find((item) => item.body.includes("<!-- orm:task-state:"));
+      const encoded = row?.body.match(
+        /<!-- orm:task-state:v1:([A-Za-z0-9_-]+):/,
+      )?.[1];
+      if (
+        encoded &&
+        JSON.parse(Buffer.from(encoded, "base64url").toString())
+          .session_artifact
+      ) {
+        loseReferenceResponse = false;
+        lostReferenceResponse = true;
+        remote.state.dropAfter = "comment";
+      }
+    }
     if (selectedIssue === 10 && dataRoot === "/data" && kind === "pull") {
       remote.state.dropAfter = "pull";
       remote.state.rejectBefore = "comment";
@@ -101,7 +125,7 @@ const store = {
 };
 let fixture = makeFixture();
 function makeFixture() {
-  return modelFixture(
+  const selected = modelFixture(
     config,
     store,
     actions ? `${dataRoot}/actions/${selectedIssue}/runtime` : "/data/runtime",
@@ -133,13 +157,69 @@ function makeFixture() {
       },
     },
   );
+  selected.session = (text, role, first) => {
+    if (role === "audit" || role === "output_review") {
+      assert(
+        !text.includes("native-history-canary"),
+        "Auditor inherited coding history",
+      );
+      assert(
+        !text.includes("Appended factual answer"),
+        "Auditor inherited the coding reply",
+      );
+      return { result: "fresh-auditor" };
+    }
+    const resumed = ["resume", "interrupt", "duplicate"].includes(sessionPhase);
+    if (first && resumed) {
+      assert(
+        text.includes("native-history-canary"),
+        "Native conversation history was lost",
+      );
+      assert(
+        text.includes("Appended factual answer"),
+        "New admitted reply was lost",
+      );
+    }
+    if (first && !resumed)
+      assert(
+        !text.includes("native-history-canary"),
+        "Fresh recovery reused expired history",
+      );
+    return first
+      ? {
+          command: [
+            "set -eu",
+            'test "$(id -u)" = 10001',
+            'test -z "${ORM_SESSION_KEY:-}${ACTIONS_RUNTIME_TOKEN:-}${ORM_ARTIFACT_TOKEN:-}"',
+            'test "$(node --version)" = v24.18.0',
+            ...(resumed
+              ? [
+                  'test "$(cat unfinished.txt)" = first',
+                  "test ! -e README.md",
+                  "test ! -e node_modules",
+                  "test ! -e .venv",
+                  "printf -- '-second' >> unfinished.txt",
+                ]
+              : [
+                  "printf first > unfinished.txt",
+                  "rm README.md",
+                  "mkdir -p node_modules/fixture .venv",
+                  "printf cache > node_modules/fixture/cache",
+                  "printf cache > .venv/cache",
+                ]),
+          ].join("\n"),
+        }
+      : { result: "native-history-canary" };
+  };
+  return selected;
 }
 const tls = httpsServer(
   {
     key: readFileSync("/fixture-key.pem"),
     cert: readFileSync("/fixture-ca.pem"),
   },
-  (req, res) => {
+  async (req, res) => {
+    if (artifacts && (await artifacts.handle(req, res))) return;
     const upstream = request(
       remote.url + req.url,
       { method: req.method, headers: req.headers },
@@ -157,6 +237,7 @@ const http = createServer(async (req, res) => {
   if (actions && url.pathname === "/select" && req.method === "POST") {
     if (database) databases.set(`${dataRoot}:${selectedIssue}`, database);
     selectedIssue = Number(url.searchParams.get("issue"));
+    sessionPhase = url.searchParams.get("session") ?? "seed";
     dataRoot =
       url.searchParams.get("fresh") === "true" ? "/fresh-data" : "/data";
     if (selectedIssue === 999)
@@ -168,6 +249,43 @@ const http = createServer(async (req, res) => {
     held = false;
     fixture = makeFixture();
     res.end("selected");
+  } else if (
+    actions &&
+    url.pathname === "/artifact-fault" &&
+    req.method === "POST"
+  ) {
+    if (url.searchParams.get("kind") === "drop_reference")
+      loseReferenceResponse = true;
+    else
+      artifacts.fault(
+        Number(url.searchParams.get("id")),
+        url.searchParams.get("kind"),
+      );
+    res.end("armed");
+  } else if (
+    actions &&
+    url.pathname === "/session-issue" &&
+    req.method === "POST"
+  ) {
+    const number = Number(url.searchParams.get("issue"));
+    remote.state.issues.set(number, {
+      id: 1000 + number,
+      number,
+      title: "native session continuation",
+      body: "Preserve unfinished work",
+      updated_at: "2026-10-28T00:00:00Z",
+    });
+    res.end("created");
+  } else if (
+    actions &&
+    url.pathname === "/forget-local" &&
+    req.method === "POST"
+  ) {
+    const key = `${dataRoot}:${selectedIssue}`;
+    database?.close();
+    database = undefined;
+    databases.delete(key);
+    res.end("closed local fixture connection");
   } else if (
     actions &&
     url.pathname === "/corrupt-state" &&
@@ -202,6 +320,15 @@ const http = createServer(async (req, res) => {
     res.end("advanced");
   } else if (
     actions &&
+    url.pathname === "/restore-main" &&
+    req.method === "POST"
+  ) {
+    const sha = url.searchParams.get("sha");
+    assert(/^[a-f0-9]{40}$/.test(sha));
+    remote.git(["update-ref", "refs/heads/main", sha]);
+    res.end("restored fixture main");
+  } else if (
+    actions &&
     url.pathname === "/reject-checkpoint" &&
     req.method === "POST"
   ) {
@@ -220,11 +347,13 @@ const http = createServer(async (req, res) => {
     remote.state.closed.add(number);
     remote.git(["update-ref", "refs/heads/main", remote.head(pull.branch)]);
     res.end("merged");
-  } else if (req.url === "/proof") {
+  } else if (url.pathname === "/proof") {
     res.setHeader("content-type", "application/json");
     res.end(
       JSON.stringify({
         source,
+        artifacts: artifacts?.proof(),
+        lost_reference_response: lostReferenceResponse,
         held,
         github_requests: remote.state.requests,
         runs: database

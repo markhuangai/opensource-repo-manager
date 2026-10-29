@@ -56,7 +56,10 @@ export async function createApplication(
             if (store.db.open) {
               try {
                 if (store.durability)
-                  await store.checkpoint(AbortSignal.timeout(9000));
+                  await store.checkpoint(
+                    AbortSignal.timeout(9000),
+                    options.mode === "actions",
+                  );
               } finally {
                 store.close();
               }

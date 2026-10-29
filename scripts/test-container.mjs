@@ -381,7 +381,7 @@ try {
       "-subj",
       "/CN=api.github.com",
       "-addext",
-      "subjectAltName=DNS:api.github.com,DNS:github.com,DNS:localhost",
+      "subjectAltName=DNS:api.github.com,DNS:github.com,DNS:localhost,DNS:results-receiver.actions.githubusercontent.com",
       "-days",
       "1",
       "-keyout",
@@ -746,6 +746,8 @@ try {
     `type=bind,src=${join(testInputs, "tests", "integration", "mcp-writes")},dst=/mcp-write-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(testInputs, "tests", "integration", "investigation")},dst=/investigation-fixtures,readonly`,
+    "--mount",
+    `type=bind,src=${join(testInputs, "tests", "integration", "actions")},dst=/actions-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(testInputs, "tests", "integration", "implementation")},dst=/implementation-fixtures,readonly`,
     "--mount",
@@ -1242,6 +1244,15 @@ try {
           (await readFile(join(prompts, name), "utf8")) +
             `\n${name === "system.md" ? "OPERATOR_SYSTEM_CANARY" : "OPERATOR_USER_CANARY"}\n`,
         );
+      if (suite === "actions") {
+        await cp(prompts, join(directory, "prompts-incompatible"), {
+          recursive: true,
+        });
+        await appendFile(
+          join(directory, "prompts-incompatible", "user.md"),
+          "\nChanged protected prompt snapshot.\n",
+        );
+      }
       const skill = join(directory, "skills", "example", "SKILL.md");
       await writeFile(
         skill,
@@ -1312,7 +1323,15 @@ try {
         JSON.stringify({
           ...config,
           ...(suite === "actions"
-            ? { session_key: randomBytes(32).toString("base64") }
+            ? {
+                session_key: randomBytes(32).toString("base64"),
+                artifact_tokens: Object.fromEntries(
+                  [100, 101].map((run) => [
+                    run,
+                    `${Buffer.from('{"alg":"HS256","typ":"JWT"}').toString("base64url")}.${Buffer.from(JSON.stringify({ scp: `Actions.Results:00000000-0000-4000-8000-${String(run).padStart(12, "0")}:11111111-1111-4111-8111-111111111111` })).toString("base64url")}.fixture-signature`,
+                  ]),
+                ),
+              }
             : {}),
         }),
       );
@@ -1371,6 +1390,8 @@ try {
         "github.com",
         "--network-alias",
         "investigation-fixture",
+        "--network-alias",
+        "results-receiver.actions.githubusercontent.com",
         "--mount",
         `type=volume,src=${data},dst=/data,readonly`,
         ...(suite === "actions"
@@ -1417,6 +1438,12 @@ try {
             result,
             register,
             waitUntil,
+            sessionFixtures: join(
+              testInputs,
+              "tests",
+              "integration",
+              "actions",
+            ),
           }),
         );
         continue;

@@ -242,12 +242,12 @@ describe("durable maintenance implementation", () => {
     const jobs = f.store.jobs(),
       instance = f.publications.instance();
     f.store.db.exec(
-      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; PRAGMA user_version=8",
+      "DROP TABLE agent_conversations; DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; PRAGMA user_version=8",
     );
     f.store.close();
     const upgraded = new Store(f.path);
     cleanup.push(() => upgraded.close());
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(10);
+    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(11);
     expect(upgraded.jobs()).toEqual(jobs);
     expect(new PublicationRepository(upgraded).instance()).toBe(instance);
     expect(new ImplementationRepository(upgraded).all()).toEqual([]);
@@ -257,7 +257,7 @@ describe("durable maintenance implementation", () => {
     const f = await fixture();
     const jobs = f.store.jobs();
     f.store.db.exec(
-      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; CREATE TABLE implementations(marker TEXT); INSERT INTO implementations VALUES('preserve'); PRAGMA user_version=8",
+      "DROP TABLE agent_conversations; DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; CREATE TABLE implementations(marker TEXT); INSERT INTO implementations VALUES('preserve'); PRAGMA user_version=8",
     );
     f.store.close();
     expect(() => new Store(f.path)).toThrow();

@@ -12,6 +12,8 @@ import { createApplication, type Application } from "../runtime/application.ts";
 import { assertRuntimeIdentity } from "../runtime/process.ts";
 import { rootDirectory } from "../services/workspaces/files.ts";
 import { ActionsState } from "./persistence.ts";
+import { ActionsArtifacts } from "./artifacts.ts";
+import { GitHubArtifacts } from "../adapters/github/artifacts.ts";
 import { StateError } from "./state.ts";
 import {
   assertTaskStore,
@@ -74,12 +76,21 @@ try {
   await rootDirectory(root, 0o711);
   store = new Store(join(root, "state", "manager.sqlite"));
   assertTaskStore(store, request, loaded.snapshot.settings.github.repository);
+  const artifacts = new ActionsArtifacts(
+    loaded.actions,
+    loaded.snapshot,
+    loaded.secrets,
+    join(root, "runtime"),
+    new GitHubArtifacts(loaded.actions, loaded.secrets),
+  );
+  await artifacts.initialize(controller.signal);
   state = await ActionsState.open(
     store,
     loaded.snapshot,
     loaded.secrets,
     request.issue_number,
     controller.signal,
+    { artifacts },
   );
   if (state.result()) result = state.result()!;
   else {
@@ -114,8 +125,12 @@ try {
   try {
     await application?.close();
     if (!application && state && store?.db.open)
-      await store.checkpoint(AbortSignal.timeout(9000));
+      await store.checkpoint(AbortSignal.timeout(9000), true);
   } catch (error) {
+    logger.error(
+      "Final Actions checkpoint failed; only the last acknowledged artifact is recoverable.",
+    );
+    result = { ...result, checkpoint_failed: true };
     if (error instanceof StateError)
       result = {
         ...result,

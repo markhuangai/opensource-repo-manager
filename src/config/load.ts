@@ -7,6 +7,7 @@ import {
 } from "./bundles.ts";
 import { ConfigurationError } from "./errors.ts";
 import { readRegularFile } from "./files.ts";
+import { captureActionsContext } from "../actions/context.ts";
 import {
   parseActionsConfiguration,
   parseConfiguration,
@@ -71,6 +72,7 @@ async function loadConfiguration(
   path: string,
   parse: typeof parseConfiguration | typeof parseActionsConfiguration,
   sessionKey?: string,
+  runtimeToken?: string,
 ) {
   const bytes = await readRegularFile(path, true);
   let source: string;
@@ -79,7 +81,11 @@ async function loadConfiguration(
   } catch {
     throw new ConfigurationError("yaml_invalid");
   }
-  const { settings, secrets } = separateSecrets(parse(source), sessionKey);
+  const { settings, secrets } = separateSecrets(
+    parse(source),
+    sessionKey,
+    runtimeToken,
+  );
   const bundles = await loadWorkflowBundles(settings, secrets);
   return Object.freeze({
     snapshot: createRunSnapshot(settings, bundles, secrets),
@@ -103,5 +109,15 @@ export function loadProtectedActionsConfiguration(
   )
     throw new ConfigurationError("session_key_invalid");
   delete process.env.ORM_SESSION_KEY;
-  return loadConfiguration(path, parseActionsConfiguration, key);
+  const { context, token } = captureActionsContext();
+  return loadConfiguration(path, parseActionsConfiguration, key, token).then(
+    (loaded) => {
+      if (
+        loaded.snapshot.settings.github.repository.toLowerCase() !==
+        context.repository.toLowerCase()
+      )
+        throw new ConfigurationError("actions_context_invalid");
+      return { ...loaded, actions: context };
+    },
+  );
 }

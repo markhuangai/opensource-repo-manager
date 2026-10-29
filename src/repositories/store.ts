@@ -80,10 +80,10 @@ export class Store {
   readonly db: Database.Database;
   durability?: TaskDurability;
 
-  async checkpoint(signal: AbortSignal) {
+  async checkpoint(signal: AbortSignal, artifacts = false) {
     if (!this.durability) return;
     signal.throwIfAborted();
-    await this.durability.checkpoint(signal);
+    await this.durability.checkpoint(signal, artifacts);
     signal.throwIfAborted();
   }
 
@@ -93,7 +93,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].includes(version as number))
+      if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(version as number))
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -316,6 +316,18 @@ export class Store {
             PRIMARY KEY(job_id,kind)
           );
           PRAGMA user_version = 10;
+        `),
+          )
+          .immediate();
+      if ((version as number) < 11)
+        this.db
+          .transaction(() =>
+            this.db.exec(`
+          CREATE TABLE agent_conversations (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, content TEXT NOT NULL
+          );
+          PRAGMA user_version = 11;
         `),
           )
           .immediate();

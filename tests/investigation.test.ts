@@ -102,10 +102,10 @@ describe("durable investigations", () => {
     const jobs = f.store.jobs(),
       instance = new PublicationRepository(f.store).instance();
     f.store.db.exec(
-      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; PRAGMA user_version=7",
+      "DROP TABLE agent_conversations; DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; PRAGMA user_version=7",
     );
     const reopened = f.reopen();
-    expect(reopened.db.pragma("user_version", { simple: true })).toBe(10);
+    expect(reopened.db.pragma("user_version", { simple: true })).toBe(11);
     expect(reopened.jobs()).toEqual(jobs);
     expect(reopened.snapshot(f.loaded.snapshot.digest)).toEqual(
       f.loaded.snapshot,
@@ -117,7 +117,7 @@ describe("durable investigations", () => {
     const f = await fixture();
     const jobs = f.store.jobs();
     f.store.db.exec(
-      "DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; CREATE TABLE investigation_evidence(marker TEXT); INSERT INTO investigation_evidence VALUES('preserve'); PRAGMA user_version=7",
+      "DROP TABLE agent_conversations; DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; CREATE TABLE investigation_evidence(marker TEXT); INSERT INTO investigation_evidence VALUES('preserve'); PRAGMA user_version=7",
     );
     f.store.close();
     expect(() => new Store(f.path)).toThrow();
