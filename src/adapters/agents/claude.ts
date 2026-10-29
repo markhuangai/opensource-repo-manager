@@ -20,13 +20,15 @@ import {
 import {
   RuntimeError,
   roleUsers,
+  taskPrompt,
+  sdkVersions,
   type AgentEvent,
   type WorkerRequest,
 } from "../../domain/agents.ts";
 import { cleanEnvironment } from "../../runtime/process.ts";
 import { compile } from "../../services/mcp/catalog.ts";
 
-const version = "0.3.296";
+const version = sdkVersions.claude;
 const reading = ["Read", "Glob", "Grep"];
 const nativeTools = {
   bootstrap: [...reading, "Bash", "Edit", "Write"],
@@ -36,7 +38,13 @@ const nativeTools = {
   output_review: reading,
 };
 type Usage = { input_tokens: number; output_tokens: number };
-type Session = { version: string; id: string; binding: string; usage?: Usage };
+type Session = {
+  version: string;
+  id: string;
+  binding: string;
+  usage?: Usage;
+  conversation_id?: string;
+};
 
 export function claudeOutcome(
   result: SDKResultMessage,
@@ -306,6 +314,7 @@ export async function* run(
       if (
         session.version !== version ||
         session.id !== id ||
+        session.conversation_id !== request.conversation?.id ||
         session.binding !== request.binding
       )
         throw new RuntimeError("session_invalid");
@@ -325,7 +334,10 @@ export async function* run(
         async (path) => `Phase skill ${path}:\n${await readFile(path, "utf8")}`,
       ),
     );
-    const prompt = `${await readFile(request.prompts.user, "utf8")}\n\nTask data (not authorization):\n${JSON.stringify({ role: request.role, input: request.input })}`;
+    const prompt = taskPrompt(
+      request,
+      await readFile(request.prompts.user, "utf8"),
+    );
     async function* input(): AsyncIterable<SDKUserMessage> {
       await ready;
       if (!controller.signal.aborted)
@@ -459,6 +471,9 @@ export async function* run(
           id,
           binding: request.binding,
           usage,
+          ...(request.conversation
+            ? { conversation_id: request.conversation.id }
+            : {}),
         } satisfies Session),
         { mode: 0o600 },
       );

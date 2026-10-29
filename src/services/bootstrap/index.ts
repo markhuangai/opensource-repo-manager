@@ -23,6 +23,7 @@ import { materialize } from "./environment.ts";
 
 export class BootstrapService {
   readonly toolchains: Toolchains;
+  private readonly prepared = new Set<string>();
   private readonly supervisor: Supervisor;
   private readonly store: Store;
   private readonly secrets: SecretAccessor;
@@ -226,6 +227,7 @@ export class BootstrapService {
           receipt.status = "ready";
           receipt.finished_at = Date.now();
           save();
+          this.prepared.add(receipt.id);
           return this.store.bootstrap(receipt.id);
         } catch (error) {
           receipt.status = session.signal.aborted ? "interrupted" : "blocked";
@@ -274,6 +276,18 @@ export class BootstrapService {
     ) => Promise<{ stdout: string; stderr: string }>,
   ) {
     const receipt = this.receipt(request);
+    if (this.store.durability && !this.prepared.has(receipt.id)) {
+      const environment = await this.toolchains.ensure(
+        receipt.plan!,
+        signal,
+        (command) =>
+          this.store.recordBootstrapCommand(receipt.id, runId, command),
+        workerLimits(this.store.snapshot(request.snapshot_digest)),
+      );
+      if (digest(environment) !== digest(receipt.environment))
+        throw new RuntimeError("bootstrap_environment_changed");
+      this.prepared.add(receipt.id);
+    }
     await this.toolchains.verify(
       receipt.environment!,
       signal,

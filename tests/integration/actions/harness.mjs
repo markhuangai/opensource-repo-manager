@@ -17,9 +17,11 @@ export async function runActionsTests({
   result,
   register,
   waitUntil,
+  sessionFixtures,
 }) {
   const node = "/opt/orm-runtime/bin/node";
   const completed = [];
+  let resets = 0;
   const config = JSON.parse(
     await readFile(join(directory, "configuration.json"), "utf8"),
   );
@@ -36,8 +38,25 @@ export async function runActionsTests({
   const proof = () => JSON.parse(upstream("/proof"));
   const inspect = (name) =>
     JSON.parse(docker(["container", "inspect", name]))[0];
-  function launch(name, number, fresh = false) {
-    upstream(`/select?issue=${number}&fresh=${fresh}`, "POST");
+  function runtimeEnvironment(fresh = false) {
+    const run = fresh ? 101 : 100;
+    return Object.entries({
+      GITHUB_ACTIONS: "true",
+      GITHUB_REPOSITORY: "owner/repo",
+      GITHUB_REPOSITORY_ID: "42",
+      GITHUB_RUN_ID: String(run),
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_SHA: "f".repeat(40),
+      ACTIONS_RUNTIME_TOKEN: config.artifact_tokens[run],
+      ACTIONS_RESULTS_URL:
+        "https://results-receiver.actions.githubusercontent.com/",
+    }).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
+  }
+  function launch(name, number, fresh = false, options = {}) {
+    upstream(
+      `/select?issue=${number}&fresh=${fresh}&session=${options.session ?? "seed"}`,
+      "POST",
+    );
     register("container", name);
     docker([
       "run",
@@ -57,17 +76,27 @@ export async function runActionsTests({
       "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
       "--env",
       `ORM_SESSION_KEY=${config.session_key}`,
+      ...runtimeEnvironment(fresh),
+      ...Object.entries(options.environment ?? {}).flatMap(([key, value]) => [
+        "--env",
+        `${key}=${value}`,
+      ]),
+      "--mount",
+      `type=bind,src=${sessionFixtures},dst=/actions-fixtures,readonly`,
       ...["config", "skills", "prompts"].flatMap((name) => [
         "--mount",
-        `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
+        `type=bind,src=${join(directory, name === "prompts" && options.changedPrompts ? "prompts-incompatible" : name)},dst=/${name},readonly`,
       ]),
       "--entrypoint",
       "/usr/bin/tini",
       image,
       "--",
       node,
-      "/opt/orm/app/dist/actions/main.js",
+      options.session
+        ? "/actions-fixtures/session.mjs"
+        : "/opt/orm/app/dist/actions/main.js",
       String(number),
+      ...(options.session ? [options.session] : []),
     ]);
     assert.deepEqual(inspect(name).Config.Healthcheck.Test, ["NONE"]);
   }
@@ -78,6 +107,7 @@ export async function runActionsTests({
       config.github.token,
       config.proxy.key,
       config.session_key,
+      ...Object.values(config.artifact_tokens),
     ])
       assert(
         !(logs.stdout + logs.stderr).includes(secret),
@@ -85,6 +115,7 @@ export async function runActionsTests({
       );
     const lines = logs.stdout.trim().split("\n");
     assert.equal(lines.length, 1, logs.stdout + logs.stderr);
+    assert(lines[0], logs.stdout + logs.stderr);
     const outcome = JSON.parse(lines[0]);
     return { logs, outcome };
   }
@@ -282,6 +313,11 @@ export async function runActionsTests({
   upstream("/reject-checkpoint", "POST");
   docker(["kill", "--signal", "SIGTERM", cancelling]);
   const cancelled = await finished(cancelling, "failed", "cancelled");
+  assert.equal(
+    cancelled.checkpoint_failed,
+    true,
+    "Failed final checkpoint was not reported",
+  );
   assert.equal(cancelled.repository, "owner/repo");
   assert.equal(cancelled.issue_number, 7);
   assert(cancelled.job_id > 0);
@@ -320,6 +356,7 @@ export async function runActionsTests({
       "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
       "--env",
       `ORM_SESSION_KEY=${config.session_key}`,
+      ...runtimeEnvironment(),
       ...["config", "skills", "prompts"].flatMap((name) => [
         "--mount",
         `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
@@ -329,7 +366,7 @@ export async function runActionsTests({
       image,
       "--input-type=module",
       "-e",
-      "import {Store} from '/opt/orm/app/dist/repositories/store.js'; import {ActionsState} from '/opt/orm/app/dist/actions/persistence.js'; import {loadProtectedActionsConfiguration} from '/opt/orm/app/dist/config/load.js'; const store=new Store('/data/actions/'+process.argv[1]+'/state/manager.sqlite'); const signal=AbortSignal.timeout(30000); if(process.argv[3]==='true'){const loaded=await loadProtectedActionsConfiguration(); await ActionsState.open(store,loaded.snapshot,loaded.secrets,Number(process.argv[1]),signal);} store.db.exec(process.argv[2]); if(process.argv[3]==='true') await store.checkpoint(signal); store.close();",
+      "import {Store} from '/opt/orm/app/dist/repositories/store.js'; import {ActionsState} from '/opt/orm/app/dist/actions/persistence.js'; import {ActionsArtifacts} from '/opt/orm/app/dist/actions/artifacts.js'; import {GitHubArtifacts} from '/opt/orm/app/dist/adapters/github/artifacts.js'; import {loadProtectedActionsConfiguration} from '/opt/orm/app/dist/config/load.js'; const root='/data/actions/'+process.argv[1]; const store=new Store(root+'/state/manager.sqlite'); const signal=AbortSignal.timeout(30000); if(process.argv[3]==='true'){const loaded=await loadProtectedActionsConfiguration(); const artifacts=new ActionsArtifacts(loaded.actions,loaded.snapshot,loaded.secrets,root+'/runtime',new GitHubArtifacts(loaded.actions,loaded.secrets)); await ActionsState.open(store,loaded.snapshot,loaded.secrets,Number(process.argv[1]),signal,{artifacts});} store.db.exec(process.argv[2]); if(process.argv[3]==='true') await store.checkpoint(signal); store.close();",
       String(number),
       sql,
       String(persist),
@@ -376,7 +413,65 @@ export async function runActionsTests({
     return state;
   }
   const readyState = durable(1);
+  assert.equal(readyState.pending.status, "uncertain");
+  const publicationCount = proof().mutations.filter(
+    (kind) => kind !== "comment",
+  ).length;
+  launch(`${manager}-older-artifact-publication-authority`, 1, true);
+  const importedOwnership = await finished(
+    `${manager}-older-artifact-publication-authority`,
+    "waiting",
+    "retry_scheduled",
+  );
+  assert.equal(importedOwnership.pull_number, readyState.pull.number);
+  assert.equal(importedOwnership.head_sha, readyState.pull.head);
+  assert.equal(importedOwnership.retry_at, readyState.pending.retry_at);
+  assert.deepEqual(durable(1).budget, readyState.budget);
+  assert.deepEqual(durable(1).pull, readyState.pull);
+  assert.equal(durable(1).pending.status, "uncertain");
+  assert.equal(proof().requests.length, 0);
+  assert.equal(
+    proof().mutations.filter((kind) => kind !== "comment").length,
+    publicationCount,
+  );
+  const inspection = `${manager}-inspect-import`;
+  register("container", inspection);
+  const restoredRuns = Number(
+    docker([
+      "run",
+      "--rm",
+      "--name",
+      inspection,
+      "--label",
+      `${label}=${id}`,
+      "--mount",
+      `type=volume,src=${freshData},dst=/data,readonly`,
+      "--entrypoint",
+      node,
+      image,
+      "--input-type=module",
+      "-e",
+      "import assert from 'node:assert/strict'; import {copyFileSync,existsSync} from 'node:fs'; import Database from 'better-sqlite3'; process.umask(0o077); const source='/data/actions/1/state/manager.sqlite'; assert(!existsSync(source+'-wal')); copyFileSync(source,'/tmp/checkpoint.sqlite'); const db=new Database('/tmp/checkpoint.sqlite',{readonly:true,fileMustExist:true}); console.log(db.prepare('SELECT count(*) AS count FROM agent_runs').get().count); db.close();",
+    ]),
+  );
+  assert(restoredRuns > 0, "Older checkpoint database was not imported");
+  assert(
+    proof().artifacts.requests.some(
+      (item) =>
+        item.path ===
+        `/repos/owner/repo/actions/artifacts/${readyState.session_artifact.artifact_id}/zip`,
+    ),
+  );
+  discardTask(1, true);
   assert(readyState.budget.wait_ms > 0, "CI waiting was not accounted");
+  assert(
+    readyState.session_artifact,
+    "Production entrypoint did not publish a session checkpoint",
+  );
+  upstream(
+    `/artifact-fault?id=${readyState.session_artifact.artifact_id}&kind=expired`,
+    "POST",
+  );
   launch(`${manager}-fresh-owned-pr`, 1, true);
   const owned = await finished(
     `${manager}-fresh-owned-pr`,
@@ -387,6 +482,7 @@ export async function runActionsTests({
   assert.equal(durable(1).task_id, readyState.task_id);
   assert.deepEqual(durable(1).budget, readyState.budget);
   assert.equal(proof().requests.length, 0);
+  assert.equal(owned.session_recovery, "expired_or_deleted");
 
   const noFixState = durable(4);
   launch(`${manager}-fresh-terminal`, 4, true);
@@ -428,17 +524,70 @@ export async function runActionsTests({
   await finished(unpublished, "failed", "cancelled");
   upstream("/release", "POST");
   const interrupted = durable(9);
+  const unpublishedAuthority = {
+    budget: interrupted.budget,
+    pull: interrupted.pull,
+    branch: interrupted.branch,
+    reference: interrupted.session_artifact,
+  };
+  launch(`${manager}-artifact-changed-configuration`, 9, true, {
+    changedPrompts: true,
+  });
+  await finished(
+    `${manager}-artifact-changed-configuration`,
+    "blocked",
+    "session_incompatible",
+  );
+  assert.equal(proof().requests.length, 0);
+  assert.deepEqual(
+    {
+      budget: durable(9).budget,
+      pull: durable(9).pull,
+      branch: durable(9).branch,
+      reference: durable(9).session_artifact,
+    },
+    unpublishedAuthority,
+  );
+  discardTask(9, true);
+  upstream("/advance-main", "POST");
+  launch(`${manager}-artifact-changed-source`, 9, true);
+  await finished(
+    `${manager}-artifact-changed-source`,
+    "blocked",
+    "state_incompatible",
+  );
+  assert.equal(proof().requests.length, 0);
+  assert.deepEqual(
+    {
+      budget: durable(9).budget,
+      pull: durable(9).pull,
+      branch: durable(9).branch,
+      reference: durable(9).session_artifact,
+    },
+    unpublishedAuthority,
+  );
+  upstream(`/restore-main?sha=${interrupted.job.source.sha}`, "POST");
+  discardTask(9, true);
+  assert(
+    interrupted.session_artifact,
+    "Graceful interruption lost completed investigation/bootstrap checkpoints",
+  );
+  discardTask(9, false);
   launch(`${manager}-fresh-unpublished`, 9, true);
   await finished(`${manager}-fresh-unpublished`, "waiting", "remote_checks");
   const resumed = durable(9);
   assert.equal(resumed.task_id, interrupted.task_id);
   assert.equal(resumed.scope_digest, interrupted.scope_digest);
-  assert.notEqual(resumed.findings.objective, interrupted.findings.objective);
+  assert.equal(resumed.findings.objective, interrupted.findings.objective);
   assert.equal(resumed.scope.objective, interrupted.scope.objective);
   assert(resumed.budget.model_requests > interrupted.budget.model_requests);
   assert(resumed.budget.active_ms >= interrupted.budget.active_ms);
   for (const task of ["implementation_audit", "external_output_review"])
     assert(proof().requests.includes(task));
+  assert(
+    !proof().requests.includes("investigation_result"),
+    "Restored completed investigation was rerun",
+  );
   assert.equal(
     proof().reconstructed,
     0,
@@ -512,6 +661,170 @@ export async function runActionsTests({
     "Actions read an unrelated issue",
   );
   assert.equal(evidence.pulls.length, 3);
+  function discardTask(number, fresh) {
+    upstream(`/select?issue=${number}&fresh=${fresh}`, "POST");
+    upstream("/forget-local", "POST");
+    const name = `${manager}-discard-${resets++}`;
+    register("container", name);
+    docker([
+      "run",
+      "--rm",
+      "--name",
+      name,
+      "--label",
+      `${label}=${id}`,
+      "--mount",
+      `type=volume,src=${fresh ? freshData : data},dst=/data`,
+      "--entrypoint",
+      node,
+      image,
+      "--input-type=module",
+      "-e",
+      "import {rm,access} from 'node:fs/promises'; const path='/data/actions/'+process.argv[1]; await rm(path,{recursive:true,force:true}); await access(path).then(()=>{throw Error('Task storage survived')},error=>{if(error.code!=='ENOENT')throw error});",
+      String(number),
+    ]);
+  }
+  const number = 30;
+  upstream(`/session-issue?issue=${number}`, "POST");
+  upstream("/artifact-fault?kind=drop_finalize", "POST");
+  upstream("/artifact-fault?kind=drop_reference", "POST");
+  launch(`${manager}-session-seed`, number, false, { session: "seed" });
+  const seeded = await finished(
+    `${manager}-session-seed`,
+    "waiting",
+    "session_verified",
+  );
+  const checkpoint = durable(number).session_artifact;
+  assert.equal(checkpoint.run_id, 100);
+  assert.equal(seeded.messages, 1);
+  assert.equal(
+    proof().lost_reference_response,
+    true,
+    "Reference acknowledgement loss was not exercised",
+  );
+  assert(
+    proof().artifacts.requests.some((item) =>
+      item.path.endsWith("/FinalizeArtifact"),
+    ),
+  );
+  discardTask(number, false);
+  for (const [fault, reason] of [
+    ["foreign", "session_provenance_invalid"],
+    ["corrupt", "session_corrupt"],
+  ]) {
+    upstream(
+      `/artifact-fault?id=${checkpoint.artifact_id}&kind=${fault}`,
+      "POST",
+    );
+    const name = `${manager}-session-${fault}`;
+    launch(name, number, true);
+    await finished(name, "blocked", reason);
+    assert.equal(
+      proof().requests.length,
+      0,
+      "Unverified artifact started model work",
+    );
+    assert.equal(
+      durable(number).session_artifact.artifact_id,
+      checkpoint.artifact_id,
+    );
+    discardTask(number, true);
+  }
+  upstream(`/artifact-fault?id=${checkpoint.artifact_id}&kind=none`, "POST");
+  launch(`${manager}-session-missing-runtime`, number, true, {
+    environment: { ACTIONS_RUNTIME_TOKEN: "" },
+  });
+  await finished(
+    `${manager}-session-missing-runtime`,
+    "failed",
+    "configuration_invalid",
+  );
+  launch(`${manager}-session-wrong-key`, number, true, {
+    environment: { ORM_SESSION_KEY: Buffer.alloc(32, 19).toString("base64") },
+  });
+  await finished(`${manager}-session-wrong-key`, "blocked", "state_invalid");
+  discardTask(number, true);
+  const interruptedName = `${manager}-session-unacknowledged`;
+  launch(interruptedName, number, true, { session: "interrupt" });
+  await waitUntil(
+    () => !inspect(interruptedName).State.Running,
+    "Native checkpoint interruption did not finish",
+    600000,
+  );
+  assert.equal(
+    inspect(interruptedName).State.ExitCode,
+    137,
+    result(["logs", interruptedName]).stderr,
+  );
+  assert.equal(
+    durable(number).session_artifact.artifact_id,
+    checkpoint.artifact_id,
+    "Unacknowledged local work replaced the verified checkpoint",
+  );
+  const charged = durable(number).budget;
+  assert(charged.model_requests > seeded.after.model_requests);
+  discardTask(number, true);
+  launch(`${manager}-session-resumed`, number, true, { session: "resume" });
+  const resumedSession = await finished(
+    `${manager}-session-resumed`,
+    "waiting",
+    "session_verified",
+  );
+  assert.equal(
+    resumedSession.native_id,
+    seeded.native_id,
+    "Native session identity was not retained",
+  );
+  assert.equal(resumedSession.messages, 2);
+  assert.deepEqual(
+    resumedSession.before,
+    charged,
+    "Old artifact rolled back charged work",
+  );
+  assert.equal(durable(number).session_artifact.run_id, 101);
+  assert(
+    proof().artifacts.requests.some((item) =>
+      /\/artifacts\/\d+\/zip$/.test(item.path),
+    ),
+    "Real artifact download client was not exercised",
+  );
+  let previous = resumedSession;
+  for (const kind of ["expired", "deleted"]) {
+    const reference = durable(number).session_artifact;
+    upstream(
+      `/artifact-fault?id=${reference.artifact_id}&kind=${kind}`,
+      "POST",
+    );
+    discardTask(number, true);
+    launch(`${manager}-session-${kind}`, number, true, { session: "fresh" });
+    const fresh = await finished(
+      `${manager}-session-${kind}`,
+      "waiting",
+      "session_verified",
+    );
+    assert.equal(fresh.session_recovery, "expired_or_deleted");
+    assert.notEqual(
+      fresh.native_id,
+      previous.native_id,
+      "Expired native conversation was reused",
+    );
+    assert.deepEqual(fresh.before, previous.after, "Expiry reset task budgets");
+    assert.equal(
+      proof().pulls.length,
+      3,
+      "Session recovery created another PR",
+    );
+    assert(
+      proof()
+        .comments.find(([issue]) => issue === number)[1]
+        .some((comment) =>
+          comment.body.includes("Saved session expired or was deleted."),
+        ),
+    );
+    previous = fresh;
+  }
+  assert.deepEqual(proof().artifacts.errors, []);
+  assert.deepEqual(proof().errors, []);
   return {
     sdk,
     actions: "passed",
@@ -519,5 +832,6 @@ export async function runActionsTests({
     credential_exclusion: "passed",
     no_public_listener: "passed",
     unrelated_issue: "untouched",
+    native_session_artifacts: "passed",
   };
 }

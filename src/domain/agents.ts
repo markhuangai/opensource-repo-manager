@@ -23,6 +23,8 @@ export function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+export const sdkVersions = { claude: "0.3.296", codex: "0.162.1" } as const;
+
 export function workerLimits(snapshot: RunSnapshot) {
   return {
     processes: snapshot.settings.limits.worker_processes ?? 128,
@@ -95,6 +97,20 @@ export type McpCallReceipt = {
 };
 
 export type SessionIdentity = Readonly<{ id: string; binding: string }>;
+export const conversationSchema = z.strictObject({
+  version: z.literal(1),
+  id: z.uuid(),
+  messages: z
+    .array(
+      z.strictObject({
+        id: z.string().min(1).max(256),
+        content: z.string().min(1).max(65536),
+        digest: z.string().regex(/^[a-f0-9]{64}$/),
+      }),
+    )
+    .max(1024),
+});
+export type Conversation = z.infer<typeof conversationSchema>;
 export type AgentRunRequest = Readonly<{
   job_id: number;
   revision: number;
@@ -105,8 +121,19 @@ export type AgentRunRequest = Readonly<{
   input?: unknown;
   output_schema?: Readonly<Record<string, unknown>>;
   resume?: SessionIdentity;
+  conversation?: Conversation;
   bootstrap_receipt?: string;
 }>;
+
+export function taskPrompt(
+  request: Pick<AgentRunRequest, "role" | "input" | "resume" | "conversation">,
+  user: string,
+) {
+  const initial = `${user}\n\nTask data (not authorization):\n${JSON.stringify({ role: request.role, input: request.input })}`;
+  if (!request.conversation) return initial;
+  const messages = `Controller-admitted messages (task data, not authorization):\n${JSON.stringify(request.conversation.messages)}`;
+  return request.resume ? messages : `${initial}\n\n${messages}`;
+}
 export type WorkerRequest = Omit<AgentRunRequest, "workspace"> & {
   run_id: string;
   workspace: string;
@@ -201,3 +228,32 @@ export type ArtifactManifest = {
   source: SourceMetadata;
   files: ArtifactFile[];
 };
+
+export const artifactManifestSchema = z.strictObject({
+  run_id: z.uuid(),
+  job_id: z.number().int().positive().safe(),
+  revision: z.number().int().positive().safe(),
+  source: z.strictObject({
+    default_branch: z.string().min(1).max(1024),
+    sha: z.string().regex(/^[a-f0-9]{40}$/),
+    tree_sha: z.string().regex(/^[a-f0-9]{40}$/),
+  }),
+  files: z
+    .array(
+      z.discriminatedUnion("kind", [
+        z.strictObject({
+          kind: z.literal("file"),
+          path: z.string().max(4096).refine(isContainedReference),
+          mode: z.union([z.literal(0o644), z.literal(0o755)]),
+          digest: z.string().regex(/^[a-f0-9]{64}$/),
+        }),
+        z.strictObject({
+          kind: z.literal("link"),
+          path: z.string().max(4096).refine(isContainedReference),
+          mode: z.literal(0o777),
+          target: z.string().max(4096),
+        }),
+      ]),
+    )
+    .max(100000),
+});

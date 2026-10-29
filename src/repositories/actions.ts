@@ -59,6 +59,48 @@ export class ActionsRepository {
       | undefined;
   }
 
+  importCheckpoint(path: string, body: string) {
+    if (this.store.jobs().length || this.local())
+      throw new StateError("state_local_conflict");
+    const db = this.store.db;
+    db.prepare("ATTACH DATABASE ? AS checkpoint").run(path);
+    try {
+      const definitions = (schema: "main" | "checkpoint") =>
+        db
+          .prepare(
+            `SELECT type,name,tbl_name,sql FROM ${schema}.sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`,
+          )
+          .all();
+      if (
+        digest(definitions("main")) !== digest(definitions("checkpoint")) ||
+        db.pragma("checkpoint.user_version", { simple: true }) !==
+          db.pragma("main.user_version", { simple: true }) ||
+        db.pragma("checkpoint.quick_check", { simple: true }) !== "ok" ||
+        (db.pragma("checkpoint.foreign_key_check") as unknown[]).length
+      )
+        throw new StateError("session_schema_unsupported");
+      const tables = (
+        db
+          .prepare(
+            "SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+          )
+          .all() as { name: string }[]
+      ).map(({ name }) => `"${name.replaceAll('"', '""')}"`);
+      db.transaction(() => {
+        db.pragma("defer_foreign_keys = ON");
+        for (const table of tables) db.exec(`DELETE FROM main.${table}`);
+        // WHERE disables SQLite's transfer optimization, which leaves deferred foreign-key counters unresolved across attached databases.
+        for (const table of tables)
+          db.exec(
+            `INSERT INTO main.${table} SELECT * FROM checkpoint.${table} WHERE 1`,
+          );
+        this.acknowledge(body);
+      }).immediate();
+    } finally {
+      db.exec("DETACH DATABASE checkpoint");
+    }
+  }
+
   intent(body: string) {
     this.store.db
       .prepare("UPDATE actions_checkpoint SET intent=? WHERE singleton=1")

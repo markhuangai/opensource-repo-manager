@@ -510,7 +510,7 @@ for (const name of names)
 export function dependencyExclusions(sourceFiles: readonly string[]) {
   const original = new Set(sourceFiles);
   return (path: string) =>
-    /(?:^|\/)node_modules(?:\/|$)|(?:^|\/)\.yarn\/(?:cache|install-state\.gz|unplugged)(?:\/|$)|(?:^|\/)\.pnp\.(?:cjs|loader\.mjs)$/.test(
+    /(?:^|\/)(?:node_modules|\.venv|venv|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.cache)(?:\/|$)|(?:^|\/)\.yarn\/(?:cache|install-state\.gz|unplugged)(?:\/|$)|(?:^|\/)\.pnp\.(?:cjs|loader\.mjs)$/.test(
       path,
     ) &&
     !original.has(path) &&

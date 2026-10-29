@@ -51,7 +51,17 @@ export type TaskResult = Readonly<{
     | "state_unreviewed"
     | "state_secret"
     | "state_write_uncertain"
-    | "recovery_evidence_missing";
+    | "recovery_evidence_missing"
+    | "session_transport_unavailable"
+    | "session_provenance_invalid"
+    | "session_upload_uncertain"
+    | "session_checkpoint_busy"
+    | "session_incompatible"
+    | "session_schema_unsupported"
+    | "session_corrupt"
+    | "session_file_invalid"
+    | "session_size_limit"
+    | "session_secret";
   repository?: string;
   issue_number?: number;
   job_id?: number;
@@ -62,6 +72,8 @@ export type TaskResult = Readonly<{
   task_id?: string;
   state_comment_id?: number;
   state_generation?: number;
+  session_recovery?: "expired_or_deleted";
+  checkpoint_failed?: true;
 }>;
 
 export function parseTaskRequest(args: string[]): TaskRequest {
@@ -243,7 +255,7 @@ export async function executeTask(
       signal.throwIfAborted();
       await monitor.reconcile(signal);
       signal.throwIfAborted();
-      await store.checkpoint(signal);
+      await store.checkpoint(signal, true);
       const outcome = taskOutcome(store, request, monitor.enabled());
       if (outcome) return outcome;
       if (progress(store, request) === before)

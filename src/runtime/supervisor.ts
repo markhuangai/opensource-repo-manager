@@ -23,9 +23,13 @@ import {
 } from "../domain/agents.ts";
 import type { SourceMetadata } from "../domain/jobs.ts";
 import type { Store } from "../repositories/store.ts";
+import { ConversationRepository } from "../repositories/conversations.ts";
 import { ModelRelay } from "../services/model-relay.ts";
 import { BootstrapService } from "../services/bootstrap/index.ts";
-import { commandDirectory } from "../services/bootstrap/environment.ts";
+import {
+  commandDirectory,
+  dependencyExclusions,
+} from "../services/bootstrap/environment.ts";
 import type {
   BootstrapCommand,
   CommandReceipt,
@@ -823,6 +827,16 @@ export class Supervisor implements AgentRunner {
         ...(parent ? [parent.signal] : []),
       ]);
     combined.throwIfAborted();
+    const continuation = new ConversationRepository(this.store).prepare(
+      request,
+    );
+    if (continuation?.duplicate) {
+      yield { type: "session", id: request.resume!.id };
+      yield continuation.duplicate;
+      return;
+    }
+    if (continuation)
+      request = { ...request, conversation: continuation.conversation };
     const lease =
       parent?.lease ??
       held?.lease ??
@@ -1021,6 +1035,9 @@ export class Supervisor implements AgentRunner {
       }
       signal.throwIfAborted();
       const binding = digest({
+        ...(request.conversation
+          ? { conversation: { version: 1, id: request.conversation.id } }
+          : {}),
         job_id: request.job_id,
         revision: request.revision,
         role: request.role,
@@ -1277,7 +1294,7 @@ export class Supervisor implements AgentRunner {
           limits.storage,
           signal,
           undefined,
-          excluded,
+          excluded ?? dependencyExclusions(prepared.source_files),
         );
         if (session && identity.uid === 10001) {
           await treeBytes(prepared.root, limits.storage);
@@ -1289,6 +1306,7 @@ export class Supervisor implements AgentRunner {
             limits.storage,
             signal,
             outputCredentials,
+            request.conversation,
           );
         }
         if (terminal.outcome === "completed") {
@@ -1359,17 +1377,35 @@ export class Supervisor implements AgentRunner {
           )
             terminal = { type: "terminal", outcome: "stale" };
           if (registered)
-            this.store.finishRun(
-              id,
-              terminal!.outcome,
-              !signal.aborted &&
-                ["completed", "limited"].includes(terminal!.outcome)
-                ? session
-                : null,
-              terminal?.outcome === "completed"
-                ? (terminal.artifact ?? null)
-                : null,
-            );
+            this.store.db
+              .transaction(() => {
+                this.store.finishRun(
+                  id,
+                  terminal!.outcome,
+                  !signal.aborted &&
+                    ["completed", "limited"].includes(terminal!.outcome)
+                    ? session
+                    : null,
+                  terminal?.outcome === "completed"
+                    ? (terminal.artifact ?? null)
+                    : null,
+                );
+                if (
+                  session &&
+                  request.conversation &&
+                  !signal.aborted &&
+                  ["completed", "limited"].includes(terminal!.outcome)
+                ) {
+                  if (this.secrets.containsCredentials(terminal))
+                    throw new RuntimeError("secret_in_session");
+                  new ConversationRepository(this.store).complete(
+                    request,
+                    id,
+                    terminal!,
+                  );
+                }
+              })
+              .immediate();
           cleaned = true;
         }
       } catch (error) {

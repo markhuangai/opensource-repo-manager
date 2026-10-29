@@ -168,7 +168,10 @@ export async function respond(req, res, fixture) {
       fixture.held = true;
       return;
     }
-    if (
+    if (["session_checkpoint", "session_audit"].includes(scenario)) {
+      investigation = fixture.session(text, active.role, previous === 0);
+      if (investigation.command) output = command(investigation.command);
+    } else if (
       ["investigation_plan", "investigation_result"].includes(scenario) ||
       scenario.startsWith("implementation_")
     ) {

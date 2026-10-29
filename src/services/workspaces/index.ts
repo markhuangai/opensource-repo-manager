@@ -28,6 +28,7 @@ import {
   roleUsers,
   type ArtifactFile,
   type ArtifactManifest,
+  type Conversation,
   digest,
 } from "../../domain/agents.ts";
 import type { KnownSecretChecker } from "../../logging/redact.ts";
@@ -45,6 +46,7 @@ export type PreparedWorkspace = {
   home: string;
   temporary: string;
   session: string;
+  source_files: readonly string[];
   prompts: { system: string; user: string; skills: string };
 };
 
@@ -327,6 +329,15 @@ export class WorkspaceService {
         role,
         processes: limits.processes,
       });
+      const sourceFiles: string[] = [];
+      await walkTree(workspace, async (_path, reference, stat) => {
+        if (reference.split("/").includes(".git")) return false;
+        if (!stat.isDirectory()) {
+          if (sourceFiles.length >= 100000)
+            throw new RuntimeError("artifact_metadata_limit");
+          sourceFiles.push(reference);
+        }
+      });
       await mkdir(trusted, { mode: 0o750 });
       await chown(trusted, 0, user.gid);
       for (const [name, content] of [
@@ -363,6 +374,7 @@ export class WorkspaceService {
         home,
         temporary,
         session,
+        source_files: sourceFiles,
         prompts: {
           system: join(trusted, "system.md"),
           user: join(trusted, "user.md"),
@@ -571,6 +583,37 @@ export class WorkspaceService {
     await rm(join(this.runsRoot, id), { recursive: true, force: true });
   }
 
+  async sourceManifest(
+    request: Omit<ArtifactManifest, "files">,
+    snapshot: RunSnapshot,
+    signal: AbortSignal,
+  ) {
+    const id = randomUUID();
+    try {
+      const prepared = await this.prepare(
+        id,
+        "bootstrap",
+        snapshot.roles.bootstrap.bundle,
+        request.source,
+        snapshot.settings.github.repository,
+        {
+          processes: snapshot.settings.limits.worker_processes ?? 128,
+          storage:
+            snapshot.settings.limits.worker_storage_bytes ?? 4 * 1024 ** 3,
+        },
+        signal,
+      );
+      return await this.freeze(
+        { ...request, run_id: id },
+        prepared.workspace,
+        snapshot.settings.limits.worker_storage_bytes ?? 4 * 1024 ** 3,
+        signal,
+      );
+    } finally {
+      await this.remove(id);
+    }
+  }
+
   async saveSession(
     binding: string,
     session: string,
@@ -579,6 +622,7 @@ export class WorkspaceService {
     limit: number,
     signal: AbortSignal,
     credentials: KnownSecretChecker,
+    conversation?: Conversation,
   ) {
     if (!/^[a-f0-9-]{36}$/.test(workspace.run_id))
       throw new RuntimeError("session_invalid");
@@ -589,7 +633,20 @@ export class WorkspaceService {
       signal,
       credentials,
     );
-    const checkpoint = { binding, session, workspace, transcript };
+    const checkpoint = {
+      binding,
+      session,
+      workspace,
+      transcript,
+      ...(conversation
+        ? {
+            conversation: {
+              version: conversation.version,
+              id: conversation.id,
+            },
+          }
+        : {}),
+    };
     const directory = join(this.privateRoot, "sessions", workspace.run_id);
     await mkdir(directory, { mode: 0o700 });
     const content = JSON.stringify({ checkpoint, digest: digest(checkpoint) });

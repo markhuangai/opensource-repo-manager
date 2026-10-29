@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,6 +7,9 @@ import { Octokit } from "@octokit/rest";
 import { OctokitWriter } from "../src/adapters/github/writer.ts";
 import { OctokitReader } from "../src/adapters/github/reader.ts";
 import { ActionsState } from "../src/actions/persistence.ts";
+import { ActionsArtifacts } from "../src/actions/artifacts.ts";
+import { fileDigest } from "../src/actions/bundle.ts";
+import type { ArtifactTransport } from "../src/adapters/github/artifacts.ts";
 import { StateCodec, stateBytes, commentBytes } from "../src/actions/state.ts";
 import { Store } from "../src/repositories/store.ts";
 import { ActionsRepository } from "../src/repositories/actions.ts";
@@ -58,10 +61,11 @@ async function setup() {
     });
     return store;
   };
-  const open = (store: Store) =>
+  const open = (store: Store, artifacts?: ActionsArtifacts) =>
     ActionsState.open(store, snapshot, secrets, 1, signal(), {
       writer,
       reader,
+      artifacts,
     });
   const store = database();
   const read = () => {
@@ -75,7 +79,50 @@ async function setup() {
       author_id: 7,
     });
   };
+  const archived = `${store.db.name}.artifact`,
+    transport: ArtifactTransport = {
+      async verify() {},
+      async upload(path, identity, limit, signal) {
+        await copyFile(path, archived);
+        return {
+          ...identity,
+          ...(await fileDigest(archived, limit, signal)),
+          artifact_id: 1,
+          expires_at: Date.now() + 86400000,
+        };
+      },
+      async download(_reference, directory) {
+        const path = join(directory, "checkpoint.orm");
+        try {
+          await copyFile(archived, path);
+          return path;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          return undefined;
+        }
+      },
+    };
+  const artifactsFor = async (store: Store) => {
+    const artifacts = new ActionsArtifacts(
+      {
+        repository: "owner/repo",
+        repository_id: 42,
+        run_id: 100,
+        run_attempt: 1,
+        head_sha: remote.source.sha,
+        results_url: "https://results.actions.githubusercontent.com",
+      },
+      snapshot,
+      secrets,
+      `${store.db.name}.runtime`,
+      transport,
+    );
+    await artifacts.initialize(signal());
+    return artifacts;
+  };
   return {
+    artifactsFor,
+    deleteArtifact: () => rm(archived),
     remote,
     writer,
     reader,
@@ -135,6 +182,29 @@ describe("authenticated Actions task authority", () => {
         (request) => request.path === "/repos/owner/repo/issues",
       ),
     ).toBe(false);
+  });
+
+  it("imports a populated checkpoint atomically and overlays newer durable budgets", async () => {
+    const f = await setup();
+    await f.open(f.store);
+    const archived = f.read(),
+      path = `${f.store.db.name}.checkpoint`;
+    await f.store.db.backup(path);
+    f.store.reserveInfrastructureRetry(1);
+    await f.store.checkpoint(signal());
+    const current = f.read(),
+      fresh = f.database(),
+      repository = new ActionsRepository(fresh);
+    repository.importCheckpoint(path, current.body);
+    expect(fresh.jobs()).toHaveLength(1);
+    expect(fresh.db.pragma("foreign_key_check")).toEqual([]);
+    expect(JSON.parse(fresh.job(1)!.budget_json)).toEqual(
+      archived.state.budget,
+    );
+    expect(repository.local()!.body).toBe(current.body);
+    await f.open(fresh);
+    expect(JSON.parse(fresh.job(1)!.budget_json)).toEqual(current.state.budget);
+    expect(f.read().state.task_id).toBe(archived.state.task_id);
   });
 
   it.each(["acknowledge", "reconstructed"])(
@@ -489,11 +559,131 @@ describe("authenticated Actions task authority", () => {
     expect(providerRequests).toBe(1);
   });
 
-  it.each(["empty", "retained"])(
+  it("allows fresh recovery after confirmed artifact deletion when no PR is owned", async () => {
+    const f = await setup();
+    await f.open(f.store, await f.artifactsFor(f.store));
+    f.store.reserveInfrastructureRetry(1);
+    await f.store.checkpoint(signal(), true);
+    const saved = f.read(),
+      row = f.remote.state.comments.get(1)![0];
+    row.body = f.codec.encode(
+      {
+        ...saved.state,
+        generation: saved.state.generation + 1,
+        outcome: "blocked",
+        reason: "recovery_evidence_missing",
+      },
+      saved.narrative,
+    );
+    await f.deleteArtifact();
+    const fresh = f.database(),
+      recovered = await f.open(fresh, await f.artifactsFor(fresh));
+    expect(recovered.identifiers().session_recovery).toBe("expired_or_deleted");
+    expect(recovered.result()).toBeUndefined();
+    expect(JSON.parse(fresh.job(1)!.budget_json)).toEqual(saved.state.budget);
+    expect(fresh.ownedPulls()).toEqual([]);
+  });
+
+  it("restores an older checkpoint after durable task progress advances", async () => {
+    const f = await setup();
+    await f.open(f.store, await f.artifactsFor(f.store));
+    await f.store.checkpoint(signal(), true);
+    const archived = f.read().state;
+    f.store.db
+      .prepare("UPDATE jobs SET phase='implementation' WHERE id=1")
+      .run();
+    f.store.reserveInfrastructureRetry(1);
+    await f.store.checkpoint(signal());
+    const current = f.read().state;
+    expect(current.job!.phase).not.toBe(archived.job!.phase);
+    expect(current.session_artifact).toEqual(archived.session_artifact);
+    const fresh = f.database(),
+      recovered = await f.open(fresh, await f.artifactsFor(fresh));
+    expect(recovered.result()).toBeUndefined();
+    expect(recovered.identifiers().task_id).toBe(current.task_id);
+    expect(JSON.parse(fresh.job(1)!.budget_json)).toEqual(current.budget);
+    expect(fresh.ownedPulls()).toEqual([]);
+  });
+
+  it("recovers newly accepted scope without permitting conflicting frozen scope", async () => {
+    const f = await setup(),
+      original = await f.open(f.store, await f.artifactsFor(f.store));
+    f.store.db
+      .prepare("UPDATE jobs SET phase='implementation' WHERE id=1")
+      .run();
+    f.store.db.prepare("UPDATE actions_checkpoint SET reconstructed=0").run();
+    await f.store.checkpoint(signal(), true);
+    const archived = f.read().state;
+    const review = (store: Store) =>
+      new PublicationRepository(store).review({
+        id: randomUUID(),
+        job_id: 1,
+        revision: 1,
+        binding: "b".repeat(64),
+        policy_identity: "fixture-review-policy",
+        approved: true,
+        run_id: randomUUID(),
+        created_at: Date.now(),
+      });
+    const scope = {
+      job_id: 1,
+      revision: 1,
+      investigation_id: randomUUID(),
+      source: f.remote.source,
+      snapshot_digest: f.snapshot.digest,
+      objective: "Restore existing behavior",
+      plan: {
+        acceptance: ["The documented behavior works"],
+        paths: ["app.txt"],
+        regression: { cwd: ".", argv: ["true"] },
+        checks: [],
+      },
+      checks: [],
+      remote_checks: [],
+    };
+    f.store.reserveInfrastructureRetry(1);
+    await original.acceptScope(scope, review(f.store).id, signal());
+    const current = f.read().state;
+    expect(current.session_artifact).toEqual(archived.session_artifact);
+    expect(archived.scope).toBeNull();
+    const fresh = f.database(),
+      recovered = await f.open(fresh, await f.artifactsFor(fresh));
+    expect(recovered.result()).toBeUndefined();
+    expect(new ActionsRepository(fresh).local()!.reconstructed).toBe(0);
+    expect(recovered.recoveryContext()?.scope).toEqual(scope);
+    expect(JSON.parse(fresh.job(1)!.budget_json)).toEqual(current.budget);
+    await recovered.acceptScope(scope, review(fresh).id, signal());
+    expect(recovered.recoveryContext()).toBeUndefined();
+    expect(f.read().state.scope_digest).toBe(digest(scope));
+    await fresh.checkpoint(signal(), true);
+    const saved = f.read(),
+      conflicting = { ...scope, objective: "A different frozen objective" };
+    f.remote.state.comments.get(1)![0].body = f.codec.encode(
+      {
+        ...saved.state,
+        generation: saved.state.generation + 1,
+        scope: conflicting,
+        scope_digest: digest(conflicting),
+      },
+      saved.narrative,
+    );
+    const blocked = f.database();
+    await expect(
+      f.open(blocked, await f.artifactsFor(blocked)),
+    ).rejects.toMatchObject({ code: "session_incompatible" });
+    expect(blocked.jobs()).toEqual([]);
+  });
+
+  it.each(["empty", "retained", "checkpoint"])(
     "recovers a created PR after response loss with %s local storage",
     async (storage) => {
       const f = await setup();
       await f.open(f.store);
+      if (storage === "checkpoint") {
+        await f.open(f.store, await f.artifactsFor(f.store));
+        await f.store.checkpoint(signal(), true);
+        expect(f.read().state.session_artifact).not.toBeNull();
+      }
       const repository = new PublicationRepository(f.store),
         target = repository.target(1);
       const commit = f.remote.commit(
@@ -516,6 +706,26 @@ describe("authenticated Actions task authority", () => {
         branch: target.branch,
         base: "main",
       };
+      if (storage === "checkpoint")
+        new ActionsRepository(f.store).scope(
+          {
+            job_id: 1,
+            revision: 1,
+            investigation_id: randomUUID(),
+            source: f.remote.source,
+            snapshot_digest: f.snapshot.digest,
+            objective: "Restore existing behavior",
+            plan: {
+              acceptance: ["The documented behavior works"],
+              paths: ["app.txt"],
+              regression: { cwd: ".", argv: ["true"] },
+              checks: [],
+            },
+            checks: [],
+            remote_checks: [],
+          },
+          review.id,
+        );
       repository.begin({
         id: "d".repeat(64),
         job_id: 1,
@@ -582,9 +792,11 @@ describe("authenticated Actions task authority", () => {
         operation.status = "confirmed";
         repository.save(operation);
       }
-      const fresh = storage === "empty" ? f.database() : f.store,
-        recovered = await f.open(fresh);
-      if (storage === "empty")
+      const fresh = storage !== "retained" ? f.database() : f.store,
+        artifacts =
+          storage === "checkpoint" ? await f.artifactsFor(fresh) : undefined,
+        recovered = await f.open(fresh, artifacts);
+      if (storage !== "retained")
         expect(recovered.result()).toMatchObject({
           outcome: "blocked",
           reason: "recovery_evidence_missing",
@@ -598,7 +810,18 @@ describe("authenticated Actions task authority", () => {
       expect(Object.keys(restored.pull!).sort()).toEqual(
         ["id", "number", "title", "body", "head", "base", "author_id"].sort(),
       );
-      await f.open(fresh);
+      await f.open(fresh, artifacts);
+      if (storage === "checkpoint") {
+        await f.deleteArtifact();
+        const empty = f.database(),
+          expired = await f.open(empty, await f.artifactsFor(empty));
+        expect(expired.result()).toMatchObject({
+          outcome: "blocked",
+          reason: "recovery_evidence_missing",
+          pull_number: f.remote.state.pulls[0].number,
+        });
+        expect(f.read().state.budget).toEqual(before.budget);
+      }
       expect(f.remote.state.pulls).toHaveLength(1);
       expect(
         f.remote.state.mutations.filter((kind) => kind === "pull"),

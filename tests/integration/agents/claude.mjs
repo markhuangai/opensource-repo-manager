@@ -85,7 +85,15 @@ export async function respond(req, res, fixture) {
       res.end("event: message_start\ndata: {not-json}\n\n");
       return;
     }
-    if (scenario === "external_output_review") {
+    if (["session_checkpoint", "session_audit"].includes(scenario)) {
+      const call = fixture.session(text, active.role, !results.length);
+      if (call.command)
+        use("Bash", {
+          command: call.command,
+          description: "Verify native cross-container continuation",
+        });
+      else content = [{ type: "text", text: call.result }];
+    } else if (scenario === "external_output_review") {
       assert(!toolNames.includes("Bash"));
       assert(!toolNames.some((name) => name.startsWith("mcp__")));
       use("StructuredOutput", await fixture.outputReview(text));

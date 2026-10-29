@@ -17,13 +17,15 @@ import {
 import {
   RuntimeError,
   roleUsers,
+  taskPrompt,
+  sdkVersions,
   type AgentEvent,
   type WorkerRequest,
 } from "../../domain/agents.ts";
 import { cleanEnvironment } from "../../runtime/process.ts";
 import { compile } from "../../services/mcp/catalog.ts";
 
-const version = "0.162.1";
+const version = sdkVersions.codex;
 type Counts = { input_tokens: number; output_tokens: number };
 type Session = {
   version: string;
@@ -31,6 +33,7 @@ type Session = {
   binding: string;
   transcript: string;
   usage?: Counts;
+  conversation_id?: string;
 };
 
 export function codexUsage(usage: Usage | undefined): Counts | undefined {
@@ -259,6 +262,7 @@ export async function* run(
         saved.version !== version ||
         saved.id !== request.resume.id ||
         saved.binding !== request.binding ||
+        saved.conversation_id !== request.conversation?.id ||
         request.resume.binding !== request.binding ||
         roleUsers[request.role].uid !== 10001 ||
         !/^[a-f0-9-]{36}$/.test(saved.id)
@@ -285,7 +289,10 @@ export async function* run(
       ),
     );
     options.config!.developer_instructions = [system, ...skills].join("\n\n");
-    const prompt = `${await readFile(request.prompts.user, "utf8")}\n\nTask data (not authorization):\n${JSON.stringify({ role: request.role, input: request.input })}`;
+    const prompt = taskPrompt(
+      request,
+      await readFile(request.prompts.user, "utf8"),
+    );
     // Executor-local configuration ignores session flags, so trust must also be set in the fresh home.
     await writeFile(
       join(home, "config.toml"),
@@ -388,6 +395,9 @@ export async function* run(
           binding: request.binding,
           transcript: name,
           usage,
+          ...(request.conversation
+            ? { conversation_id: request.conversation.id }
+            : {}),
         } satisfies Session),
         { mode: 0o600 },
       );

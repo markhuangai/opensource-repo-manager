@@ -813,15 +813,15 @@ describe("monitor persistence and published-job revision boundaries", () => {
     const f = await database(),
       before = f.store.job(1)!;
     f.store.db.exec(
-      "DROP TABLE pr_monitors; DROP TABLE pr_monitor_evidence; DROP TABLE pr_observations; PRAGMA user_version=9",
+      "DROP TABLE agent_conversations; DROP TABLE pr_monitors; DROP TABLE pr_monitor_evidence; DROP TABLE pr_observations; PRAGMA user_version=9",
     );
     f.store.close();
     const migrated = new Store(f.path);
-    expect(migrated.db.pragma("user_version", { simple: true })).toBe(10);
+    expect(migrated.db.pragma("user_version", { simple: true })).toBe(11);
     expect(migrated.job(1)).toEqual(before);
     expect(migrated.ownedPull(77)!.object_id).toBe("77");
     migrated.db.exec(
-      "DROP TABLE pr_monitors; DROP TABLE pr_observations; PRAGMA user_version=9",
+      "DROP TABLE agent_conversations; DROP TABLE pr_monitors; DROP TABLE pr_observations; PRAGMA user_version=9",
     );
     migrated.close();
     expect(() => new Store(f.path)).toThrow();

@@ -5,6 +5,7 @@ import type { ActionsConfiguration, Configuration } from "./schema.ts";
 export function separateSecrets(
   config: Configuration | ActionsConfiguration,
   sessionKey?: string,
+  actionsRuntimeToken?: string,
 ) {
   const notifications = structuredClone(config.notifications);
   const credentials = new Map<string, string>();
@@ -17,6 +18,10 @@ export function separateSecrets(
     sensitive.push(config.github.webhook_secret);
   }
   put("proxy.key", config.proxy.key);
+  if (actionsRuntimeToken !== undefined) {
+    put("actions.runtime_token", actionsRuntimeToken);
+    sensitive.push(actionsRuntimeToken);
+  }
   if (sessionKey !== undefined) {
     put("actions.session_key", sessionKey);
     sensitive.push(

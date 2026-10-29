@@ -85,6 +85,7 @@ describe("immutable workspace artifacts", () => {
           root: workspace,
           workspace,
           session: workspace,
+          source_files: [],
           home: workspace,
           temporary: workspace,
           prompts: { system: "", user: "", skills: "" },

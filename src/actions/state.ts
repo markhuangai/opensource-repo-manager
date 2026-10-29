@@ -1,6 +1,7 @@
 import { createHmac, hkdfSync, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import { RuntimeError } from "../domain/agents.ts";
+import { StateError } from "../domain/durability.ts";
+export { StateError } from "../domain/durability.ts";
 import {
   budgetUsage,
   githubId,
@@ -10,6 +11,7 @@ import {
 import { investigationResultSchema } from "../services/investigation/contracts.ts";
 import { implementationPlanSchema } from "../services/implementation/contracts.ts";
 import { commandSchema } from "../services/bootstrap/contracts.ts";
+import { artifactReferenceSchema } from "./bundle.ts";
 
 const count = z.number().int().nonnegative().safe();
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -148,7 +150,7 @@ export const taskStateSchema = z.strictObject({
   head: sha.nullable(),
   pull: ownedPull.nullable(),
   pending: publication.nullable(),
-  session_artifact: z.null(),
+  session_artifact: artifactReferenceSchema.nullable(),
 });
 export type TaskState = z.infer<typeof taskStateSchema>;
 export type DurablePublication = NonNullable<TaskState["pending"]>;
@@ -160,12 +162,6 @@ export type StateComment = {
 export const stateMarker = "<!-- orm:task-state:";
 export const stateBytes = 32 * 1024;
 export const commentBytes = 60 * 1024;
-
-export class StateError extends RuntimeError {
-  constructor(code: string) {
-    super(code);
-  }
-}
 
 export class StateCodec {
   private readonly key: Buffer;
@@ -266,6 +262,7 @@ export class StateCodec {
         state.head !== null ||
         state.scope !== null ||
         state.findings !== null ||
+        state.session_artifact !== null ||
         Object.values(state.budget).some(Boolean)
       )
         throw new StateError("state_invalid");
