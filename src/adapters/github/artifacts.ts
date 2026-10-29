@@ -128,7 +128,7 @@ export class GitHubArtifacts implements ArtifactTransport {
     await this.helper({ operation: "list", directory }, 1024 * 1024, signal);
   }
 
-  private async artifacts(run: number, signal: AbortSignal) {
+  private async artifacts(run: number, name: string, signal: AbortSignal) {
     const rows: Artifact[] = [];
     for (let page = 1; page <= 10; page++) {
       const result = z
@@ -139,7 +139,7 @@ export class GitHubArtifacts implements ArtifactTransport {
         .safeParse(
           await this.read(
             "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
-            { run_id: run, per_page: 100, page },
+            { run_id: run, name, per_page: 100, page },
             signal,
           ),
         );
@@ -180,7 +180,7 @@ export class GitHubArtifacts implements ArtifactTransport {
     const expected = await fileDigest(path, limit, signal);
     const run = await this.run(identity.run_id, identity.run_attempt, signal);
     const name = basename(path);
-    let rows = (await this.artifacts(run.id, signal)).filter(
+    let rows = (await this.artifacts(run.id, name, signal)).filter(
       (artifact) => artifact.name === name,
     );
     if (!rows.length) {
@@ -193,7 +193,7 @@ export class GitHubArtifacts implements ArtifactTransport {
       } catch {
         signal.throwIfAborted();
       }
-      rows = (await this.artifacts(run.id, signal)).filter(
+      rows = (await this.artifacts(run.id, name, signal)).filter(
         (artifact) => artifact.name === name,
       );
     }
@@ -229,7 +229,11 @@ export class GitHubArtifacts implements ArtifactTransport {
     )
       throw new StateError("session_provenance_invalid");
     const run = await this.run(reference.run_id, reference.run_attempt, signal);
-    const rows = await this.artifacts(run.id, signal);
+    const rows = await this.artifacts(
+      run.id,
+      `orm-session-${reference.checkpoint_id}.orm`,
+      signal,
+    );
     const matches = rows.filter(
       (artifact) => artifact.id === reference.artifact_id,
     );

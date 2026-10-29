@@ -387,7 +387,11 @@ export class ActionsArtifacts {
         checkpoint.jobs().length !== 1 ||
         !archived.job ||
         !state.job ||
-        digest(archived.job) !== digest(state.job) ||
+        digest({
+          ...archived.job,
+          phase: state.job.phase,
+          status: state.job.status,
+        }) !== digest(state.job) ||
         (archived.scope_digest !== null &&
           archived.scope_digest !== state.scope_digest)
       )
@@ -407,8 +411,6 @@ export class ActionsArtifacts {
         (state.head && !archived.head && !state.pending)
       )
         throw new StateError("recovery_evidence_missing");
-      if (archived.scope_digest !== state.scope_digest)
-        throw new StateError("session_incompatible");
       const manifests = this.manifests(checkpoint),
         sessions: Array<{ run: string; saved: Session; path: string }> = [];
       for (const run of this.sessionRuns(checkpoint)) {

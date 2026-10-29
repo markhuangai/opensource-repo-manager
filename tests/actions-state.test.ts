@@ -584,6 +584,96 @@ describe("authenticated Actions task authority", () => {
     expect(fresh.ownedPulls()).toEqual([]);
   });
 
+  it("restores an older checkpoint after durable task progress advances", async () => {
+    const f = await setup();
+    await f.open(f.store, await f.artifactsFor(f.store));
+    await f.store.checkpoint(signal(), true);
+    const archived = f.read().state;
+    f.store.db
+      .prepare("UPDATE jobs SET phase='implementation' WHERE id=1")
+      .run();
+    f.store.reserveInfrastructureRetry(1);
+    await f.store.checkpoint(signal());
+    const current = f.read().state;
+    expect(current.job!.phase).not.toBe(archived.job!.phase);
+    expect(current.session_artifact).toEqual(archived.session_artifact);
+    const fresh = f.database(),
+      recovered = await f.open(fresh, await f.artifactsFor(fresh));
+    expect(recovered.result()).toBeUndefined();
+    expect(recovered.identifiers().task_id).toBe(current.task_id);
+    expect(JSON.parse(fresh.job(1)!.budget_json)).toEqual(current.budget);
+    expect(fresh.ownedPulls()).toEqual([]);
+  });
+
+  it("recovers newly accepted scope without permitting conflicting frozen scope", async () => {
+    const f = await setup(),
+      original = await f.open(f.store, await f.artifactsFor(f.store));
+    f.store.db
+      .prepare("UPDATE jobs SET phase='implementation' WHERE id=1")
+      .run();
+    f.store.db.prepare("UPDATE actions_checkpoint SET reconstructed=0").run();
+    await f.store.checkpoint(signal(), true);
+    const archived = f.read().state;
+    const review = (store: Store) =>
+      new PublicationRepository(store).review({
+        id: randomUUID(),
+        job_id: 1,
+        revision: 1,
+        binding: "b".repeat(64),
+        policy_identity: "fixture-review-policy",
+        approved: true,
+        run_id: randomUUID(),
+        created_at: Date.now(),
+      });
+    const scope = {
+      job_id: 1,
+      revision: 1,
+      investigation_id: randomUUID(),
+      source: f.remote.source,
+      snapshot_digest: f.snapshot.digest,
+      objective: "Restore existing behavior",
+      plan: {
+        acceptance: ["The documented behavior works"],
+        paths: ["app.txt"],
+        regression: { cwd: ".", argv: ["true"] },
+        checks: [],
+      },
+      checks: [],
+      remote_checks: [],
+    };
+    f.store.reserveInfrastructureRetry(1);
+    await original.acceptScope(scope, review(f.store).id, signal());
+    const current = f.read().state;
+    expect(current.session_artifact).toEqual(archived.session_artifact);
+    expect(archived.scope).toBeNull();
+    const fresh = f.database(),
+      recovered = await f.open(fresh, await f.artifactsFor(fresh));
+    expect(recovered.result()).toBeUndefined();
+    expect(new ActionsRepository(fresh).local()!.reconstructed).toBe(0);
+    expect(recovered.recoveryContext()?.scope).toEqual(scope);
+    expect(JSON.parse(fresh.job(1)!.budget_json)).toEqual(current.budget);
+    await recovered.acceptScope(scope, review(fresh).id, signal());
+    expect(recovered.recoveryContext()).toBeUndefined();
+    expect(f.read().state.scope_digest).toBe(digest(scope));
+    await fresh.checkpoint(signal(), true);
+    const saved = f.read(),
+      conflicting = { ...scope, objective: "A different frozen objective" };
+    f.remote.state.comments.get(1)![0].body = f.codec.encode(
+      {
+        ...saved.state,
+        generation: saved.state.generation + 1,
+        scope: conflicting,
+        scope_digest: digest(conflicting),
+      },
+      saved.narrative,
+    );
+    const blocked = f.database();
+    await expect(
+      f.open(blocked, await f.artifactsFor(blocked)),
+    ).rejects.toMatchObject({ code: "session_incompatible" });
+    expect(blocked.jobs()).toEqual([]);
+  });
+
   it.each(["empty", "retained", "checkpoint"])(
     "recovers a created PR after response loss with %s local storage",
     async (storage) => {

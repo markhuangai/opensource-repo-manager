@@ -470,7 +470,11 @@ export class ActionsState implements TaskDurability {
   }
 
   recoveryContext() {
-    if (!this.reconstructed) return undefined;
+    if (
+      !this.reconstructed &&
+      (!this.comment.state.scope || this.repository.local()?.scope_json)
+    )
+      return undefined;
     return {
       findings:
         this.comment.state.findings?.summary ??

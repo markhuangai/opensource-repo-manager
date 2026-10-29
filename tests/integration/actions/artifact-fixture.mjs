@@ -193,9 +193,12 @@ export function artifactFixture(config) {
         const download = /\/artifacts\/(\d+)\/zip$/.exec(url.pathname);
         if (attempt) res.end(JSON.stringify(run(Number(attempt[1]))));
         else if (listing) {
+          const name = url.searchParams.get("name");
+          assert(/^orm-session-[a-f0-9-]{36}\.orm$/.test(name ?? ""));
           const selected = artifacts.filter(
             (item) =>
               item.run === Number(listing[1]) &&
+              item.name === name &&
               item.finalized &&
               !item.deleted,
           );

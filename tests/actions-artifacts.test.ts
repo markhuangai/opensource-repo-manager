@@ -3,8 +3,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
+import { createServer } from "node:http";
+import { Octokit } from "@octokit/rest";
 import { afterEach, describe, expect, it } from "vitest";
 import { captureActionsContext } from "../src/actions/context.ts";
+import { GitHubArtifacts } from "../src/adapters/github/artifacts.ts";
+import { separateSecrets } from "../src/config/secrets.ts";
+import { fixtureConfiguration } from "./fixtures.ts";
 import {
   fileDigest,
   openBundle,
@@ -257,6 +262,127 @@ describe("encrypted Actions bundles", () => {
       }),
     ).rejects.toThrow("session_size_limit");
   });
+});
+
+describe("checkpoint artifact selection", () => {
+  it.each(["nullable digest", "more than 1000 artifacts"])(
+    "ignores unrelated run artifacts with %s while preserving selected-artifact checks",
+    async (mode) => {
+      const f = await setup(),
+        name = `orm-session-${f.identity.checkpoint_id}.orm`,
+        path = join(f.root, name);
+      await sealBundle({ ...f.options, destination: path });
+      const observed = await fileDigest(path, f.options.limit, signal()),
+        expires = new Date(Date.now() + 86400000).toISOString(),
+        run = {
+          id: 100,
+          run_attempt: 1,
+          head_sha: "f".repeat(40),
+          repository: { id: 42, full_name: "owner/repo" },
+          head_repository: { id: 42 },
+        },
+        selected = {
+          id: 200,
+          name,
+          size_in_bytes: observed.size,
+          digest: `sha256:${observed.digest}`,
+          expired: false,
+          expires_at: expires,
+          workflow_run: {
+            id: run.id,
+            repository_id: 42,
+            head_repository_id: 42,
+            head_sha: run.head_sha,
+          },
+        },
+        unrelated = Array.from(
+          { length: mode === "nullable digest" ? 1 : 1001 },
+          (_, index) => ({
+            ...selected,
+            id: index + 1000,
+            name: `unrelated-${index}`,
+            digest: mode === "nullable digest" ? null : selected.digest,
+          }),
+        ),
+        queries: Array<string | null> = [];
+      const server = createServer((request, response) => {
+        const url = new URL(request.url!, "http://fixture");
+        response.setHeader("content-type", "application/json");
+        if (url.pathname.endsWith("/attempts/1"))
+          return response.end(JSON.stringify(run));
+        if (url.pathname.endsWith("/artifacts")) {
+          const filter = url.searchParams.get("name"),
+            rows = [selected, ...unrelated].filter(
+              (artifact) => filter === null || artifact.name === filter,
+            ),
+            page = Number(url.searchParams.get("page") ?? 1),
+            count = Number(url.searchParams.get("per_page") ?? 100);
+          queries.push(filter);
+          return response.end(
+            JSON.stringify({
+              total_count: rows.length,
+              artifacts: rows.slice((page - 1) * count, page * count),
+            }),
+          );
+        }
+        response.writeHead(404).end("{}");
+      });
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", resolve),
+      );
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("address");
+        const { secrets } = separateSecrets(fixtureConfiguration()),
+          transport = new GitHubArtifacts(
+            {
+              repository: "owner/repo",
+              repository_id: 42,
+              run_id: 100,
+              run_attempt: 1,
+              head_sha: run.head_sha,
+              results_url: "https://results.actions.githubusercontent.com",
+            },
+            secrets,
+            new Octokit({ baseUrl: `http://127.0.0.1:${address.port}` }),
+          ),
+          reference = await transport.upload(
+            path,
+            f.identity,
+            f.options.limit,
+            signal(),
+          );
+        expect(reference).toEqual({
+          ...f.identity,
+          ...observed,
+          artifact_id: selected.id,
+          expires_at: Date.parse(expires),
+        });
+        selected.expired = true;
+        await expect(
+          transport.download(
+            reference,
+            await f.directory(),
+            f.options.limit,
+            signal(),
+          ),
+        ).resolves.toBeUndefined();
+        selected.digest = `sha256:${"0".repeat(64)}`;
+        await expect(
+          transport.download(
+            reference,
+            await f.directory(),
+            f.options.limit,
+            signal(),
+          ),
+        ).rejects.toThrow("session_provenance_invalid");
+        expect(queries).toEqual([name, name, name]);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+  );
 });
 
 describe("protected Actions runtime context", () => {
