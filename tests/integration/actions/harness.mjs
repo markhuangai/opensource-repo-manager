@@ -825,6 +825,273 @@ export async function runActionsTests({
   }
   assert.deepEqual(proof().artifacts.errors, []);
   assert.deepEqual(proof().errors, []);
+  upstream(`/restore-main?sha=${proof().source.sha}`, "POST");
+  for (const [issue, mode] of [
+    [40, "clarification_investigation"],
+    [41, "clarification_planning"],
+    [42, "clarification_coding"],
+    [43, "clarification_intent"],
+    [44, "monitor_clarification"],
+    [45, "disguised_feature"],
+    [46, "clarification_investigation"],
+    [47, "clarification_coding"],
+    [48, "clarification_coding"],
+    [49, "clarification_investigation"],
+    [50, "clarification_rejected"],
+    [53, "clarification_invalid"],
+  ]) {
+    upstream(
+      `/clarification-issue?issue=${issue}&mode=${mode}&early=${issue === 46}`,
+      "POST",
+    );
+    const prefix = `${manager}-clarify-${issue}`;
+    launch(`${prefix}-question`, issue);
+    if (mode === "clarification_rejected" || mode === "clarification_invalid") {
+      await finished(`${prefix}-question`, "blocked", "investigation_blocked");
+      assert(
+        !proof()
+          .comments.find(([number]) => number === issue)[1]
+          .some((row) => row.body.includes("Reply in a new issue comment.")),
+      );
+      if (mode === "clarification_invalid") {
+        const evidence = proof();
+        assert.deepEqual(evidence.errors, []);
+        assert(
+          evidence.runs.some(
+            (run) => run.role === "investigation" && run.status === "completed",
+          ),
+        );
+        assert(
+          evidence.workflow
+            .find((phase) => phase.phase === "investigations")
+            .records.some(
+              (record) => record.failure === "investigation_failed",
+            ),
+        );
+      }
+      continue;
+    }
+    if (mode === "disguised_feature") {
+      await finished(`${prefix}-question`, "out_of_scope", "manual_feature");
+      assert(
+        !proof().requests.some(
+          (task) =>
+            task.startsWith("bootstrap_") || task.startsWith("implementation_"),
+        ),
+      );
+      continue;
+    }
+    if (mode === "monitor_clarification") {
+      await finished(`${prefix}-question`, "waiting", "remote_checks");
+      upstream(`/review?issue=${issue}`, "POST");
+      launch(`${prefix}-repair-question`, issue);
+      await finished(
+        `${prefix}-repair-question`,
+        "waiting",
+        "needs_information",
+      );
+    } else await finished(`${prefix}-question`, "waiting", "needs_information");
+    if (issue === 49) {
+      const legacy = durable(issue);
+      upstream(`/legacy-question?issue=${issue}`, "POST");
+      discardTask(issue, true);
+      launch(`${prefix}-legacy-reissued`, issue, true);
+      await finished(
+        `${prefix}-legacy-reissued`,
+        "waiting",
+        "needs_information",
+      );
+      assert.equal(durable(issue).task_id, legacy.task_id);
+      assert.equal(durable(issue).job.revision, legacy.job.revision);
+      assert.equal(durable(issue).question.audience, "maintainer");
+      assert(
+        durable(issue).budget.model_requests >= legacy.budget.model_requests,
+      );
+    }
+    const before = durable(issue),
+      questions = () =>
+        proof()
+          .comments.find(([number]) => number === issue)[1]
+          .filter((row) => row.body.includes("Reply in a new issue comment."));
+    assert.equal(before.active, null);
+    assert.equal(before.wait_accounted_at, null);
+    const nativeBefore = proof().conversations.find(
+      (conversation) => conversation.id === before.question.conversation_id,
+    );
+    assert.equal(questions().length, issue === 49 ? 2 : 1);
+    assert.equal(
+      before.question.phase,
+      issue === 49
+        ? "investigation_triage"
+        : mode === "clarification_investigation"
+          ? "investigation_plan"
+          : mode === "clarification_planning"
+            ? "implementation_plan"
+            : mode === "clarification_intent"
+              ? "investigation_triage"
+              : "implementation_change",
+    );
+    if (issue !== 46) {
+      upstream(
+        `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 ? "reporter" : "outsider"}`,
+        "POST",
+      );
+      discardTask(issue, true);
+      launch(`${prefix}-unauthorized`, issue, true);
+      await finished(`${prefix}-unauthorized`, "waiting", "needs_information");
+      assert.deepEqual(durable(issue).budget, before.budget);
+      assert.equal(proof().requests.length, 0);
+    }
+    if (issue === 40) {
+      upstream(`/answer?issue=${issue}&body=insufficient`, "POST");
+      discardTask(issue, true);
+      launch(`${prefix}-insufficient`, issue, true);
+      await finished(`${prefix}-insufficient`, "waiting", "needs_information");
+      assert.equal(questions().length, 2);
+      const afterInsufficient = durable(issue);
+      discardTask(issue, true);
+      launch(`${prefix}-duplicate`, issue, true);
+      await finished(`${prefix}-duplicate`, "waiting", "needs_information");
+      assert.deepEqual(durable(issue).budget, afterInsufficient.budget);
+      assert.equal(proof().requests.length, 0);
+    }
+    if (issue !== 46)
+      upstream(
+        `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 || issue === 48 ? "fixture" : "reporter"}${issue === 48 ? "&body=SCOPE_EXPANSION%3A%20add%20an%20unrelated%20feature" : ""}`,
+        "POST",
+      );
+    if (issue === 47)
+      upstream(
+        `/artifact-fault?id=${durable(issue).session_artifact.artifact_id}&kind=expired`,
+        "POST",
+      );
+    discardTask(issue, true);
+    launch(`${prefix}-resumed`, issue, true);
+    if (issue === 48) {
+      await finished(`${prefix}-resumed`, "blocked", "implementation_blocked");
+      assert.equal(durable(issue).scope_digest, before.scope_digest);
+      assert.equal(durable(issue).scope.objective, before.scope.objective);
+      const continued = proof().conversations.find(
+        (conversation) => conversation.id === before.question.conversation_id,
+      );
+      assert.equal(continued.request_digest, nativeBefore.request_digest);
+      assert.equal(continued.native_id, nativeBefore.native_id);
+      assert.equal(
+        proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
+          .length,
+        0,
+      );
+      assert(
+        proof()
+          .workflow.find((phase) => phase.phase === "implementations")
+          .records.some(
+            (record) => record.failure === "implementation_out_of_scope",
+          ),
+      );
+      continue;
+    }
+    const resumed = await finished(
+      `${prefix}-resumed`,
+      "waiting",
+      "remote_checks",
+    );
+    assert.equal(durable(issue).task_id, before.task_id);
+    assert.equal(durable(issue).job.revision, before.job.revision);
+    assert(durable(issue).budget.active_ms >= before.budget.active_ms);
+    assert(
+      durable(issue).budget.model_requests >= before.budget.model_requests,
+    );
+    assert(durable(issue).budget.wait_ms < before.budget.wait_ms + 60000);
+    if (issue === 47)
+      assert.equal(resumed.session_recovery, "expired_or_deleted");
+    if (nativeBefore && issue !== 47) {
+      const continued = proof().conversations.find(
+        (conversation) => conversation.id === before.question.conversation_id,
+      );
+      assert.equal(continued.native_id, nativeBefore.native_id);
+      assert.equal(continued.request_digest, nativeBefore.request_digest);
+    }
+    if (mode === "monitor_clarification")
+      assert.equal(resumed.pull_number, before.pull.number);
+    assert.equal(
+      proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
+        .length,
+      1,
+    );
+    assert.equal(questions().length, issue === 40 || issue === 49 ? 2 : 1);
+    assert.deepEqual(proof().errors, []);
+  }
+  for (const [issue, boundary] of [
+    [51, "checkpoint"],
+    [52, "dispatch"],
+  ]) {
+    upstream(
+      `/clarification-issue?issue=${issue}&mode=clarification_coding&boundary=${boundary}`,
+      "POST",
+    );
+    const prefix = `${manager}-question-boundary-${boundary}`;
+    launch(`${prefix}-interrupted`, issue);
+    await waitUntil(
+      () => proof().question_boundary?.held,
+      `Question ${boundary} boundary was not reached`,
+      300000,
+    );
+    const before = durable(issue);
+    assert.equal(
+      before.active,
+      null,
+      "Question publication retained an active worker deadline",
+    );
+    const beforeConversation = proof().conversations.find(
+      (conversation) => conversation.id === before.question.conversation_id,
+    );
+    const questions = () =>
+      proof()
+        .comments.find(([number]) => number === issue)[1]
+        .filter((row) => row.body.includes("Reply in a new issue comment."));
+    assert.equal(questions().length, boundary === "checkpoint" ? 0 : 1);
+    docker(["kill", "--signal", "KILL", `${prefix}-interrupted`]);
+    await waitUntil(
+      () => !inspect(`${prefix}-interrupted`).State.Running,
+      "Interrupted question container stayed alive",
+    );
+    upstream("/release-question-boundary", "POST");
+    discardTask(issue, true);
+    launch(`${prefix}-restored`, issue, true);
+    if (boundary === "checkpoint") {
+      await finished(`${prefix}-restored`, "waiting", "needs_information");
+      assert.equal(durable(issue).question.id, before.question.id);
+      assert.equal(questions().length, 1);
+      upstream(`/answer?issue=${issue}`, "POST");
+      discardTask(issue, true);
+      launch(`${prefix}-answered`, issue, true);
+      await finished(`${prefix}-answered`, "waiting", "remote_checks");
+    } else {
+      await finished(`${prefix}-restored`, "waiting", "remote_checks");
+      const continued = proof().conversations.find(
+        (conversation) => conversation.id === before.question.conversation_id,
+      );
+      assert.equal(continued.native_id, beforeConversation.native_id);
+      assert.equal(continued.messages.length, 1);
+    }
+    assert.equal(questions().length, 1);
+    assert.equal(durable(issue).task_id, before.task_id);
+    assert.equal(
+      proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
+        .length,
+      1,
+    );
+    const completedBudget = durable(issue).budget;
+    discardTask(issue, true);
+    launch(`${prefix}-duplicate`, issue, true);
+    await finished(`${prefix}-duplicate`, "waiting", "remote_checks");
+    assert.equal(proof().requests.length, 0);
+    assert.equal(
+      durable(issue).budget.model_requests,
+      completedBudget.model_requests,
+    );
+    assert.equal(durable(issue).budget.active_ms, completedBudget.active_ms);
+  }
   return {
     sdk,
     actions: "passed",

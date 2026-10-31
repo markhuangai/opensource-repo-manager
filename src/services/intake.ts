@@ -345,6 +345,7 @@ export class IntakeService {
       this.store.repository()!,
       signal,
     );
+    this.store.durability?.prepareIssue(context);
     await this.hooks.beforeIssue?.(context, signal);
     context.comments = context.comments.filter(
       (comment) => !this.store.owns("issue_comment", comment.id),

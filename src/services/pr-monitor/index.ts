@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
+import { currentContinuation } from "../clarification.ts";
 import type { GitHubReader } from "../../adapters/github/reader.ts";
 import type { RunSnapshot } from "../../config/load.ts";
 import type { SecretAccessor } from "../../config/secrets.ts";
@@ -230,6 +231,12 @@ export class PrMonitorService {
       this.busy.add(item.job_id);
       const record = this.repository.get(item.job_id)!;
       try {
+        const question = currentContinuation(
+          this.store,
+          record.job_id,
+        )?.question;
+        if (question && !this.store.durability?.replies(question.id).length)
+          continue;
         if (record.stage === "closed" || Date.now() < record.retry_at) continue;
         if (record.stage === "assessing" && !this.active) {
           record.stage = "queued";
@@ -521,6 +528,8 @@ export class PrMonitorService {
   }
 
   async advance(job: Job, signal: AbortSignal) {
+    const question = currentContinuation(this.store, job.id)?.question;
+    if (question && !this.store.durability?.replies(question.id).length) return;
     if (this.busy.has(job.id)) return;
     const record = this.repository.get(job.id);
     if (
@@ -561,6 +570,13 @@ export class PrMonitorService {
           },
           signal,
         );
+        if (!assessment) {
+          record.pending_agent = null;
+          record.stage = "queued";
+          record.wait_accounted_at = null;
+          this.repository.save(record);
+          return;
+        }
         const refreshed = await this.read(record, signal);
         this.assertOwned(record, refreshed);
         if (digest(this.surfaces(refreshed)) !== digest(surfaces)) {

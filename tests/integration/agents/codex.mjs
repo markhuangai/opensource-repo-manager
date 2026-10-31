@@ -172,7 +172,11 @@ export async function respond(req, res, fixture) {
       investigation = fixture.session(text, active.role, previous === 0);
       if (investigation.command) output = command(investigation.command);
     } else if (
-      ["investigation_plan", "investigation_result"].includes(scenario) ||
+      [
+        "investigation_triage",
+        "investigation_plan",
+        "investigation_result",
+      ].includes(scenario) ||
       scenario.startsWith("implementation_")
     ) {
       investigation = await fixture[

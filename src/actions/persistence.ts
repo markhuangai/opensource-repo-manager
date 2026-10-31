@@ -10,7 +10,11 @@ import {
 } from "../adapters/github/writer.ts";
 import type { RunSnapshot } from "../config/load.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
-import { digest } from "../domain/agents.ts";
+import { digest, type Conversation } from "../domain/agents.ts";
+import { admitReplies, pinIssueComments } from "../services/clarification.ts";
+import { type Question } from "../services/clarification-contracts.ts";
+import { InvestigationRepository } from "../repositories/investigation.ts";
+import { ImplementationRepository } from "../repositories/implementation.ts";
 import { initialBudget, type IssueContext } from "../domain/jobs.ts";
 import type { TaskDurability } from "../domain/durability.ts";
 import {
@@ -55,6 +59,8 @@ export class ActionsState implements TaskDurability {
   private reconstructed = false;
   private restoredResult: TaskResult | undefined;
   private expired = false;
+  private admitted:
+    { question: string; messages: Conversation["messages"] } | undefined;
   private constructor(
     private readonly store: Store,
     private readonly snapshot: RunSnapshot,
@@ -89,13 +95,32 @@ export class ActionsState implements TaskDurability {
       comment: (issue, id, body, signal) => {
         if (issue !== this.comment.state.issue.number)
           return transport.comment(issue, id, body, signal);
-        return this.serial(async () => {
-          if (id !== this.comment.state.comment_id)
-            throw new StateError("state_conflict");
+        if (id === null) {
+          if (this.fault) throw this.fault;
           const pending = new PublicationRepository(store).pending(
             this.comment.state.job!.id,
           );
           const payload = pending?.payload as { comment?: string } | undefined;
+          if (
+            pending?.proposal.kind !== "question" ||
+            !pending.review_id ||
+            payload?.comment !== body ||
+            !pending.steps.some(
+              (step) =>
+                step.kind === "question_comment" &&
+                step.state === "dispatching",
+            )
+          )
+            throw new StateError("state_unreviewed");
+          return transport.comment(issue, null, body, signal);
+        }
+        return this.serial(async () => {
+          const pending = new PublicationRepository(store).pending(
+            this.comment.state.job!.id,
+          );
+          const payload = pending?.payload as { comment?: string } | undefined;
+          if (id !== this.comment.state.comment_id)
+            throw new StateError("state_conflict");
           if (
             !pending?.review_id ||
             payload?.comment !== body ||
@@ -305,6 +330,38 @@ export class ActionsState implements TaskDurability {
     let pull: RemotePull | undefined;
     if (state.pull) {
       pull = await this.transport.pull(state.pull.number, signal);
+      const pending = state.pending;
+      const deferredRepair =
+        pending?.kind === "change" &&
+        pending.retry_at > Date.now() &&
+        ["dispatching", "uncertain"].includes(pending.status) &&
+        pending.commit === pull.head &&
+        pending.branch === state.branch &&
+        pending.steps.some(
+          (step) =>
+            step.kind === "branch" &&
+            ["dispatching", "uncertain"].includes(step.state),
+        ) &&
+        digest({ ...compactPull(pull), head: state.pull.head }) ===
+          digest(state.pull) &&
+        pull.branch === state.branch &&
+        pull.repository_id === repository.id &&
+        pull.base_repository_id === repository.id;
+      if (deferredRepair) {
+        this.restoredResult = {
+          version: 1,
+          repository: state.repository.full_name,
+          issue_number: state.issue.number,
+          job_id: state.job?.id,
+          revision: state.job?.revision,
+          outcome: "waiting",
+          reason: "retry_scheduled",
+          retry_at: pending.retry_at,
+          pull_number: state.pull.number,
+          head_sha: state.pull.head,
+        };
+        return;
+      }
       if (
         digest(compactPull(pull)) !== digest(state.pull) ||
         pull.branch !== state.branch ||
@@ -331,6 +388,82 @@ export class ActionsState implements TaskDurability {
       this.snapshot,
       pull,
     );
+    const question = this.question();
+    if (question && context.state !== "closed" && pull?.state !== "closed") {
+      if (
+        state.job &&
+        (issueDigest(context) !== state.job.issue_digest ||
+          (!state.pull && digest(context.source) !== digest(state.job.source)))
+      )
+        throw new StateError("state_incompatible");
+      const messages = await admitReplies(
+        reader,
+        number,
+        question,
+        {
+          author_id: state.author_id,
+          instance: state.publication_instance,
+          job_id: state.job!.id,
+        },
+        (id) => this.store.owns("issue_comment", id) || id === canonicalId,
+        signal,
+      );
+      if (this.secrets.containsCredentials(messages))
+        throw new StateError("state_secret");
+      question.answers = messages.map((message) => {
+        const answer = JSON.parse(message.content) as { body: string };
+        return {
+          id: Number(message.id.slice("github-comment:".length)),
+          digest: digest(answer.body),
+        };
+      });
+      this.admitted = { question: question.id, messages };
+      const job = this.store.jobById(state.job!.id)!;
+      if (job.phase === "investigation") {
+        const repository = new InvestigationRepository(this.store),
+          record = repository.current(job);
+        if (record?.continuation) {
+          if (record.continuation.id === question.conversation_id)
+            record.continuation.question = structuredClone(question);
+          else delete record.continuation;
+          repository.save(record);
+        }
+      } else {
+        const repository = new ImplementationRepository(this.store),
+          record = repository.current(job);
+        if (record?.continuation) {
+          if (record.continuation.id === question.conversation_id)
+            record.continuation.question = structuredClone(question);
+          else delete record.continuation;
+          repository.save(record);
+        }
+      }
+      if (question.comment_id && !messages.length && !missingEvidence)
+        this.restoredResult = {
+          version: 1,
+          repository: state.repository.full_name,
+          issue_number: number,
+          job_id: state.job?.id,
+          revision: state.job?.revision,
+          outcome: "waiting",
+          reason: "needs_information",
+        };
+    } else if (
+      state.question &&
+      !("version" in state.question) &&
+      state.job &&
+      !state.pull
+    ) {
+      const investigations = new InvestigationRepository(this.store),
+        record = investigations.current(this.store.jobById(state.job.id)!);
+      if (record?.result?.outcome === "needs_information") {
+        record.stage = "queued";
+        record.result = null;
+        record.triage = undefined;
+        record.agent_pending = false;
+        investigations.save(record);
+      }
+    }
     if (!state.job) {
       this.store.applyIssue(
         this.store.refreshIssue(number),
@@ -340,6 +473,7 @@ export class ActionsState implements TaskDurability {
       this.bindComment();
     }
     if (
+      !this.restoredResult &&
       state.job &&
       (this.reconstructed ||
         context.state === "closed" ||
@@ -427,6 +561,7 @@ export class ActionsState implements TaskDurability {
     const input = { ...context, source: job.source, updated_at: undefined };
     const unchanged = digest(input) === job.input_digest;
     if (
+      !state.question &&
       unchanged &&
       [
         "needs_information",
@@ -458,6 +593,16 @@ export class ActionsState implements TaskDurability {
   failure() {
     return this.fault;
   }
+  question(): Question | null {
+    const question = this.comment?.state.question;
+    return question && "version" in question ? question : null;
+  }
+  replies(question: string) {
+    return this.admitted?.question === question ? this.admitted.messages : [];
+  }
+  prepareIssue(context: IssueContext) {
+    pinIssueComments(this.store, context);
+  }
   identifiers() {
     return {
       task_id: this.comment.state.task_id,
@@ -470,7 +615,11 @@ export class ActionsState implements TaskDurability {
   }
 
   recoveryContext() {
+    const legacy =
+      this.comment.state.question &&
+      !("version" in this.comment.state.question);
     if (
+      !legacy &&
       !this.reconstructed &&
       (!this.comment.state.scope || this.repository.local()?.scope_json)
     )
@@ -480,6 +629,10 @@ export class ActionsState implements TaskDurability {
         this.comment.state.findings?.summary ??
         "No reviewed findings survived. Establish fresh evidence.",
       scope: this.comment.state.scope as FrozenScope | null,
+      ...(this.comment.state.question &&
+      !("version" in this.comment.state.question)
+        ? { legacy_questions: this.comment.state.question.questions }
+        : {}),
     };
   }
 
@@ -675,7 +828,26 @@ export class ActionsState implements TaskDurability {
     for (const step of pending.steps) {
       if (!["dispatching", "uncertain"].includes(step.state)) continue;
       let matched = false;
-      if (step.kind === "comment")
+      if (step.kind === "question_comment") {
+        const matches = (
+          await this.transport.comments(state.issue.number, signal)
+        ).filter(
+          (comment) =>
+            comment.author_id === pending.actor.id &&
+            digest(comment.body) === step.body_digest &&
+            (step.object_id === null || comment.id === step.object_id),
+        );
+        matched = matches.length === 1;
+        if (matched) {
+          step.object_id = matches[0].id;
+          if (
+            state.question &&
+            "version" in state.question &&
+            state.question.publication_id === pending.id
+          )
+            state.question.comment_id = matches[0].id;
+        }
+      } else if (step.kind === "comment")
         matched = digest(this.comment.narrative) === step.body_digest;
       else if (step.kind === "branch") {
         const branch = await this.transport.branch(pending.branch, signal);

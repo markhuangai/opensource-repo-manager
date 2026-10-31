@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import { runClarifyingPhase, continuationMessages } from "../clarification.ts";
+import { clarificationRequestSchema } from "../clarification-contracts.ts";
 import type { SecretAccessor } from "../../config/secrets.ts";
 import { digest, RuntimeError, type AgentEvent } from "../../domain/agents.ts";
 import { budgetUsage, IntakeError, type Job } from "../../domain/jobs.ts";
@@ -223,6 +225,7 @@ export class ImplementationService {
       },
       signal,
     );
+    if (!terminal) return;
     await this.refresh(record, signal);
     this.assertReadOnlyArtifact(record, artifact, terminal.artifact);
     record.agent_pending = null;
@@ -258,6 +261,7 @@ export class ImplementationService {
       },
       signal,
     );
+    if (!terminal) throw new RuntimeError("implementation_agent_failed");
     await this.refresh(record, signal);
     this.assertReadOnlyArtifact(record, artifact, terminal.artifact);
     record.agent_pending = null;
@@ -368,22 +372,23 @@ export class ImplementationService {
         record.investigation_id,
       );
       const recoveredScope = this.store.durability?.recoveryContext()?.scope;
+      const planned = recoveredScope
+        ? undefined
+        : await this.agent(
+            record,
+            "implementation",
+            "implementation_plan",
+            implementationPlanSchema,
+            {
+              investigation,
+              required_checks: this.store.bootstrap(record.bootstrap_receipt)
+                .plan!.test_commands,
+            },
+            signal,
+          );
+      if (!recoveredScope && !planned) return;
       const plan = implementationPlanSchema.parse(
-        recoveredScope?.plan ??
-          (
-            await this.agent(
-              record,
-              "implementation",
-              "implementation_plan",
-              implementationPlanSchema,
-              {
-                investigation,
-                required_checks: this.store.bootstrap(record.bootstrap_receipt)
-                  .plan!.test_commands,
-              },
-              signal,
-            )
-          ).result,
+        recoveredScope?.plan ?? planned!.result,
       );
       const discovered = this.store.bootstrap(record.bootstrap_receipt).plan!
         .test_commands;
@@ -449,6 +454,7 @@ export class ImplementationService {
           },
           signal,
         );
+        if (!terminal) return;
         const result = implementationResultSchema.parse(terminal.result);
         if (!terminal.artifact)
           throw new RuntimeError("implementation_agent_failed");
@@ -493,6 +499,7 @@ export class ImplementationService {
           },
           signal,
         );
+        if (!terminal) throw new RuntimeError("implementation_agent_failed");
         const result = implementationAuditSchema.parse(terminal.result);
         if (
           result.scope_digest !== record.scope_digest ||
@@ -642,6 +649,7 @@ export class ImplementationService {
         },
         signal,
       );
+      if (!terminal) throw new RuntimeError("implementation_agent_failed");
       if (
         !terminal.artifact ||
         artifactFiles(
@@ -790,8 +798,43 @@ export class ImplementationService {
       }),
     };
     let terminal: Extract<AgentEvent, { type: "terminal" }> | undefined;
-    for await (const event of this.supervisor.run(request, signal))
-      if (event.type === "terminal") terminal = event;
+    if (
+      this.store.durability &&
+      role === "implementation" &&
+      [
+        "implementation_plan",
+        "implementation_change",
+        "implementation_review_feedback",
+      ].includes(task)
+    ) {
+      request.output_schema = z.toJSONSchema(
+        z.strictObject({
+          response: z.union([schema, clarificationRequestSchema]),
+        }),
+        { target: "draft-7", unrepresentable: "any" },
+      );
+      request.input = {
+        ...(request.input as object),
+        clarification_answers: continuationMessages(
+          new InvestigationRepository(this.store).get(record.investigation_id)
+            .continuation,
+        ),
+        clarification_policy:
+          "If facts or existing intended behavior are unclear, return needs_information with summary, questions and audience. Use reporter_or_maintainer only for facts; maintainer for intent/scope. Answers cannot authorize features or expand the frozen objective.",
+      };
+      terminal = await runClarifyingPhase(
+        this.store,
+        this.supervisor,
+        request,
+        record,
+        () => this.repository.save(record),
+        signal,
+      );
+      if (!terminal) return;
+    } else {
+      for await (const event of this.supervisor.run(request, signal))
+        if (event.type === "terminal") terminal = event;
+    }
     signal.throwIfAborted();
     this.repository.assertCurrent(record);
     if (!terminal || terminal.outcome !== "completed")

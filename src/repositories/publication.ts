@@ -189,7 +189,7 @@ export class PublicationRepository {
         const step = receipt.steps.find((item) => item.kind === kind);
         if (step?.state === "confirmed")
           step.confirmed_at ??= new Date().toISOString();
-        this.saveTarget(receipt.target);
+        if (kind !== "question_comment") this.saveTarget(receipt.target);
         this.save(receipt);
         if ((kind === "branch" || kind === "pull") && receipt.target.pull)
           this.store.db
@@ -202,15 +202,19 @@ export class PublicationRepository {
               String(receipt.target.pull.id),
             );
         const object =
-          kind === "comment"
-            ? receipt.target.comment
-            : kind === "pull"
-              ? receipt.target.pull
-              : null;
+          kind === "question_comment" && step?.object_id
+            ? { id: step.object_id }
+            : kind === "comment"
+              ? receipt.target.comment
+              : kind === "pull"
+                ? receipt.target.pull
+                : null;
         if (
           object &&
           !this.store.owns(
-            kind === "comment" ? "issue_comment" : "pull_request",
+            kind === "comment" || kind === "question_comment"
+              ? "issue_comment"
+              : "pull_request",
             object.id,
           )
         ) {
@@ -222,7 +226,9 @@ export class PublicationRepository {
               randomUUID(),
               receipt.job_id,
               receipt.revision,
-              kind === "comment" ? "issue_comment" : "pull_request",
+              kind === "comment" || kind === "question_comment"
+                ? "issue_comment"
+                : "pull_request",
               String(object.id),
               "number" in object ? object.number : null,
               receipt.target.head,

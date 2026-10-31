@@ -404,6 +404,7 @@ export class ActionsArtifacts {
           throw new StateError("state_conflict");
       if (
         (state.pending &&
+          state.pending.kind !== "question" &&
           !checkpoint.db
             .prepare("SELECT 1 FROM publication_operations WHERE id=?")
             .get(state.pending.id)) ||

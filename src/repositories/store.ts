@@ -633,6 +633,21 @@ export class Store {
         if (previous && previous.issue_id !== context.id)
           throw new IntakeError("issue_identity_changed");
         if (
+          this.durability &&
+          previous?.status === "pending" &&
+          context.state === "open"
+        ) {
+          const original = JSON.parse(previous.input_json) as IssueContext;
+          if (
+            original.title === context.title &&
+            original.body === context.body &&
+            JSON.stringify(original.source) === JSON.stringify(context.source)
+          ) {
+            this.complete(target);
+            return true;
+          }
+        }
+        if (
           previous &&
           previous.status === "pending" &&
           context.state === "open" &&

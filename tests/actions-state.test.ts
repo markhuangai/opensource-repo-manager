@@ -2,7 +2,12 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { admitReplies } from "../src/services/clarification.ts";
+import {
+  renderQuestion,
+  type Question,
+} from "../src/services/clarification-contracts.ts";
 import { Octokit } from "@octokit/rest";
 import { OctokitWriter } from "../src/adapters/github/writer.ts";
 import { OctokitReader } from "../src/adapters/github/reader.ts";
@@ -26,6 +31,7 @@ import { createPublicationFixture } from "./fixtures/publication.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const close of cleanups.splice(0).reverse()) await close();
 });
 const signal = () => new AbortController().signal;
@@ -175,7 +181,7 @@ describe("authenticated Actions task authority", () => {
       error() {},
     });
     await intake.enrollIssue(1, signal());
-    expect(fresh.job(1)!.revision).toBe(before.job!.revision + 1);
+    expect(fresh.job(1)!.revision).toBe(before.job!.revision);
     await intake.stop();
     expect(
       f.remote.state.requests.some(
@@ -377,6 +383,11 @@ describe("authenticated Actions task authority", () => {
       const investigation = investigations.ensure(job);
       investigation.result = {
         outcome: "maintenance_candidate",
+        bug: {
+          expected_behavior: "Documented existing behavior",
+          observed_behavior: "Supported behavior fails",
+          existing_contract: "Verified supported source contract",
+        },
         summary: "The fixture source violates its documented behavior",
         objective: "Restore existing behavior",
         proof: "source",
@@ -829,11 +840,14 @@ describe("authenticated Actions task authority", () => {
     },
   );
 
-  it.each(["empty", "retained"])(
+  it.each(["empty", "retained", "checkpoint"])(
     "reconciles an interrupted repair push with %s local storage and rejects later human edits",
     async (storage) => {
       const f = await setup();
       await f.open(f.store);
+      const artifacts =
+        storage === "checkpoint" ? await f.artifactsFor(f.store) : undefined;
+      if (artifacts) await f.open(f.store, artifacts);
       const repository = new PublicationRepository(f.store),
         target = repository.target(1),
         initial = f.remote.commit(
@@ -877,7 +891,7 @@ describe("authenticated Actions task authority", () => {
         revision: 1,
         status: "dispatching",
         failure: null,
-        retry_at: 0,
+        retry_at: Date.now() + 60000,
         retry_pending: false,
         source: f.remote.source,
         target,
@@ -904,24 +918,67 @@ describe("authenticated Actions task authority", () => {
             after: repaired.sha,
             state: "dispatching",
           },
+          ...(storage === "checkpoint"
+            ? [
+                {
+                  kind: "pull" as const,
+                  before: target.pull,
+                  after: payload,
+                  state: "prepared" as const,
+                },
+              ]
+            : []),
         ],
       });
       f.store.reserveInfrastructureRetry(1);
-      await f.store.checkpoint(signal());
+      await f.store.checkpoint(signal(), Boolean(artifacts));
       const repairBudget = f.read().state.budget;
       expect(f.read().state.pending?.commit).toBe(repaired.sha);
       f.remote.git(["update-ref", `refs/heads/${target.branch}`, repaired.sha]);
-      const repairStore = storage === "empty" ? f.database() : f.store;
-      await f.open(repairStore);
+      const deadline = f.read().state.pending!.retry_at;
+      const repairStore = storage === "retained" ? f.store : f.database();
+      const restoredArtifacts =
+        storage === "checkpoint"
+          ? await f.artifactsFor(repairStore)
+          : undefined;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const early = await f.open(repairStore, restoredArtifacts);
+        expect(early.result()).toMatchObject({
+          outcome: "waiting",
+          reason: "retry_scheduled",
+          retry_at: deadline,
+        });
+        expect(f.read().state.head).toBe(initial.sha);
+        expect(f.read().state.budget).toEqual(repairBudget);
+      }
+      const earlyHuman = f.remote.commit(
+        { "app.txt": "human edit before deadline\n" },
+        repaired.sha,
+      );
+      f.remote.git([
+        "update-ref",
+        `refs/heads/${target.branch}`,
+        earlyHuman.sha,
+      ]);
+      await expect(f.open(repairStore, restoredArtifacts)).rejects.toThrow(
+        "state_conflict",
+      );
+      f.remote.git(["update-ref", `refs/heads/${target.branch}`, repaired.sha]);
+      vi.spyOn(Date, "now").mockReturnValue(deadline);
+      await f.open(repairStore, restoredArtifacts);
       const afterRepair = f.read().state,
         repairedTarget = new PublicationRepository(repairStore).target(1);
-      expect(afterRepair.pending?.status).toBe("confirmed");
+      expect(afterRepair.pending?.status).toBe(
+        storage === "checkpoint" ? "reviewed" : "confirmed",
+      );
+      if (storage === "checkpoint")
+        expect(afterRepair.pending?.steps[1].state).toBe("prepared");
       expect(afterRepair.head).toBe(repaired.sha);
       expect(afterRepair.pull?.head).toBe(repaired.sha);
       expect(repairedTarget.head).toBe(repaired.sha);
       expect(repairedTarget.pull?.head).toBe(repaired.sha);
       expect(afterRepair.budget).toEqual(repairBudget);
-      await f.open(repairStore);
+      await f.open(repairStore, restoredArtifacts);
       expect(f.remote.state.pulls).toHaveLength(1);
       expect(
         f.remote.state.mutations.filter((kind) => kind === "pull"),
@@ -932,8 +989,222 @@ describe("authenticated Actions task authority", () => {
         repaired.sha,
       );
       f.remote.git(["update-ref", `refs/heads/${target.branch}`, human.sha]);
-      await expect(f.open(repairStore)).rejects.toThrow("state_conflict");
+      await expect(f.open(repairStore, restoredArtifacts)).rejects.toThrow(
+        "state_conflict",
+      );
       expect(f.read().state.budget).toEqual(repairBudget);
     },
   );
+});
+
+describe("authenticated question replies", () => {
+  it("reads an authenticated legacy question without adding fields or resetting authority", async () => {
+    const f = await setup();
+    await f.open(f.store);
+    const before = f.read(),
+      questions = ["Which existing supported input fails?"];
+    before.state.question = {
+      questions,
+      input_digest: before.state.job!.input_digest,
+    };
+    before.state.findings = {
+      outcome: "needs_information",
+      summary: "Facts are missing",
+      objective: "",
+      proof: "none",
+      evidence_ids: [],
+      questions,
+    };
+    before.state.outcome = "waiting";
+    before.state.reason = "needs_information";
+    before.state.generation++;
+    const body = f.codec.encode(before.state, before.narrative);
+    const decoded = f.codec.decode(body, {
+      repository_id: 42,
+      issue_id: 1001,
+      comment_id: before.state.comment_id!,
+      author_id: 7,
+    });
+    expect(decoded.state.question).toEqual({
+      questions,
+      input_digest: before.state.job!.input_digest,
+    });
+    expect(f.codec.encode(decoded.state, decoded.narrative)).toBe(body);
+    await f.writer.comment(1, before.state.comment_id, body, signal());
+    const restored = await f.open(f.database());
+    expect(restored.recoveryContext()?.legacy_questions).toEqual(questions);
+    expect(restored.question()).toBeNull();
+    expect(restored.identifiers().task_id).toBe(before.state.task_id);
+    expect(f.read().state.budget).toEqual(before.state.budget);
+  });
+  async function questionFixture(
+    audience: Question["audience"] = "reporter_or_maintainer",
+  ) {
+    const f = await setup();
+    await f.open(f.store);
+    const state = f.read().state;
+    const question: Question = {
+      version: 1,
+      id: randomUUID(),
+      phase: "investigation_plan",
+      summary: "Confirm the observed input.",
+      questions: ["Which input fails?"],
+      audience,
+      input_digest: state.job!.input_digest,
+      conversation_id: randomUUID(),
+      publication_id: "a".repeat(64),
+      comment_id: null,
+      answers: [],
+    };
+    const publication = {
+      author_id: state.author_id,
+      instance: state.publication_instance,
+      job_id: state.job!.id,
+    };
+    await f.writer.comment(
+      1,
+      null,
+      renderQuestion(
+        question,
+        `<!-- orm:${publication.instance}:${publication.job_id}:${question.publication_id} -->`,
+      ),
+      signal(),
+    );
+    question.comment_id = f.remote.state.comments.get(1)!.at(-1)!.id;
+    const reply = (
+      id: number,
+      author_id: number,
+      author_login: string,
+      body: string,
+      author_type = "User",
+    ) => {
+      f.remote.state.comments
+        .get(1)!
+        .push({ id, author_id, author_login, body, author_type });
+    };
+    const read = () =>
+      admitReplies(
+        f.reader,
+        1,
+        question,
+        publication,
+        (id) => id === state.comment_id,
+        signal(),
+      );
+    return { ...f, question, publication, reply, readReplies: read };
+  }
+
+  it("admits reporter facts and PAT-owner human replies, excluding unauthorized users and bots", async () => {
+    const f = await questionFixture();
+    f.remote.state.permissions.set("outsider", { id: 9, permission: "read" });
+    f.reply(200, 8, "reporter", "increment(1) returns 3");
+    f.reply(201, 9, "outsider", "Implement an unrelated feature");
+    f.reply(202, 7, "fixture", "The existing contract is add one");
+    f.reply(203, 11, "robot[bot]", "Automated reply", "Bot");
+    const replies = await f.readReplies();
+    expect(replies.map((reply) => reply.id)).toEqual([
+      "github-comment:200",
+      "github-comment:202",
+    ]);
+    expect(
+      replies.every((reply) => reply.digest === digest(reply.content)),
+    ).toBe(true);
+    expect(JSON.parse(replies[0].content).trust).toContain(
+      "cannot change task authority",
+    );
+    expect(await f.readReplies()).toEqual(replies);
+  });
+
+  it("requires verified maintainer authority for intent and fails closed on permission read failures", async () => {
+    const f = await questionFixture("maintainer");
+    f.reply(200, 8, "reporter", "Change the intended behavior");
+    expect(await f.readReplies()).toEqual([]);
+    f.remote.state.permissions.set("reporter", { id: 8, permission: "write" });
+    expect(await f.readReplies()).toHaveLength(1);
+    f.remote.state.rateLimit = {
+      method: "GET",
+      path: "/repos/owner/repo/collaborators/reporter/permission",
+      seconds: 60,
+    };
+    await expect(f.readReplies()).rejects.toThrow("github_rate_limited");
+  });
+
+  it("rejects edited or missing admitted messages and tampered question comments", async () => {
+    const f = await questionFixture();
+    f.reply(200, 8, "reporter", "Original fact");
+    f.question.answers = [{ id: 200, digest: digest("Original fact") }];
+    f.remote.state.comments.get(1)!.at(-1)!.body = "Changed authority";
+    await expect(f.readReplies()).rejects.toThrow(
+      "clarification_reply_changed",
+    );
+    f.remote.state.comments.get(1)!.pop();
+    await expect(f.readReplies()).rejects.toThrow(
+      "clarification_reply_changed",
+    );
+    f.remote.state.comments.get(1)!.at(-1)!.body = "Forged question";
+    await expect(f.readReplies()).rejects.toThrow(
+      "clarification_question_changed",
+    );
+  });
+
+  it("rejects an unknown retained phase before returning a clarification wait", async () => {
+    const f = await questionFixture();
+    const original = f.read();
+    original.state.question = f.question;
+    original.state.outcome = "waiting";
+    original.state.reason = "needs_information";
+    original.state.generation++;
+    await f.writer.comment(
+      1,
+      original.state.comment_id,
+      f.codec.encode(original.state, original.narrative),
+      signal(),
+    );
+    const retained = f.database();
+    expect((await f.open(retained)).result()?.reason).toBe("needs_information");
+    const before = f.read();
+    retained.db.exec("UPDATE jobs SET phase='unrecognized'");
+    await expect(f.open(retained)).rejects.toMatchObject({
+      code: "state_invalid",
+    });
+    expect(f.read().body).toBe(before.body);
+    expect(retained.runs()).toEqual([]);
+  });
+
+  it("retains a question beyond fourteen days and admits an early reply without changing the task revision or budgets", async () => {
+    const f = await questionFixture();
+    const original = f.read();
+    original.state.question = f.question;
+    original.state.outcome = "waiting";
+    original.state.reason = "needs_information";
+    original.state.generation++;
+    await f.writer.comment(
+      1,
+      original.state.comment_id,
+      f.codec.encode(original.state, original.narrative),
+      signal(),
+    );
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 15 * 86400000);
+    const waiting = await f.open(f.database());
+    expect(waiting.result()).toMatchObject({
+      outcome: "waiting",
+      reason: "needs_information",
+    });
+    expect(f.read().state.budget).toEqual(original.state.budget);
+    f.reply(200, 8, "reporter", "increment(1) returns 3");
+    const resumedStore = f.database(),
+      resumed = await f.open(resumedStore);
+    expect(resumed.result()).toBeUndefined();
+    expect(resumed.replies(f.question.id)).toHaveLength(1);
+    expect(resumedStore.job(1)!.revision).toBe(original.state.job!.revision);
+    expect(f.read().state.budget).toEqual(original.state.budget);
+    const context = await f.reader.issue(
+      1,
+      await f.reader.repository(signal()),
+      signal(),
+    );
+    resumed.prepareIssue(context);
+    resumedStore.applyIssue(resumedStore.refreshIssue(1), context, f.snapshot);
+    expect(resumedStore.job(1)!.revision).toBe(original.state.job!.revision);
+  });
 });

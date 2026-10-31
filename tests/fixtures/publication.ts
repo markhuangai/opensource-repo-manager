@@ -159,6 +159,11 @@ export async function createPublicationFixture(root: string) {
     >(),
     token: "github-fixture-token",
     actor: { id: 7, login: "fixture" },
+    reporter: { id: 8, login: "reporter", type: "User" },
+    permissions: new Map<string, { id: number; permission: string }>([
+      ["fixture", { id: 7, permission: "admin" }],
+      ["reporter", { id: 8, permission: "read" }],
+    ]),
     repository_id: 42,
     default_branch: "main",
     closed: new Set<number>(),
@@ -172,6 +177,7 @@ export async function createPublicationFixture(root: string) {
         body: string;
         author_id: number | null;
         author_login?: string;
+        author_type?: string;
         created_at?: string;
         updated_at?: string;
       }>
@@ -628,6 +634,20 @@ export async function createPublicationFixture(root: string) {
       );
       return;
     }
+    const permission = path.match(
+      /^\/repos\/owner\/repo\/collaborators\/([^/]+)\/permission$/,
+    );
+    if (permission) {
+      const login = decodeURIComponent(permission[1]);
+      const actor = state.permissions.get(login);
+      send(
+        actor
+          ? { permission: actor.permission, user: { id: actor.id, login } }
+          : {},
+        actor ? 200 : 404,
+      );
+      return;
+    }
     const issue = path.match(
       /^\/repos\/owner\/repo\/issues\/(\d+)(\/comments)?$/,
     );
@@ -636,6 +656,7 @@ export async function createPublicationFixture(root: string) {
       if (!issue[2]) {
         send({
           ...state.issues.get(number),
+          user: state.reporter,
           number,
           state: state.closed.has(number) ? "closed" : "open",
           labels: (state.issueLabels.get(number) ?? []).map((name) => ({
@@ -656,7 +677,11 @@ export async function createPublicationFixture(root: string) {
             user:
               row.author_id === null
                 ? null
-                : { id: row.author_id, login: row.author_login ?? "fixture" },
+                : {
+                    id: row.author_id,
+                    login: row.author_login ?? "fixture",
+                    type: row.author_type ?? "User",
+                  },
           })),
         );
         return;
@@ -744,6 +769,18 @@ export async function createPublicationFixture(root: string) {
     throw Error("fixture unavailable");
   return {
     state,
+    addComment(
+      issue: number,
+      author_id: number,
+      author_login: string,
+      body: string,
+    ) {
+      const row = { id: ++nextId, author_id, author_login, body };
+      const rows = state.comments.get(issue) ?? [];
+      rows.push(row);
+      state.comments.set(issue, rows);
+      return row;
+    },
     source,
     initial,
     repository,

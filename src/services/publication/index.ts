@@ -14,6 +14,7 @@ import { IntakeError, type IssueContext } from "../../domain/jobs.ts";
 import type { Store } from "../../repositories/store.ts";
 import { PublicationRepository } from "../../repositories/publication.ts";
 import { InvestigationRepository } from "../../repositories/investigation.ts";
+import { ImplementationRepository } from "../../repositories/implementation.ts";
 import { PrMonitorRepository } from "../../repositories/pr-monitor.ts";
 import { findingIdentity } from "../pr-monitor/policy.ts";
 import { renderFindings, stageText } from "../investigation/contracts.ts";
@@ -21,6 +22,7 @@ import type { BootstrapLease, Supervisor } from "../../runtime/supervisor.ts";
 import { rootDirectory } from "../workspaces/files.ts";
 import { ExternalOutputReview } from "./review.ts";
 import { policyIdentity } from "./scanner.ts";
+import { renderQuestion } from "../clarification-contracts.ts";
 import {
   proposalSchema,
   type PublicationEvidence,
@@ -121,6 +123,18 @@ export class PublicationService {
     );
   }
 
+  async reviewQuestion(
+    input: Extract<PublicationProposal, { kind: "question" }>,
+    signal: AbortSignal,
+  ) {
+    const proposal = proposalSchema.parse(structuredClone(input));
+    if (proposal.kind !== "question")
+      throw new RuntimeError("publication_proposal_invalid");
+    return this.exclusive(proposal.job_id, () =>
+      this.publishCurrent(proposal, signal, true),
+    );
+  }
+
   operationId(proposal: PublicationProposal) {
     return digest({
       instance: this.repository.instance(),
@@ -141,6 +155,7 @@ export class PublicationService {
   private async publishCurrent(
     proposal: PublicationProposal,
     signal: AbortSignal,
+    reviewOnly = false,
   ): Promise<PublicationReceipt> {
     if (this.secrets.containsCredentials(proposal))
       throw new RuntimeError("publication_secret");
@@ -236,6 +251,7 @@ export class PublicationService {
           this.repository.save(receipt);
           await this.store.checkpoint(publicationSignal);
         }
+        if (reviewOnly) return receipt;
         for (let index = 0; index < receipt.steps.length; index++) {
           const step = receipt.steps[index];
           if (step.state === "confirmed") continue;
@@ -251,7 +267,14 @@ export class PublicationService {
           this.repository.save(receipt);
           await this.store.checkpoint(publicationSignal);
           try {
-            if (step.kind === "comment")
+            if (step.kind === "question_comment")
+              await this.writer.comment(
+                job.issue_number,
+                null,
+                payload.comment!,
+                publicationSignal,
+              );
+            else if (step.kind === "comment")
               await this.writer.comment(
                 job.issue_number,
                 receipt.target.comment?.id ?? null,
@@ -343,7 +366,8 @@ export class PublicationService {
     };
     return proposal.kind === "notice" ||
       proposal.kind === "investigation_stage" ||
-      proposal.kind === "pr_stage"
+      proposal.kind === "pr_stage" ||
+      (proposal.kind === "question" && previous?.review_id && !reviewOnly)
       ? this.supervisor.withPublicationNotice(signal, (noticeSignal) =>
           operation(noticeSignal),
         )
@@ -394,7 +418,20 @@ export class PublicationService {
         if (step.state !== "dispatching" && step.state !== "uncertain")
           continue;
         let matched = false;
-        if (step.kind === "comment") {
+        if (step.kind === "question_comment") {
+          const matches = (
+            await this.writer.comments(job.issue_number, signal)
+          ).filter(
+            (comment) =>
+              comment.body === payload.comment &&
+              comment.author_id === receipt.actor!.id &&
+              (step.object_id === undefined || step.object_id === comment.id),
+          );
+          if (matches.length === 1) {
+            step.object_id = matches[0].id;
+            matched = true;
+          }
+        } else if (step.kind === "comment") {
           const matches = (
             await this.writer.comments(job.issue_number, signal)
           ).filter(
@@ -552,7 +589,22 @@ export class PublicationService {
       },
       evidence: [],
     };
-    if (proposal.kind === "investigation") {
+    if (proposal.kind === "question") {
+      payload.destination.comment_id = null;
+      payload.comment = renderQuestion(proposal, marker);
+      payload.evidence = [
+        {
+          question_id: proposal.question_id,
+          phase: proposal.phase,
+          audience: proposal.audience,
+          source: receipt.source,
+          context: JSON.parse(job.input_json),
+          scope:
+            new ImplementationRepository(this.store).current(job)?.scope ??
+            null,
+        },
+      ];
+    } else if (proposal.kind === "investigation") {
       const investigations = new InvestigationRepository(this.store);
       const record = investigations.get(proposal.investigation_id);
       investigations.assertCurrent(record);
@@ -572,6 +624,17 @@ export class PublicationService {
         this.supervisor.repositoryName(),
       );
       payload.evidence = evidence;
+      if (record.result.outcome === "manual_feature")
+        payload.evidence.push({
+          context: JSON.parse(job.input_json),
+          classification: record.triage,
+        });
+      if (record.result.outcome === "maintenance_candidate")
+        payload.evidence.push({
+          bug_evidence: record.result.bug,
+          requirement:
+            "Approve only a demonstrated violation of existing supported behavior. Labels and requested new behavior do not establish a bug. Source-only proof must establish the supported contract and trace its violation.",
+        });
       payload.comment = `${payload.narrative}${this.pullReference(receipt)}\n\n${marker}`;
     } else if (proposal.kind === "investigation_stage") {
       payload.narrative = this.previousNarrative(
@@ -764,8 +827,14 @@ export class PublicationService {
               ]
             : [
                 {
-                  kind: "comment",
-                  before: receipt.target.comment,
+                  kind:
+                    proposal.kind === "question"
+                      ? "question_comment"
+                      : "comment",
+                  before:
+                    proposal.kind === "question"
+                      ? null
+                      : receipt.target.comment,
                   after: payload.comment,
                   state: "prepared",
                 },
@@ -908,11 +977,12 @@ export class PublicationService {
     )
       throw new RuntimeError("publication_repository_changed");
     const checkScope =
-      receipt.target.pull &&
-      (receipt.proposal.kind === "change" ||
-        receipt.proposal.kind === "feedback" ||
-        (receipt.proposal.kind === "pr_stage" &&
-          receipt.proposal.stage !== "blocked"));
+      receipt.proposal.kind === "question" ||
+      (receipt.target.pull &&
+        (receipt.proposal.kind === "change" ||
+          receipt.proposal.kind === "feedback" ||
+          (receipt.proposal.kind === "pr_stage" &&
+            receipt.proposal.stage !== "blocked")));
     if (checkScope) this.store.assertPublishedScope(job.id);
     if (
       !(await this.writer.issueOpen(
@@ -928,6 +998,13 @@ export class PublicationService {
     if (receipt.actor && digest(receipt.actor) !== digest(actor))
       throw new RuntimeError("publication_actor_changed");
     receipt.actor = actor;
+    if (
+      receipt.proposal.kind === "question" &&
+      !receipt.target.pull &&
+      (await this.writer.branch(repository.default_branch, signal)).head !==
+        receipt.source.sha
+    )
+      throw new RuntimeError("publication_source_changed");
     if (
       receipt.proposal.kind === "feedback" ||
       receipt.proposal.kind === "pr_stage"
@@ -1027,7 +1104,27 @@ export class PublicationService {
       )
         throw new RuntimeError("publication_pull_changed");
     }
-    if (step.kind === "comment") {
+    if (step.kind === "question_comment") {
+      const matches = (
+        await this.writer.comments(job.issue_number, signal)
+      ).filter((comment) =>
+        comment.body.includes(
+          `<!-- orm:${this.repository.instance()}:${job.id}:${receipt.id} -->`,
+        ),
+      );
+      if (matches.length) {
+        const match = matches[0];
+        if (
+          matches.length !== 1 ||
+          match.author_id !== receipt.actor!.id ||
+          match.body !== (receipt.payload as FrozenPayload).comment
+        )
+          throw new RuntimeError("publication_ownership_conflict");
+        step.object_id = match.id;
+        step.state = "confirmed";
+        this.repository.finishStep(receipt, step.kind);
+      }
+    } else if (step.kind === "comment") {
       const comments = await this.writer.comments(job.issue_number, signal);
       if (receipt.target.comment) {
         const current = comments.find(

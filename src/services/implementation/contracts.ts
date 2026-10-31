@@ -2,6 +2,7 @@ import { z } from "zod";
 import { isContainedReference } from "../../config/files.ts";
 import type { SourceMetadata } from "../../domain/jobs.ts";
 import type { ModelProfile } from "../../config/schema.ts";
+import type { PhaseContinuation } from "../clarification-contracts.ts";
 import {
   commandSchema,
   type CommandReceipt,
@@ -68,6 +69,7 @@ export type VerificationReceipt = {
   evidence_id: string | null;
 };
 export type Implementation = {
+  continuation?: PhaseContinuation;
   id: string;
   job_id: number;
   revision: number;

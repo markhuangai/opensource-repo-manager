@@ -798,6 +798,13 @@ describe("monitor persistence and published-job revision boundaries", () => {
     resumed.accountWait(loaded, publishedAt + 5000);
     expect(JSON.parse(restarted.job(1)!.budget_json).wait_ms).toBe(5000);
     expect(restarted.leases()).toEqual([]);
+    loaded.wait_accounted_at = null;
+    resumed.save(loaded);
+    resumed.accountWait(resumed.get(1)!, publishedAt + 15 * 86400000);
+    expect(JSON.parse(restarted.job(1)!.budget_json).wait_ms).toBe(5000);
+    loaded.wait_accounted_at = publishedAt + 15 * 86400000;
+    resumed.accountWait(loaded, loaded.wait_accounted_at + 100);
+    expect(JSON.parse(restarted.job(1)!.budget_json).wait_ms).toBe(5100);
   });
 
   it("fences post-publication scope edits without changing the coding revision", async () => {
