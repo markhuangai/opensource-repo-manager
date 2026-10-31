@@ -839,6 +839,7 @@ export async function runActionsTests({
     [49, "clarification_investigation"],
     [50, "clarification_rejected"],
     [53, "clarification_invalid"],
+    [54, "clarification_marker"],
   ]) {
     upstream(
       `/clarification-issue?issue=${issue}&mode=${mode}&early=${issue === 46}`,
@@ -919,11 +920,20 @@ export async function runActionsTests({
       (conversation) => conversation.id === before.question.conversation_id,
     );
     assert.equal(questions().length, issue === 49 ? 2 : 1);
+    if (mode === "clarification_marker") {
+      assert(!questions().at(-1).body.includes("<!-- orm:task-state:"));
+      assert.equal(
+        proof()
+          .comments.find(([number]) => number === issue)[1]
+          .filter((row) => row.body.includes("<!-- orm:task-state:")).length,
+        1,
+      );
+    }
     assert.equal(
       before.question.phase,
       issue === 49
         ? "investigation_triage"
-        : mode === "clarification_investigation"
+        : ["clarification_investigation", "clarification_marker"].includes(mode)
           ? "investigation_plan"
           : mode === "clarification_planning"
             ? "implementation_plan"
@@ -933,9 +943,14 @@ export async function runActionsTests({
     );
     if (issue !== 46) {
       upstream(
-        `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 ? "reporter" : "outsider"}`,
+        `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 ? "reporter" : "outsider"}${issue === 47 ? "&body=UNADMITTED_CLARIFICATION_REPLY_OUTSIDER" : ""}`,
         "POST",
       );
+      if (issue === 47)
+        upstream(
+          `/answer?issue=${issue}&actor=robot%5Bbot%5D&body=UNADMITTED_CLARIFICATION_REPLY_BOT`,
+          "POST",
+        );
       discardTask(issue, true);
       launch(`${prefix}-unauthorized`, issue, true);
       await finished(`${prefix}-unauthorized`, "waiting", "needs_information");
@@ -1002,8 +1017,26 @@ export async function runActionsTests({
       durable(issue).budget.model_requests >= before.budget.model_requests,
     );
     assert(durable(issue).budget.wait_ms < before.budget.wait_ms + 60000);
-    if (issue === 47)
+    if (issue === 47) {
       assert.equal(resumed.session_recovery, "expired_or_deleted");
+      const evidence = proof(),
+        rejected = evidence.comments
+          .find(([number]) => number === issue)[1]
+          .filter((row) => row.body.includes("UNADMITTED_CLARIFICATION_REPLY")),
+        messages = evidence.conversations.flatMap((item) => item.messages);
+      assert.equal(rejected.length, 2);
+      assert(
+        rejected.every(
+          (row) =>
+            !messages.some((item) => item.id === `github-comment:${row.id}`),
+        ),
+      );
+      assert(
+        evidence.workflow
+          .find((phase) => phase.phase === "investigations")
+          .records.some((record) => record.context_comment_count === 0),
+      );
+    }
     if (nativeBefore && issue !== 47) {
       const continued = proof().conversations.find(
         (conversation) => conversation.id === before.question.conversation_id,

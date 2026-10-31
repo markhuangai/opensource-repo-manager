@@ -395,22 +395,27 @@ const http = createServer(async (req, res) => {
   } else if (actions && url.pathname === "/answer" && req.method === "POST") {
     const number = Number(url.searchParams.get("issue"));
     const login = url.searchParams.get("actor") ?? "reporter";
-    const id = login === "fixture" ? 7 : login === "reporter" ? 8 : 9;
+    const id =
+      login === "fixture"
+        ? 7
+        : login === "reporter"
+          ? 8
+          : login.endsWith("[bot]")
+            ? 10
+            : 9;
     remote.state.permissions.set(login, {
       id,
       permission: login === "fixture" ? "admin" : "read",
     });
-    res.end(
-      JSON.stringify(
-        remote.addComment(
-          number,
-          id,
-          login,
-          url.searchParams.get("body") ??
-            "Confirmed fact: increment(1) must return 2.",
-        ),
-      ),
+    const row = remote.addComment(
+      number,
+      id,
+      login,
+      url.searchParams.get("body") ??
+        "Confirmed fact: increment(1) must return 2.",
     );
+    if (login.endsWith("[bot]")) row.author_type = "Bot";
+    res.end(JSON.stringify(row));
   } else if (
     actions &&
     url.pathname === "/artifact-fault" &&
@@ -558,6 +563,7 @@ const http = createServer(async (req, res) => {
                   .prepare(
                     `SELECT job_id, json_extract(content,'$.stage') AS stage,
                     json_extract(content,'$.failure') AS failure,
+                    json_array_length(content,'$.continuation.request.input.context.comments') AS context_comment_count,
                     json_extract(content,'$.retry_at') AS retry_at FROM ${phase}`,
                   )
                   .all()

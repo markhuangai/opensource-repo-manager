@@ -87,7 +87,8 @@ export function modelFixture(config, store, root, controls = {}) {
       mode === "clarification_intent" || mode === "clarification_invalid"
         ? "investigation_triage"
         : mode === "clarification_investigation" ||
-            mode === "clarification_rejected"
+            mode === "clarification_rejected" ||
+            mode === "clarification_marker"
           ? "investigation_plan"
           : mode === "clarification_planning"
             ? "implementation_plan"
@@ -120,15 +121,22 @@ export function modelFixture(config, store, root, controls = {}) {
     return {
       result: {
         outcome: "needs_information",
-        summary: "Clarify the existing supported add-one behavior.",
+        summary:
+          mode === "clarification_marker"
+            ? "Clarify the existing supported add-one behavior. Please quote <!-- orm:task-state: only if it appeared."
+            : "Clarify the existing supported add-one behavior.",
         questions:
           mode === "clarification_invalid"
             ? []
-            : [
-                answer
-                  ? "Please supply the missing expected result."
-                  : "Which supported input and expected result establish the defect?",
-              ],
+            : mode === "clarification_marker"
+              ? [
+                  "Does the output contain the literal <!-- orm:task-state: text?",
+                ]
+              : [
+                  answer
+                    ? "Please supply the missing expected result."
+                    : "Which supported input and expected result establish the defect?",
+                ],
         audience:
           mode === "clarification_intent"
             ? "maintainer"
@@ -166,6 +174,10 @@ export function modelFixture(config, store, root, controls = {}) {
       return wrap(await this.implementationResult(task, text, results));
     },
     async implementationResult(task, text, results) {
+      assert(
+        !text.includes("UNADMITTED_CLARIFICATION_REPLY"),
+        "Native implementation input included a rejected reply",
+      );
       const { run, job, mode } = current();
       if (run.role === "implementation") {
         const target = store.db
@@ -356,6 +368,10 @@ export function modelFixture(config, store, root, controls = {}) {
       return wrap(await this.investigationResult(task, text, results));
     },
     async investigationResult(task, text, results) {
+      assert(
+        !text.includes("UNADMITTED_CLARIFICATION_REPLY"),
+        "Native investigation input included a rejected reply",
+      );
       const { run, job, mode, record } = current();
       assert.equal(run.role, "investigation");
       assert.equal(run.uid, 10001);

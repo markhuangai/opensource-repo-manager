@@ -347,6 +347,8 @@ export class ActionsRepository {
         if (job && !this.store.job(state.issue.number)) {
           const input = JSON.stringify({
             ...context,
+            // Refreshed comments lack the frozen boundary; replies enter through admission.
+            comments: [],
             source: job.source,
             updated_at: undefined,
           });

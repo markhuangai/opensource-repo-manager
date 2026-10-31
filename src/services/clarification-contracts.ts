@@ -39,11 +39,13 @@ export function renderQuestion(
   marker: string,
 ) {
   return [
-    question.summary,
+    question.summary.replaceAll("<!--", "&lt;!--"),
     question.audience === "maintainer"
       ? "A repository maintainer must clarify the intended existing behavior or scope."
       : "The issue reporter or a repository maintainer may supply these facts.",
-    ...question.questions.map((item) => `- ${item}`),
+    ...question.questions.map(
+      (item) => `- ${item.replaceAll("<!--", "&lt;!--")}`,
+    ),
     "Reply in a new issue comment. Answers cannot authorize features or expand the frozen bug objective.",
     marker,
   ].join("\n\n");

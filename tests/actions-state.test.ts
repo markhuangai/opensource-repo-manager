@@ -15,7 +15,12 @@ import { ActionsState } from "../src/actions/persistence.ts";
 import { ActionsArtifacts } from "../src/actions/artifacts.ts";
 import { fileDigest } from "../src/actions/bundle.ts";
 import type { ArtifactTransport } from "../src/adapters/github/artifacts.ts";
-import { StateCodec, stateBytes, commentBytes } from "../src/actions/state.ts";
+import {
+  StateCodec,
+  stateBytes,
+  commentBytes,
+  stateMarker,
+} from "../src/actions/state.ts";
 import { Store } from "../src/repositories/store.ts";
 import { ActionsRepository } from "../src/repositories/actions.ts";
 import { PublicationRepository } from "../src/repositories/publication.ts";
@@ -998,6 +1003,79 @@ describe("authenticated Actions task authority", () => {
 });
 
 describe("authenticated question replies", () => {
+  it("quarantines refreshed comments when reconstructing a task and admits only the maintainer answer", async () => {
+    const f = await questionFixture("maintainer");
+    const before = f.read();
+    before.state.question = f.question;
+    before.state.outcome = "waiting";
+    before.state.reason = "needs_information";
+    before.state.generation++;
+    await f.writer.comment(
+      1,
+      before.state.comment_id,
+      f.codec.encode(before.state, before.narrative),
+      signal(),
+    );
+    f.remote.state.permissions.set("outsider", { id: 9, permission: "read" });
+    f.reply(200, 9, "outsider", "UNADMITTED_OUTSIDER");
+    f.reply(201, 8, "reporter", "UNADMITTED_INTENT");
+    f.reply(202, 10, "robot[bot]", "UNADMITTED_BOT", "Bot");
+    f.reply(203, 7, "fixture", "Confirmed existing maintainer intent");
+    const fresh = f.database(),
+      restored = await f.open(fresh);
+    expect(restored.result()).toBeUndefined();
+    expect(JSON.parse(fresh.job(1)!.input_json).comments).toEqual([]);
+    const messages = restored.replies(f.question.id);
+    expect(messages.map((message) => message.id)).toEqual([
+      "github-comment:203",
+    ]);
+    expect(JSON.parse(messages[0].content).body).toBe(
+      "Confirmed existing maintainer intent",
+    );
+    const context = await f.reader.issue(
+      1,
+      await f.reader.repository(signal()),
+      signal(),
+    );
+    restored.prepareIssue(context);
+    expect(context.comments).toEqual([]);
+    fresh.applyIssue(fresh.refreshIssue(1), context, f.snapshot);
+    expect(fresh.job(1)!.input_digest).toBe(before.state.job!.input_digest);
+    expect(fresh.job(1)!.revision).toBe(before.state.job!.revision);
+    expect(restored.identifiers().task_id).toBe(before.state.task_id);
+    expect(f.read().state.budget).toEqual(before.state.budget);
+    expect(fresh.runs()).toEqual([]);
+  });
+
+  it("keeps rendered question text outside the canonical state namespace on a fresh open", async () => {
+    const f = await setup();
+    await f.open(f.store);
+    const before = f.read(),
+      marker = `<!-- orm:${before.state.publication_instance}:${before.state.job!.id}:${"b".repeat(64)} -->`,
+      body = renderQuestion(
+        {
+          summary: `Which record contains ${stateMarker}?`,
+          questions: [`What value follows ${stateMarker}?`],
+          audience: "maintainer",
+        },
+        marker,
+      );
+    expect(body).not.toContain(stateMarker);
+    expect(body).toContain("&lt;!-- orm:task-state:");
+    expect(body.endsWith(marker)).toBe(true);
+    await f.writer.comment(1, null, body, signal());
+    const restored = await f.open(f.database());
+    expect(restored.identifiers().state_comment_id).toBe(
+      before.state.comment_id,
+    );
+    expect(restored.identifiers().task_id).toBe(before.state.task_id);
+    expect(
+      f.remote.state.comments
+        .get(1)!
+        .filter((comment) => comment.body.includes(stateMarker)),
+    ).toHaveLength(1);
+  });
+
   it("reads an authenticated legacy question without adding fields or resetting authority", async () => {
     const f = await setup();
     await f.open(f.store);
