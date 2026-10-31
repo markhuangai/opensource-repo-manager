@@ -8,6 +8,7 @@ import { ImplementationRepository } from "./implementation.ts";
 import { PrMonitorRepository } from "./pr-monitor.ts";
 import {
   StateError,
+  taskStateSchema,
   type DurablePublication,
   type StateComment,
   type TaskState,
@@ -18,6 +19,7 @@ import type {
   PublicationReceipt,
 } from "../services/publication/contracts.ts";
 import { taskOutcome } from "../actions/task.ts";
+import { currentContinuation } from "../services/clarification.ts";
 
 export function issueDigest(context: IssueContext) {
   return digest({ id: context.id, title: context.title, body: context.body });
@@ -202,13 +204,35 @@ export class ActionsRepository {
         publications.reviewed(operation.review_id).approved
       ) {
         state.findings = structuredClone(investigation.result);
-        state.question =
-          investigation.result.outcome === "needs_information"
-            ? {
-                questions: [...investigation.result.questions],
-                input_digest: job.input_digest,
-              }
-            : null;
+        if (
+          !currentContinuation(this.store, job.id) &&
+          (!state.question || !("version" in state.question))
+        )
+          state.question =
+            investigation.result.outcome === "needs_information"
+              ? {
+                  questions: [...investigation.result.questions],
+                  input_digest: job.input_digest,
+                }
+              : null;
+      }
+    }
+    const continuation = currentContinuation(this.store, job.id);
+    if (continuation) {
+      state.question =
+        continuation.question && structuredClone(continuation.question);
+      if (state.question && "version" in state.question) {
+        const question = state.question;
+        const step = publications
+          .operation(question.publication_id)
+          ?.steps.find((step) => step.kind === "question_comment");
+        if (step?.object_id) question.comment_id = step.object_id;
+        if (
+          previous.question &&
+          "version" in previous.question &&
+          previous.question.id === question.id
+        )
+          question.answers = structuredClone(previous.question.answers);
       }
     }
     const current =
@@ -272,17 +296,19 @@ export class ActionsRepository {
         before_digest: digest(step.before),
         after_digest: digest(step.after),
         object_id:
-          step.kind === "comment"
-            ? (receipt.target.comment?.id ?? null)
-            : step.kind === "pull"
-              ? (receipt.target.pull?.id ?? null)
-              : null,
+          step.kind === "question_comment"
+            ? (step.object_id ?? null)
+            : step.kind === "comment"
+              ? (receipt.target.comment?.id ?? null)
+              : step.kind === "pull"
+                ? (receipt.target.pull?.id ?? null)
+                : null,
         thread_id: payload.feedback?.thread ?? null,
         title_digest: step.kind === "pull" ? digest(payload.pull!.title) : null,
         body_digest:
           step.kind === "pull"
             ? digest(payload.pull!.body)
-            : step.kind === "comment"
+            : step.kind === "comment" || step.kind === "question_comment"
               ? digest(payload.comment!)
               : ["feedback_reply", "thread_resolution"].includes(step.kind)
                 ? digest(payload.feedback!.body)
@@ -321,6 +347,8 @@ export class ActionsRepository {
         if (job && !this.store.job(state.issue.number)) {
           const input = JSON.stringify({
             ...context,
+            // Refreshed comments lack the frozen boundary; replies enter through admission.
+            comments: [],
             source: job.source,
             updated_at: undefined,
           });
@@ -345,6 +373,12 @@ export class ActionsRepository {
           const localJob = this.store.job(state.issue.number);
           if (localJob?.id !== job.id || localJob.issue_id !== state.issue.id)
             throw new StateError("state_local_conflict");
+          if (
+            !taskStateSchema.shape.job
+              .unwrap()
+              .shape.phase.safeParse(localJob.phase).success
+          )
+            throw new StateError("state_invalid");
           this.store.db
             .prepare("UPDATE jobs SET budget_json=? WHERE id=?")
             .run(JSON.stringify(state.budget), job.id);
@@ -401,6 +435,11 @@ export class ActionsRepository {
               operation.target = target;
               for (const [index, step] of operation.steps.entries()) {
                 step.state = state.pending.steps[index].state;
+                if (
+                  step.kind === "question_comment" &&
+                  state.pending.steps[index].object_id
+                )
+                  step.object_id = state.pending.steps[index].object_id!;
                 if (step.state === "confirmed")
                   publications.finishStep(operation, step.kind);
               }
@@ -415,6 +454,19 @@ export class ActionsRepository {
             null,
             null,
           );
+          if (
+            state.question &&
+            "version" in state.question &&
+            state.question.comment_id
+          )
+            this.own(
+              "issue_comment",
+              state.question.comment_id,
+              job.id,
+              job.revision,
+              null,
+              null,
+            );
           if (state.pull)
             this.own(
               "pull_request",

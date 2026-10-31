@@ -7,6 +7,7 @@ import type {
   Investigation,
   InvestigationEvidence,
 } from "../services/investigation/contracts.ts";
+import { bugEvidenceSchema } from "../services/investigation/contracts.ts";
 
 export class InvestigationRepository {
   private readonly store: Store;
@@ -154,6 +155,11 @@ export class InvestigationRepository {
           { status: string } | undefined;
         if (publication?.status !== "confirmed" || !record.result)
           throw new RuntimeError("investigation_publication_unconfirmed");
+        if (
+          record.result.outcome === "maintenance_candidate" &&
+          !bugEvidenceSchema.safeParse(record.result.bug).success
+        )
+          throw new RuntimeError("investigation_evidence_invalid");
         record.stage =
           record.result.outcome === "blocked" ? "blocked" : "completed";
         record.retry_stage = null;

@@ -1,5 +1,6 @@
 import { Octokit } from "@octokit/rest";
 import { z } from "zod";
+import type { Discussion } from "../../services/clarification-contracts.ts";
 import {
   prReview,
   prComment,
@@ -25,6 +26,11 @@ import {
 } from "../../domain/jobs.ts";
 
 export interface GitHubReader {
+  discussion(number: number, signal: AbortSignal): Promise<Discussion>;
+  maintainer(
+    actor: { id: number; login: string },
+    signal: AbortSignal,
+  ): Promise<boolean>;
   repository(signal: AbortSignal): Promise<RepositoryIdentity>;
   issuePage(
     page: number,
@@ -171,6 +177,60 @@ export class OctokitReader implements GitHubReader {
     return repositoryIdentity.parse(
       await this.read("GET /repos/{owner}/{repo}", {}, signal),
     );
+  }
+
+  async discussion(number: number, signal: AbortSignal): Promise<Discussion> {
+    const actor = z.object({
+      id: githubId,
+      login: z.string(),
+      type: z.string(),
+    });
+    const issue = z
+      .object({
+        id: githubId,
+        user: actor.nullable(),
+        pull_request: z.unknown().optional(),
+      })
+      .parse(
+        await this.read(
+          "GET /repos/{owner}/{repo}/issues/{issue_number}",
+          { issue_number: number },
+          signal,
+        ),
+      );
+    if (issue.pull_request) throw new IntakeError("issue_is_pull_request");
+    const comments = await this.pages(
+      "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
+      { issue_number: number },
+      z.object({
+        id: githubId,
+        body: z.string().nullable(),
+        user: actor.nullable(),
+      }),
+      signal,
+    );
+    return { reporter: issue.user, comments };
+  }
+
+  async maintainer(actor: { id: number; login: string }, signal: AbortSignal) {
+    const permission = z
+      .object({
+        permission: z.string(),
+        user: z.object({ id: githubId, login: z.string() }),
+      })
+      .parse(
+        await this.read(
+          "GET /repos/{owner}/{repo}/collaborators/{username}/permission",
+          { username: actor.login },
+          signal,
+        ),
+      );
+    if (
+      permission.user.id !== actor.id ||
+      permission.user.login.toLowerCase() !== actor.login.toLowerCase()
+    )
+      throw new IntakeError("github_actor_changed");
+    return ["write", "maintain", "admin"].includes(permission.permission);
   }
 
   async issuePage(page: number, signal: AbortSignal) {

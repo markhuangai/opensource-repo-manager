@@ -7,6 +7,7 @@ import { ImplementationRepository } from "../repositories/implementation.ts";
 import { PrMonitorRepository } from "../repositories/pr-monitor.ts";
 import { PublicationRepository } from "../repositories/publication.ts";
 import type { Application } from "../runtime/application.ts";
+import { currentContinuation } from "../services/clarification.ts";
 
 export type TaskRequest = Readonly<{ issue_number: number }>;
 export type TaskResult = Readonly<{
@@ -21,6 +22,10 @@ export type TaskResult = Readonly<{
     | "failed";
   reason:
     | "needs_information"
+    | "clarification_question_changed"
+    | "clarification_reply_changed"
+    | "clarification_reply_limit"
+    | "clarification_scope_changed"
     | "remote_checks"
     | "monitor_disabled"
     | "retry_scheduled"
@@ -156,6 +161,15 @@ export function taskOutcome(
         : monitor;
   const retry = Math.max(current?.retry_at ?? 0, pending?.retry_at ?? 0);
   if (retry > now) return result("waiting", "retry_scheduled", retry);
+  const question = currentContinuation(store, job.id)?.question;
+  if (
+    question?.comment_id &&
+    !pending &&
+    current?.stage !== "blocked" &&
+    new PublicationRepository(store).operation(question.publication_id)
+      ?.status === "confirmed"
+  )
+    return result("waiting", "needs_information");
   if (job.phase === "investigation" && investigation) {
     if (investigation.stage === "blocked" && !investigation.retry_stage)
       return result("blocked", "investigation_blocked");

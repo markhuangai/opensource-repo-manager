@@ -26,9 +26,13 @@ export async function respond(req, res, fixture) {
       .flatMap((message) =>
         typeof message.content === "string"
           ? [message.content]
-          : message.content
-              .filter((block) => block.type === "text")
-              .map((block) => block.text),
+          : message.content.flatMap((block) =>
+              block.type === "text"
+                ? [block.text]
+                : block.type === "tool_use" && block.name === "StructuredOutput"
+                  ? [JSON.stringify(block.input)]
+                  : [],
+            ),
       )
       .join("\n");
     const scenario =
@@ -98,7 +102,11 @@ export async function respond(req, res, fixture) {
       assert(!toolNames.some((name) => name.startsWith("mcp__")));
       use("StructuredOutput", await fixture.outputReview(text));
     } else if (
-      ["investigation_plan", "investigation_result"].includes(scenario) ||
+      [
+        "investigation_triage",
+        "investigation_plan",
+        "investigation_result",
+      ].includes(scenario) ||
       scenario.startsWith("implementation_")
     ) {
       const call = await fixture[

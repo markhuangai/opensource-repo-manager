@@ -2,8 +2,21 @@ import { z } from "zod";
 import { isContainedReference } from "../../config/files.ts";
 import { commandSchema } from "../bootstrap/contracts.ts";
 import type { SourceMetadata } from "../../domain/jobs.ts";
+import {
+  clarificationRequestSchema,
+  type PhaseContinuation,
+} from "../clarification-contracts.ts";
 
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
+export const bugEvidenceSchema = z.strictObject({
+  expected_behavior: z.string().trim().min(1).max(4096),
+  observed_behavior: z.string().trim().min(1).max(4096),
+  existing_contract: z.string().trim().min(1).max(4096),
+});
+export const investigationTriageSchema = clarificationRequestSchema.extend({
+  outcome: z.enum(["investigate", "manual_feature", "needs_information"]),
+  questions: z.array(z.string().trim().min(1).max(1024)).max(8),
+});
 export const sourceReference = z.strictObject({
   kind: z.literal("source"),
   path: z.string().min(1).max(4096).refine(isContainedReference),
@@ -28,6 +41,7 @@ export const investigationResultSchema = z.strictObject({
   proof: z.enum(["reproduced", "source", "none"]),
   evidence_ids: z.array(hash).max(64),
   questions: z.array(z.string().min(1).max(1024)).max(8),
+  bug: bugEvidenceSchema.nullable().optional(),
 });
 export const investigationStage = z.enum([
   "queued",
@@ -49,6 +63,8 @@ export type InvestigationEvidence = {
   details: unknown;
 };
 export type Investigation = {
+  triage?: z.infer<typeof investigationTriageSchema>;
+  continuation?: PhaseContinuation;
   id: string;
   job_id: number;
   revision: number;

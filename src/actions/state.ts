@@ -12,6 +12,7 @@ import { investigationResultSchema } from "../services/investigation/contracts.t
 import { implementationPlanSchema } from "../services/implementation/contracts.ts";
 import { commandSchema } from "../services/bootstrap/contracts.ts";
 import { artifactReferenceSchema } from "./bundle.ts";
+import { questionSchema } from "../services/clarification-contracts.ts";
 
 const count = z.number().int().nonnegative().safe();
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -51,6 +52,7 @@ const publication = z.strictObject({
     "feedback",
     "notice",
     "change",
+    "question",
   ]),
   actor: z.strictObject({ id: githubId, login: z.string().min(1).max(128) }),
   source: stateSource,
@@ -73,6 +75,7 @@ const publication = z.strictObject({
       z.strictObject({
         kind: z.enum([
           "comment",
+          "question_comment",
           "branch",
           "pull",
           "feedback_reply",
@@ -126,10 +129,13 @@ export const taskStateSchema = z.strictObject({
   scope: durableScope.nullable(),
   scope_digest: hash.nullable(),
   question: z
-    .strictObject({
-      questions: z.array(z.string().min(1).max(1024)).max(8),
-      input_digest: hash,
-    })
+    .union([
+      questionSchema,
+      z.strictObject({
+        questions: z.array(z.string().min(1).max(1024)).max(8),
+        input_digest: hash,
+      }),
+    ])
     .nullable(),
   outcome: z
     .enum([

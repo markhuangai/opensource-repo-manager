@@ -203,6 +203,11 @@ describe("durable investigations", () => {
       record.stage = stage;
       record.result = {
         outcome: "maintenance_candidate",
+        bug: {
+          expected_behavior: "Documented existing behavior",
+          observed_behavior: "Supported behavior fails",
+          existing_contract: "Verified supported source contract",
+        },
         summary: "Defect",
         proof: "source",
         objective: "Fix defect",
@@ -264,6 +269,11 @@ describe("durable investigations", () => {
       record = f.repository.ensure(f.store.job(1)!);
     record.result = {
       outcome: "maintenance_candidate",
+      bug: {
+        expected_behavior: "Documented existing behavior",
+        observed_behavior: "Supported behavior fails",
+        existing_contract: "Verified supported source contract",
+      },
       summary: "Defect",
       proof: "source",
       objective: "Fix defect",

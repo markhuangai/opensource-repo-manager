@@ -70,6 +70,14 @@ async function fixture() {
   ) => {
     investigation.result = {
       outcome,
+      bug:
+        outcome === "maintenance_candidate"
+          ? {
+              expected_behavior: "Documented existing behavior",
+              observed_behavior: "Supported behavior fails",
+              existing_contract: "Verified supported source contract",
+            }
+          : null,
       summary: "Verified defect",
       objective: "Fix the existing behavior",
       proof: "source",
@@ -120,6 +128,15 @@ async function fixture() {
 }
 
 describe("durable maintenance implementation", () => {
+  it("blocks a historical generic candidate without an explicit existing-behavior contract", async () => {
+    const f = await fixture();
+    f.handoff();
+    f.investigation.result!.bug = null;
+    f.investigations.save(f.investigation);
+    expect(() => f.repository.ensure(f.store.job(1)!)).toThrow(
+      "implementation_handoff_invalid",
+    );
+  });
   it("requires the reviewed maintenance handoff and excludes feature outcomes", async () => {
     const f = await fixture();
     expect(() => f.repository.ensure(f.store.job(1)!)).toThrow(

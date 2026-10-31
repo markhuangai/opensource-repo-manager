@@ -1,11 +1,24 @@
 import { z } from "zod";
 import { githubId, sha, type SourceMetadata } from "../../domain/jobs.ts";
 import { investigationStage } from "../investigation/contracts.ts";
+import {
+  questionAudience,
+  questionSchema,
+} from "../clarification-contracts.ts";
 
 export const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const text = z.string().max(65536);
 const job = { job_id: githubId, revision: githubId };
 export const proposalSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    ...job,
+    kind: z.literal("question"),
+    question_id: z.uuid(),
+    phase: questionSchema.shape.phase,
+    summary: z.string().min(1).max(4096),
+    questions: z.array(z.string().min(1).max(1024)).min(1).max(8),
+    audience: questionAudience,
+  }),
   z.strictObject({
     ...job,
     kind: z.literal("investigation"),
@@ -110,7 +123,14 @@ export type PublicationTarget = {
   pull: OwnedPull | null;
 };
 export type MutationStep = {
-  kind: "comment" | "branch" | "pull" | "feedback_reply" | "thread_resolution";
+  kind:
+    | "comment"
+    | "question_comment"
+    | "branch"
+    | "pull"
+    | "feedback_reply"
+    | "thread_resolution";
+  object_id?: number;
   before: unknown;
   after: unknown;
   state: "prepared" | "dispatching" | "confirmed" | "uncertain";

@@ -5,6 +5,7 @@ import type { Store } from "./store.ts";
 import { InvestigationRepository } from "./investigation.ts";
 import { PublicationRepository } from "./publication.ts";
 import type { Implementation } from "../services/implementation/contracts.ts";
+import { bugEvidenceSchema } from "../services/investigation/contracts.ts";
 
 export class ImplementationRepository {
   private readonly store: Store;
@@ -42,6 +43,7 @@ export class ImplementationRepository {
       job.phase !== "implementation" ||
       investigation?.stage !== "completed" ||
       investigation.result?.outcome !== "maintenance_candidate" ||
+      !bugEvidenceSchema.safeParse(investigation.result?.bug).success ||
       publication?.status !== "confirmed"
     )
       throw new RuntimeError("implementation_handoff_invalid");
@@ -107,6 +109,13 @@ export class ImplementationRepository {
       throw new RuntimeError("revision_stale");
     if (record.scope && digest(record.scope) !== record.scope_digest)
       throw new RuntimeError("implementation_scope_changed");
+    if (
+      !bugEvidenceSchema.safeParse(
+        new InvestigationRepository(this.store).get(record.investigation_id)
+          .result?.bug,
+      ).success
+    )
+      throw new RuntimeError("implementation_handoff_invalid");
     this.store.assertPublishedScope(job.id);
     if (this.store.hasUncertainMcpWrite(job.id))
       throw new RuntimeError("mcp_write_uncertain");

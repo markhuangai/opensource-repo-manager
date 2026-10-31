@@ -66,6 +66,84 @@ export function modelFixture(config, store, root, controls = {}) {
       .get(job.id, job.revision);
     return { run, job, mode, record: row && JSON.parse(row.content) };
   };
+  function envelope(task) {
+    const { run, job } = current();
+    const table =
+      job.phase === "investigation" ? "investigations" : "implementations";
+    const row = store.db
+      .prepare(`SELECT content FROM ${table} WHERE job_id=? AND revision=?`)
+      .get(job.id, job.revision);
+    const record = row && JSON.parse(row.content);
+    const wrapped =
+      run.role !== "audit" &&
+      run.role !== "output_review" &&
+      record?.continuation?.request.input?.task === task &&
+      record.continuation.request.output_schema?.properties?.response;
+    return (call) =>
+      call?.result && wrapped ? { result: { response: call.result } } : call;
+  }
+  function clarification(record, task, mode, text) {
+    const phase =
+      mode === "clarification_intent" || mode === "clarification_invalid"
+        ? "investigation_triage"
+        : mode === "clarification_investigation" ||
+            mode === "clarification_rejected" ||
+            mode === "clarification_marker"
+          ? "investigation_plan"
+          : mode === "clarification_planning"
+            ? "implementation_plan"
+            : mode === "clarification_coding" ||
+                (mode === "monitor_clarification" && record?.feedback?.length)
+              ? "implementation_change"
+              : null;
+    if (phase !== task) return;
+    const messages = [
+      ...(record?.continuation?.request.input?.clarification_answers ?? []),
+      ...(record?.continuation?.messages ?? []),
+    ];
+    const answer = messages.length
+      ? JSON.parse(messages.at(-1).content).body
+      : null;
+    if (answer && answer !== "insufficient") {
+      assert(
+        text.includes(answer),
+        "Native history omitted the admitted answer",
+      );
+      if (
+        record.continuation.question?.conversation_id === record.continuation.id
+      )
+        assert(
+          text.includes("Clarify the existing supported add-one behavior."),
+          "Native history omitted the original question",
+        );
+      return;
+    }
+    return {
+      result: {
+        outcome: "needs_information",
+        summary:
+          mode === "clarification_marker"
+            ? "Clarify the existing supported add-one behavior. Please quote <!-- orm:task-state: only if it appeared."
+            : "Clarify the existing supported add-one behavior.",
+        questions:
+          mode === "clarification_invalid"
+            ? []
+            : mode === "clarification_marker"
+              ? [
+                  "Does the output contain the literal <!-- orm:task-state: text?",
+                ]
+              : [
+                  answer
+                    ? "Please supply the missing expected result."
+                    : "Which supported input and expected result establish the defect?",
+                ],
+        audience:
+          mode === "clarification_intent"
+            ? "maintainer"
+            : "reporter_or_maintainer",
+      },
+    };
+  }
   return {
     config,
     store,
@@ -92,6 +170,14 @@ export function modelFixture(config, store, root, controls = {}) {
       };
     },
     async implementation(task, text, results) {
+      const wrap = envelope(task);
+      return wrap(await this.implementationResult(task, text, results));
+    },
+    async implementationResult(task, text, results) {
+      assert(
+        !text.includes("UNADMITTED_CLARIFICATION_REPLY"),
+        "Native implementation input included a rejected reply",
+      );
       const { run, job, mode } = current();
       if (run.role === "implementation") {
         const target = store.db
@@ -122,6 +208,52 @@ export function modelFixture(config, store, root, controls = {}) {
         results,
       });
       if (override) return override;
+      const answers = [
+        ...(record?.continuation?.request.input?.clarification_answers ?? []),
+        ...(record?.continuation?.messages ?? []),
+      ];
+      if (
+        task === "implementation_change" &&
+        answers.some((message) =>
+          JSON.parse(message.content).body.includes("SCOPE_EXPANSION"),
+        )
+      ) {
+        const feature = await readFile(
+          join(root, "runs", run.id, "workspace", "feature.mjs"),
+          "utf8",
+        ).catch((error) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (!feature)
+          return {
+            command: maintenanceCommand(1, {
+              "feature.mjs": "export const unrelatedFeature = true;\n",
+            }),
+          };
+      }
+      const question = clarification(record, task, mode, text);
+      if (question) {
+        if (task === "implementation_change" && !results.length)
+          return { command: maintenanceCommand() };
+        return question;
+      }
+      if (
+        (mode === "clarification_coding" || mode === "monitor_clarification") &&
+        task === "implementation_change" &&
+        record?.continuation?.messages.length &&
+        record.continuation.question?.conversation_id === record.continuation.id
+      ) {
+        assert(
+          (
+            await readFile(
+              join(root, "runs", run.id, "workspace", "bug.mjs"),
+              "utf8",
+            )
+          ).includes("+ 1"),
+          "Partial coding workspace was not restored",
+        );
+      }
       if (task === "implementation_review_feedback") {
         const input = taskInput(text);
         const source = await readFile(
@@ -215,12 +347,14 @@ export function modelFixture(config, store, root, controls = {}) {
       };
     },
     async outputReview(text) {
-      const { run } = current();
+      const { run, mode } = current();
       assert.equal(run.role, "output_review");
       assert.equal(run.uid, 10003);
       const binding = /"binding":"([a-f0-9]{64})"/.exec(text)[1];
       await controls.review?.(text);
       const rejected =
+        (mode === "clarification_rejected" &&
+          text.includes('"kind":"question"')) ||
         controls.rejectReview ||
         (controls.rejectWrite && text.includes('"type":"mcp_write"'));
       return {
@@ -230,11 +364,36 @@ export function modelFixture(config, store, root, controls = {}) {
       };
     },
     async investigation(task, text, results) {
+      const wrap = envelope(task);
+      return wrap(await this.investigationResult(task, text, results));
+    },
+    async investigationResult(task, text, results) {
+      assert(
+        !text.includes("UNADMITTED_CLARIFICATION_REPLY"),
+        "Native investigation input included a rejected reply",
+      );
       const { run, job, mode, record } = current();
       assert.equal(run.role, "investigation");
       assert.equal(run.uid, 10001);
       assert(text.includes("Features remain manual"));
       await controls.investigate?.(task, { run, job, mode, record, results });
+      const question = clarification(record, task, mode, text);
+      if (question) return question;
+      if (task === "investigation_triage")
+        return {
+          result: {
+            outcome:
+              mode === "manual_feature" || mode === "disguised_feature"
+                ? "manual_feature"
+                : "investigate",
+            summary:
+              mode === "manual_feature" || mode === "disguised_feature"
+                ? "The requested behavior is a feature, not an existing supported contract."
+                : "Check the documented add-one behavior against the supplied report.",
+            questions: [],
+            audience: "maintainer",
+          },
+        };
       if (task === "investigation_plan") {
         if (mode.startsWith("mcp")) {
           const read = store.db
@@ -322,6 +481,15 @@ export function modelFixture(config, store, root, controls = {}) {
           outcome === "needs_information"
             ? ["Which input and expected result demonstrate the issue?"]
             : [],
+        bug:
+          outcome === "maintenance_candidate"
+            ? {
+                expected_behavior: "increment adds one",
+                observed_behavior: "increment adds two",
+                existing_contract:
+                  "README.md specifies adding one on the supported entrypoint.",
+              }
+            : null,
       };
       return { result };
     },

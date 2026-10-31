@@ -13,6 +13,7 @@ import { respond as claude } from "/agent-fixtures/claude.mjs";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
 import { sourceFiles, modelFixture } from "./protocol.mjs";
 import { artifactFixture } from "/actions-fixtures/artifact-fixture.mjs";
+import { StateCodec } from "/opt/orm/app/dist/actions/state.js";
 
 const actions = process.argv.includes("--actions");
 let selectedIssue = 1;
@@ -24,6 +25,9 @@ const artifacts = actions ? artifactFixture(config) : undefined;
 let sessionPhase = "seed";
 let loseReferenceResponse = false,
   lostReferenceResponse = false;
+let earlyQuestionReply = false;
+let questionBoundary;
+let releaseQuestionBoundary;
 const remote = await createPublicationFixture("/fixture/git");
 mkdirSync("/fixture/notifications", { recursive: true });
 const notificationServer = await notificationFixture("/fixture/notifications", {
@@ -73,6 +77,68 @@ if (actions) {
       updated_at: "2026-10-21T00:00:00Z",
     });
   remote.state.afterMutation = (kind) => {
+    if (
+      questionBoundary?.issue === selectedIssue &&
+      kind === "comment" &&
+      !questionBoundary.armed
+    ) {
+      const rows = remote.state.comments.get(selectedIssue) ?? [];
+      const canonical = rows.find((row) =>
+        row.body.includes("<!-- orm:task-state:"),
+      );
+      const encoded = canonical?.body.match(
+        /<!-- orm:task-state:v1:([A-Za-z0-9_-]+):/,
+      )?.[1];
+      const state =
+        encoded && JSON.parse(Buffer.from(encoded, "base64url").toString());
+      if (
+        questionBoundary.stage === "checkpoint" &&
+        state?.pending?.kind === "question" &&
+        state.pending.status === "reviewed"
+      )
+        questionBoundary.armed = true;
+      if (
+        questionBoundary.stage === "dispatch" &&
+        rows.some((row) => row.body.includes("Reply in a new issue comment."))
+      ) {
+        questionBoundary.armed = true;
+        remote.addComment(
+          selectedIssue,
+          8,
+          "reporter",
+          "Confirmed fact: increment(1) must return 2.",
+        );
+        remote.state.dropAfter = "comment";
+        remote.state.beforeRequest = async (method, path) => {
+          if (
+            method === "GET" &&
+            path === `/repos/owner/repo/issues/${selectedIssue}/comments`
+          ) {
+            questionBoundary.held = true;
+            await new Promise((resolve) => {
+              releaseQuestionBoundary = resolve;
+            });
+          }
+        };
+      }
+    }
+    if (
+      earlyQuestionReply &&
+      kind === "comment" &&
+      remote.state.comments
+        .get(selectedIssue)
+        ?.at(-1)
+        ?.body.includes("Reply in a new issue comment.")
+    ) {
+      earlyQuestionReply = false;
+      remote.addComment(
+        selectedIssue,
+        8,
+        "reporter",
+        "Confirmed fact: increment(1) must return 2.",
+      );
+      remote.state.dropAfter = "comment";
+    }
     if (selectedIssue === 30 && kind === "comment" && loseReferenceResponse) {
       const row = remote.state.comments
         .get(30)
@@ -219,6 +285,17 @@ const tls = httpsServer(
     cert: readFileSync("/fixture-ca.pem"),
   },
   async (req, res) => {
+    if (
+      questionBoundary?.stage === "checkpoint" &&
+      questionBoundary.armed &&
+      req.url.endsWith("/CreateArtifact")
+    ) {
+      questionBoundary.held = true;
+      await new Promise((resolve) => {
+        releaseQuestionBoundary = resolve;
+      });
+      if (res.destroyed) return;
+    }
     if (artifacts && (await artifacts.handle(req, res))) return;
     const upstream = request(
       remote.url + req.url,
@@ -249,6 +326,96 @@ const http = createServer(async (req, res) => {
     held = false;
     fixture = makeFixture();
     res.end("selected");
+  } else if (
+    actions &&
+    url.pathname === "/clarification-issue" &&
+    req.method === "POST"
+  ) {
+    const number = Number(url.searchParams.get("issue"));
+    remote.state.issues.set(number, {
+      id: 1000 + number,
+      number,
+      title: url.searchParams.get("mode"),
+      body: "increment returns the wrong value; bug label alone is not proof",
+      updated_at: new Date().toISOString(),
+    });
+    earlyQuestionReply = url.searchParams.get("early") === "true";
+    questionBoundary = url.searchParams.has("boundary")
+      ? {
+          issue: number,
+          stage: url.searchParams.get("boundary"),
+          armed: false,
+          held: false,
+        }
+      : undefined;
+    res.end("created");
+  } else if (
+    actions &&
+    url.pathname === "/release-question-boundary" &&
+    req.method === "POST"
+  ) {
+    remote.state.beforeRequest = undefined;
+    questionBoundary = undefined;
+    releaseQuestionBoundary?.();
+    res.end("released");
+  } else if (
+    actions &&
+    url.pathname === "/legacy-question" &&
+    req.method === "POST"
+  ) {
+    const number = Number(url.searchParams.get("issue"));
+    const row = remote.state.comments
+      .get(number)
+      .find((row) => row.body.includes("<!-- orm:task-state:"));
+    const codec = new StateCodec(config.session_key);
+    const decoded = codec.decode(row.body, {
+      repository_id: 42,
+      issue_id: 1000 + number,
+      comment_id: row.id,
+      author_id: remote.state.actor.id,
+    });
+    const state = decoded.state;
+    state.question = {
+      questions: [...state.question.questions],
+      input_digest: state.job.input_digest,
+    };
+    state.findings = {
+      outcome: "needs_information",
+      summary: "Existing legacy question awaiting a factual answer.",
+      objective: "",
+      proof: "none",
+      evidence_ids: [],
+      questions: state.question.questions,
+    };
+    state.pending = null;
+    state.session_artifact = null;
+    state.generation++;
+    row.body = codec.encode(state, decoded.narrative);
+    res.end("legacy signed state prepared");
+  } else if (actions && url.pathname === "/answer" && req.method === "POST") {
+    const number = Number(url.searchParams.get("issue"));
+    const login = url.searchParams.get("actor") ?? "reporter";
+    const id =
+      login === "fixture"
+        ? 7
+        : login === "reporter"
+          ? 8
+          : login.endsWith("[bot]")
+            ? 10
+            : 9;
+    remote.state.permissions.set(login, {
+      id,
+      permission: login === "fixture" ? "admin" : "read",
+    });
+    const row = remote.addComment(
+      number,
+      id,
+      login,
+      url.searchParams.get("body") ??
+        "Confirmed fact: increment(1) must return 2.",
+    );
+    if (login.endsWith("[bot]")) row.author_type = "Bot";
+    res.end(JSON.stringify(row));
   } else if (
     actions &&
     url.pathname === "/artifact-fault" &&
@@ -355,6 +522,21 @@ const http = createServer(async (req, res) => {
         artifacts: artifacts?.proof(),
         lost_reference_response: lostReferenceResponse,
         held,
+        question_boundary: questionBoundary,
+        conversations: database
+          ? store.db
+              .prepare("SELECT content FROM agent_conversations")
+              .all()
+              .map((row) => JSON.parse(row.content))
+              .map((conversation) => ({
+                id: conversation.id,
+                request_digest: conversation.request_digest,
+                messages: conversation.messages,
+                native_id: store
+                  .runs()
+                  .find((run) => run.id === conversation.run_id)?.session_id,
+              }))
+          : [],
         github_requests: remote.state.requests,
         runs: database
           ? store.runs().map(({ role, uid, status, finished_at }) => ({
@@ -381,6 +563,7 @@ const http = createServer(async (req, res) => {
                   .prepare(
                     `SELECT job_id, json_extract(content,'$.stage') AS stage,
                     json_extract(content,'$.failure') AS failure,
+                    json_array_length(content,'$.continuation.request.input.context.comments') AS context_comment_count,
                     json_extract(content,'$.retry_at') AS retry_at FROM ${phase}`,
                   )
                   .all()
@@ -434,7 +617,7 @@ const http = createServer(async (req, res) => {
           )
         : remote.state.pulls[0],
       head = remote.head(pull.branch);
-    if (req.url === "/review")
+    if (url.pathname === "/review")
       remote.state.threads.set(pull.number, [makeThread(9001, head)]);
     remote.state.checks.set(head, [makeCheck(head)]);
     remote.state.reviews.set(
