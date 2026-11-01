@@ -37,9 +37,19 @@ export const proposalSchema = z.discriminatedUnion("kind", [
     kind: z.literal("pr_stage"),
     stage: z.enum(["waiting", "blocked", "ready"]),
     expected_head: sha,
-    previous_operation: hash,
+    previous_operation: hash.nullable(),
     readiness_id: hash.nullable(),
     generation: githubId,
+  }),
+  z.strictObject({
+    ...job,
+    kind: z.literal("pr_notification"),
+    stage: z.literal("ready"),
+    expected_head: sha,
+    previous_operation: hash.nullable(),
+    readiness_id: hash,
+    generation: githubId,
+    event_id: hash,
   }),
   z.strictObject({
     ...job,
@@ -59,6 +69,7 @@ export const proposalSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     ...job,
     kind: z.literal("change"),
+    recovery_of: hash.optional(),
     artifact_digest: hash,
     expected_head: sha.nullable(),
     evidence_ids: z.array(hash).min(2).max(64),
@@ -126,6 +137,7 @@ export type MutationStep = {
   kind:
     | "comment"
     | "question_comment"
+    | "notification_comment"
     | "branch"
     | "pull"
     | "feedback_reply"
@@ -137,6 +149,7 @@ export type MutationStep = {
   confirmed_at?: string;
 };
 export type PublicationReceipt = {
+  recovered?: true;
   id: string;
   job_id: number;
   revision: number;

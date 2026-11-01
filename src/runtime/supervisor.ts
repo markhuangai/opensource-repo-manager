@@ -461,8 +461,15 @@ export class Supervisor implements AgentRunner {
     session: BootstrapLease,
     request: AgentRunRequest,
     operation: (workspace: PreparedWorkspace, runId: string) => Promise<T>,
+    publishedHead?: string,
   ): Promise<T> {
     this.validateBootstrapLease(session, request);
+    if (
+      publishedHead &&
+      (request.role !== "audit" ||
+        publishedHead !== this.store.durability?.publishedHead())
+    )
+      throw new RuntimeError("publication_head_changed");
     const snapshot = this.store.snapshot(request.snapshot_digest),
       id = randomUUID(),
       user = roleUsers[request.role],
@@ -525,6 +532,7 @@ export class Supervisor implements AgentRunner {
         snapshot.settings.github.repository,
         limits,
         signal,
+        publishedHead,
       );
       if (request.workspace.artifact) {
         const artifact = this.store.artifact(

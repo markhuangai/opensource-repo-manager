@@ -27,6 +27,8 @@ let loseReferenceResponse = false,
   lostReferenceResponse = false;
 let earlyQuestionReply = false;
 let questionBoundary;
+let publicationFault;
+const publicationFaults = [];
 let releaseQuestionBoundary;
 const remote = await createPublicationFixture("/fixture/git");
 mkdirSync("/fixture/notifications", { recursive: true });
@@ -155,6 +157,20 @@ if (actions) {
         lostReferenceResponse = true;
         remote.state.dropAfter = "comment";
       }
+    }
+    const notice =
+      kind === "comment" && remote.state.comments.get(selectedIssue)?.at(-1);
+    if (
+      publicationFault === kind ||
+      (publicationFault === "notification" &&
+        notice &&
+        !notice.body.includes("<!-- orm:task-state:") &&
+        notice.body.includes("Automation clean; awaiting human review."))
+    ) {
+      publicationFaults.push({ issue: selectedIssue, kind: publicationFault });
+      publicationFault = undefined;
+      remote.state.dropAfter = kind;
+      remote.state.rejectBefore = "comment";
     }
     if (selectedIssue === 10 && dataRoot === "/data" && kind === "pull") {
       remote.state.dropAfter = "pull";
@@ -326,6 +342,47 @@ const http = createServer(async (req, res) => {
     held = false;
     fixture = makeFixture();
     res.end("selected");
+  } else if (
+    actions &&
+    url.pathname === "/publication-fault" &&
+    req.method === "POST"
+  ) {
+    publicationFault = url.searchParams.get("kind");
+    assert(
+      ["notification", "thread_reply", "branch", "pull"].includes(
+        publicationFault,
+      ),
+    );
+    res.end("armed");
+  } else if (
+    actions &&
+    url.pathname === "/age-repair-question" &&
+    req.method === "POST"
+  ) {
+    const number = Number(url.searchParams.get("issue"));
+    const row = remote.state.comments
+      .get(number)
+      .find((item) => item.body.includes("<!-- orm:task-state:"));
+    const codec = new StateCodec(config.session_key);
+    const saved = codec.decode(row.body, {
+      repository_id: 42,
+      issue_id: 1000 + number,
+      comment_id: row.id,
+      author_id: remote.state.actor.id,
+    });
+    assert(saved.state.pr.repair_reserved);
+    assert.equal(saved.state.wait_accounted_at, null);
+    saved.state.budget.repair_cycles = saved.state.limits.repair_cycles;
+    saved.state.generation++;
+    const old = new Date(Date.now() - 15 * 86400000).toISOString();
+    const question = remote.state.comments
+      .get(number)
+      .find((item) => item.id === saved.state.question.comment_id);
+    question.created_at = old;
+    question.updated_at = old;
+    artifacts.fault(saved.state.session_artifact.artifact_id, "expired");
+    row.body = codec.encode(saved.state, saved.narrative);
+    res.end("aged fifteen days at the final reserved repair cycle");
   } else if (
     actions &&
     url.pathname === "/clarification-issue" &&
@@ -523,6 +580,7 @@ const http = createServer(async (req, res) => {
         lost_reference_response: lostReferenceResponse,
         held,
         question_boundary: questionBoundary,
+        publication_faults: publicationFaults,
         conversations: database
           ? store.db
               .prepare("SELECT content FROM agent_conversations")
@@ -618,7 +676,9 @@ const http = createServer(async (req, res) => {
         : remote.state.pulls[0],
       head = remote.head(pull.branch);
     if (url.pathname === "/review")
-      remote.state.threads.set(pull.number, [makeThread(9001, head)]);
+      remote.state.threads.set(pull.number, [
+        makeThread(9000 + pull.number, head),
+      ]);
     remote.state.checks.set(head, [makeCheck(head)]);
     remote.state.reviews.set(
       pull.number,

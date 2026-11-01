@@ -9,10 +9,16 @@ import { PrMonitorRepository } from "./pr-monitor.ts";
 import {
   StateError,
   taskStateSchema,
+  durablePublicationSchema,
+  prContinuationSchema,
   type DurablePublication,
   type StateComment,
   type TaskState,
 } from "../actions/state.ts";
+import { findingIdentity } from "../services/pr-monitor/policy.ts";
+import type { PrMonitor } from "../services/pr-monitor/contracts.ts";
+import type { Implementation } from "../services/implementation/contracts.ts";
+import { bugEvidenceSchema } from "../services/investigation/contracts.ts";
 import type { FrozenScope } from "../services/implementation/contracts.ts";
 import type {
   OwnedPull,
@@ -256,6 +262,116 @@ export class ActionsRepository {
       if (operation?.review_id && operation.actor && operation.payload)
         state.pending = this.publication(operation);
     }
+    if (implementation) {
+      const change = implementation.publication_id
+        ? publications.operation(implementation.publication_id)
+        : undefined;
+      const origin =
+        change?.proposal.kind === "change" &&
+        change.commit &&
+        change.actor &&
+        change.review_id
+          ? {
+              id: change.id,
+              head: change.commit,
+              actor: change.actor,
+              published_at: publications.publishedAt(change),
+            }
+          : new ImplementationRepository(this.store).published(implementation);
+      if (origin) {
+        let resume = state.pr?.resume_publication;
+        if (resume) {
+          if (
+            resume.kind === "change" &&
+            change?.proposal.kind === "change" &&
+            change.id !== resume.id &&
+            change.proposal.recovery_of &&
+            change.review_id &&
+            change.actor &&
+            change.payload
+          ) {
+            if (
+              !implementation.recovering ||
+              change.proposal.recovery_of !== resume.id ||
+              change.proposal.expected_head !== resume.commit ||
+              change.commit !== resume.commit ||
+              digest(change.source) !== digest(resume.source) ||
+              change.target.branch !== resume.branch ||
+              !resume.pull_intent ||
+              change.proposal.title !== resume.pull_intent.title ||
+              change.proposal.body !== resume.pull_intent.body
+            )
+              throw new StateError("state_local_conflict");
+            resume = this.publication(change);
+          }
+          const operation = publications.operation(resume.id);
+          if (operation?.review_id && operation.actor && operation.payload)
+            resume = this.publication(operation);
+          if (
+            (resume.kind === "feedback" &&
+              monitor?.findings.some(
+                (item) => item.publication_id === resume!.id,
+              )) ||
+            (resume.kind === "pr_notification" &&
+              monitor?.notification_id === resume.event_id) ||
+            (resume.kind === "change" && !implementation.recovering)
+          )
+            resume = undefined;
+        }
+        state.pr = prContinuationSchema.parse({
+          version: 1,
+          ...(resume ? { resume_publication: resume } : {}),
+          repair_reserved:
+            job.phase === "implementation" &&
+            monitor?.stage === "repairing" &&
+            monitor.findings.some(
+              (item) => item.disposition === "fix" && !item.fixed_head,
+            ),
+          owned: (
+            this.store.db
+              .prepare(
+                "SELECT DISTINCT kind,object_id FROM publications WHERE job_id=? AND kind IN ('issue_comment','review_comment','review')",
+              )
+              .all(job.id) as {
+              kind: "issue_comment" | "review_comment" | "review";
+              object_id: string;
+            }[]
+          ).map((item) => ({ kind: item.kind, id: Number(item.object_id) })),
+          implementation_id: implementation.id,
+          publication_id: origin.id,
+          actor: origin.actor,
+          head: origin.head,
+          published_at: origin.published_at,
+          evidence_ids: [
+            ...implementation.audits.flatMap((item) =>
+              item.evidence_id ? [item.evidence_id] : [],
+            ),
+            ...implementation.tests.flatMap((item) =>
+              item.evidence_id ? [item.evidence_id] : [],
+            ),
+          ],
+          monitor: monitor
+            ? {
+                id: monitor.id,
+                policy_digest: monitor.policy_digest,
+                policy_generation: monitor.policy_generation,
+                generation: monitor.generation,
+                stage: monitor.stage,
+                failure: monitor.failure,
+                notification_id: monitor.notification_id,
+                findings: monitor.findings.map((item) => ({
+                  ...item,
+                  action_id: findingIdentity(item),
+                  evidence: item.evidence.filter(
+                    (value) =>
+                      value && typeof value === "object" && "path" in value,
+                  ),
+                })),
+              }
+            : null,
+        });
+      }
+    }
     const outcome = taskOutcome(
       this.store,
       { issue_number: job.issue_number },
@@ -272,11 +388,12 @@ export class ActionsRepository {
     );
     if (!review.approved) throw new StateError("state_unreviewed");
     const payload = receipt.payload as {
-      pull?: { title: string; body: string };
+      pull?: { title: string; body: string; branch: string; base: string };
       comment?: string;
       feedback?: { thread: string | null; body: string };
     };
-    return {
+    const raw = receipt.payload as Record<string, unknown>;
+    return durablePublicationSchema.parse({
       id: receipt.id,
       revision: receipt.revision,
       kind: receipt.proposal.kind,
@@ -290,13 +407,33 @@ export class ActionsRepository {
       status: receipt.status === "prepared" ? "reviewed" : receipt.status,
       retry_at: receipt.retry_at,
       retry_pending: receipt.retry_pending,
+      ...(receipt.proposal.kind === "pr_notification"
+        ? { event_id: receipt.proposal.event_id }
+        : {}),
+      ...(["feedback", "pr_notification"].includes(receipt.proposal.kind)
+        ? {
+            intent: {
+              payload: Object.fromEntries(
+                ["destination", "comment", "narrative", "feedback"]
+                  .filter((key) => raw[key] !== undefined)
+                  .map((key) => [key, raw[key]]),
+              ),
+              steps: receipt.steps.map((step) => ({
+                before: step.before,
+                after: step.after,
+              })),
+            },
+          }
+        : {}),
+      ...(payload.pull ? { pull_intent: payload.pull } : {}),
       steps: receipt.steps.map((step) => ({
         kind: step.kind,
         state: step.state,
         before_digest: digest(step.before),
         after_digest: digest(step.after),
         object_id:
-          step.kind === "question_comment"
+          step.kind === "question_comment" ||
+          step.kind === "notification_comment"
             ? (step.object_id ?? null)
             : step.kind === "comment"
               ? (receipt.target.comment?.id ?? null)
@@ -308,13 +445,15 @@ export class ActionsRepository {
         body_digest:
           step.kind === "pull"
             ? digest(payload.pull!.body)
-            : step.kind === "comment" || step.kind === "question_comment"
+            : step.kind === "comment" ||
+                step.kind === "question_comment" ||
+                step.kind === "notification_comment"
               ? digest(payload.comment!)
               : ["feedback_reply", "thread_resolution"].includes(step.kind)
                 ? digest(payload.feedback!.body)
                 : null,
       })),
-    };
+    });
   }
 
   restore(
@@ -415,31 +554,35 @@ export class ActionsRepository {
             target.pull = { id, number, title, body, head, base, author_id };
           }
           publications.saveTarget(target);
-          if (state.pending) {
-            const operation = publications.operation(state.pending.id);
+          for (const pending of new Map(
+            [state.pr?.resume_publication, state.pending]
+              .filter((item) => item != null)
+              .map((item) => [item.id, item]),
+          ).values()) {
+            const operation = publications.operation(pending.id);
             if (operation) {
               if (
-                operation.review_id !== state.pending.review_id ||
-                operation.steps.length !== state.pending.steps.length ||
+                operation.review_id !== pending.review_id ||
+                operation.steps.length !== pending.steps.length ||
                 operation.steps.some(
                   (step, index) =>
-                    step.kind !== state.pending!.steps[index].kind ||
-                    digest(step.after) !==
-                      state.pending!.steps[index].after_digest,
+                    step.kind !== pending.steps[index].kind ||
+                    digest(step.after) !== pending.steps[index].after_digest,
                 )
               )
                 throw new StateError("state_local_conflict");
-              operation.status = state.pending.status;
-              operation.retry_at = state.pending.retry_at;
-              operation.retry_pending = state.pending.retry_pending;
+              operation.status = pending.status;
+              operation.retry_at = pending.retry_at;
+              operation.retry_pending = pending.retry_pending;
               operation.target = target;
               for (const [index, step] of operation.steps.entries()) {
-                step.state = state.pending.steps[index].state;
+                step.state = pending.steps[index].state;
                 if (
-                  step.kind === "question_comment" &&
-                  state.pending.steps[index].object_id
+                  (step.kind === "question_comment" ||
+                    step.kind === "notification_comment") &&
+                  pending.steps[index].object_id
                 )
-                  step.object_id = state.pending.steps[index].object_id!;
+                  step.object_id = pending.steps[index].object_id!;
                 if (step.state === "confirmed")
                   publications.finishStep(operation, step.kind);
               }
@@ -477,6 +620,148 @@ export class ActionsRepository {
               state.head,
             );
         }
+        if (
+          job &&
+          pull &&
+          state.pr &&
+          state.scope &&
+          state.head === state.pr.head &&
+          !new ImplementationRepository(this.store).current(
+            this.store.jobById(job.id)!,
+          )
+        ) {
+          if (
+            digest(state.scope) !== state.scope_digest ||
+            !bugEvidenceSchema.safeParse(state.findings?.bug).success
+          )
+            throw new StateError("recovery_evidence_missing");
+          const investigations = new InvestigationRepository(this.store);
+          const investigation = investigations.ensure(
+            this.store.jobById(job.id)!,
+          );
+          if (investigation.id !== state.scope.investigation_id) {
+            this.store.db
+              .prepare("UPDATE investigations SET id=? WHERE id=?")
+              .run(state.scope.investigation_id, investigation.id);
+            investigation.id = state.scope.investigation_id;
+          }
+          investigation.result = state.findings;
+          investigation.stage = "completed";
+          investigations.save(investigation);
+          const pr = state.pr;
+          const pending = pr.resume_publication ?? state.pending;
+          const implementation: Implementation = {
+            id: pr.implementation_id,
+            job_id: job.id,
+            revision: job.revision,
+            investigation_id: investigation.id,
+            source: job.source,
+            snapshot_digest: job.snapshot_digest,
+            stage: "auditing",
+            scope: state.scope,
+            scope_digest: state.scope_digest,
+            baseline_digest: null,
+            artifact_digest: null,
+            result: null,
+            bootstrap_receipt: null,
+            candidate_bootstrap: null,
+            milestone_done: false,
+            audit_id: null,
+            test_id: null,
+            audits: [],
+            tests: [],
+            agent_pending: null,
+            recovery_attempts: [],
+            publication_id: pr.publication_id,
+            status_operation: null,
+            status_generation: 0,
+            feedback: [],
+            failure: null,
+            retry_at: state.retry_at,
+            retry_stage: null,
+            started_at: pr.published_at ?? Date.now(),
+            recovering: true,
+            resume_repair: pr.repair_reserved ?? false,
+            recovery_pull:
+              pending?.kind === "change" &&
+              pending.steps.some(
+                (step) => step.kind === "pull" && step.state === "prepared",
+              )
+                ? pending.pull_intent
+                : undefined,
+            published_origin: {
+              id: pr.publication_id,
+              head: pr.head,
+              actor: pr.actor,
+              published_at: pr.published_at,
+            },
+          };
+          this.store.db
+            .prepare("INSERT INTO implementations VALUES(?,?,?,?,?)")
+            .run(
+              implementation.id,
+              job.id,
+              job.revision,
+              implementation.stage,
+              JSON.stringify(implementation),
+            );
+          this.store.db
+            .prepare("UPDATE jobs SET phase='implementation' WHERE id=?")
+            .run(job.id);
+          this.scope(state.scope, "recovered");
+          if (pr.monitor) {
+            const monitor: PrMonitor = {
+              ...pr.monitor,
+              job_id: job.id,
+              implementation_id: implementation.id,
+              revision: job.revision,
+              pull_number: pull.number,
+              expected_head: pr.head,
+              observed_head: null,
+              publication_id: pr.publication_id,
+              stage: pr.repair_reserved
+                ? "repairing"
+                : pr.monitor.stage === "blocked"
+                  ? "blocked"
+                  : "waiting",
+              snapshot_digest: null,
+              assessment_digest: null,
+              pending_agent: null,
+              recovery_attempts: [],
+              mcp_done_for: null,
+              readiness_id: null,
+              status_operation: null,
+              status_text: null,
+              started_at: implementation.started_at,
+              head_published_at: pr.published_at,
+              wait_accounted_at: state.wait_accounted_at,
+              retry_at: state.retry_at,
+            };
+            this.store.db
+              .prepare("INSERT OR REPLACE INTO pr_monitors VALUES(?,?,?,?)")
+              .run(monitor.id, job.id, monitor.stage, JSON.stringify(monitor));
+          }
+        }
+        if (job && state.pr?.monitor) {
+          const monitors = new PrMonitorRepository(this.store),
+            current = monitors.get(job.id);
+          if (current) {
+            current.notification_id = state.pr.monitor.notification_id;
+            current.generation = state.pr.monitor.generation;
+            if (
+              !new ImplementationRepository(this.store).current(
+                this.store.jobById(job.id)!,
+              )?.recovering
+            ) {
+              current.stage = state.pr.monitor.stage;
+              current.failure = state.pr.monitor.failure;
+            }
+            monitors.save(current);
+          }
+        }
+        if (job)
+          for (const owned of state.pr?.owned ?? [])
+            this.own(owned.kind, owned.id, job.id, job.revision, null, null);
         this.acknowledge(comment.body);
         this.store.db
           .prepare(
@@ -489,7 +774,7 @@ export class ActionsRepository {
   }
 
   own(
-    kind: "issue_comment" | "pull_request",
+    kind: "issue_comment" | "review_comment" | "review" | "pull_request",
     id: number,
     jobId: number,
     revision: number,

@@ -382,15 +382,19 @@ export function modelFixture(config, store, root, controls = {}) {
       if (task === "investigation_triage")
         return {
           result: {
-            outcome:
-              mode === "manual_feature" || mode === "disguised_feature"
+            outcome: mode.startsWith("triage_information")
+              ? "needs_information"
+              : mode === "manual_feature" || mode === "disguised_feature"
                 ? "manual_feature"
                 : "investigate",
             summary:
               mode === "manual_feature" || mode === "disguised_feature"
                 ? "The requested behavior is a feature, not an existing supported contract."
                 : "Check the documented add-one behavior against the supplied report.",
-            questions: [],
+            questions:
+              mode === "triage_information_valid"
+                ? ["Which existing behavior is expected?"]
+                : [],
             audience: "maintainer",
           },
         };

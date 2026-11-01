@@ -507,14 +507,18 @@ export class InvestigationService {
               item.kind === "command" &&
               (item.details as { command: { outcome: string } }).command
                 .outcome === "completed",
-          )) ||
-        (result.outcome === "needs_information" && !result.questions.length)
+          ))
       )
         throw new RuntimeError("investigation_evidence_invalid");
       record.result = result;
       record.agent_pending = false;
       this.repository.save(record);
     }
+    if (
+      record.result?.outcome === "needs_information" &&
+      !record.result.questions.length
+    )
+      throw new RuntimeError("investigation_evidence_invalid");
     await this.refresh(record);
     await this.stage(record, "publishing");
     const proposal: PublicationProposal = {

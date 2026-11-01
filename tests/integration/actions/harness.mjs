@@ -614,17 +614,18 @@ export async function runActionsTests({
   launch(`${manager}-fresh-lost-pull`, 10, true);
   const recovered = await finished(
     `${manager}-fresh-lost-pull`,
-    "blocked",
-    "recovery_evidence_missing",
+    "waiting",
+    "remote_checks",
   );
   assert(recovered.pull_number > 0);
   assert.equal(proof().pulls.length, count);
   assert.equal(
-    durable(10).budget.model_requests,
-    uncertain.budget.model_requests,
+    durable(10).budget.repair_cycles,
+    uncertain.budget.repair_cycles,
   );
   assert.equal(durable(10).pending.status, "confirmed");
-  assert.equal(proof().requests.length, 0);
+  assert(proof().requests.includes("implementation_audit"));
+  assert(durable(10).budget.model_requests > uncertain.budget.model_requests);
 
   upstream("/merge-owned?issue=9", "POST");
   launch(`${manager}-retained-closed-after-main-advances`, 9, true);
@@ -826,6 +827,149 @@ export async function runActionsTests({
   assert.deepEqual(proof().artifacts.errors, []);
   assert.deepEqual(proof().errors, []);
   upstream(`/restore-main?sha=${proof().source.sha}`, "POST");
+  const recoveredIssue = 60;
+  upstream(
+    `/clarification-issue?issue=${recoveredIssue}&mode=source_only`,
+    "POST",
+  );
+  launch(`${manager}-recovery-seed`, recoveredIssue);
+  const originalPull = await finished(
+    `${manager}-recovery-seed`,
+    "waiting",
+    "remote_checks",
+  );
+  upstream(`/checks?issue=${recoveredIssue}`, "POST");
+  launch(`${manager}-recovery-ready`, recoveredIssue);
+  await finished(`${manager}-recovery-ready`, "ready", "human_review");
+  const notices = () =>
+    proof()
+      .comments.find(([issue]) => issue === recoveredIssue)[1]
+      .filter(
+        (row) =>
+          !row.body.includes("<!-- orm:task-state:") &&
+          row.body.includes("Automation clean; awaiting human review."),
+      );
+  assert.equal(notices().length, 1);
+  for (const fault of ["expired", "deleted"]) {
+    const before = durable(recoveredIssue);
+    upstream(
+      `/artifact-fault?id=${before.session_artifact.artifact_id}&kind=${fault}`,
+      "POST",
+    );
+    discardTask(recoveredIssue, true);
+    launch(`${manager}-recover-owned-${fault}`, recoveredIssue, true);
+    const recovered = await finished(
+      `${manager}-recover-owned-${fault}`,
+      "ready",
+      "human_review",
+    );
+    const after = durable(recoveredIssue);
+    assert.equal(recovered.pull_number, originalPull.pull_number);
+    assert.equal(recovered.head_sha, originalPull.head_sha);
+    assert.equal(recovered.session_recovery, "expired_or_deleted");
+    assert.equal(after.task_id, before.task_id);
+    assert.equal(after.scope_digest, before.scope_digest);
+    assert.equal(after.budget.repair_cycles, before.budget.repair_cycles);
+    assert(after.budget.model_requests > before.budget.model_requests);
+    assert(proof().requests.includes("implementation_audit"));
+    assert(!proof().requests.includes("implementation_change"));
+    assert.equal(
+      proof().pulls.filter((pull) =>
+        pull.branch.endsWith(`/issue-${recoveredIssue}`),
+      ).length,
+      1,
+    );
+    assert.equal(notices().length, 1);
+    launch(`${manager}-recover-repeat-${fault}`, recoveredIssue, true);
+    await finished(
+      `${manager}-recover-repeat-${fault}`,
+      "ready",
+      "human_review",
+    );
+    assert.equal(proof().requests.length, 0);
+    assert.equal(notices().length, 1);
+  }
+  for (const [issue, fault, mode] of [
+    [61, "notification", "source_only"],
+    [62, "thread_reply", "source_only"],
+    [63, "branch", "monitor_pipeline"],
+  ]) {
+    const prefix = `${manager}-publication-recovery-${fault}`;
+    upstream(`/clarification-issue?issue=${issue}&mode=${mode}`, "POST");
+    launch(`${prefix}-seed`, issue);
+    const seeded = await finished(`${prefix}-seed`, "waiting", "remote_checks");
+    upstream(`/publication-fault?kind=${fault}`, "POST");
+    upstream(
+      `/${fault === "notification" ? "checks" : "review"}?issue=${issue}`,
+      "POST",
+    );
+    launch(`${prefix}-interrupted`, issue);
+    await finished(`${prefix}-interrupted`, "blocked", "state_write_uncertain");
+    const before = durable(issue);
+    assert(
+      proof().publication_faults.some(
+        (item) => item.issue === issue && item.kind === fault,
+      ),
+    );
+    if (fault === "thread_reply") {
+      assert.equal(before.pending.steps[0].state, "dispatching");
+      assert.equal(before.pending.steps[1].state, "prepared");
+    }
+    discardTask(issue, true);
+    if (fault === "branch") {
+      upstream("/publication-fault?kind=pull", "POST");
+      launch(`${prefix}-second-interruption`, issue, true);
+      await finished(
+        `${prefix}-second-interruption`,
+        "blocked",
+        "state_write_uncertain",
+      );
+      const second = durable(issue);
+      assert.notEqual(second.pending.id, before.pending.id);
+      assert.equal(second.pr.resume_publication.id, second.pending.id);
+      assert.equal(
+        second.pending.steps.find((step) => step.kind === "pull").state,
+        "dispatching",
+      );
+      assert.equal(second.budget.repair_cycles, before.budget.repair_cycles);
+      discardTask(issue, true);
+    }
+    launch(`${prefix}-recovered`, issue, true);
+    const recovered = await finished(
+      `${prefix}-recovered`,
+      fault === "branch" ? "waiting" : "ready",
+      fault === "branch" ? "remote_checks" : "human_review",
+    );
+    assert.equal(recovered.pull_number, seeded.pull_number);
+    assert.equal(
+      durable(issue).budget.repair_cycles,
+      before.budget.repair_cycles,
+    );
+    assert.equal(
+      proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
+        .length,
+      1,
+    );
+    if (fault === "notification") {
+      const comments = proof().comments.find(([number]) => number === issue)[1];
+      assert.equal(
+        comments.filter(
+          (row) =>
+            !row.body.includes("<!-- orm:task-state:") &&
+            row.body.includes("Automation clean; awaiting human review."),
+        ).length,
+        1,
+      );
+    } else {
+      const thread = proof().threads.find(
+        ([number]) => number === seeded.pull_number,
+      )[1][0];
+      assert.equal(thread.comments.length, 2);
+      assert.equal(thread.isResolved, true);
+    }
+    assert(proof().requests.includes("implementation_audit"));
+    assert.deepEqual(proof().errors, []);
+  }
   for (const [issue, mode] of [
     [40, "clarification_investigation"],
     [41, "clarification_planning"],
@@ -970,12 +1114,22 @@ export async function runActionsTests({
       assert.deepEqual(durable(issue).budget, afterInsufficient.budget);
       assert.equal(proof().requests.length, 0);
     }
+    if (mode === "monitor_clarification") {
+      upstream(`/age-repair-question?issue=${issue}`, "POST");
+      const question = questions().at(-1);
+      assert(Date.now() - Date.parse(question.created_at) >= 15 * 86400000);
+      assert.equal(
+        durable(issue).budget.repair_cycles,
+        durable(issue).limits.repair_cycles,
+      );
+      assert.equal(durable(issue).wait_accounted_at, null);
+    }
     if (issue !== 46)
       upstream(
         `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 || issue === 48 ? "fixture" : "reporter"}${issue === 48 ? "&body=SCOPE_EXPANSION%3A%20add%20an%20unrelated%20feature" : ""}`,
         "POST",
       );
-    if (issue === 47)
+    if (issue === 47 || mode === "monitor_clarification")
       upstream(
         `/artifact-fault?id=${durable(issue).session_artifact.artifact_id}&kind=expired`,
         "POST",
@@ -1037,15 +1191,22 @@ export async function runActionsTests({
           .records.some((record) => record.context_comment_count === 0),
       );
     }
-    if (nativeBefore && issue !== 47) {
+    if (mode === "monitor_clarification")
+      assert.equal(resumed.session_recovery, "expired_or_deleted");
+    if (nativeBefore && issue !== 47 && mode !== "monitor_clarification") {
       const continued = proof().conversations.find(
         (conversation) => conversation.id === before.question.conversation_id,
       );
       assert.equal(continued.native_id, nativeBefore.native_id);
       assert.equal(continued.request_digest, nativeBefore.request_digest);
     }
-    if (mode === "monitor_clarification")
+    if (mode === "monitor_clarification") {
       assert.equal(resumed.pull_number, before.pull.number);
+      assert.equal(
+        durable(issue).budget.repair_cycles,
+        durable(issue).limits.repair_cycles,
+      );
+    }
     assert.equal(
       proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
         .length,

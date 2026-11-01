@@ -101,6 +101,27 @@ export class PublicationService {
       );
   }
 
+  async verifyOwnedPull(jobId: number, head: string, signal: AbortSignal) {
+    const target = this.repository.target(jobId);
+    if (
+      !target.pull ||
+      head !== this.store.durability?.publishedHead() ||
+      head !== target.head
+    )
+      throw new RuntimeError("publication_head_changed");
+    const current = await this.writer.pull(target.pull.number, signal);
+    if (
+      digest(this.ownedPull(current)) !== digest(target.pull) ||
+      current.state !== "open" ||
+      current.draft ||
+      current.branch !== target.branch ||
+      current.repository_id !== this.store.repository()!.id ||
+      current.base_repository_id !== current.repository_id
+    )
+      throw new RuntimeError("publication_pull_changed");
+    return current;
+  }
+
   async recordEvidence(evidence: PublicationEvidence, signal: AbortSignal) {
     const frozen = structuredClone(evidence);
     await this.outputReview.scanner.scan(frozen, signal);
@@ -138,7 +159,16 @@ export class PublicationService {
   operationId(proposal: PublicationProposal) {
     return digest({
       instance: this.repository.instance(),
-      proposal: proposalSchema.parse(proposal),
+      proposal:
+        proposal.kind === "pr_notification"
+          ? {
+              kind: proposal.kind,
+              job_id: proposal.job_id,
+              revision: proposal.revision,
+              expected_head: proposal.expected_head,
+              event_id: proposal.event_id,
+            }
+          : proposalSchema.parse(proposal),
     });
   }
 
@@ -172,23 +202,53 @@ export class PublicationService {
       const source = (
         JSON.parse(job.input_json) as { source: PublicationReceipt["source"] }
       ).source;
+      const durable = !previous
+        ? this.store.durability?.publicationIntent(id)
+        : undefined;
+      const recovered =
+        durable?.intent &&
+        ["feedback", "pr_notification"].includes(proposal.kind)
+          ? durable
+          : undefined;
+      const steps = recovered
+        ? recovered.steps.map((step, index) => {
+            const intent = recovered.intent!.steps[index];
+            if (
+              !intent ||
+              digest(intent.before) !== step.before_digest ||
+              digest(intent.after) !== step.after_digest ||
+              !["prepared", "confirmed"].includes(step.state)
+            )
+              throw new RuntimeError("publication_effect_uncertain");
+            return {
+              kind: step.kind,
+              state: step.state as "prepared" | "confirmed",
+              before: intent.before,
+              after: intent.after,
+              ...(step.object_id ? { object_id: step.object_id } : {}),
+            };
+          })
+        : [];
       const receipt = this.repository.begin({
         id,
         job_id: job.id,
         revision: job.revision,
         status: "prepared",
         failure: null,
-        retry_at: 0,
-        retry_pending: false,
+        retry_at: recovered?.retry_at ?? 0,
+        retry_pending: recovered?.retry_pending ?? false,
         proposal,
         source,
         target: this.repository.target(job.id),
-        actor: null,
+        actor: recovered?.actor ?? null,
         timestamp: new Date().toISOString(),
         review_id: null,
-        payload: null,
+        payload: recovered
+          ? { ...(recovered.intent!.payload as object), evidence: [] }
+          : null,
         commit: null,
-        steps: [],
+        steps,
+        ...(recovered ? { recovered: true as const } : {}),
       });
       let git: PublicationGit | undefined, directory: string | undefined;
       this.repository.retry(receipt);
@@ -226,7 +286,8 @@ export class PublicationService {
           if (
             proposal.kind === "notice" ||
             proposal.kind === "investigation_stage" ||
-            proposal.kind === "pr_stage"
+            proposal.kind === "pr_stage" ||
+            proposal.kind === "pr_notification"
           ) {
             await this.outputReview.scanner.scan(payload, publicationSignal);
             receipt.review_id = this.repository.review({
@@ -267,7 +328,10 @@ export class PublicationService {
           this.repository.save(receipt);
           await this.store.checkpoint(publicationSignal);
           try {
-            if (step.kind === "question_comment")
+            if (
+              step.kind === "question_comment" ||
+              step.kind === "notification_comment"
+            )
               await this.writer.comment(
                 job.issue_number,
                 null,
@@ -367,6 +431,7 @@ export class PublicationService {
     return proposal.kind === "notice" ||
       proposal.kind === "investigation_stage" ||
       proposal.kind === "pr_stage" ||
+      proposal.kind === "pr_notification" ||
       (proposal.kind === "question" && previous?.review_id && !reviewOnly)
       ? this.supervisor.withPublicationNotice(signal, (noticeSignal) =>
           operation(noticeSignal),
@@ -418,7 +483,10 @@ export class PublicationService {
         if (step.state !== "dispatching" && step.state !== "uncertain")
           continue;
         let matched = false;
-        if (step.kind === "question_comment") {
+        if (
+          step.kind === "question_comment" ||
+          step.kind === "notification_comment"
+        ) {
           const matches = (
             await this.writer.comments(job.issue_number, signal)
           ).filter(
@@ -642,16 +710,33 @@ export class PublicationService {
         job.id,
       );
       payload.comment = `${this.investigationStatus(proposal.stage, payload.narrative)}${this.pullReference(receipt)}\n\n${marker}`;
-    } else if (proposal.kind === "pr_stage") {
-      payload.narrative = this.previousNarrative(
-        proposal.previous_operation,
-        job.id,
-      );
-      payload.comment = `${this.prStatus(receipt, payload.narrative)}\n\n${marker}`;
-      if (proposal.readiness_id)
-        payload.evidence = [
-          new PrMonitorRepository(this.store).readiness(proposal.readiness_id),
-        ];
+    } else if (
+      proposal.kind === "pr_stage" ||
+      proposal.kind === "pr_notification"
+    ) {
+      const narrative = receipt.recovered
+        ? (receipt.payload as FrozenPayload).narrative
+        : this.previousNarrative(proposal.previous_operation, job.id);
+      if (narrative === undefined)
+        throw new RuntimeError("publication_payload_changed");
+      payload.narrative = narrative;
+      payload.comment = `${this.prStatus(receipt, narrative)}\n\n${marker}`;
+      if (proposal.readiness_id) {
+        const readiness = new PrMonitorRepository(this.store).readiness(
+          proposal.readiness_id,
+        );
+        if (
+          proposal.kind === "pr_notification" &&
+          proposal.event_id !==
+            digest({
+              head: readiness.head_sha,
+              policy: readiness.policy_digest,
+              observation: readiness.observation_digest,
+            })
+        )
+          throw new RuntimeError("pr_readiness_stale");
+        payload.evidence = [readiness];
+      }
     } else if (proposal.kind === "feedback") {
       const monitors = new PrMonitorRepository(this.store),
         monitor = monitors.get(job.id);
@@ -717,7 +802,8 @@ export class PublicationService {
       if (receipt.payload !== null) {
         const frozen = receipt.payload as FrozenPayload;
         payload.feedback = frozen.feedback;
-        payload.evidence = frozen.evidence;
+        if (!receipt.recovered || receipt.review_id)
+          payload.evidence = frozen.evidence;
       }
     } else if (proposal.kind !== "change")
       payload.comment = `${proposal.kind === "notice" ? notices[proposal.reason] : proposal.body}\n\n${marker}`;
@@ -767,7 +853,9 @@ export class PublicationService {
       );
       payload.pull = {
         title: proposal.title,
-        body: `${proposal.body}\n\nclose #${job.issue_number}\n\n${marker}`,
+        body: proposal.recovery_of
+          ? proposal.body
+          : `${proposal.body}\n\nclose #${job.issue_number}\n\n${marker}`,
         branch: receipt.target.branch,
         base: receipt.source.default_branch,
       };
@@ -782,8 +870,22 @@ export class PublicationService {
     }
     if (payload.comment && Buffer.byteLength(payload.comment) > 65536)
       throw new RuntimeError("publication_size_limit");
-    if (receipt.payload !== null && digest(receipt.payload) !== digest(payload))
-      throw new RuntimeError("publication_payload_changed");
+    if (receipt.payload !== null) {
+      const mutation = (value: FrozenPayload) =>
+        Object.fromEntries(
+          ["destination", "comment", "narrative", "feedback"]
+            .filter((key) => value[key as keyof FrozenPayload] !== undefined)
+            .map((key) => [key, value[key as keyof FrozenPayload]]),
+        );
+      const firstRecovery = receipt.recovered && !receipt.review_id;
+      if (
+        firstRecovery
+          ? digest(mutation(receipt.payload as FrozenPayload)) !==
+            digest(mutation(payload))
+          : digest(receipt.payload) !== digest(payload)
+      )
+        throw new RuntimeError("publication_payload_changed");
+    }
     receipt.payload = payload;
     if (!receipt.steps.length)
       receipt.steps =
@@ -830,9 +932,12 @@ export class PublicationService {
                   kind:
                     proposal.kind === "question"
                       ? "question_comment"
-                      : "comment",
+                      : proposal.kind === "pr_notification"
+                        ? "notification_comment"
+                        : "comment",
                   before:
-                    proposal.kind === "question"
+                    proposal.kind === "question" ||
+                    proposal.kind === "pr_notification"
                       ? null
                       : receipt.target.comment,
                   after: payload.comment,
@@ -870,17 +975,21 @@ export class PublicationService {
     if (
       receipt.proposal.kind !== "notice" &&
       receipt.proposal.kind !== "investigation_stage" &&
-      receipt.proposal.kind !== "pr_stage"
+      receipt.proposal.kind !== "pr_stage" &&
+      receipt.proposal.kind !== "pr_notification"
     ) {
       this.outputReview.verify(receipt.review_id, request);
       return;
     }
     const proposal = receipt.proposal;
-    const narrative =
-      proposal.kind === "investigation_stage" || proposal.kind === "pr_stage"
+    const narrative = receipt.recovered
+      ? ((receipt.payload as FrozenPayload).narrative ?? "")
+      : proposal.kind === "investigation_stage" ||
+          proposal.kind === "pr_stage" ||
+          proposal.kind === "pr_notification"
         ? this.previousNarrative(proposal.previous_operation, receipt.job_id)
         : "";
-    const expected = `${proposal.kind === "notice" ? notices[proposal.reason] : proposal.kind === "pr_stage" ? this.prStatus(receipt, narrative) : `${this.investigationStatus(proposal.stage, narrative)}${this.pullReference(receipt)}`}\n\n<!-- orm:${this.repository.instance()}:${receipt.job_id}:${receipt.id} -->`;
+    const expected = `${proposal.kind === "notice" ? notices[proposal.reason] : proposal.kind === "pr_stage" || proposal.kind === "pr_notification" ? this.prStatus(receipt, narrative) : `${this.investigationStatus(proposal.stage, narrative)}${this.pullReference(receipt)}`}\n\n<!-- orm:${this.repository.instance()}:${receipt.job_id}:${receipt.id} -->`;
     const review = this.repository.reviewed(receipt.review_id);
     if (
       (receipt.payload as FrozenPayload).comment !== expected ||
@@ -901,7 +1010,7 @@ export class PublicationService {
 
   private prStatus(receipt: PublicationReceipt, narrative: string) {
     const proposal = receipt.proposal;
-    if (proposal.kind !== "pr_stage")
+    if (proposal.kind !== "pr_stage" && proposal.kind !== "pr_notification")
       throw new RuntimeError("publication_invalid");
     const text =
       proposal.stage === "ready"
@@ -981,7 +1090,8 @@ export class PublicationService {
       (receipt.target.pull &&
         (receipt.proposal.kind === "change" ||
           receipt.proposal.kind === "feedback" ||
-          (receipt.proposal.kind === "pr_stage" &&
+          ((receipt.proposal.kind === "pr_stage" ||
+            receipt.proposal.kind === "pr_notification") &&
             receipt.proposal.stage !== "blocked")));
     if (checkScope) this.store.assertPublishedScope(job.id);
     if (
@@ -1007,7 +1117,8 @@ export class PublicationService {
       throw new RuntimeError("publication_source_changed");
     if (
       receipt.proposal.kind === "feedback" ||
-      receipt.proposal.kind === "pr_stage"
+      receipt.proposal.kind === "pr_stage" ||
+      receipt.proposal.kind === "pr_notification"
     ) {
       const current = await this.writer.pull(
         receipt.target.pull!.number,
@@ -1018,7 +1129,8 @@ export class PublicationService {
         !this.matchesPull(
           receipt,
           current,
-          receipt.proposal.kind === "pr_stage" &&
+          (receipt.proposal.kind === "pr_stage" ||
+            receipt.proposal.kind === "pr_notification") &&
             receipt.proposal.stage === "blocked"
             ? current.head
             : expected,
@@ -1026,7 +1138,8 @@ export class PublicationService {
       )
         throw new RuntimeError("publication_pull_changed");
       if (
-        receipt.proposal.kind === "pr_stage" &&
+        (receipt.proposal.kind === "pr_stage" ||
+          receipt.proposal.kind === "pr_notification") &&
         receipt.proposal.stage === "ready"
       ) {
         if (!receipt.proposal.readiness_id || !this.readinessValidator)
@@ -1104,7 +1217,10 @@ export class PublicationService {
       )
         throw new RuntimeError("publication_pull_changed");
     }
-    if (step.kind === "question_comment") {
+    if (
+      step.kind === "question_comment" ||
+      step.kind === "notification_comment"
+    ) {
       const matches = (
         await this.writer.comments(job.issue_number, signal)
       ).filter((comment) =>

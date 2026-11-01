@@ -231,6 +231,7 @@ export class PrMonitorService {
       this.busy.add(item.job_id);
       const record = this.repository.get(item.job_id)!;
       try {
+        if (this.repository.implementation(record).recovering) continue;
         const question = currentContinuation(
           this.store,
           record.job_id,
@@ -755,7 +756,8 @@ export class PrMonitorService {
     const implementation = this.repository.implementation(record),
       publication = this.supervisor.publication.repository.operation(
         record.publication_id,
-      );
+      ),
+      origin = this.implementation.repository.published(implementation);
     const audit = implementation.audits.find(
         (item) => item.id === implementation.audit_id,
       ),
@@ -773,10 +775,14 @@ export class PrMonitorService {
       test.scope_digest !== implementation.scope_digest ||
       test.audit_id !== audit.id ||
       this.store.run(test.run_id)?.status !== "completed" ||
-      publication?.status !== "confirmed" ||
-      publication.commit !== record.expected_head ||
-      publication.proposal.kind !== "change" ||
-      publication.proposal.artifact_digest !== implementation.artifact_digest
+      origin?.id !== record.publication_id ||
+      origin.head !== record.expected_head ||
+      implementation.recovering ||
+      (publication &&
+        (publication.status !== "confirmed" ||
+          publication.proposal.kind !== "change" ||
+          publication.proposal.artifact_digest !==
+            implementation.artifact_digest))
     )
       throw new RuntimeError("pr_local_evidence_missing");
     return [audit.evidence_id, test.evidence_id].map((id) => ({
@@ -834,20 +840,21 @@ export class PrMonitorService {
   }
 
   private assertOwned(record: PrMonitor, snapshot: PrSnapshot) {
-    const publication = this.supervisor.publication.repository.operation(
-      record.publication_id,
+    const origin = this.implementation.repository.published(
+      this.repository.implementation(record),
     );
     const target = this.supervisor.publication.repository.target(record.job_id);
     if (
-      !publication?.actor ||
+      !origin ||
       !target.pull ||
       target.pull.id !== snapshot.id ||
       record.pull_number !== snapshot.number ||
-      publication.actor.id !== snapshot.author_id ||
+      origin.actor.id !== snapshot.author_id ||
       snapshot.repository_id !== this.store.repository()?.id ||
       snapshot.base_repository_id !== snapshot.repository_id ||
       snapshot.branch !== target.branch ||
-      snapshot.base !== publication.source.default_branch
+      snapshot.base !==
+        this.repository.implementation(record).source.default_branch
     )
       throw new RuntimeError("pr_ownership_changed");
     if (
@@ -1001,7 +1008,7 @@ export class PrMonitorService {
       revision: record.revision,
       stage,
       expected_head: record.expected_head,
-      previous_operation: investigation.publication_id!,
+      previous_operation: investigation.publication_id,
       readiness_id: stage === "ready" ? record.readiness_id : null,
       generation: record.policy_generation,
     };
@@ -1018,6 +1025,39 @@ export class PrMonitorService {
     const job = this.store.jobById(record.job_id);
     if (!job || job.status !== "pending" || job.revision !== record.revision)
       return;
+    if (this.store.durability) {
+      if (!ready) return;
+      const readiness = this.repository.readiness(record.readiness_id!);
+      const key = digest({
+        head: record.expected_head,
+        policy: record.policy_digest,
+        observation: readiness.observation_digest,
+      });
+      if (record.notification_id === key) return;
+      await this.validateReadiness(record.readiness_id!, signal);
+      const investigation = new InvestigationRepository(this.store).get(
+        this.repository.implementation(record).investigation_id,
+      );
+      const receipt = await this.supervisor.publication.publish(
+        {
+          kind: "pr_notification",
+          job_id: job.id,
+          revision: job.revision,
+          stage: "ready",
+          expected_head: record.expected_head,
+          previous_operation: investigation.publication_id,
+          readiness_id: record.readiness_id!,
+          generation: record.policy_generation,
+          event_id: key,
+        },
+        signal,
+      );
+      if (receipt.status !== "confirmed")
+        throw new RuntimeError(receipt.failure ?? "publication_pending");
+      record.notification_id = key;
+      this.repository.save(record);
+      return;
+    }
     const id = this.notificationId(record, ready);
     if (this.supervisor.notifications.repository.event(id)) return;
     if (ready) await this.validateReadiness(record.readiness_id!, signal);

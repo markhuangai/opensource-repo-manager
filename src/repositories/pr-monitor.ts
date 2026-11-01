@@ -42,31 +42,31 @@ export class PrMonitorRepository {
     const existing = this.get(implementation.job_id);
     if (existing) return existing;
     const publications = new PublicationRepository(this.store);
-    const operation =
-      implementation.publication_id &&
-      publications.operation(implementation.publication_id);
+    const origin = new ImplementationRepository(this.store).published(
+      implementation,
+    );
+    const target = publications.target(implementation.job_id);
     if (
-      !operation ||
-      operation.status !== "confirmed" ||
-      operation.proposal.kind !== "change" ||
-      !operation.target.pull ||
+      !origin ||
+      !target.pull ||
+      target.head !== origin.head ||
+      implementation.recovering ||
       !implementation.scope ||
       !implementation.artifact_digest ||
       !implementation.audit_id ||
       !implementation.test_id
     )
       throw new RuntimeError("pr_handoff_invalid");
-    const started = Date.parse(operation.timestamp);
-    if (!Number.isFinite(started)) throw new RuntimeError("pr_handoff_invalid");
+    const started = origin.published_at ?? now;
     const record: PrMonitor = {
       id: randomUUID(),
       job_id: implementation.job_id,
       implementation_id: implementation.id,
       revision: implementation.revision,
-      pull_number: operation.target.pull.number,
-      expected_head: operation.commit!,
+      pull_number: target.pull.number,
+      expected_head: origin.head,
       observed_head: null,
-      publication_id: operation.id,
+      publication_id: origin.id,
       stage: "waiting",
       policy_digest: policyDigest,
       policy_generation: 1,
@@ -82,7 +82,7 @@ export class PrMonitorRepository {
       status_text: null,
       notification_id: null,
       started_at: started,
-      head_published_at: publications.publishedAt(operation),
+      head_published_at: origin.published_at,
       wait_accounted_at: Math.min(started, now),
       retry_at: 0,
       failure: null,

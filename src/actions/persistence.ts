@@ -102,12 +102,14 @@ export class ActionsState implements TaskDurability {
           );
           const payload = pending?.payload as { comment?: string } | undefined;
           if (
-            pending?.proposal.kind !== "question" ||
+            (pending?.proposal.kind !== "question" &&
+              pending?.proposal.kind !== "pr_notification") ||
             !pending.review_id ||
             payload?.comment !== body ||
             !pending.steps.some(
               (step) =>
-                step.kind === "question_comment" &&
+                (step.kind === "question_comment" ||
+                  step.kind === "notification_comment") &&
                 step.state === "dispatching",
             )
           )
@@ -311,6 +313,20 @@ export class ActionsState implements TaskDurability {
     )
       throw new StateError("state_local_conflict");
     await this.reconcile(signal);
+    const recoveredPending = this.comment.state.pending;
+    if (
+      this.comment.state.pr &&
+      recoveredPending &&
+      ["change", "feedback", "pr_notification"].includes(
+        recoveredPending.kind,
+      ) &&
+      !new PublicationRepository(this.store).operation(recoveredPending.id)
+    ) {
+      const held = this.comment.state.pr.resume_publication;
+      if (held && held.id !== recoveredPending.id)
+        throw new StateError("state_local_conflict");
+      this.comment.state.pr.resume_publication = recoveredPending;
+    }
     const context = await reader.issue(number, repository, signal);
     context.comments = context.comments.filter(
       (comment) =>
@@ -328,10 +344,11 @@ export class ActionsState implements TaskDurability {
       state.active = null;
     }
     let pull: RemotePull | undefined;
+    let deferredRepair = false;
     if (state.pull) {
       pull = await this.transport.pull(state.pull.number, signal);
-      const pending = state.pending;
-      const deferredRepair =
+      const pending = state.pr?.resume_publication ?? state.pending;
+      deferredRepair =
         pending?.kind === "change" &&
         pending.retry_at > Date.now() &&
         ["dispatching", "uncertain"].includes(pending.status) &&
@@ -347,23 +364,8 @@ export class ActionsState implements TaskDurability {
         pull.branch === state.branch &&
         pull.repository_id === repository.id &&
         pull.base_repository_id === repository.id;
-      if (deferredRepair) {
-        this.restoredResult = {
-          version: 1,
-          repository: state.repository.full_name,
-          issue_number: state.issue.number,
-          job_id: state.job?.id,
-          revision: state.job?.revision,
-          outcome: "waiting",
-          reason: "retry_scheduled",
-          retry_at: pending.retry_at,
-          pull_number: state.pull.number,
-          head_sha: state.pull.head,
-        };
-        return;
-      }
       if (
-        digest(compactPull(pull)) !== digest(state.pull) ||
+        (!deferredRepair && digest(compactPull(pull)) !== digest(state.pull)) ||
         pull.branch !== state.branch ||
         pull.repository_id !== repository.id ||
         pull.base_repository_id !== repository.id
@@ -378,9 +380,39 @@ export class ActionsState implements TaskDurability {
         issueDigest(context) !== state.job?.issue_digest)
     )
       throw new StateError("state_incompatible");
+    if (
+      state.pr &&
+      !deferredRepair &&
+      (missingEvidence || this.expired) &&
+      state.reason === "recovery_evidence_missing"
+    )
+      state.reason = null;
+    if (missingEvidence && state.pr && !deferredRepair) missingEvidence = false;
     if (missingEvidence) {
       state.outcome = "blocked";
       state.reason = "recovery_evidence_missing";
+    }
+    if (deferredRepair) {
+      this.restoredResult = {
+        version: 1,
+        repository: state.repository.full_name,
+        issue_number: state.issue.number,
+        job_id: state.job?.id,
+        revision: state.job?.revision,
+        outcome: "waiting",
+        reason: "retry_scheduled",
+        retry_at: (state.pr?.resume_publication ?? state.pending)!.retry_at,
+        pull_number: state.pull!.number,
+        head_sha: state.pull!.head,
+      };
+      if (missingEvidence)
+        this.restoredResult = {
+          ...this.restoredResult,
+          outcome: "blocked",
+          reason: "recovery_evidence_missing",
+          retry_at: undefined,
+        };
+      return;
     }
     this.reconstructed = this.repository.restore(
       this.comment,
@@ -480,12 +512,16 @@ export class ActionsState implements TaskDurability {
         pull?.state === "closed")
     )
       this.restoredResult = this.recoveryResult(context, pull);
-    if (
-      !this.restoredResult &&
-      state.pending &&
-      !["confirmed", "blocked"].includes(state.pending.status) &&
-      state.pending.retry_at > Date.now()
-    )
+    const waitingPublication = [
+      state.pr?.resume_publication,
+      state.pending,
+    ].find(
+      (item) =>
+        item &&
+        !["confirmed", "blocked"].includes(item.status) &&
+        item.retry_at > Date.now(),
+    );
+    if (!this.restoredResult && waitingPublication)
       this.restoredResult = {
         version: 1,
         repository: state.repository.full_name,
@@ -494,7 +530,7 @@ export class ActionsState implements TaskDurability {
         revision: state.job?.revision,
         outcome: "waiting",
         reason: "retry_scheduled",
-        retry_at: state.pending.retry_at,
+        retry_at: waitingPublication.retry_at,
         ...(state.pull
           ? { pull_number: state.pull.number, head_sha: state.pull.head }
           : {}),
@@ -535,6 +571,19 @@ export class ActionsState implements TaskDurability {
         outcome: "closed",
         reason: context.state === "closed" ? "issue_closed" : "pull_closed",
       };
+    if (
+      state.pull &&
+      state.pr &&
+      state.scope &&
+      state.head === state.pr.head &&
+      state.reason !== "recovery_evidence_missing" &&
+      ![state.pr.resume_publication, state.pending].some((item) =>
+        item?.steps.some((step) =>
+          ["dispatching", "uncertain"].includes(step.state),
+        ),
+      )
+    )
+      return undefined;
     if (
       (!this.expired && state.reason === "recovery_evidence_missing") ||
       state.pull ||
@@ -592,6 +641,16 @@ export class ActionsState implements TaskDurability {
   }
   failure() {
     return this.fault;
+  }
+  publicationIntent(id: string) {
+    const intent = [
+      this.comment.state.pr?.resume_publication,
+      this.comment.state.pending,
+    ].find((item) => item?.id === id);
+    return intent ? structuredClone(intent) : undefined;
+  }
+  publishedHead() {
+    return this.comment.state.pr?.head;
   }
   question(): Question | null {
     const question = this.comment?.state.question;
@@ -821,14 +880,29 @@ export class ActionsState implements TaskDurability {
   }
 
   private async reconcile(signal: AbortSignal) {
-    const state = this.comment.state,
-      pending = state.pending;
-    if (!pending || ["confirmed", "blocked"].includes(pending.status)) return;
+    const intents = new Map(
+      [this.comment.state.pr?.resume_publication, this.comment.state.pending]
+        .filter((item) => item != null)
+        .map((item) => [item.id, item]),
+    );
+    for (const pending of intents.values())
+      await this.reconcilePublication(pending, signal);
+  }
+
+  private async reconcilePublication(
+    pending: NonNullable<TaskState["pending"]>,
+    signal: AbortSignal,
+  ) {
+    const state = this.comment.state;
+    if (["confirmed", "blocked"].includes(pending.status)) return;
     if (pending.retry_at > Date.now()) return;
     for (const step of pending.steps) {
       if (!["dispatching", "uncertain"].includes(step.state)) continue;
       let matched = false;
-      if (step.kind === "question_comment") {
+      if (
+        step.kind === "question_comment" ||
+        step.kind === "notification_comment"
+      ) {
         const matches = (
           await this.transport.comments(state.issue.number, signal)
         ).filter(
@@ -840,6 +914,11 @@ export class ActionsState implements TaskDurability {
         matched = matches.length === 1;
         if (matched) {
           step.object_id = matches[0].id;
+          if (state.pr)
+            (state.pr.owned ??= []).push({
+              kind: "issue_comment",
+              id: matches[0].id,
+            });
           if (
             state.question &&
             "version" in state.question &&
@@ -855,6 +934,18 @@ export class ActionsState implements TaskDurability {
         if (matched) {
           state.head = branch.head;
           if (state.pull) state.pull.head = branch.head!;
+          if (state.pr && branch.head) {
+            state.pr.head = branch.head;
+            state.pr.publication_id = pending.id;
+            state.pr.repair_reserved = false;
+            state.pr.published_at = null;
+            if (state.pr.monitor) {
+              state.pr.monitor.notification_id = null;
+              for (const finding of state.pr.monitor.findings)
+                if (finding.disposition === "fix" && !finding.fixed_head)
+                  finding.fixed_head = branch.head;
+            }
+          }
         }
       } else if (step.kind === "pull") {
         const matches = (
@@ -893,14 +984,30 @@ export class ActionsState implements TaskDurability {
           matched =
             matches.length === 1 &&
             (step.kind === "feedback_reply" || thread.resolved);
+          if (matched && state.pr) {
+            step.object_id = matches[0].id;
+            (state.pr.owned ??= []).push({
+              kind: "review_comment",
+              id: matches[0].id,
+            });
+          }
         }
       } else if (step.kind === "feedback_reply" && state.pull) {
-        matched =
-          (await this.transport.comments(state.pull.number, signal)).filter(
-            (comment) =>
-              comment.author_id === pending.actor.id &&
-              digest(comment.body) === step.body_digest,
-          ).length === 1;
+        const matches = (
+          await this.transport.comments(state.pull.number, signal)
+        ).filter(
+          (comment) =>
+            comment.author_id === pending.actor.id &&
+            digest(comment.body) === step.body_digest,
+        );
+        matched = matches.length === 1;
+        if (matched && state.pr) {
+          step.object_id = matches[0].id;
+          (state.pr.owned ??= []).push({
+            kind: "issue_comment",
+            id: matches[0].id,
+          });
+        }
       }
       if (!matched) throw new StateError("state_write_uncertain");
       step.state = "confirmed";
@@ -908,6 +1015,14 @@ export class ActionsState implements TaskDurability {
     pending.status = pending.steps.every((step) => step.state === "confirmed")
       ? "confirmed"
       : "reviewed";
-    if (pending.status === "confirmed") pending.retry_pending = false;
+    if (pending.status === "confirmed") {
+      pending.retry_pending = false;
+      if (
+        pending.kind === "pr_notification" &&
+        pending.event_id &&
+        state.pr?.monitor
+      )
+        state.pr.monitor.notification_id = pending.event_id;
+    }
   }
 }

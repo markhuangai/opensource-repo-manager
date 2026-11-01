@@ -13,6 +13,7 @@ import { implementationPlanSchema } from "../services/implementation/contracts.t
 import { commandSchema } from "../services/bootstrap/contracts.ts";
 import { artifactReferenceSchema } from "./bundle.ts";
 import { questionSchema } from "../services/clarification-contracts.ts";
+import { feedbackAssessment } from "../services/pr-monitor/contracts.ts";
 
 const count = z.number().int().nonnegative().safe();
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -41,7 +42,7 @@ const ownedPull = z.strictObject({
   title_digest: hash,
   body_digest: hash,
 });
-const publication = z.strictObject({
+export const durablePublicationSchema = z.strictObject({
   id: hash,
   revision: githubId,
   kind: z.enum([
@@ -53,6 +54,7 @@ const publication = z.strictObject({
     "notice",
     "change",
     "question",
+    "pr_notification",
   ]),
   actor: z.strictObject({ id: githubId, login: z.string().min(1).max(128) }),
   source: stateSource,
@@ -70,12 +72,30 @@ const publication = z.strictObject({
   ]),
   retry_at: count,
   retry_pending: z.boolean(),
+  event_id: hash.optional(),
+  intent: z
+    .strictObject({
+      payload: z.json(),
+      steps: z
+        .array(z.strictObject({ before: z.json(), after: z.json() }))
+        .max(5),
+    })
+    .optional(),
+  pull_intent: z
+    .strictObject({
+      title: z.string(),
+      body: z.string(),
+      branch: z.string(),
+      base: z.string(),
+    })
+    .optional(),
   steps: z
     .array(
       z.strictObject({
         kind: z.enum([
           "comment",
           "question_comment",
+          "notification_comment",
           "branch",
           "pull",
           "feedback_reply",
@@ -92,6 +112,67 @@ const publication = z.strictObject({
     )
     .max(5),
 });
+export const prContinuationSchema = z.strictObject({
+  version: z.literal(1),
+  implementation_id: z.uuid(),
+  publication_id: hash,
+  actor: z.strictObject({ id: githubId, login: z.string().min(1).max(128) }),
+  head: sha,
+  published_at: count.nullable(),
+  evidence_ids: z.array(hash).max(64),
+  repair_reserved: z.boolean().optional(),
+  resume_publication: durablePublicationSchema.optional(),
+  owned: z
+    .array(
+      z.strictObject({
+        kind: z.enum(["issue_comment", "review_comment", "review"]),
+        id: githubId,
+      }),
+    )
+    .max(512)
+    .optional(),
+  monitor: z
+    .strictObject({
+      id: z.uuid(),
+      policy_digest: hash,
+      policy_generation: githubId,
+      generation: count,
+      stage: z.enum([
+        "waiting",
+        "queued",
+        "assessing",
+        "repairing",
+        "ready",
+        "blocked",
+        "closed",
+      ]),
+      failure: z.string().max(128).nullable(),
+      findings: z
+        .array(
+          feedbackAssessment.shape.dispositions.element.extend({
+            surface: z.strictObject({
+              id: z.string(),
+              kind: z.enum(["thread", "review", "comment", "check"]),
+              author: z.string().nullable(),
+              reviewed_sha: sha.nullable(),
+              thread_id: z.string().nullable(),
+              body: z.string(),
+              digest: hash,
+            }),
+            action_id: hash.optional(),
+            run_id: z.string(),
+            assessed_head: sha,
+            fixed_head: sha.nullable(),
+            publication_id: hash.nullable(),
+            evidence: z.array(z.json()).max(64),
+          }),
+        )
+        .max(256),
+      notification_id: z.string().max(256).nullable(),
+    })
+    .nullable(),
+});
+export type PrContinuation = z.infer<typeof prContinuationSchema>;
 export const taskStateSchema = z.strictObject({
   version: z.literal(1),
   repository: repositoryIdentity.strict(),
@@ -155,8 +236,9 @@ export const taskStateSchema = z.strictObject({
   branch: z.string().min(1).max(1024),
   head: sha.nullable(),
   pull: ownedPull.nullable(),
-  pending: publication.nullable(),
+  pending: durablePublicationSchema.nullable(),
   session_artifact: artifactReferenceSchema.nullable(),
+  pr: prContinuationSchema.optional(),
 });
 export type TaskState = z.infer<typeof taskStateSchema>;
 export type DurablePublication = NonNullable<TaskState["pending"]>;
@@ -269,6 +351,7 @@ export class StateCodec {
         state.scope !== null ||
         state.findings !== null ||
         state.session_artifact !== null ||
+        state.pr !== undefined ||
         Object.values(state.budget).some(Boolean)
       )
         throw new StateError("state_invalid");

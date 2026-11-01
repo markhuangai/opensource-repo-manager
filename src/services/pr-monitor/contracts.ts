@@ -148,6 +148,7 @@ export const feedbackAssessment = z.strictObject({
 });
 export type FeedbackAssessment = z.infer<typeof feedbackAssessment>;
 export type FindingDisposition = FeedbackAssessment["dispositions"][number] & {
+  action_id?: string;
   surface: ReviewSurface;
   run_id: string;
   assessed_head: string;

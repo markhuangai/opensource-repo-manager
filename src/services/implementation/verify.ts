@@ -53,23 +53,29 @@ export async function captureBaseline(
   store: Store,
   jobId: number,
   signal: AbortSignal,
+  publishedHead?: string,
 ) {
   const request = supervisor.request(jobId, "audit");
   return supervisor.withJobLease(request, signal, (lease) =>
-    supervisor.bootstrapWorkspace(lease, request, async (workspace, runId) => {
-      const manifest = await supervisor.workspaces.freeze(
-        {
-          run_id: runId,
-          job_id: request.job_id,
-          revision: request.revision,
-          source: request.workspace.source,
-        },
-        workspace.workspace,
-        workerLimits(store.snapshot(request.snapshot_digest)).storage,
-        lease.signal,
-      );
-      return store.recordArtifact(manifest);
-    }),
+    supervisor.bootstrapWorkspace(
+      lease,
+      request,
+      async (workspace, runId) => {
+        const manifest = await supervisor.workspaces.freeze(
+          {
+            run_id: runId,
+            job_id: request.job_id,
+            revision: request.revision,
+            source: request.workspace.source,
+          },
+          workspace.workspace,
+          workerLimits(store.snapshot(request.snapshot_digest)).storage,
+          lease.signal,
+        );
+        return store.recordArtifact(manifest);
+      },
+      publishedHead,
+    ),
   );
 }
 

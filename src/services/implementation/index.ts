@@ -51,6 +51,7 @@ const safeFailures = new Set([
   "model_request_limit",
   "infrastructure_budget_exhausted",
   "repair_budget_exhausted",
+  "pr_wait_budget_exhausted",
   "implementation_interrupted_after_write",
   "implementation_scope_changed",
   "pr_scope_changed",
@@ -148,7 +149,7 @@ export class ImplementationService {
             record.publication_id,
           )
         : undefined;
-      if (operation?.status === "confirmed") {
+      if (!record.recovering && operation?.status === "confirmed") {
         const transitioned = record.stage !== "remote_review";
         if (transitioned) this.repository.finish(record);
         if (!new PrMonitorRepository(this.store).get(record.job_id))
@@ -437,6 +438,36 @@ export class ImplementationService {
       record.agent_pending = null;
       this.repository.save(record);
     }
+    if (record.recovering) {
+      const monitor = this.monitor?.repository.get(job.id);
+      if (monitor) {
+        this.monitor!.repository.accountWait(monitor);
+        monitor.wait_accounted_at = null;
+        this.monitor!.repository.save(monitor);
+      }
+      if (
+        budgetUsage.parse(JSON.parse(this.store.jobById(job.id)!.budget_json))
+          .wait_ms >=
+        snapshot.settings.limits.wait_hours * 3600000
+      )
+        throw new RuntimeError("pr_wait_budget_exhausted");
+    }
+    if (record.recovering && !record.artifact_digest) {
+      const pull = await this.supervisor.publication.verifyOwnedPull(
+        job.id,
+        record.published_origin!.head,
+        signal,
+      );
+      record.artifact_digest = await captureBaseline(
+        this.supervisor,
+        this.store,
+        job.id,
+        signal,
+        pull.head,
+      );
+      record.stage = "auditing";
+      this.repository.save(record);
+    }
     for (;;) {
       this.repository.assertCurrent(record);
       if (!record.artifact_digest || record.stage === "implementing") {
@@ -535,6 +566,8 @@ export class ImplementationService {
         record.agent_pending = null;
         this.repository.save(record);
         if (!result.approved || result.findings.length) {
+          if (record.recovering)
+            throw new RuntimeError("implementation_audit_mismatch");
           this.repository.repair(
             record,
             result.findings.length
@@ -599,7 +632,8 @@ export class ImplementationService {
         } catch (error) {
           if (
             error instanceof RuntimeError &&
-            error.code === "implementation_test_failed"
+            error.code === "implementation_test_failed" &&
+            !record.recovering
           ) {
             this.repository.repair(record, [
               "Supervisor verification failed.",
@@ -627,6 +661,65 @@ export class ImplementationService {
         this.repository.save(record);
       }
       break;
+    }
+    if (record.recovering) {
+      await this.supervisor.publication.verifyOwnedPull(
+        job.id,
+        record.published_origin!.head,
+        signal,
+      );
+      if (record.recovery_pull) {
+        const audit = record.audits.find(
+          (item) => item.id === record.audit_id,
+        )!;
+        const test = record.tests.find((item) => item.id === record.test_id)!;
+        const proposal: PublicationProposal = {
+          kind: "change",
+          recovery_of: record.published_origin!.id,
+          job_id: job.id,
+          revision: job.revision,
+          expected_head: record.published_origin!.head,
+          artifact_digest: record.artifact_digest!,
+          evidence_ids: [audit.evidence_id!, test.evidence_id!],
+          title: record.recovery_pull.title,
+          body: record.recovery_pull.body,
+          commit_message: "Revalidate the recorded maintenance candidate",
+        };
+        record.publication_id =
+          this.supervisor.publication.operationId(proposal);
+        this.repository.save(record);
+        await this.confirm(proposal, signal);
+        delete record.recovery_pull;
+      }
+      record.recovering = false;
+      if (record.resume_repair) {
+        delete record.resume_repair;
+        record.feedback = this.monitor!.repository.get(job.id)!
+          .findings.filter(
+            (item) => item.disposition === "fix" && !item.fixed_head,
+          )
+          .map((item) =>
+            JSON.stringify({
+              surface: item.surface,
+              explanation: item.explanation,
+              evidence: item.evidence,
+            }),
+          );
+        record.publication_id = null;
+        record.audit_id = null;
+        record.test_id = null;
+        record.candidate_bootstrap = null;
+        record.milestone_done = false;
+        record.stage = "implementing";
+        this.repository.save(record);
+        return;
+      }
+      record.stage = "remote_review";
+      this.repository.save(record);
+      this.store.db
+        .prepare("UPDATE jobs SET phase='remote_review' WHERE id=?")
+        .run(job.id);
+      return;
     }
     const hasWrites = Object.values(snapshot.roles.implementation.mcp).some(
       (grant) =>

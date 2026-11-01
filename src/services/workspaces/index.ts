@@ -195,6 +195,7 @@ export class WorkspaceService {
     repository: string,
     limits: { processes: number; storage: number },
     signal: AbortSignal,
+    publishedHead?: string,
   ): Promise<PreparedWorkspace> {
     const user = roleUsers[role],
       root = join(this.runsRoot, id),
@@ -281,6 +282,38 @@ export class WorkspaceService {
       );
       if (fetched !== `${source.sha}\n${source.tree_sha}`)
         throw new RuntimeError("source_identity_changed");
+      if (publishedHead) {
+        if (!/^[a-f0-9]{40}$/.test(publishedHead))
+          throw new RuntimeError("source_invalid");
+        await gitCommand(
+          [
+            "--git-dir",
+            sourceGit,
+            "fetch",
+            "--no-tags",
+            endpoint.href,
+            publishedHead,
+          ],
+          { cwd: stage, env, signal: combined },
+        );
+        const actual = await gitCommand(
+          ["--git-dir", sourceGit, "rev-parse", "FETCH_HEAD"],
+          { cwd: stage, env, signal: combined },
+        );
+        if (actual.trim() !== publishedHead)
+          throw new RuntimeError("source_identity_changed");
+        await gitCommand(
+          [
+            "--git-dir",
+            sourceGit,
+            "merge-base",
+            "--is-ancestor",
+            source.sha,
+            publishedHead,
+          ],
+          { cwd: stage, env, signal: combined },
+        );
+      }
       await treeBytes(stage, limits.storage);
       const workspace = join(root, "workspace"),
         home = join(root, "home"),
@@ -322,7 +355,7 @@ export class WorkspaceService {
       await ownedDirectory(temporary, user.uid, user.gid);
       const session = join(root, "session");
       await ownedDirectory(session, user.uid, user.gid);
-      await gitCommand(["checkout", "--detach", source.sha], {
+      await gitCommand(["checkout", "--detach", publishedHead ?? source.sha], {
         cwd: workspace,
         env: publicEnv,
         signal: combined,
