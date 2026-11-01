@@ -4,7 +4,10 @@ import { budgetUsage, type IssueContext, type Job } from "../domain/jobs.ts";
 import type { Store } from "./store.ts";
 import { InvestigationRepository } from "./investigation.ts";
 import { PublicationRepository } from "./publication.ts";
-import type { Implementation } from "../services/implementation/contracts.ts";
+import type {
+  Implementation,
+  PublishedOrigin,
+} from "../services/implementation/contracts.ts";
 import { bugEvidenceSchema } from "../services/investigation/contracts.ts";
 
 export class ImplementationRepository {
@@ -153,6 +156,9 @@ export class ImplementationRepository {
         if (record.stage !== "remote_review" || !record.publication_id)
           throw new RuntimeError("pr_repair_state_invalid");
         this.repair(record, findings);
+        record.published_origin = this.published(record);
+        if (!record.published_origin)
+          throw new RuntimeError("pr_repair_state_invalid");
         record.publication_id = null;
         record.status_operation = null;
         record.status_generation++;
@@ -162,6 +168,29 @@ export class ImplementationRepository {
           .run(record.job_id);
       })
       .immediate();
+  }
+
+  published(record: Implementation): PublishedOrigin | undefined {
+    const publications = new PublicationRepository(this.store);
+    const operation = record.publication_id
+      ? publications.operation(record.publication_id)
+      : undefined;
+    if (
+      operation?.status === "confirmed" &&
+      operation.proposal.kind === "change" &&
+      operation.commit &&
+      operation.actor
+    )
+      return {
+        id: operation.id,
+        head: operation.commit,
+        actor: operation.actor,
+        published_at:
+          publications.publishedAt(operation) ??
+          record.published_origin?.published_at ??
+          null,
+      };
+    return record.published_origin;
   }
 
   finish(record: Implementation) {

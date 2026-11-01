@@ -3,6 +3,7 @@ import type { ReviewRequest } from "../services/publication/contracts.ts";
 import { RuntimeError } from "./agents.ts";
 import type { Conversation } from "./agents.ts";
 import type { IssueContext } from "./jobs.ts";
+import type { DurablePublication } from "../actions/state.ts";
 import type { Question } from "../services/clarification-contracts.ts";
 
 export class StateError extends RuntimeError {
@@ -12,6 +13,8 @@ export class StateError extends RuntimeError {
 }
 
 export interface TaskDurability {
+  publicationIntent(id: string): DurablePublication | undefined;
+  publishedHead(): string | undefined;
   question(): Question | null;
   replies(question: string): Conversation["messages"];
   prepareIssue(context: IssueContext): void;

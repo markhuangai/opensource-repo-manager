@@ -68,7 +68,17 @@ export type VerificationReceipt = {
   finished_at: number | null;
   evidence_id: string | null;
 };
+export type PublishedOrigin = {
+  id: string;
+  head: string;
+  actor: { id: number; login: string };
+  published_at: number | null;
+};
 export type Implementation = {
+  published_origin?: PublishedOrigin;
+  recovering?: boolean;
+  resume_repair?: boolean;
+  recovery_pull?: { title: string; body: string; branch: string; base: string };
   continuation?: PhaseContinuation;
   id: string;
   job_id: number;

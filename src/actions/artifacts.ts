@@ -412,6 +412,23 @@ export class ActionsArtifacts {
         (state.head && !archived.head && !state.pending)
       )
         throw new StateError("recovery_evidence_missing");
+      const validation = (pr: TaskState["pr"]) =>
+        pr && {
+          ...pr,
+          owned: undefined,
+          resume_publication: undefined,
+          monitor: pr.monitor && {
+            id: pr.monitor.id,
+            policy_digest: pr.monitor.policy_digest,
+            policy_generation: pr.monitor.policy_generation,
+            findings: pr.monitor.findings,
+          },
+        };
+      if (
+        state.pr &&
+        digest(validation(archived.pr) ?? null) !== digest(validation(state.pr))
+      )
+        return "none";
       const manifests = this.manifests(checkpoint),
         sessions: Array<{ run: string; saved: Session; path: string }> = [];
       for (const run of this.sessionRuns(checkpoint)) {

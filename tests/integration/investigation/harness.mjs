@@ -272,6 +272,45 @@ export async function runInvestigationTests() {
       };
 
       for (const mode of [
+        "triage_information_empty",
+        "triage_information_valid",
+      ]) {
+        const value = await run(mode);
+        assert.equal(
+          value.record.stage,
+          mode.endsWith("empty") ? "blocked" : "completed",
+        );
+        if (mode.endsWith("empty")) {
+          assert.equal(value.record.failure, "investigation_evidence_invalid");
+          assert(
+            !notifications.some(
+              (item) =>
+                item.reason === "needs_information" &&
+                item.issue_number === value.job.issue_number,
+            ),
+          );
+          const comments =
+            remote.state.comments.get(value.job.issue_number) ?? [];
+          assert(
+            !comments.some((item) =>
+              item.body.includes("More information is needed"),
+            ),
+          );
+        } else
+          assert.deepEqual(value.record.result.questions, [
+            "Which existing behavior is expected?",
+          ]);
+        assert.equal(
+          store.db
+            .prepare(
+              "SELECT count(*) AS count FROM bootstrap_attempts WHERE job_id=?",
+            )
+            .get(value.job.id).count,
+          0,
+        );
+      }
+      proof.push({ sdk, service_triage_questions: "passed" });
+      for (const mode of [
         "source_only",
         "needs_information",
         "no_fix",

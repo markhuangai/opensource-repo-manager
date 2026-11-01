@@ -8,7 +8,7 @@ import type {
 } from "./contracts.ts";
 
 export function findingIdentity(finding: FindingDisposition) {
-  return digest({ ...finding, publication_id: null });
+  return finding.action_id ?? digest({ ...finding, publication_id: null });
 }
 
 export function observationDigest(snapshot: PrSnapshot) {

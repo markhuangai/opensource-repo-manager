@@ -25,6 +25,7 @@ import { Store } from "../src/repositories/store.ts";
 import { ActionsRepository } from "../src/repositories/actions.ts";
 import { PublicationRepository } from "../src/repositories/publication.ts";
 import { InvestigationRepository } from "../src/repositories/investigation.ts";
+import { PrMonitorRepository } from "../src/repositories/pr-monitor.ts";
 import { ImplementationRepository } from "../src/repositories/implementation.ts";
 import { IntakeService } from "../src/services/intake.ts";
 import { ModelRelay } from "../src/services/model-relay.ts";
@@ -690,6 +691,218 @@ describe("authenticated Actions task authority", () => {
     expect(blocked.jobs()).toEqual([]);
   });
 
+  it("retains newer authenticated PR findings over an older checkpoint without inventing validation receipts", async () => {
+    const f = await setup();
+    await f.open(f.store);
+    const target = new PublicationRepository(f.store).target(1);
+    const commit = f.remote.commit(
+      { "app.txt": "fixed\n" },
+      f.remote.source.sha,
+    );
+    f.remote.git(["update-ref", `refs/heads/${target.branch}`, commit.sha]);
+    await f.writer.updatePull(
+      null,
+      {
+        title: "Fix",
+        body: "Verified existing behavior",
+        branch: target.branch,
+        base: "main",
+      },
+      signal(),
+    );
+    const pull = await f.writer.pull(f.remote.state.pulls[0].number, signal());
+    const saved = f.read(),
+      state = saved.state,
+      investigationId = randomUUID(),
+      implementationId = randomUUID();
+    state.scope = {
+      job_id: 1,
+      revision: 1,
+      investigation_id: investigationId,
+      source: state.job!.source,
+      snapshot_digest: f.snapshot.digest,
+      objective: "Restore existing behavior",
+      plan: {
+        acceptance: ["Existing behavior works"],
+        paths: ["app.txt"],
+        regression: { cwd: ".", argv: ["true"] },
+        checks: [],
+      },
+      checks: [],
+      remote_checks: [],
+    };
+    state.scope_digest = digest(state.scope);
+    state.findings = {
+      outcome: "maintenance_candidate",
+      summary: "Confirmed defect",
+      objective: state.scope.objective,
+      proof: "source",
+      evidence_ids: [],
+      questions: [],
+      bug: {
+        expected_behavior: "Existing behavior",
+        observed_behavior: "Broken behavior",
+        existing_contract: "Documented contract",
+      },
+    };
+    state.head = commit.sha;
+    state.pull = {
+      id: pull.id,
+      number: pull.number,
+      author_id: pull.author_id!,
+      head: commit.sha,
+      base: "main",
+      title_digest: digest(pull.title),
+      body_digest: digest(pull.body),
+    };
+    state.pr = {
+      version: 1,
+      implementation_id: implementationId,
+      publication_id: "d".repeat(64),
+      actor: f.remote.state.actor,
+      head: commit.sha,
+      published_at: Date.now(),
+      evidence_ids: [],
+      monitor: {
+        id: randomUUID(),
+        policy_digest: digest(f.snapshot.settings.pr_monitor),
+        policy_generation: 1,
+        generation: 1,
+        stage: "waiting",
+        failure: null,
+        notification_id: null,
+        findings: [],
+      },
+    };
+    f.remote.state.comments
+      .get(1)!
+      .find((row) => row.id === state.comment_id)!.body = f.codec.encode(
+      state,
+      saved.narrative,
+    );
+    const working = f.database(),
+      artifacts = await f.artifactsFor(working);
+    await f.open(working, artifacts);
+    await working.checkpoint(signal(), true);
+    const reference = f.read().state.session_artifact;
+    expect(reference).not.toBeNull();
+    const monitors = new PrMonitorRepository(working),
+      monitor = monitors.get(1)!;
+    monitor.generation++;
+    monitor.notification_id = "f".repeat(64);
+    monitors.save(monitor);
+    await working.checkpoint(signal());
+    const cursors = f.read(),
+      compatible = f.database(),
+      compatibleArtifacts = await f.artifactsFor(compatible);
+    expect(
+      await compatibleArtifacts.restore(compatible, cursors, signal()),
+    ).toBe("restored");
+    await f.open(compatible, compatibleArtifacts);
+    expect(new PrMonitorRepository(compatible).get(1)!.notification_id).toBe(
+      monitor.notification_id,
+    );
+    expect(new PrMonitorRepository(compatible).get(1)!.generation).toBe(
+      monitor.generation,
+    );
+    monitor.findings.push({
+      surface_id: "comment:900",
+      disposition: "informational",
+      explanation: "No correction requested",
+      citations: [],
+      surface: {
+        id: "comment:900",
+        kind: "comment",
+        author: "reviewer",
+        reviewed_sha: commit.sha,
+        thread_id: null,
+        body: "Informational",
+        digest: "e".repeat(64),
+      },
+      run_id: randomUUID(),
+      assessed_head: commit.sha,
+      fixed_head: null,
+      publication_id: null,
+      evidence: [],
+    });
+    new PrMonitorRepository(compatible).save(monitor);
+    await compatible.checkpoint(signal());
+    const current = f.read().state;
+    expect(current.session_artifact).toEqual(reference);
+    const fresh = f.database();
+    await f.open(fresh, await f.artifactsFor(fresh));
+    expect(new PrMonitorRepository(fresh).get(1)!.findings).toEqual(
+      current.pr!.monitor!.findings,
+    );
+    expect(f.read().state.pr!.monitor!.generation).toBe(
+      current.pr!.monitor!.generation,
+    );
+    const implementation = new ImplementationRepository(fresh).current(
+      fresh.job(1)!,
+    )!;
+    expect(implementation.recovering).toBe(true);
+    expect(implementation.audits).toEqual([]);
+    expect(implementation.tests).toEqual([]);
+    expect(fresh.runs()).toEqual([]);
+    expect(f.read().state.budget).toEqual(current.budget);
+    const interrupted = f.read();
+    const intent = {
+      ...state.pr,
+      resume_publication: {
+        id: "f".repeat(64),
+        revision: 1,
+        kind: "feedback" as const,
+        actor: f.remote.state.actor,
+        source: f.remote.source,
+        branch: target.branch,
+        commit: null,
+        review_id: randomUUID(),
+        review_binding: "b".repeat(64),
+        policy_identity: "fixture-review-policy",
+        status: "reviewed" as const,
+        retry_at: 0,
+        retry_pending: false,
+        intent: {
+          payload: { feedback: { body: "Reviewed", thread: null } },
+          steps: [{ before: null, after: "Reviewed" }],
+        },
+        steps: [
+          {
+            kind: "feedback_reply" as const,
+            state: "prepared" as const,
+            before_digest: digest(null),
+            after_digest: digest("Reviewed"),
+            object_id: null,
+            thread_id: null,
+            title_digest: null,
+            body_digest: digest("Reviewed"),
+          },
+        ],
+      },
+    };
+    interrupted.state.pr = {
+      ...interrupted.state.pr!,
+      resume_publication: intent.resume_publication,
+    };
+    f.remote.state.comments
+      .get(1)!
+      .find((row) => row.id === state.comment_id)!.body = f.codec.encode(
+      interrupted.state,
+      interrupted.narrative,
+    );
+    const again = f.database();
+    const continued = await f.open(again, await f.artifactsFor(again));
+    expect(continued.publicationIntent(intent.resume_publication.id)).toEqual(
+      intent.resume_publication,
+    );
+    await again.checkpoint(signal());
+    const twice = f.database();
+    const resumed = await f.open(twice, await f.artifactsFor(twice));
+    expect(resumed.publicationIntent(intent.resume_publication.id)).toEqual(
+      intent.resume_publication,
+    );
+  });
+
   it.each(["empty", "retained", "checkpoint"])(
     "recovers a created PR after response loss with %s local storage",
     async (storage) => {
@@ -845,9 +1058,15 @@ describe("authenticated Actions task authority", () => {
     },
   );
 
-  it.each(["empty", "retained", "checkpoint"])(
-    "reconciles an interrupted repair push with %s local storage and rejects later human edits",
-    async (storage) => {
+  it.each([
+    ["empty", null],
+    ["retained", null],
+    ["checkpoint", null],
+    ["checkpoint", "scope"],
+    ["checkpoint", "evidence"],
+  ] as const)(
+    "reconciles an interrupted repair push with %s storage and %s diagnostic precedence",
+    async (storage, fault) => {
       const f = await setup();
       await f.open(f.store);
       const artifacts =
@@ -890,6 +1109,28 @@ describe("authenticated Actions task authority", () => {
           run_id: null,
           created_at: Date.now(),
         });
+      if (fault === "scope") {
+        new ActionsRepository(f.store).scope(
+          {
+            job_id: 1,
+            revision: 1,
+            investigation_id: randomUUID(),
+            source: f.remote.source,
+            snapshot_digest: f.snapshot.digest,
+            objective: "Restore existing behavior",
+            plan: {
+              acceptance: ["The documented behavior works"],
+              paths: ["app.txt"],
+              regression: { cwd: ".", argv: ["true"] },
+              checks: [],
+            },
+            checks: [],
+            remote_checks: [],
+          },
+          review.id,
+        );
+      }
+      if (fault === "evidence") await f.store.checkpoint(signal(), true);
       repository.begin({
         id: "c".repeat(64),
         job_id: 1,
@@ -936,7 +1177,10 @@ describe("authenticated Actions task authority", () => {
         ],
       });
       f.store.reserveInfrastructureRetry(1);
-      await f.store.checkpoint(signal(), Boolean(artifacts));
+      await f.store.checkpoint(
+        signal(),
+        Boolean(artifacts) && fault !== "evidence",
+      );
       const repairBudget = f.read().state.budget;
       expect(f.read().state.pending?.commit).toBe(repaired.sha);
       f.remote.git(["update-ref", `refs/heads/${target.branch}`, repaired.sha]);
@@ -946,6 +1190,30 @@ describe("authenticated Actions task authority", () => {
         storage === "checkpoint"
           ? await f.artifactsFor(repairStore)
           : undefined;
+      if (fault) {
+        const before = f.read();
+        if (fault === "scope")
+          f.remote.state.issues.get(1)!.body = "Changed frozen scope";
+        for (const now of [Date.now(), deadline]) {
+          vi.spyOn(Date, "now").mockReturnValue(now);
+          if (fault === "scope")
+            await expect(
+              f.open(repairStore, restoredArtifacts),
+            ).rejects.toThrow("state_incompatible");
+          else
+            expect(
+              (await f.open(repairStore, restoredArtifacts)).result(),
+            ).toMatchObject({
+              outcome: "blocked",
+              reason: "recovery_evidence_missing",
+            });
+          expect(f.read().state.budget).toEqual(before.state.budget);
+          expect(f.read().state.pending!.retry_at).toBe(deadline);
+          expect(f.remote.state.pulls).toHaveLength(1);
+          expect(f.read().state.pending!.steps[1].state).toBe("prepared");
+        }
+        return;
+      }
       for (let attempt = 0; attempt < 2; attempt++) {
         const early = await f.open(repairStore, restoredArtifacts);
         expect(early.result()).toMatchObject({
