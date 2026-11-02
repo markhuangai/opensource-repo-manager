@@ -46,6 +46,7 @@ WORKDIR /opt/orm/app
 COPY --from=build /build/package.json ./
 COPY --from=build /build/node_modules ./node_modules
 COPY --from=build /build/dist ./dist
+COPY --chown=0:0 examples/workflow /opt/orm/defaults
 COPY --from=build /build/mise/bin/mise /opt/orm-runtime/bin/mise
 COPY --from=build --chown=0:0 /build/gitleaks /opt/orm-runtime/bin/gitleaks
 EXPOSE 8080

@@ -1,4 +1,4 @@
-import { LineCounter, parseDocument } from "yaml";
+import { LineCounter, parseDocument, stringify } from "yaml";
 import { z } from "zod";
 import { ConfigurationError, configurationSections } from "./errors.ts";
 import { isContainedReference } from "./files.ts";
@@ -357,4 +357,32 @@ export function parseActionsConfiguration(
   const config = parseSchema(source, actionsConfigurationSchema);
   validateReferences(config);
   return config;
+}
+
+export function parseRepositoryActionsConfiguration(
+  source: string,
+  credentials: { repository: string; token: string; proxyKey: string },
+): ActionsConfiguration {
+  const input = parseSchema(
+    source,
+    configurationSchema
+      .omit({ github: true, notifications: true, mcp: true })
+      .extend({
+        proxy: configurationSchema.shape.proxy.omit({ key: true }),
+        roles: z.strictObject({
+          bootstrap: role.omit({ mcp: true }),
+          investigation: role.omit({ mcp: true }),
+          implementation: role.omit({ mcp: true }),
+          audit: role.omit({ mcp: true }),
+          output_review: role.omit({ mcp: true }),
+        }),
+      }),
+  );
+  return parseActionsConfiguration(
+    stringify({
+      ...input,
+      github: { repository: credentials.repository, token: credentials.token },
+      proxy: { ...input.proxy, key: credentials.proxyKey },
+    }),
+  );
 }

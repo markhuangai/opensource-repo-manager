@@ -1,0 +1,142 @@
+name: Bounded maintenance
+
+on:
+  workflow_call:
+    inputs:
+      runtime-image:
+        description: Immutable runtime image reference including its sha256 digest
+        required: true
+        type: string
+      runner:
+        description: Compatible Linux AMD64 or ARM64 Docker runner label
+        default: ubuntu-24.04
+        type: string
+      issue-number:
+        description: Issue selected by a maintainer through workflow_dispatch
+        default: ""
+        type: string
+    secrets:
+      ORM_GITHUB_TOKEN:
+        required: true
+      ORM_PROXY_KEY:
+        required: true
+      ORM_SESSION_KEY:
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  resolve:
+    name: Resolve maintenance issues
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    outputs:
+      issues: ${{ steps.route.outputs.issues }}
+      has_work: ${{ steps.route.outputs.has_work }}
+    steps:
+      - name: Route through the pinned controller
+        id: route
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
+          ORM_ISSUE_NUMBER: ${{ inputs.issue-number }}
+          ORM_GITHUB_TOKEN: ${{ secrets.ORM_GITHUB_TOKEN }}
+          ORM_SESSION_KEY: ${{ secrets.ORM_SESSION_KEY }}
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            const image = process.env.ORM_RUNTIME_IMAGE;
+            assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
+            const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-route`;
+            await exec.exec("docker", ["pull", image]);
+            const environment = ["ORM_GITHUB_TOKEN", "ORM_SESSION_KEY", "ORM_ISSUE_NUMBER", "GITHUB_REPOSITORY", "GITHUB_EVENT_NAME", "GITHUB_REF"];
+            await exec.exec("docker", ["create", "--name", name,
+              "--label", `org.opensource-repo-manager.actions-run=${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`,
+              "--no-healthcheck", "--mount", `type=bind,src=${process.env.GITHUB_EVENT_PATH},dst=/event.json,readonly`,
+              "--env", "GITHUB_EVENT_PATH=/event.json", ...environment.flatMap(key => ["--env", key]),
+              "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "route"]);
+            const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true});
+            const result = JSON.parse(output.stdout.trim());
+            assert(result.version === 1 && result.repository_id === Number(process.env.GITHUB_REPOSITORY_ID) &&
+              Array.isArray(result.issues) && result.issues.length <= 256 &&
+              result.issues.every(number => Number.isSafeInteger(number) && number > 0) &&
+              new Set(result.issues).size === result.issues.length, "Invalid routing result.");
+            core.setOutput("issues", JSON.stringify(result.issues));
+            core.setOutput("has_work", String(result.issues.length > 0));
+      - name: Remove the routing container
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-route`;
+            const inspected = await exec.getExecOutput("docker", ["inspect", "--format",
+              '{{index .Config.Labels "org.opensource-repo-manager.actions-run"}}', name], {silent: true, ignoreReturnCode: true});
+            if (inspected.exitCode && /No such (object|container)/i.test(inspected.stderr)) return;
+            assert(!inspected.exitCode && inspected.stdout.trim() === `${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`, "Routing container ownership is unverified.");
+            await exec.exec("docker", ["stop", "--time", "15", name]);
+            await exec.exec("docker", ["rm", "--volumes", name]);
+            core.info(JSON.stringify({container: name, cleanup: "passed"}));
+
+  maintenance:
+    name: Maintain issue ${{ matrix.issue }}
+    needs: resolve
+    if: needs.resolve.outputs.has_work == 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        issue: ${{ fromJSON(needs.resolve.outputs.issues) }}
+    concurrency:
+      group: orm-${{ github.repository_id }}-issue-${{ matrix.issue }}
+      cancel-in-progress: false
+    steps:
+      - name: Execute the bounded maintenance task
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
+          ORM_SELECTED_ISSUE: ${{ matrix.issue }}
+          ORM_GITHUB_TOKEN: ${{ secrets.ORM_GITHUB_TOKEN }}
+          ORM_PROXY_KEY: ${{ secrets.ORM_PROXY_KEY }}
+          ORM_SESSION_KEY: ${{ secrets.ORM_SESSION_KEY }}
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            const image = process.env.ORM_RUNTIME_IMAGE, issue = process.env.ORM_SELECTED_ISSUE;
+            assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
+            assert(/^[1-9][0-9]*$/.test(issue) && Number.isSafeInteger(Number(issue)), "Invalid selected issue.");
+            const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-issue-${issue}`;
+            await exec.exec("docker", ["pull", image]);
+            const environment = ["ORM_GITHUB_TOKEN", "ORM_PROXY_KEY", "ORM_SESSION_KEY", "GITHUB_ACTIONS", "GITHUB_REPOSITORY",
+              "GITHUB_REPOSITORY_ID", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_RESULTS_URL"];
+            assert(environment.every(key => process.env[key]), "Missing trusted Actions context or credentials.");
+            await exec.exec("docker", ["create", "--name", name,
+              "--label", `org.opensource-repo-manager.actions-run=${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`,
+              "--no-healthcheck", ...environment.flatMap(key => ["--env", key]),
+              "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "run", issue]);
+            const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true, ignoreReturnCode: true});
+            const result = JSON.parse(output.stdout.trim());
+            assert(result.version === 1 && typeof result.outcome === "string", "Missing bounded-task result.");
+            await core.summary.addHeading(`Maintenance issue ${issue}`).addCodeBlock(JSON.stringify(result, null, 2), "json").write();
+            if (output.exitCode) core.setFailed(`Maintenance stopped: ${result.reason}`);
+      - name: Remove the maintenance container
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ORM_SELECTED_ISSUE: ${{ matrix.issue }}
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            const issue = process.env.ORM_SELECTED_ISSUE;
+            assert(/^[1-9][0-9]*$/.test(issue) && Number.isSafeInteger(Number(issue)), "Invalid cleanup issue.");
+            const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-issue-${issue}`;
+            const inspected = await exec.getExecOutput("docker", ["inspect", "--format",
+              '{{index .Config.Labels "org.opensource-repo-manager.actions-run"}}', name], {silent: true, ignoreReturnCode: true});
+            if (inspected.exitCode && /No such (object|container)/i.test(inspected.stderr)) return;
+            assert(!inspected.exitCode && inspected.stdout.trim() === `${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`, "Maintenance container ownership is unverified.");
+            await exec.exec("docker", ["stop", "--time", "15", name]);
+            await exec.exec("docker", ["rm", "--volumes", name]);
+            core.info(JSON.stringify({container: name, cleanup: "passed"}));

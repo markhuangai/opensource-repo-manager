@@ -1,7 +1,9 @@
 import { createServer, request } from "node:http";
 import assert from "node:assert/strict";
 import { createServer as httpsServer } from "node:https";
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync, readdirSync, lstatSync } from "node:fs";
+import { join } from "node:path";
+import { stringify as stringifyYaml } from "/opt/orm/app/node_modules/yaml/dist/index.js";
 import Database from "/opt/orm/app/node_modules/better-sqlite3/lib/index.js";
 import {
   createPublicationFixture,
@@ -327,7 +329,48 @@ const tls = httpsServer(
 );
 const http = createServer(async (req, res) => {
   const url = new URL(req.url, "http://fixture");
-  if (actions && url.pathname === "/select" && req.method === "POST") {
+  if (
+    actions &&
+    url.pathname === "/controller-source" &&
+    req.method === "POST"
+  ) {
+    const operator = {
+      version: config.version,
+      proxy: { url: config.proxy.url },
+      profiles: config.profiles,
+      roles: config.roles,
+      pr_monitor: config.pr_monitor,
+      limits: config.limits,
+    };
+    const files = {
+      ...sourceFiles,
+      ".github/orm.yml": stringifyYaml(operator),
+    };
+    function bundles(directory, prefix) {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name),
+          reference = `${prefix}/${entry.name}`;
+        if (entry.isDirectory()) bundles(path, reference);
+        else {
+          assert(entry.isFile());
+          files[reference] = readFileSync(path);
+        }
+      }
+    }
+    for (const reference of new Set(
+      Object.values(config.roles).flatMap((role) =>
+        Object.values(role.prompts),
+      ),
+    )) {
+      const path = join("/fixture/prompts", reference);
+      assert(lstatSync(path).isFile());
+      files[`.github/orm/prompts/${reference}`] = readFileSync(path);
+    }
+    bundles("/fixture/skills", ".github/orm/skills");
+    const pinned = remote.commit(files, remote.head("main"));
+    remote.git(["update-ref", "refs/heads/main", pinned.sha]);
+    res.end(JSON.stringify(pinned));
+  } else if (actions && url.pathname === "/select" && req.method === "POST") {
     if (database) databases.set(`${dataRoot}:${selectedIssue}`, database);
     selectedIssue = Number(url.searchParams.get("issue"));
     sessionPhase = url.searchParams.get("session") ?? "seed";

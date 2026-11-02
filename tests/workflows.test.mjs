@@ -20,6 +20,7 @@ const review = await workflow("ai-pr-review");
 const release = await workflow("release");
 const ci = await workflow("ci");
 const codeql = await workflow("codeql");
+const maintenance = await workflow("maintenance");
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const step = (job, name) => job.steps.find((entry) => entry.name === name);
 const sha = "a".repeat(40);
@@ -447,6 +448,15 @@ describe("release and CI boundaries", () => {
       ),
     );
     expect(release.concurrency["cancel-in-progress"]).toBe(false);
+    expect(release.concurrency.group).toContain("github.event.release.id");
+    expect(release.jobs.promote_latest.needs).toEqual(["resolve", "publish"]);
+    expect(release.jobs.promote_latest.if).toBe(
+      "needs.resolve.outputs.prerelease == 'false'",
+    );
+    expect(release.jobs.promote_latest.concurrency).toEqual({
+      group: "release-${{ github.repository }}",
+      "cancel-in-progress": false,
+    });
   });
 
   it("requires native smoke tests for both architectures", () => {
@@ -498,7 +508,7 @@ describe("release and CI boundaries", () => {
     expect(step(review.jobs.review, "Review pull request").uses).toBe(
       "markhuangai/ai-pr-reviewer@v1-prerelease",
     );
-    for (const document of [ci, codeql, review, release]) {
+    for (const document of [ci, codeql, review, release, maintenance]) {
       for (const job of Object.values(document.jobs)) {
         for (const entry of job.steps) {
           if (
@@ -583,6 +593,8 @@ describe("native suite aggregation", () => {
         containerSuites.map((suite) => ({
           suite,
           architecture,
+          workflow_run_id: 123,
+          run_attempt: 1,
           queue_ms: 10000,
           execution_ms: 900000,
           job_url: "https://example.invalid/job",
@@ -632,7 +644,181 @@ describe("native suite aggregation", () => {
       list[index].conclusion = "failure";
       expect((await run(script, { env, jobs: list })).failures).toEqual([]);
     });
+    it(`marks inconsistent ${architecture} timestamps unavailable instead of reporting negative latency`, async () => {
+      const list = jobs();
+      list[selected(list)].created_at = "2026-10-25T00:20:00Z";
+      list[selected(list)].completed_at = "2026-10-25T00:00:00Z";
+      const result = await run(script, { env, jobs: list });
+      expect(result.failures).toEqual([]);
+      expect(JSON.parse(result.notices.at(-1))).toMatchObject({
+        queue_ms: null,
+        execution_ms: null,
+        timing_error: "invalid_timestamps",
+        run_attempt: 1,
+      });
+    });
   }
+});
+
+describe("pinned reusable maintenance workflow", () => {
+  const image = `ghcr.io/markhuangai/opensource-repo-manager@sha256:${"a".repeat(64)}`;
+  const route = step(
+    maintenance.jobs.resolve,
+    "Route through the pinned controller",
+  ).with.script;
+  const execute = step(
+    maintenance.jobs.maintenance,
+    "Execute the bounded maintenance task",
+  ).with.script;
+  const cleanup = step(
+    maintenance.jobs.maintenance,
+    "Remove the maintenance container",
+  ).with.script;
+  const environment = {
+    ORM_RUNTIME_IMAGE: image,
+    ORM_SELECTED_ISSUE: "7",
+    ORM_GITHUB_TOKEN: "protected-pat",
+    ORM_PROXY_KEY: "protected-proxy",
+    ORM_SESSION_KEY: "protected-key",
+    GITHUB_ACTIONS: "true",
+    GITHUB_REPOSITORY: "owner/repo",
+    GITHUB_REPOSITORY_ID: "42",
+    GITHUB_RUN_ID: "123",
+    GITHUB_SHA: sha,
+    GITHUB_EVENT_PATH: "/runner/event.json",
+    ACTIONS_RUNTIME_TOKEN: "protected-runtime",
+    ACTIONS_RESULTS_URL: "https://results.actions.githubusercontent.com/",
+  };
+  it("exposes exactly three secrets and resolves root issues before the shared concurrency group", async () => {
+    expect(Object.keys(maintenance.on["workflow_call"].secrets).sort()).toEqual(
+      ["ORM_GITHUB_TOKEN", "ORM_PROXY_KEY", "ORM_SESSION_KEY"],
+    );
+    expect(maintenance.on["workflow_call"].inputs.runner.default).toBe(
+      "ubuntu-24.04",
+    );
+    expect(
+      maintenance.on["workflow_call"].inputs["runtime-image"].required,
+    ).toBe(true);
+    expect(maintenance.jobs.maintenance.needs).toBe("resolve");
+    expect(maintenance.jobs.maintenance.concurrency).toEqual({
+      group: "orm-${{ github.repository_id }}-issue-${{ matrix.issue }}",
+      "cancel-in-progress": false,
+    });
+    expect(JSON.stringify(maintenance)).not.toMatch(
+      /queue:|actions\/checkout|--privileged|docker.sock|--network.?host/,
+    );
+    const consumer = parse(
+      await readFile(
+        new URL("../examples/actions/maintenance.yml", import.meta.url),
+        "utf8",
+      ),
+    );
+    expect(consumer.on.schedule).toEqual([{ cron: "7,22,37,52 * * * *" }]);
+    expect(consumer.on.pull_request_target.types).toEqual([
+      "synchronize",
+      "closed",
+    ]);
+    expect(consumer.on.issue_comment.types).toEqual(["created"]);
+    expect(consumer.jobs.maintenance.uses).toMatch(
+      /@REPLACE_WITH_FULL_COMMIT_SHA$/,
+    );
+  });
+  for (const mutable of [
+    "ghcr.io/owner/image:latest",
+    "ghcr.io/owner/image:sha-abc",
+    "ghcr.io/owner/image@sha256:short",
+    `${image}; unsafe`,
+  ])
+    it(`rejects mutable or malformed image ${mutable} before Docker execution`, async () => {
+      const calls = [];
+      for (const script of [route, execute])
+        await expect(
+          run(script, {
+            env: { ...environment, ORM_RUNTIME_IMAGE: mutable },
+            executor: { exec: async (...args) => calls.push(args) },
+          }),
+        ).rejects.toThrow("pinned by digest");
+      expect(calls).toEqual([]);
+    });
+  it("runs only the pinned controller and passes credentials by environment name", async () => {
+    const calls = [];
+    const result = await run(route, {
+      env: environment,
+      executor: {
+        exec: async (command, args) => calls.push([command, args]),
+        getExecOutput: async () => ({
+          stdout: JSON.stringify({
+            version: 1,
+            repository_id: 42,
+            issues: [7, 9],
+          }),
+          exitCode: 0,
+        }),
+      },
+    });
+    expect(result.outputs).toEqual({ issues: "[7,9]", has_work: "true" });
+    expect(calls[1][1].slice(-4)).toEqual([
+      "--",
+      "/opt/orm-runtime/bin/node",
+      "/opt/orm/app/dist/actions/controller.js",
+      "route",
+    ]);
+    expect(JSON.stringify(calls)).not.toContain("protected-");
+    expect(calls[1][1]).toContain("ORM_GITHUB_TOKEN");
+    expect(calls[1][1]).not.toContain("ORM_PROXY_KEY");
+  });
+  it("treats waiting as a successful bounded exit and preserves failed results", async () => {
+    for (const exitCode of [0, 1]) {
+      const result = await run(execute, {
+        env: environment,
+        executor: {
+          exec: async () => {},
+          getExecOutput: async () => ({
+            exitCode,
+            stdout: JSON.stringify({
+              version: 1,
+              outcome: exitCode ? "blocked" : "waiting",
+              reason: "needs_information",
+            }),
+          }),
+        },
+      });
+      expect(result.failures).toHaveLength(exitCode);
+      expect(result.summaries[0].outcome).toBe(
+        exitCode ? "blocked" : "waiting",
+      );
+    }
+  });
+  it("refuses cleanup when container ownership is different or unverified", async () => {
+    const calls = [];
+    await expect(
+      run(cleanup, {
+        env: environment,
+        executor: {
+          exec: async (...args) => calls.push(args),
+          getExecOutput: async () => ({
+            exitCode: 0,
+            stdout: "other-run",
+            stderr: "",
+          }),
+        },
+      }),
+    ).rejects.toThrow("ownership is unverified");
+    expect(calls).toEqual([]);
+    const result = await run(cleanup, {
+      env: environment,
+      executor: {
+        exec: async (...args) => calls.push(args),
+        getExecOutput: async () => ({
+          exitCode: 0,
+          stdout: "123-1",
+          stderr: "",
+        }),
+      },
+    });
+    expect(calls.map((row) => row[1][0])).toEqual(["stop", "rm"]);
+    expect(JSON.parse(result.notices[0]).cleanup).toBe("passed");
+  });
 });
 
 const image = "ghcr.io/markhuangai/opensource-repo-manager";
@@ -820,6 +1006,23 @@ const combinedManifest = {
   digest: digest("e"),
   manifests: nativeReceipts.map(descriptor),
 };
+const publicationAnnotation = (
+  release = publishedRelease,
+  receipts = nativeReceipts,
+) => ({
+  version: 1,
+  release_id: release.id,
+  source_sha: receipts[0].source_sha,
+  release_version: release.tag_name.slice(1),
+  platforms: receipts.map(({ platform, platform_digest }) => ({
+    platform,
+    platform_digest,
+  })),
+});
+const promotionScript = step(
+  release.jobs.promote_latest,
+  "Promote the current verified stable release",
+).with.script;
 const publishScript = step(
   release.jobs.publish,
   "Verify manifests and publish release tags",
@@ -859,6 +1062,25 @@ function registryTransport(overrides = {}) {
         expect(command).toBe("docker");
         expect(args.slice(0, 3)).toEqual(["buildx", "imagetools", "create"]);
         publications.push(args);
+        const annotationIndex = args.indexOf("--annotation");
+        const annotations =
+          annotationIndex < 0
+            ? {}
+            : {
+                "org.opensource-repo-manager.publication": args[
+                  annotationIndex + 1
+                ]
+                  .split("=")
+                  .slice(1)
+                  .join("="),
+              };
+        for (let index = 0; index < args.length; index++) {
+          if (args[index] === "--tag")
+            manifests[args[index + 1]] = {
+              ...combinedManifest,
+              annotations,
+            };
+        }
       },
       getExecOutput: async (command, args) => {
         expect(command).toBe("docker");
@@ -882,7 +1104,7 @@ const publicationEnv = (directory) => ({
 });
 
 describe("release manifest promotion", () => {
-  it("combines the tested digests and promotes only the verified combined digest", async () => {
+  it("publishes version and source tags with verified promotion evidence", async () => {
     await withReceipts(async (directory) => {
       const registry = registryTransport();
       const result = await run(publishScript, {
@@ -900,15 +1122,9 @@ describe("release manifest promotion", () => {
           `${image}:0.1.0`,
           "--tag",
           `${image}:sha-${sha}`,
+          "--annotation",
+          `index:org.opensource-repo-manager.publication=${JSON.stringify(publicationAnnotation())}`,
           ...nativeReceipts.map((receipt) => `${image}@${receipt.digest}`),
-        ],
-        [
-          "buildx",
-          "imagetools",
-          "create",
-          "--tag",
-          `${image}:latest`,
-          `${image}@${digest("e")}`,
         ],
       ]);
       expect(result.summaries).toEqual([
@@ -917,7 +1133,7 @@ describe("release manifest promotion", () => {
           version: "0.1.0",
           source_sha: sha,
           digest: digest("e"),
-          tags: [`${image}:0.1.0`, `${image}:sha-${sha}`, `${image}:latest`],
+          tags: [`${image}:0.1.0`, `${image}:sha-${sha}`],
           platforms: nativeReceipts.map(
             ({ platform, digest, platform_digest }) => ({
               platform,
@@ -1117,8 +1333,204 @@ describe("release manifest promotion", () => {
         transport: releaseTransport(),
         executor: registry.executor,
       });
-      expect(registry.publications).toHaveLength(2);
+      expect(registry.publications).toHaveLength(1);
     });
+  });
+});
+
+describe("serialized latest reconciliation", () => {
+  const verified = (release = publishedRelease, changes = {}) => ({
+    ...combinedManifest,
+    annotations: {
+      "org.opensource-repo-manager.publication": JSON.stringify(
+        publicationAnnotation(release),
+      ),
+    },
+    ...changes,
+  });
+  const reconcile = (
+    registry,
+    transport = releaseTransport(),
+    context = releaseContext(),
+  ) =>
+    run(promotionScript, {
+      context,
+      env: { IMAGE: image },
+      transport,
+      executor: registry.executor,
+    });
+
+  it("reconciles the current latest release even when an older run wins the pending slot", async () => {
+    const current = { ...publishedRelease, id: 44, tag_name: "v0.3.0" };
+    const registry = registryTransport({
+      [`${image}:0.3.0`]: verified(current),
+    });
+    const result = await reconcile(
+      registry,
+      releaseTransport({ latest: current }),
+    );
+    expect(registry.publications).toEqual([
+      [
+        "buildx",
+        "imagetools",
+        "create",
+        "--tag",
+        `${image}:latest`,
+        `${image}@${digest("e")}`,
+      ],
+    ]);
+    expect(result.summaries[0]).toMatchObject({
+      release_id: 44,
+      version: "0.3.0",
+      source_sha: sha,
+    });
+  });
+
+  it("publishes all three versions before a coalesced promotion and tolerates reruns", async () => {
+    const registry = registryTransport();
+    const versions = ["0.1.0", "0.2.0", "0.3.0"];
+    for (const index of [0, 2, 1, 0]) {
+      const version = versions[index];
+      const release = {
+        ...publishedRelease,
+        id: 42 + index,
+        tag_name: `v${version}`,
+      };
+      await withReceipts(
+        async (directory) => {
+          await run(publishScript, {
+            context: releaseContext(release),
+            env: { ...publicationEnv(directory), VERSION: version },
+            transport: releaseTransport({ current: release }),
+            executor: registry.executor,
+          });
+        },
+        nativeReceipts.map((receipt) => ({ ...receipt, version })),
+      );
+    }
+    expect(registry.publications).toHaveLength(4);
+    for (const version of versions)
+      expect(
+        registry.publications.some((args) =>
+          args.includes(`${image}:${version}`),
+        ),
+      ).toBe(true);
+    expect(
+      registry.publications.every((args) => !args.includes(`${image}:latest`)),
+    ).toBe(true);
+    const latest = { ...publishedRelease, id: 44, tag_name: "v0.3.0" };
+    await reconcile(registry, releaseTransport({ latest }));
+    expect(registry.publications).toHaveLength(5);
+  });
+
+  it("accepts a source tag concurrently published by another verified version of the same source", async () => {
+    const other = { ...publishedRelease, id: 43, tag_name: "v0.2.0" };
+    const registry = registryTransport({
+      [`${image}:sha-${sha}`]: verified(other, { digest: digest("f") }),
+    });
+    await withReceipts((directory) =>
+      run(publishScript, {
+        context: releaseContext(),
+        env: publicationEnv(directory),
+        transport: releaseTransport(),
+        executor: registry.executor,
+      }),
+    );
+    expect(registry.publications).toHaveLength(1);
+  });
+
+  it("rejects a competing source tag that identifies another source", async () => {
+    const proof = { ...publicationAnnotation(), source_sha: "f".repeat(40) };
+    const registry = registryTransport({
+      [`${image}:sha-${sha}`]: {
+        ...combinedManifest,
+        digest: digest("f"),
+        annotations: {
+          "org.opensource-repo-manager.publication": JSON.stringify(proof),
+        },
+      },
+    });
+    await expect(
+      withReceipts((directory) =>
+        run(publishScript, {
+          context: releaseContext(),
+          env: publicationEnv(directory),
+          transport: releaseTransport(),
+          executor: registry.executor,
+        }),
+      ),
+    ).rejects.toThrow("Source tag");
+  });
+
+  for (const changes of [
+    { release_id: 43 },
+    { source_sha: "f".repeat(40) },
+    { release_version: "0.2.0" },
+    { platforms: [] },
+    {
+      platforms: [
+        publicationAnnotation().platforms[0],
+        publicationAnnotation().platforms[0],
+      ],
+    },
+  ])
+    it(`rejects invalid promotion provenance ${JSON.stringify(changes)}`, async () => {
+      const manifest = verified();
+      manifest.annotations["org.opensource-repo-manager.publication"] =
+        JSON.stringify({ ...publicationAnnotation(), ...changes });
+      const registry = registryTransport({ [`${image}:0.1.0`]: manifest });
+      await expect(reconcile(registry)).rejects.toThrow();
+      expect(registry.publications).toEqual([]);
+    });
+
+  for (const change of [
+    { prerelease: true },
+    { draft: true },
+    { tag_name: "v0.1.0-rc.1" },
+  ])
+    it("never promotes a prerelease or draft", async () => {
+      const registry = registryTransport();
+      await expect(
+        reconcile(
+          registry,
+          releaseTransport({ latest: { ...publishedRelease, ...change } }),
+        ),
+      ).rejects.toThrow("stable release");
+      expect(registry.publications).toEqual([]);
+    });
+
+  it("does not regress latest when the release changes during registry inspection", async () => {
+    const registry = registryTransport({ [`${image}:0.1.0`]: verified() });
+    const transport = releaseTransport();
+    let reads = 0;
+    transport.repos.getLatestRelease = async () => ({
+      data: ++reads === 1 ? publishedRelease : { ...publishedRelease, id: 43 },
+    });
+    const result = await reconcile(registry, transport);
+    expect(registry.publications).toEqual([]);
+    expect(result.notices.join(" ")).toContain("changed during inspection");
+  });
+
+  it("defers a latest release whose version image has not passed publication yet", async () => {
+    const registry = registryTransport();
+    registry.executor.getExecOutput = async () => ({
+      exitCode: 1,
+      stderr: "manifest unknown",
+      stdout: "",
+    });
+    const result = await reconcile(registry);
+    expect(result.notices.join(" ")).toContain("not published yet");
+    expect(registry.publications).toEqual([]);
+  });
+
+  it("does not hide registry authentication or transport failures as missing images", async () => {
+    const registry = registryTransport();
+    registry.executor.getExecOutput = async () => ({
+      exitCode: 1,
+      stderr: "unauthorized",
+      stdout: "",
+    });
+    await expect(reconcile(registry)).rejects.toThrow("inspection failed");
   });
 });
 

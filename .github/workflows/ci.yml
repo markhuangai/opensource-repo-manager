@@ -48,7 +48,7 @@ jobs:
           sha256sum --check selected-checksum.txt
           tar -xzf "$archive" actionlint
           cd "$GITHUB_WORKSPACE"
-          "$tool_dir/actionlint"
+          "$tool_dir/actionlint" .github/workflows/*.yml examples/actions/maintenance.yml
 
   containers:
     name: Container tests (${{ matrix.architecture }}, ${{ matrix.suite }})
@@ -132,11 +132,17 @@ jobs:
                 continue;
               }
               const job = matches[0];
+              const created = Date.parse(job.created_at), started = Date.parse(job.started_at), completed = Date.parse(job.completed_at);
+              const queueValid = Number.isFinite(created) && Number.isFinite(started) && started >= created;
+              const executionValid = Number.isFinite(started) && Number.isFinite(completed) && completed >= started;
               core.info(JSON.stringify({
                 suite,
                 architecture: process.env.TEST_ARCHITECTURE,
-                queue_ms: Date.parse(job.started_at) - Date.parse(job.created_at),
-                execution_ms: Date.parse(job.completed_at) - Date.parse(job.started_at),
+                workflow_run_id: context.runId,
+                run_attempt: job.run_attempt,
+                queue_ms: queueValid ? started - created : null,
+                execution_ms: executionValid ? completed - started : null,
+                timing_error: queueValid && executionValid ? undefined : "invalid_timestamps",
                 job_url: job.html_url,
               }));
             }
