@@ -9,7 +9,69 @@ import {
   actionsGroups,
   verifyActionsReceipts,
   selectActionsCpuSet,
+  runActionsChains,
 } from "../scripts/container-suites.mjs";
+import { setTimeout as delay } from "node:timers/promises";
+
+describe("Actions chain scheduling", () => {
+  for (const concurrency of [1, 2, 3, 4])
+    it(`runs every intact chain with ${concurrency} lanes and at most two per SDK`, async () => {
+      const counts = { codex: 0, claude: 0 };
+      const started = [];
+      let active = 0,
+        peak = 0;
+      await runActionsChains(concurrency, async ({ sdk, group }) => {
+        counts[sdk]++;
+        active++;
+        peak = Math.max(peak, active);
+        expect(counts[sdk]).toBeLessThanOrEqual(2);
+        expect(active).toBeLessThanOrEqual(concurrency);
+        started.push(`${sdk}/${group}`);
+        await delay(sdk === "codex" ? 2 : 1);
+        active--;
+        counts[sdk]--;
+      });
+      expect(peak).toBe(concurrency);
+      expect(started.slice(0, 2)).toEqual([
+        "codex/clarification-recovery",
+        "claude/clarification-recovery",
+      ]);
+      expect(started.sort()).toEqual(
+        actionsGroups
+          .flatMap((group) =>
+            implementationSdks.map((sdk) => `${sdk}/${group}`),
+          )
+          .sort(),
+      );
+      expect(active).toBe(0);
+    });
+
+  it("stops dispatch after failure and drains all active chains before rejecting", async () => {
+    const release = Promise.withResolvers();
+    const started = [],
+      completed = [];
+    let settled = false;
+    const running = runActionsChains(4, async ({ sdk, group }) => {
+      started.push(`${sdk}/${group}`);
+      if (sdk === "codex" && group === "clarification-recovery")
+        throw new Error("lane failed");
+      await release.promise;
+      completed.push(`${sdk}/${group}`);
+    }).finally(() => {
+      settled = true;
+    });
+    const rejected = expect(running).rejects.toThrow(
+      "Actions scenario lane failed",
+    );
+    await delay(10);
+    expect(started).toHaveLength(4);
+    expect(settled).toBe(false);
+    release.resolve();
+    await rejected;
+    expect(started).toHaveLength(4);
+    expect(completed).toHaveLength(3);
+  });
+});
 
 describe("container suite selection", () => {
   it("keeps the default command complete on both native architectures", () => {
@@ -99,6 +161,7 @@ describe("Actions lane coverage and identity", () => {
         ...identity,
         suite: "actions",
         cleanup: "passed",
+        protected_configuration_and_service_startup: "parent-image-verified",
         bounded_actions: [
           {
             sdk,
@@ -182,6 +245,12 @@ describe("Actions lane coverage and identity", () => {
       expect(() => selectContainerSuites(args)).toThrow();
   });
   for (const [name, corrupt] of [
+    [
+      "missing shared startup proof",
+      (rows) => {
+        delete rows[0].protected_configuration_and_service_startup;
+      },
+    ],
     [
       "wrong worker CPU affinity",
       (rows) => {

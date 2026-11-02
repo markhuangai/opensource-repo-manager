@@ -21,6 +21,7 @@ export async function runActionsTests({
   result,
   register,
   waitUntil,
+  waitForContainer,
   sessionFixtures,
 }) {
   const node = "/opt/orm-runtime/bin/node";
@@ -224,10 +225,9 @@ export async function runActionsTests({
     return { logs, outcome };
   }
   async function finished(name, expected, reason) {
-    await waitUntil(
-      () => {
-        const running = inspect(name).State.Running;
-        if (running && Date.now() - lastSample >= 30000) {
+    const exitCode = await waitForContainer(name, {
+      sample: () => {
+        if (Date.now() - lastSample >= 30000) {
           lastSample = Date.now();
           const sample = docker([
             "stats",
@@ -243,11 +243,8 @@ export async function runActionsTests({
               ...JSON.parse(sample),
             });
         }
-        return !running;
       },
-      `Actions ${sdk}/${name} did not exit`,
-      300_000,
-    );
+    });
     const { logs, outcome } = output(name);
     if (outcome.outcome !== expected) {
       const evidence = proof();
@@ -263,12 +260,15 @@ export async function runActionsTests({
     }
     assert.equal(outcome.reason, reason, logs.stdout + logs.stderr);
     assert.equal(
-      inspect(name).State.ExitCode,
+      exitCode,
       ["blocked", "failed"].includes(expected) ? 1 : 0,
       logs.stderr,
     );
-    assert.equal(inspect(name).State.OOMKilled, false);
-    assert.equal(inspect(name).State.Pid, 0);
+    const state = inspect(name).State;
+    assert.equal(state.ExitCode, exitCode);
+    assert.equal(state.Running, false);
+    assert.equal(state.OOMKilled, false);
+    assert.equal(state.Pid, 0);
     completed.push({
       id: name.slice(manager.length + 1),
       outcome: expected,

@@ -1,5 +1,6 @@
 import { runActionsTests } from "../tests/integration/actions/harness.mjs";
 import assert from "node:assert/strict";
+import { waitForContainer } from "./container-wait.mjs";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
@@ -27,7 +28,7 @@ import {
   implementationScenarios,
   implementationSdks,
   verifyImplementationReceipts,
-  actionsGroups,
+  runActionsChains,
   verifyActionsReceipts,
   selectActionsCpuSet,
 } from "./container-suites.mjs";
@@ -35,7 +36,7 @@ import {
 const {
   platform,
   suites,
-  actionsConcurrency = 3,
+  actionsConcurrency = 4,
   actionsSdk,
   actionsGroup,
 } = selectContainerSuites(process.argv.slice(2));
@@ -846,75 +847,117 @@ try {
     "--env",
     "NODE_EXTRA_CA_CERTS=/fixture-ca.pem",
   ];
-  for (const test of [
-    ...cases,
-    { name: "missing", expected: 1, code: "config_unreadable" },
-    { name: "linked", expected: 1, code: "config_unreadable" },
-  ]) {
-    const name = `${id}-startup-${test.name}`;
-    register("container", name);
-    docker([
-      "run",
-      "--detach",
-      "--name",
-      name,
-      "--label",
-      `${label}=${id}`,
-      ...connection,
-      "--mount",
-      `type=bind,src=${join(fixtures, "cases", test.name)},dst=/config,readonly`,
-      ...["skills", "prompts"].flatMap((directory) => [
+  if (!reusedImage) {
+    for (const mode of ["exited", "timeout", "sampler-failure"]) {
+      const name = `${id}-wait-${mode}`;
+      register("container", name);
+      docker([
+        "run",
+        "--detach",
+        "--name",
+        name,
+        "--label",
+        `${label}=${id}`,
+        "--network",
+        "none",
+        "--entrypoint",
+        "/bin/sh",
+        image,
+        "-c",
+        mode === "exited" ? "exit 7" : "sleep 30",
+      ]);
+      const boundary = ["--config", config, "--host", daemon];
+      if (mode === "exited") {
+        assert.equal(docker(["container", "wait", name]), "7");
+        assert.equal(await waitForContainer(boundary, name), 7);
+      } else {
+        const options =
+          mode === "timeout"
+            ? { timeout: 50 }
+            : {
+                sample: () => {
+                  throw new Error("resource sampler failed");
+                },
+              };
+        await assert.rejects(
+          waitForContainer(boundary, name, options),
+          mode === "timeout"
+            ? /did not exit within 50ms/
+            : /resource sampler failed/,
+        );
+        docker(["container", "kill", name]);
+      }
+    }
+    for (const test of [
+      ...cases,
+      { name: "missing", expected: 1, code: "config_unreadable" },
+      { name: "linked", expected: 1, code: "config_unreadable" },
+    ]) {
+      const name = `${id}-startup-${test.name}`;
+      register("container", name);
+      docker([
+        "run",
+        "--detach",
+        "--name",
+        name,
+        "--label",
+        `${label}=${id}`,
+        ...connection,
         "--mount",
-        `type=bind,src=${join(fixtures, directory)},dst=/${directory},readonly`,
-      ]),
-      image,
-    ]);
-    if (test.expected === 0) {
-      await waitForHealth(name);
-      stopCleanly(name);
-    } else {
-      assert.equal(
-        docker(["container", "wait", name]),
-        "1",
-        `Startup scenario ${test.name} did not reject its configuration`,
-      );
-    }
-    const output = logs(name);
-    assert(
-      !output.includes(canary),
-      `Startup scenario ${test.name} disclosed credentials`,
-    );
-    assert(!output.includes("parser-secret-canary"));
-    if (test.code) {
+        `type=bind,src=${join(fixtures, "cases", test.name)},dst=/config,readonly`,
+        ...["skills", "prompts"].flatMap((directory) => [
+          "--mount",
+          `type=bind,src=${join(fixtures, directory)},dst=/${directory},readonly`,
+        ]),
+        image,
+      ]);
+      if (test.expected === 0) {
+        await waitForHealth(name);
+        stopCleanly(name);
+      } else {
+        assert.equal(
+          docker(["container", "wait", name]),
+          "1",
+          `Startup scenario ${test.name} did not reject its configuration`,
+        );
+      }
+      const output = logs(name);
       assert(
-        output.includes(test.code),
-        `Startup scenario ${test.name} omitted its safe error code`,
+        !output.includes(canary),
+        `Startup scenario ${test.name} disclosed credentials`,
       );
-      assert(!output.includes("HTTP listening"));
+      assert(!output.includes("parser-secret-canary"));
+      if (test.code) {
+        assert(
+          output.includes(test.code),
+          `Startup scenario ${test.name} omitted its safe error code`,
+        );
+        assert(!output.includes("HTTP listening"));
+      }
     }
-  }
-  for (const arguments_ of [
-    ["config", "validate"],
-    ["serve"],
-    ["pause"],
-    ["--config", "/secret-canary/config.yml"],
-  ]) {
-    const name = `${id}-removed-command-${randomUUID()}`;
-    register("container", name);
-    const command = result([
-      "run",
-      "--rm",
-      "--name",
-      name,
-      "--label",
-      `${label}=${id}`,
-      ...mounts,
-      image,
-      ...arguments_,
-    ]);
-    assert.equal(command.status, 1);
-    assert(command.stderr.includes("arguments_invalid"));
-    assert(!command.stderr.includes("secret-canary"));
+    for (const arguments_ of [
+      ["config", "validate"],
+      ["serve"],
+      ["pause"],
+      ["--config", "/secret-canary/config.yml"],
+    ]) {
+      const name = `${id}-removed-command-${randomUUID()}`;
+      register("container", name);
+      const command = result([
+        "run",
+        "--rm",
+        "--name",
+        name,
+        "--label",
+        `${label}=${id}`,
+        ...mounts,
+        image,
+        ...arguments_,
+      ]);
+      assert.equal(command.status, 1);
+      assert(command.stderr.includes("arguments_invalid"));
+      assert(!command.stderr.includes("secret-canary"));
+    }
   }
   docker([
     "run",
@@ -1313,93 +1356,73 @@ try {
   if (suite === "actions" && !actionsGroup) {
     phase("actions-pool");
     const imageId = docker(["image", "inspect", "--format", "{{.Id}}", image]);
-    const tasks = actionsGroups.flatMap((group) =>
-      implementationSdks.map((sdk) => ({ sdk, group })),
-    );
-    const errors = [];
-    let cursor = 0;
-    async function worker() {
-      while (cursor < tasks.length && !errors.length) {
-        const { sdk, group } = tasks[cursor++];
-        laneOwners.push(`${id}-lane-${sdk}-${group}`);
-        const logPath = join(temporary, `actions-${sdk}-${group}.log`);
-        const started = performance.now();
-        const startedAt = new Date().toISOString();
-        console.log(`[actions] starting ${sdk}/${group}`);
-        try {
-          const childReceipt = await new Promise((resolve, reject) => {
-            const child = spawn(
-              process.execPath,
-              [
-                fileURLToPath(import.meta.url),
-                "--platform",
-                platform,
-                "--suite",
-                "actions",
-                "--actions-sdk",
-                sdk,
-                "--actions-group",
-                group,
-                "--actions-concurrency",
-                "1",
-              ],
-              {
-                cwd: root,
-                env: {
-                  ...process.env,
-                  ORM_TEST_IMAGE: image,
-                  ORM_TEST_IMAGE_OWNER: id,
-                  ORM_TEST_IMAGE_ID: imageId,
-                  ORM_TEST_TEMP_PARENT: temporary,
-                },
-                stdio: ["ignore", "pipe", "pipe"],
-              },
-            );
-            let stdout = "",
-              stderr = "";
-            child.stdout.on("data", (bytes) => {
-              stdout += bytes;
-            });
-            child.stderr.on("data", (bytes) => {
-              stderr += bytes;
-            });
-            child.once("error", reject);
-            child.once("close", (code, signal) => {
-              void writeFile(logPath, stdout + stderr).then(() => {
-                if (code !== 0)
-                  return reject(
-                    new Error(
-                      `${sdk}/${group} exited ${code ?? signal}: ${stdout.slice(-4000)}${stderr.slice(-8000)}`,
-                    ),
-                  );
-                try {
-                  resolve(JSON.parse(stdout.trim().split("\n").at(-1)));
-                } catch (error) {
-                  reject(error);
-                }
-              }, reject);
-            });
-          });
-          actionsLaneReceipts.push(childReceipt);
-          timings.push({
-            phase: `actions-${sdk}-${group}`,
-            started_at: startedAt,
-            duration_ms: performance.now() - started,
-          });
-          console.log(`[actions] completed ${sdk}/${group}`);
-        } catch (error) {
-          errors.push(error);
-        }
-      }
-    }
-    await Promise.all(
-      Array.from(
-        { length: Math.min(actionsConcurrency, tasks.length) },
-        worker,
-      ),
-    );
-    if (errors.length)
-      throw new AggregateError(errors, "Actions scenario lane failed");
+    await runActionsChains(actionsConcurrency, async ({ sdk, group }) => {
+      laneOwners.push(`${id}-lane-${sdk}-${group}`);
+      const logPath = join(temporary, `actions-${sdk}-${group}.log`);
+      const started = performance.now();
+      const startedAt = new Date().toISOString();
+      console.log(`[actions] starting ${sdk}/${group}`);
+      const childReceipt = await new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [
+            fileURLToPath(import.meta.url),
+            "--platform",
+            platform,
+            "--suite",
+            "actions",
+            "--actions-sdk",
+            sdk,
+            "--actions-group",
+            group,
+            "--actions-concurrency",
+            "1",
+          ],
+          {
+            cwd: root,
+            env: {
+              ...process.env,
+              ORM_TEST_IMAGE: image,
+              ORM_TEST_IMAGE_OWNER: id,
+              ORM_TEST_IMAGE_ID: imageId,
+              ORM_TEST_TEMP_PARENT: temporary,
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        let stdout = "",
+          stderr = "";
+        child.stdout.on("data", (bytes) => {
+          stdout += bytes;
+        });
+        child.stderr.on("data", (bytes) => {
+          stderr += bytes;
+        });
+        child.once("error", reject);
+        child.once("close", (code, signal) => {
+          void writeFile(logPath, stdout + stderr).then(() => {
+            if (code !== 0)
+              return reject(
+                new Error(
+                  `${sdk}/${group} exited ${code ?? signal}: ${stdout.slice(-4000)}${stderr.slice(-8000)}`,
+                ),
+              );
+            try {
+              resolve(JSON.parse(stdout.trim().split("\n").at(-1)));
+            } catch (error) {
+              reject(error);
+            }
+          }, reject);
+        });
+      });
+      actionsLaneReceipts.push(childReceipt);
+      timings.push({
+        phase: `actions-${sdk}-${group}`,
+        started_at: startedAt,
+        duration_ms: performance.now() - started,
+      });
+      console.log(`[actions] completed ${sdk}/${group}`);
+    });
     verifyActionsReceipts(actionsLaneReceipts, {
       source_sha: sourceSha,
       pr_head_sha: prHeadSha,
@@ -1657,6 +1680,12 @@ try {
             result,
             register,
             waitUntil,
+            waitForContainer: (name, options) =>
+              waitForContainer(
+                ["--config", config, "--host", daemon],
+                name,
+                options,
+              ),
             sessionFixtures: join(
               testInputs,
               "tests",
@@ -1994,7 +2023,9 @@ try {
     users_and_mounts: "passed",
     context_exclusion: "passed",
     shutdown_and_persistence: "passed",
-    protected_configuration_and_service_startup: "passed",
+    protected_configuration_and_service_startup: reusedImage
+      ? "parent-image-verified"
+      : "passed",
     webhook_intake_and_crash_recovery: "passed",
     immutable_secret_free_snapshots: "passed",
     supervised_workers: runtimeProof,
@@ -2013,6 +2044,7 @@ try {
       sdk: row.bounded_actions[0].sdk,
       group: row.bounded_actions[0].group,
       timings: row.timings,
+      generic_startup: row.protected_configuration_and_service_startup,
       cleanup: row.cleanup,
       resources_removed: row.resources_removed,
     })),

@@ -26,7 +26,7 @@ The native matrix still contains all nine suites on AMD64 and ARM64: core, inves
 
 The Actions inventory retains every original scenario ID, partitioned into five chains: lifecycle (29), sessions (8), PR recovery (16), clarification (19) and clarification recovery (22). Five production-controller scenarios extend the last chain: question, unauthorized reply, resumed work, readiness and duplicate invocation. Thus each SDK proves **99 distinct scenarios**, including all original 94. Every stateful sequence remains intact. The registry and receipt validator reject missing, duplicate, substituted, failed or stale lane/scenario evidence.
 
-Three lanes run concurrently by default inside the existing native Actions job; the profiling option accepts one through four. Each lane has separate containers/PID namespaces, volumes, network, protected configuration and upstream/artifact fixtures, and reuses the parent's built image. Docker's shared kernel can account threads for the same worker UID across containers. Test-manager affinity therefore uses at most four CPUs from the daemon's actual allowed list to bound SDK thread pools; worker identities and process limits retain their existing values. Every manager launch verifies the configured affinity, and receipts bind it to the parent alongside exact image, source commit, PR head, source/test input digest, platform and worktree state. Source changes during verification fail the run. Normal and failed lanes retain scoped ownership checks for cleanup; shared Docker caches and credentials are preserved.
+Four lanes run concurrently by default inside the existing native Actions job, with at most two chains per SDK; the profiling option accepts one through four. The longest measured chains start first. A failed lane stops new dispatch while active lanes finish and clean up. Each lane has separate containers/PID namespaces, volumes, network, protected configuration and upstream/artifact fixtures, and reuses the parent's built image. Docker's shared kernel can account threads for the same worker UID across containers. Test-manager affinity therefore uses at most four CPUs from the daemon's actual allowed list to bound SDK thread pools; worker identities and process limits retain their existing values. Every manager launch verifies the configured affinity, and receipts bind it to the parent alongside exact image, source commit, PR head, source/test input digest, platform and worktree state. Source changes during verification fail the run. Normal and failed lanes retain scoped ownership checks for cleanup; shared Docker caches and credentials are preserved.
 
 Each lane prepares its own Node archive before scenario execution using the production toolchain installer. A second installation proves the archive produces identical signed-checksum and installed-file integrity receipts; a corrupted copy must fail installation. Scenario setup copies only archive bytes into each task's private download directory. Every runtime still fetches signed checksums, verifies the archive and installs its own toolchain. No installation, receipt or mutable cache is shared between lanes, and existing cache bytes are never overwritten. Lane receipts retain the archive digest and preparation timing.
 
@@ -49,7 +49,7 @@ Collect the Repository CI/native and CodeQL jobs through paginated GitHub API re
 
 ## Results
 
-### Local serial and parallel control
+### Historical local serial and three-lane control
 
 Both AMD64 runs passed on the same uncommitted source/test input, digest `b9a0d6e26f57ebedd88c16cb041b3ec23aab85e3e2a052d885310c910b03f35b`, based on commit `bc7e5825e7de052c03d1e805f1f139832eec197c`. Each proved all 198 unique scenarios, 99 per SDK across ten chains, with unchanged source and matching source/image/affinity receipts. These are local measurements, not complete CI results.
 
@@ -68,14 +68,40 @@ The serial image was `sha256:b423ce5d0142116948f597ef468890ba2e1208cc61a52f1eec8
 
 The complete local nine-suite AMD64 command also passed both SDKs on unchanged input in 185m 21.0s. Independent cleanup verified all 99 possible owner labels empty. This sequential full-command duration is separate from the Actions comparison and from the native CI matrix.
 
-Four-worker diagnostics reproduced a Node thread-creation failure under shared kernel UID accounting. Three lanes are therefore the default; one through four remain explicit profiling selections. The successful gates above use the normal harness and production guards, without diagnostic hooks, relaxed limits or extended scenario deadlines.
+Unrestricted four-Codex diagnostics reproduced a Node thread-creation failure under shared kernel UID accounting. A later diagnostic held two Codex and two Claude workers simultaneously with the unchanged process limit of 128, reaching a sampled UID total of 116 threads. That startup trial does not prove full-suite safety or throughput. The correction caps active chains at two per SDK and retains affinity bounds; fresh normal gates remain required.
+
+A five-invocation lifecycle profile recorded 408 Docker inspections taking 25.43 seconds in a 137.51-second window. Actions now waits asynchronously for container exit, preserving its 300-second watchdog, periodic resource observations and exit/OOM/PID assertions. Timeout or sampler failure kills and reaps the Docker wait client. Real Docker cases cover already-exited containers, watchdog expiry and sampler failure. Identical generic startup/removed-command cases run once in the parent against the shared image; child receipts explicitly identify the parent image proof. Each child retains its own configuration, fixtures, service startup and runtime assertions.
+
+### Current local serial and four-lane control
+
+The correction passed both AMD64 runs on unchanged source/test input, digest `3d4cff9ed6433fcc52e97ca30a22262642cb75bd5339aba41880dd1d090524fc`, based on published head `06b214006475ece1783a611d59f6e77cf812fc3b`. Both proved **198 unique scenarios**, 99 per SDK across ten isolated chains, with matching source, input, image and affinity receipts. Four lanes, capped at two per SDK, passed the complete Actions pool. These dirty-worktree measurements do not establish fresh-head CI performance.
+
+| Measurement                         |   One lane | Four lanes |
+| ----------------------------------- | ---------: | ---------: |
+| Non-overlapping parent phases       | 127m 31.4s |  60m 30.2s |
+| Actions pool                        | 124m 56.6s |  57m 34.6s |
+| Image build                         |      11.4s |      23.6s |
+| Sampled live container observations |        176 |        301 |
+| Artifact transport requests         |      3,382 |      3,382 |
+| Cleanup                             |     Passed |     Passed |
+
+The parent-phase ratio is **2.108**, excluding overlapping lane timings. The one-lane command took 127m 31.7s overall. Its image was `sha256:70f1515a80a7525e192ced30f5a81652d2fcc3314e81bb208c07afe891b74737`; the four-lane Actions image was `sha256:825a8db60b6c5b8cc863d9c5c90af987ebb1c3d38bfadf3ec3bb42784470fc62`. Independent readback found all eleven possible owner labels empty for each Actions parent. Real Docker watchdog and sampler-failure cases passed with no wait clients left running.
+
+The local host reports 32 logical CPUs and 62.75 GiB RAM. Selected logical CPUs `0,1,2,3` map to two physical cores, with SMT siblings `0-1` and `2-3`. The agent-command cgroup reported `cpu.max = max 100000`; container ancestor quotas were not inventoried. These observations describe this local control, not native CI runner topology or quotas.
+
+The complete nine-suite AMD64 command passed both SDKs on the same unchanged input in **194m 37.5s**. Independent cleanup readback found all 99 possible owner labels empty. `npm run check` passed all **810 tests**, formatting, lint, types and build; actionlint **1.7.12** and `docker compose config --quiet` passed. The sequential full-command duration remains separate from the Actions comparison and the native CI matrix.
 
 ### Fresh-head complete CI
 
-The three fresh-head measurements are **pending**. No 30-minute complete-CI improvement is claimed yet. A failed or missing required check, incomplete coverage/cleanup, invalid source identity, or external timing constraint blocks completion rather than waiving the target.
+Three successful fresh-head measurements are **pending**. The first published head passed functional gates but failed the timing target: **51m 41.8s**, from the original validation trigger through the last required result, including an automatic restart after CodeRabbit edited the PR description. No 30-minute complete-CI improvement is claimed yet. A failed or missing required check, incomplete coverage/cleanup, invalid source identity, or external timing constraint blocks completion rather than waiving the target.
 
-| Sample | PR head / tested source | Native receipts | Complete CI elapsed | Review outcome / latency | Result  |
-| ------ | ----------------------- | --------------- | ------------------- | ------------------------ | ------- |
-| 1      | Pending                 | Pending         | Pending             | Pending                  | Pending |
-| 2      | Pending                 | Pending         | Pending             | Pending                  | Pending |
-| 3      | Pending                 | Pending         | Pending             | Pending                  | Pending |
+| Sample          | PR head / tested source | Native receipts | Complete CI elapsed | Review outcome / latency                                                   | Result        |
+| --------------- | ----------------------- | --------------- | ------------------- | -------------------------------------------------------------------------- | ------------- |
+| Failed baseline | `06b2140` / `78f61ff`   | All 18 verified | 51m 41.8s           | Codex no findings; CodeRabbit finding withdrawn; configured AI no findings | Failed target |
+| 1               | Pending                 | Pending         | Pending             | Pending                                                                    | Pending       |
+| 2               | Pending                 | Pending         | Pending             | Pending                                                                    | Pending       |
+| 3               | Pending                 | Pending         | Pending             | Pending                                                                    | Pending       |
+
+The successful replacement [Repository CI run 41431186089](https://github.com/markhuangai/opensource-repo-manager/actions/runs/41431186089) retained all nine suites on both native architectures; [CodeQL run 41431186028](https://github.com/markhuangai/opensource-repo-manager/actions/runs/41431186028) and [configured AI review 41430711551](https://github.com/markhuangai/opensource-repo-manager/actions/runs/41430711551) passed. AMD64 Actions took 45m 22.1s in non-overlapping parent phases; ARM64 took 38m 21.4s. The original cancelled jobs have no harness cleanup receipts. Their logs show orphan-process termination, and GitHub documents fresh ephemeral hosted VMs; provider teardown is the available cleanup evidence for those cancelled jobs, without an independent resource inventory. All 18 successful replacement jobs have passing harness cleanup receipts.
+
+A later description edit triggered another validation of the same `06b2140` head and older `b9a0d6e2…` input: [Repository CI 41445687960](https://github.com/markhuangai/opensource-repo-manager/actions/runs/41445687960) and [CodeQL 41445687833](https://github.com/markhuangai/opensource-repo-manager/actions/runs/41445687833) passed, with all 18 native receipts verified. The final required result was `2026-11-02T13:30:30Z`, extending that head's window from its original `10:40:33.242556Z` trigger to **2h 49m 56.8s**. This repeated same-head validation is not a fresh sample. Its AMD64 Actions parent took 55m 16.9s; ARM64 took 40m 4.3s. Both runs reported four logical CPUs and approximately 16 GB RAM; their physical CPU topology was not recorded. The configured AI resolver [41445688788](https://github.com/markhuangai/opensource-repo-manager/actions/runs/41445688788) recognized the existing review. PR description edits are therefore avoided during subsequent timing samples.

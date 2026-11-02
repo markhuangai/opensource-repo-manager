@@ -255,6 +255,40 @@ export function selectActionsCpuSet(available) {
   return selected.join(",");
 }
 
+export async function runActionsChains(concurrency, run) {
+  assert(Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 4);
+  const pending = [
+    "clarification-recovery",
+    "pr-recovery",
+    "clarification",
+    "lifecycle",
+    "sessions",
+  ].flatMap((group) => implementationSdks.map((sdk) => ({ sdk, group })));
+  const active = new Set();
+  const counts = new Map(implementationSdks.map((sdk) => [sdk, 0]));
+  const errors = [];
+  while (pending.length || active.size) {
+    while (!errors.length && active.size < concurrency) {
+      const index = pending.findIndex(({ sdk }) => counts.get(sdk) < 2);
+      if (index === -1) break;
+      const [task] = pending.splice(index, 1);
+      counts.set(task.sdk, counts.get(task.sdk) + 1);
+      const promise = Promise.resolve()
+        .then(() => run(task))
+        .catch((error) => errors.push(error))
+        .finally(() => {
+          counts.set(task.sdk, counts.get(task.sdk) - 1);
+          active.delete(promise);
+        });
+      active.add(promise);
+    }
+    if (!active.size) break;
+    await Promise.race(active);
+  }
+  if (errors.length)
+    throw new AggregateError(errors, "Actions scenario lane failed");
+}
+
 export function verifyActionsReceipts(receipts, identity) {
   assert.equal(
     selectActionsCpuSet(identity.actions_cpu_set),
@@ -296,6 +330,10 @@ export function verifyActionsReceipts(receipts, identity) {
         );
       assert.equal(receipt.suite, "actions");
       assert.equal(receipt.cleanup, "passed");
+      assert.equal(
+        receipt.protected_configuration_and_service_startup,
+        "parent-image-verified",
+      );
       assert.equal(proof.actions, "passed");
       assert.equal(proof.cpu_set, identity.actions_cpu_set);
       assert.equal(proof.toolchain_cache.seeded_installation, "verified");
