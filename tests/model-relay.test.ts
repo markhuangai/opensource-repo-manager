@@ -52,12 +52,11 @@ async function setup(
     config = fixtureConfiguration();
   config.proxy.url = `http://127.0.0.1:${port}/v1`;
   config.proxy.key = "relay-upstream-secret";
-  config.github.webhook_secret = credential;
+  config.github.token = credential;
   const loaded = await fixtureSnapshot("model", config),
     root = await mkdtemp(join(tmpdir(), "orm-relay-"));
   const store = new Store(join(root, "state", "db.sqlite"));
   store.saveSnapshot(loaded.snapshot);
-  store.discover([1], 1, true);
   const context = {
     ...makeIssue(1),
     state: "open" as const,
@@ -68,7 +67,7 @@ async function setup(
       default_branch: "main",
     },
   };
-  store.applyIssue(store.nextDirty()!, context, loaded.snapshot);
+  store.applyIssue(store.refreshIssue(1), context, loaded.snapshot);
   const job = store.job(1)!,
     lease = store.acquireLease(job.id, job.revision)!;
   const deadline = store.startRuntimeLease(lease, 60_000),
@@ -490,9 +489,8 @@ describe("scoped model relay", () => {
       if (mode === "cancellation") f.controller.abort();
       if (mode === "disconnect") client.abort();
       if (mode === "revision") {
-        f.store.discover([1], 1, true);
         f.store.applyIssue(
-          f.store.nextDirty()!,
+          f.store.refreshIssue(1),
           { ...f.context, body: "changed" },
           f.loaded.snapshot,
         );

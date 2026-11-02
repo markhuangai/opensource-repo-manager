@@ -1,21 +1,14 @@
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { tracingChannel } from "node:diagnostics_channel";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { Server } from "/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js";
-import { StreamableHTTPServerTransport } from "/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/server/streamableHttp.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/types.js";
-import { McpGateway } from "/opt/orm/app/dist/services/mcp/index.js";
 import { Supervisor } from "/opt/orm/app/dist/runtime/supervisor.js";
 import { userProcesses } from "/opt/orm/app/dist/runtime/process.js";
 import { createRunSnapshot } from "/opt/orm/app/dist/config/load.js";
-import { parseConfiguration } from "/opt/orm/app/dist/config/schema.js";
+import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
 
 const app = "/opt/orm/app";
@@ -58,12 +51,8 @@ export async function verifyAgent({
     failures = [],
     probeFailures = [],
     requests = [],
-    issued = [],
-    calls = [],
     histories = new Map(),
-    resumedBudgets = new Map(),
-    transports = new Map(),
-    servers = new Set();
+    resumedBudgets = new Map();
   const probes = tracingChannel("child_process.spawn").start;
   const observeProbe = ({ process: child }) => {
     if (!child.spawnargs[1]?.endsWith("/runtime/storage.js")) return;
@@ -92,79 +81,19 @@ export async function verifyAgent({
   probes.subscribe(observeProbe);
   let injected = 0,
     held = false,
-    holdMcp = false,
-    expireMcp = false,
-    limitedResume = false,
-    catalog = "Claude fixture reads",
-    downstreamId;
-  let supervisor, gateway;
-  const mcpExpiryWindow = 10000;
-  const mcpCredential = `claude-mcp-upstream-${randomUUID()}`;
+    limitedResume = false;
+  let supervisor;
   const hostile = createServer((_req, res) => {
     injected++;
     res.end("injected");
   });
   const hostileUrl = await listen(hostile);
-  const upstream = createServer(async (req, res) => {
-    try {
-      assert.equal(req.headers.authorization, `Bearer ${mcpCredential}`);
-      const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
-      const body = chunks.length
-        ? JSON.parse(Buffer.concat(chunks).toString())
-        : undefined;
-      let transport = transports.get(req.headers["mcp-session-id"]);
-      if (!transport) {
-        assert.equal(body?.method, "initialize");
-        const server = new Server(
-          { name: "claude-real-http-fixture", version: "1" },
-          { capabilities: { tools: {} } },
-        );
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: randomUUID,
-          onsessioninitialized: (id) => transports.set(id, transport),
-          onsessionclosed: (id) => transports.delete(id),
-          keepAliveMs: 0,
-        });
-        server.setRequestHandler(ListToolsRequestSchema, async () => ({
-          tools: ["read", "hidden"].map((name) => ({
-            name,
-            description: catalog,
-            inputSchema: {
-              type: "object",
-              properties: {},
-              additionalProperties: false,
-            },
-          })),
-        }));
-        server.setRequestHandler(
-          CallToolRequestSchema,
-          async (request, extra) => {
-            calls.push(request.params.name);
-            if (holdMcp)
-              await new Promise((resolve) =>
-                extra.signal.addEventListener("abort", resolve, { once: true }),
-              );
-            return { content: [{ type: "text", text: "granted-read-effect" }] };
-          },
-        );
-        servers.add(server);
-        await server.connect(transport);
-      }
-      await transport.handleRequest(req, res, body);
-    } catch (error) {
-      errors.push(error);
-      res.destroy();
-    }
-  });
-  const mcpUrl = await listen(upstream);
-  const config = parseConfiguration(
-    await readFile("/config/config.yml", "utf8"),
+  const config = parseActionsConfiguration(
+    await readFile("/config/actions.yml", "utf8"),
   );
   const model = createServer((req, res) =>
     driver.respond(req, res, {
       config,
-      mcpCredential,
       store,
       root,
       requests,
@@ -179,33 +108,12 @@ export async function verifyAgent({
       get limitedResume() {
         return limitedResume;
       },
-      get downstreamId() {
-        return downstreamId;
-      },
     }),
   );
   config.proxy.url = (await listen(model)) + "/v1";
   config.profiles.coding = driver.profile;
   for (const role of Object.keys(config.roles))
     config.roles[role].profile = "coding";
-  config.mcp.credentials = {
-    service: { headers: { Authorization: `Bearer ${mcpCredential}` } },
-  };
-  config.mcp.servers = {
-    context: {
-      transport: "streamable_http",
-      review_required_tools: [],
-      url: mcpUrl + "/mcp",
-      allow_plain_http: true,
-      credential_ref: "service",
-      tools: {
-        read: { effect: "read" },
-        hidden: { effect: "read" },
-        write: { effect: "write", idempotency_argument: "operation" },
-      },
-    },
-  };
-  config.roles.implementation.mcp = { context: { tools: ["read"] } };
   const trusted = globalThis.structuredClone(bundles);
   for (const bundle of Object.values(trusted)) {
     bundle.system += "\nOPERATOR_SYSTEM_CANARY";
@@ -234,60 +142,16 @@ export async function verifyAgent({
     root,
     workers: { [driver.sdk]: app + `/dist/adapters/agents/${driver.sdk}.js` },
     sourceUrl: () => sourceUrl,
-    mcp: {
-      async open(request) {
-        const resumed = resumedBudgets.get(request.job_id);
-        if (resumed) {
-          const remaining =
-            snapshot.settings.limits.active_minutes * 60000 -
-            resumed.before.active_ms;
-          assert(resumed.before.active_ms > 100);
-          assert(request.deadline >= resumed.started + remaining);
-          assert(request.deadline <= resumed.started + remaining + 100);
-          assert(
-            JSON.parse(store.jobById(request.job_id).budget_json).active_ms >=
-              resumed.before.active_ms,
-          );
-          resumed.checked = true;
-        }
-        const session = await gateway.open(
-          expireMcp
-            ? { ...request, deadline: Date.now() + mcpExpiryWindow }
-            : request,
-        );
-        issued.push(...session.connections);
-        return session;
-      },
-    },
   };
   const start = async () => {
-    gateway = new McpGateway(store, snapshot, secrets);
-    gateway.listener.on("request", (req) => {
-      if (req.headers["mcp-session-id"])
-        downstreamId = req.headers["mcp-session-id"];
-    });
     supervisor = await Supervisor.create(store, snapshot, secrets, options);
-    await gateway.start();
-  };
-  const verifyRevokedConnections = async () => {
-    for (const connection of issued)
-      assert.equal(
-        (
-          await fetch(connection.url, {
-            headers: { authorization: `Bearer ${connection.authorization}` },
-          })
-        ).status,
-        401,
-      );
-    issued.length = 0;
   };
   let number = Math.max(...store.jobs().map((job) => job.issue_number)) + 100;
   const seed = (selected = snapshot, selectedSource = source) => {
     number++;
     store.saveSnapshot(selected);
-    store.discover([number], 1, true);
     store.applyIssue(
-      store.nextDirty(),
+      store.refreshIssue(number),
       {
         id: 1000 + number,
         number,
@@ -329,6 +193,27 @@ export async function verifyAgent({
         signal,
       ),
       (event) => {
+        const resumed = resumedBudgets.get(job.id);
+        if (resumed && !resumed.checked) {
+          const lease = store.db
+            .prepare(
+              "SELECT deadline FROM runtime_leases JOIN coding_lease USING(token) WHERE job_id=?",
+            )
+            .get(job.id);
+          if (lease) {
+            const remaining =
+              snapshot.settings.limits.active_minutes * 60000 -
+              resumed.before.active_ms;
+            assert(resumed.before.active_ms > 100);
+            assert(lease.deadline >= resumed.started + remaining);
+            assert(lease.deadline <= Date.now() + remaining);
+            assert(
+              JSON.parse(store.jobById(job.id).budget_json).active_ms >=
+                resumed.before.active_ms,
+            );
+            resumed.checked = true;
+          }
+        }
         if (event.type !== "terminal" || event.outcome !== "failed") return;
         const context = [...supervisor.active.values()].find(
           (value) => value.request.job_id === job.id,
@@ -386,8 +271,6 @@ export async function verifyAgent({
       store.jobById(coding.id).budget_json,
     ).model_requests;
     await supervisor.close();
-    await verifyRevokedConnections();
-    await gateway.close();
     await start();
     const continued = await run(coding, "tools", {
       extra: { resume: resume(first) },
@@ -470,8 +353,6 @@ export async function verifyAgent({
       ).model_requests;
       limitedResume = true;
       await supervisor.close();
-      await verifyRevokedConnections();
-      await gateway.close();
       await start();
       const repaired = await run(limitedJob, "limited", {
         extra: { output_schema: schema, resume: resume(limited) },
@@ -529,62 +410,6 @@ export async function verifyAgent({
       );
       groups++;
     }
-    const mcp = await run(seed(), "mcp");
-    assert.equal(last(mcp).outcome, "completed");
-    assert.equal(await artifactFile(last(mcp), "raw-denied"), "yes");
-    assert(calls.includes("read"));
-    assert(!calls.includes("hidden"));
-    groups++;
-    expireMcp = true;
-    holdMcp = true;
-    const beforeExpiry = calls.length;
-    const expired = run(seed(), "expiry");
-    await until(() => calls.length > beforeExpiry);
-    const expiring = issued.at(-1);
-    await until(() => Date.now() > expiring.deadline);
-    assert.equal(
-      (
-        await fetch(expiring.url, {
-          headers: { authorization: `Bearer ${expiring.authorization}` },
-        })
-      ).status,
-      401,
-    );
-    await expired;
-    assert(
-      store
-        .mcpCalls()
-        .some(
-          (call) =>
-            call.started_at >= expiring.deadline - mcpExpiryWindow &&
-            call.outcome !== "completed",
-        ),
-    );
-    expireMcp = false;
-    holdMcp = false;
-    groups++;
-    holdMcp = true;
-    const beforeCancelledMcp = calls.length;
-    const mcpAbort = new globalThis.AbortController();
-    const cancellingMcp = run(seed(), "cancel_mcp", {
-      signal: mcpAbort.signal,
-    });
-    await until(() => calls.length > beforeCancelledMcp);
-    mcpAbort.abort();
-    assert.equal(last(await cancellingMcp).outcome, "cancelled");
-    holdMcp = false;
-    await verifyRevokedConnections();
-    groups++;
-    catalog = "changed MCP catalog";
-    const beforePolicy = requests.length;
-    assert.equal(
-      last(await run(coding, "tools", { extra: { resume: resume(continued) } }))
-        .outcome,
-      "failed",
-    );
-    assert.equal(requests.length, beforePolicy);
-    catalog = "Claude fixture reads";
-    groups++;
     const hostileSource = sourceWith({
       "app.txt": "base source\n",
       "CLAUDE.md": "HOSTILE_CONTEXT_CANARY",
@@ -761,19 +586,6 @@ INJECTED_ENV="injected"
     assert.equal(cancelledRun.session_id, null);
     assert.equal(cancelledRun.artifact_digest, null);
     groups++;
-    const writeSettings = globalThis.structuredClone(settings);
-    writeSettings.roles.implementation.mcp.context.tools = ["write"];
-    const writeSnapshot = createRunSnapshot(writeSettings, trusted, secrets),
-      beforeWrite = requests.length;
-    assert.equal(
-      last(await run(seed(writeSnapshot), "tools")).outcome,
-      "failed",
-    );
-    assert.equal(requests.length, beforeWrite);
-    groups++;
-    await verifyRevokedConnections();
-    assert(!JSON.stringify(store.runs()).includes(mcpCredential));
-    assert(!JSON.stringify(store.mcpCalls()).includes(mcpCredential));
     for (const uid of [10001, 10002, 10003])
       assert.equal((await userProcesses(uid)).length, 0);
     assert.deepEqual(await readdir(join(root, "runs")), []);
@@ -802,10 +614,7 @@ INJECTED_ENV="injected"
   } finally {
     for (const cleanup of [
       () => supervisor?.close(),
-      () => gateway?.close(),
-      ...[...servers].map((server) => () => server.close()),
       () => close(model),
-      () => close(upstream),
       () => close(hostile),
     ]) {
       try {

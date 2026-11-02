@@ -584,9 +584,9 @@ describe("native suite aggregation", () => {
       list.findIndex(
         (job) =>
           job.name ===
-          `Container tests (${architecture}, implementation-monitor-mcp)`,
+          `Container tests (${architecture}, implementation-monitor-state)`,
       );
-    it(`requires all nine ${architecture} suites and reports queue time separately`, async () => {
+    it(`requires all eight ${architecture} suites and reports queue time separately`, async () => {
       const result = await run(script, { env, jobs: jobs() });
       expect(result.failures).toEqual([]);
       expect(result.notices.map((value) => JSON.parse(value))).toEqual(
@@ -1536,73 +1536,158 @@ describe("serialized latest reconciliation", () => {
 
 describe("native image smoke receipts", () => {
   for (const receipt of nativeReceipts) {
-    for (const failBinary of [null, "node", "mise", "gitleaks"]) {
-      it(`${receipt.platform} requires every native executable before issuing a receipt (${failBinary})`, async () => {
-        await withReceipts(async (directory) => {
-          const commands = [];
-          const executor = {
-            exec: async (command, args) => {
-              expect(command).toBe("docker");
-              commands.push(args);
-              if (args.includes(`/opt/orm-runtime/bin/${failBinary}`))
-                throw new Error("Native binary failed");
-            },
-            getExecOutput: async (command, args) => ({
-              stdout: JSON.stringify(
-                args[0] === "image"
-                  ? [
-                      {
-                        Os: "linux",
-                        Architecture: receipt.platform.split("/")[1],
-                        Config: {
-                          Labels: {
-                            "org.opencontainers.image.revision": sha,
-                            "org.opencontainers.image.version": "0.1.0",
+    for (const failure of [
+      null,
+      "node",
+      "mise",
+      "gitleaks",
+      "timeout",
+      "result",
+      "success",
+      "entrypoint",
+    ]) {
+      it(
+        receipt.platform +
+          " requires bounded startup and every native executable (" +
+          failure +
+          ")",
+        async () => {
+          await withReceipts(async (directory) => {
+            const commands = [];
+            let containerName;
+            const executor = {
+              exec: async (command, args) => {
+                expect(command).toBe("docker");
+                commands.push(args);
+                if (args.includes("/opt/orm-runtime/bin/" + failure))
+                  throw new Error("Native binary failed");
+              },
+              getExecOutput: async (command, args, options) => {
+                if (command === "timeout") {
+                  expect(args.slice(0, 5)).toEqual([
+                    "--kill-after=15s",
+                    "30s",
+                    "docker",
+                    "run",
+                    "--rm",
+                  ]);
+                  expect(args).not.toContain("--entrypoint");
+                  expect(args).not.toContain("--env");
+                  expect(args.at(-1)).toBe("1");
+                  expect(options.ignoreReturnCode).toBe(true);
+                  containerName = args[args.indexOf("--name") + 1];
+                  return {
+                    exitCode:
+                      failure === "timeout"
+                        ? 124
+                        : failure === "success"
+                          ? 0
+                          : 1,
+                    stdout: JSON.stringify({
+                      version: 1,
+                      outcome: "failed",
+                      reason:
+                        failure === "result"
+                          ? "runtime_failed"
+                          : "configuration_invalid",
+                    }),
+                  };
+                }
+                expect(command).toBe("docker");
+                if (args[0] === "container") {
+                  expect(args).toEqual(["container", "inspect", containerName]);
+                  return failure === "timeout"
+                    ? {
+                        exitCode: 0,
+                        stdout: JSON.stringify([
+                          {
+                            Id: "owned-container",
+                            Config: {
+                              Labels: {
+                                "org.opensource-repo-manager.release-smoke":
+                                  containerName,
+                              },
+                            },
                           },
+                        ]),
+                      }
+                    : { exitCode: 1, stdout: "" };
+                }
+                return {
+                  exitCode: 0,
+                  stdout: JSON.stringify(
+                    args[0] === "image"
+                      ? [
+                          {
+                            Os: "linux",
+                            Architecture: receipt.platform.split("/")[1],
+                            Config: {
+                              Entrypoint:
+                                failure === "entrypoint"
+                                  ? ["/retired/main.js"]
+                                  : [
+                                      "/usr/bin/tini",
+                                      "--",
+                                      "/opt/orm-runtime/bin/node",
+                                      "/opt/orm/app/dist/actions/main.js",
+                                    ],
+                              Labels: {
+                                "org.opencontainers.image.revision": sha,
+                                "org.opencontainers.image.version": "0.1.0",
+                              },
+                            },
+                          },
+                        ]
+                      : {
+                          digest: receipt.digest,
+                          manifests: [descriptor(receipt)],
                         },
-                      },
-                    ]
-                  : {
-                      digest: receipt.digest,
-                      manifests: [descriptor(receipt)],
-                    },
-              ),
-            }),
-          };
-          const invocation = run(smokeScript, {
-            env: {
-              IMAGE: image,
-              IMAGE_DIGEST: receipt.digest,
-              PLATFORM: receipt.platform,
-              SOURCE_SHA: sha,
-              VERSION: "0.1.0",
-              RUNNER_TEMP: directory,
-            },
-            executor,
-          });
-          if (failBinary) {
-            await expect(invocation).rejects.toThrow("Native binary failed");
-            expect(await readdir(directory)).toEqual([]);
-          } else {
-            await invocation;
-            expect(
-              JSON.parse(
-                await readFile(
-                  join(
-                    directory,
-                    `image-${receipt.platform.split("/")[1]}.json`,
                   ),
-                  "utf8",
+                };
+              },
+            };
+            const invocation = run(smokeScript, {
+              env: {
+                IMAGE: image,
+                IMAGE_DIGEST: receipt.digest,
+                PLATFORM: receipt.platform,
+                SOURCE_SHA: sha,
+                VERSION: "0.1.0",
+                RUNNER_TEMP: directory,
+              },
+              executor,
+            });
+            if (failure) {
+              await expect(invocation).rejects.toThrow();
+              expect(await readdir(directory)).toEqual([]);
+              if (failure === "timeout")
+                expect(commands).toContainEqual([
+                  "container",
+                  "rm",
+                  "--force",
+                  "owned-container",
+                ]);
+            } else {
+              await invocation;
+              expect(
+                JSON.parse(
+                  await readFile(
+                    join(
+                      directory,
+                      "image-" + receipt.platform.split("/")[1] + ".json",
+                    ),
+                    "utf8",
+                  ),
                 ),
-              ),
-            ).toEqual(receipt);
-            expect(commands.filter((args) => args[0] === "run")).toHaveLength(
-              3,
-            );
-            expect(commands[1].at(-1)).toContain("better-sqlite3");
-          }
-        }, []);
-      });
+              ).toEqual(receipt);
+              expect(commands.filter((args) => args[0] === "run")).toHaveLength(
+                3,
+              );
+              expect(commands[1].at(-1)).toContain("better-sqlite3");
+            }
+          }, []);
+        },
+      );
     }
   }
 });

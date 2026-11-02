@@ -6,7 +6,6 @@ export type ConfigurationErrorCode =
   | "reference_invalid"
   | "bundle_invalid"
   | "secret_in_snapshot"
-  | "mcp_write_migration_required"
   | "arguments_invalid"
   | "session_key_invalid"
   | "actions_context_invalid";
@@ -18,9 +17,7 @@ export const configurationSections = [
   "proxy",
   "profiles",
   "roles",
-  "notifications",
   "limits",
-  "mcp",
 ] as const;
 
 export class ConfigurationError extends Error {
@@ -32,9 +29,6 @@ export class ConfigurationError extends Error {
   ) {
     super(
       `Configuration rejected (${code}).` +
-        (code === "mcp_write_migration_required"
-          ? " Replace effect: reviewed_write with effect: write and configure review_required_tools on its server."
-          : "") +
         (location ? ` Line ${location.line}, column ${location.column}.` : "") +
         (section ? ` Section ${section}.` : ""),
     );

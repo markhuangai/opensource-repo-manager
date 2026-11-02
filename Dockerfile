@@ -49,8 +49,5 @@ COPY --from=build /build/dist ./dist
 COPY --chown=0:0 examples/workflow /opt/orm/defaults
 COPY --from=build /build/mise/bin/mise /opt/orm-runtime/bin/mise
 COPY --from=build --chown=0:0 /build/gitleaks /opt/orm-runtime/bin/gitleaks
-EXPOSE 8080
 STOPSIGNAL SIGTERM
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD /opt/orm-runtime/bin/node --input-type=module -e "const r = await fetch('http://127.0.0.1:8080/healthz', {signal: AbortSignal.timeout(2000)}); process.exit(r.ok ? 0 : 1)"
-ENTRYPOINT ["/usr/bin/tini", "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/main.js"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/main.js"]

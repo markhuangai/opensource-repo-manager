@@ -139,21 +139,29 @@ export async function runActionsTests({
           `type=bind,src=${join(directory, name === "prompts" && options.changedPrompts ? "prompts-incompatible" : name)},dst=/${name},readonly`,
         ],
       ),
-      "--entrypoint",
-      "/usr/bin/tini",
-      image,
-      "--",
-      node,
-      options.controller
-        ? "/opt/orm/app/dist/actions/controller.js"
-        : options.session
-          ? "/actions-fixtures/session.mjs"
-          : "/opt/orm/app/dist/actions/main.js",
+      ...(options.controller || options.session
+        ? [
+            "--entrypoint",
+            "/usr/bin/tini",
+            image,
+            "--",
+            node,
+            options.controller
+              ? "/opt/orm/app/dist/actions/controller.js"
+              : "/actions-fixtures/session.mjs",
+          ]
+        : [image]),
       ...(options.controller ? ["run", String(number)] : [String(number)]),
       ...(options.session ? [options.session] : []),
     ]);
     const launched = inspect(name);
     assert.deepEqual(launched.Config.Healthcheck.Test, ["NONE"]);
+    if (!options.controller && !options.session)
+      assert(
+        launched.Config.Entrypoint.includes(
+          "/opt/orm/app/dist/actions/main.js",
+        ),
+      );
     assert.equal(launched.HostConfig.CpusetCpus, cpuSet);
   }
   async function route(event, payload, issueNumber = "") {
@@ -384,12 +392,6 @@ export async function runActionsTests({
       assert(evidence.requests.includes(task), `Missing ${task}`);
     assert(evidence.runs.every((run) => run.finished_at !== null));
     assert.equal(evidence.leases, 0);
-    assert.equal(
-      evidence.notifications.length +
-        evidence.discord.length +
-        evidence.smtp.length,
-      0,
-    );
     upstream("/checks", "POST");
     const readyName = `${manager}-ready`;
     launch(readyName, 1);

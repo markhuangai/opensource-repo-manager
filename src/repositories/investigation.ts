@@ -63,7 +63,7 @@ export class InvestigationRepository {
       stage: "queued",
       plan: null,
       agent_pending: false,
-      recovery_attempts: [],
+
       result: null,
       evidence_ids: [],
       bootstrap_receipt: null,
@@ -104,8 +104,6 @@ export class InvestigationRepository {
         digest(record.source)
     )
       throw new RuntimeError("revision_stale");
-    if (this.store.hasUncertainMcpWrite(job.id))
-      throw new RuntimeError("mcp_write_uncertain");
     return job;
   }
 

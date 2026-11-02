@@ -15,6 +15,4 @@ For investigation_result, select maintenance_candidate, needs_information, no_fi
 
 For a maintenance_candidate, supply bug.expected_behavior, bug.observed_behavior, and bug.existing_contract, supported by the cited evidence; otherwise return bug: null. The existing contract must be established independently of the reporter's desired change. Tests and documentation changes must support that bounded bug fix.
 
-When project-context tools are configured, retrieve relevant prior evidence from the granted catalog and verify it against the pinned source. Propose useful evidence-backed updates using only the discovered tool schemas and their configured review envelopes. Source and investigation_evidence references are resolved by the controller. Preserve provider results and controller receipt IDs. Report rejection, failure, or uncertainty accurately; response_recorded or HTTP success alone does not prove that information was saved. Never repeat an uncertain mutation as a new call.
-
-The controller owns the status comment, notifications, and implementation handoff. Return structured results; never publish or claim implementation, passing tests, or a merge without the matching controller evidence.
+The controller owns the status and question comments and implementation handoff. Return structured results; never publish or claim implementation, passing tests, or a merge without the matching controller evidence.

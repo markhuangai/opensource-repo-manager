@@ -32,10 +32,6 @@ export interface GitHubReader {
     signal: AbortSignal,
   ): Promise<boolean>;
   repository(signal: AbortSignal): Promise<RepositoryIdentity>;
-  issuePage(
-    page: number,
-    signal: AbortSignal,
-  ): Promise<{ numbers: number[]; finished: boolean }>;
   issue(
     number: number,
     repository: RepositoryIdentity,
@@ -231,30 +227,6 @@ export class OctokitReader implements GitHubReader {
     )
       throw new IntakeError("github_actor_changed");
     return ["write", "maintain", "admin"].includes(permission.permission);
-  }
-
-  async issuePage(page: number, signal: AbortSignal) {
-    const rows = z
-      .array(
-        z.object({ number: githubId, pull_request: z.unknown().optional() }),
-      )
-      .parse(
-        await this.read(
-          "GET /repos/{owner}/{repo}/issues",
-          {
-            state: "open",
-            sort: "created",
-            direction: "asc",
-            per_page: 100,
-            page,
-          },
-          signal,
-        ),
-      );
-    return {
-      numbers: rows.filter((row) => !row.pull_request).map((row) => row.number),
-      finished: rows.length < 100,
-    };
   }
 
   private async pages<T>(

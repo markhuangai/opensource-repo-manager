@@ -630,16 +630,15 @@ export class WorkspaceService {
         request.source,
         snapshot.settings.github.repository,
         {
-          processes: snapshot.settings.limits.worker_processes ?? 128,
-          storage:
-            snapshot.settings.limits.worker_storage_bytes ?? 4 * 1024 ** 3,
+          processes: snapshot.settings.limits.worker_processes,
+          storage: snapshot.settings.limits.worker_storage_bytes,
         },
         signal,
       );
       return await this.freeze(
         { ...request, run_id: id },
         prepared.workspace,
-        snapshot.settings.limits.worker_storage_bytes ?? 4 * 1024 ** 3,
+        snapshot.settings.limits.worker_storage_bytes,
         signal,
       );
     } finally {

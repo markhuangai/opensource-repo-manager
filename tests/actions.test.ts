@@ -3,10 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
-import {
-  parseActionsConfiguration,
-  parseConfiguration,
-} from "../src/config/schema.ts";
+import { parseActionsConfiguration } from "../src/config/schema.ts";
 import { separateSecrets } from "../src/config/secrets.ts";
 import { loadProtectedActionsConfiguration } from "../src/config/load.ts";
 import {
@@ -26,22 +23,7 @@ import {
 import { makeIssue } from "./fixtures/github.ts";
 
 function actionsConfig() {
-  const service = fixtureConfiguration();
-  const config = {
-    version: service.version,
-    github: {
-      repository: service.github.repository,
-      token: service.github.token,
-    },
-    proxy: service.proxy,
-    profiles: service.profiles,
-    roles: structuredClone(service.roles),
-    pr_monitor: service.pr_monitor,
-    limits: service.limits,
-  };
-  for (const role of Object.values(config.roles))
-    Reflect.deleteProperty(role, "mcp");
-  return config;
+  return fixtureConfiguration();
 }
 
 describe("protected Actions configuration", () => {
@@ -84,10 +66,6 @@ describe("protected Actions configuration", () => {
     const config = parseActionsConfiguration(stringify(input));
     expect(config.limits).toEqual(input.limits);
     expect(config.pr_monitor).toEqual(input.pr_monitor);
-    expect(
-      Object.values(config.notifications).every((channel) => !channel.enabled),
-    ).toBe(true);
-    expect(config.mcp.servers).toEqual({});
     const { secrets, settings } = separateSecrets(config);
     expect(secrets.get("github.token")).toBe(input.github.token);
     expect(secrets.get("proxy.key")).toBe(input.proxy.key);
@@ -95,9 +73,6 @@ describe("protected Actions configuration", () => {
       "reference_invalid",
     );
     expect(secrets.containsCredentials(settings)).toBe(false);
-    expect(() => parseConfiguration(stringify(input))).toThrow(
-      "schema_invalid",
-    );
   });
   for (const field of [
     "notifications",
@@ -119,17 +94,6 @@ describe("protected Actions configuration", () => {
       else Object.assign(config, { [field]: {} });
       expect(() => parseActionsConfiguration(stringify(config))).toThrow();
     });
-  it("keeps service-only notification validation mandatory", () => {
-    const config = fixtureConfiguration();
-    config.notifications = {
-      discord: { enabled: false },
-      smtp: { enabled: false },
-      webhook: { enabled: false },
-    };
-    expect(() => parseConfiguration(stringify(config))).toThrow(
-      "schema_invalid",
-    );
-  });
 });
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -146,7 +110,6 @@ async function setup() {
     github.reader,
     loaded.snapshot,
     loaded.secrets,
-    { info() {}, error() {} },
   );
   cleanups.push(async () => {
     await intake.stop();
@@ -261,7 +224,7 @@ describe("bounded task selection and outcomes", () => {
       reason: "monitor_disabled",
     });
     f.github.state.issues[1].state = "closed";
-    await f.intake.refresh(1, f.signal, false);
+    await f.intake.refresh(1, f.signal);
     expect(taskOutcome(f.store, { issue_number: 1 }, true)).toMatchObject({
       outcome: "closed",
       reason: "issue_closed",

@@ -1,334 +1,87 @@
-import { createHmac, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { setTimeout as delay } from "node:timers/promises";
 import { Store } from "../src/repositories/store.ts";
 import { IntakeService } from "../src/services/intake.ts";
-import { createApp } from "../src/http/app.ts";
-import {
-  fixtureConfiguration,
-  fixtureGitHub,
-  fixtureSnapshot,
-} from "./fixtures.ts";
+import { fixtureGitHub, fixtureSnapshot } from "./fixtures.ts";
 import { makeIssue } from "./fixtures/github.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
-
+const signal = () => AbortSignal.timeout(10000);
 async function setup(
-  enroll = true,
-  hooks: ConstructorParameters<typeof IntakeService>[5] = {},
+  hooks: ConstructorParameters<typeof IntakeService>[4] = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "orm-intake-"));
   const github = await fixtureGitHub();
   const loaded = await fixtureSnapshot();
-  const path = join(root, "state", "manager.sqlite");
-  const store = new Store(path);
-  const logs: string[] = [];
-  const logger = {
-    info: (message: string) => logs.push(message),
-    error: (message: string) => logs.push(message),
-  };
+  const store = new Store(join(root, "state", "manager.sqlite"));
   const service = new IntakeService(
     store,
     github.reader,
     loaded.snapshot,
     loaded.secrets,
-    logger,
     hooks,
   );
-  const services = [service],
-    stores = [store];
-  const app = createApp(service, "webhook-fixture-secret");
-  const address = await app.listen({ host: "127.0.0.1", port: 0 });
   cleanups.push(async () => {
-    await app.close();
-    for (const intake of services) await intake.stop();
-    for (const database of stores) if (database.db.open) database.close();
+    await service.stop();
+    store.close();
     await github.close();
     await rm(root, { recursive: true });
   });
-  if (enroll) await service.reconcile();
-  async function send(
-    payload: unknown,
-    event = "issues",
-    id = randomUUID(),
-    headers: Record<string, string> = {},
-  ) {
-    const body =
-      typeof payload === "string" ? payload : JSON.stringify(payload);
-    const signature =
-      "sha256=" +
-      createHmac("sha256", "webhook-fixture-secret").update(body).digest("hex");
-    return fetch(address + "/webhooks/github", {
-      method: "POST",
-      body,
-      headers: {
-        "content-type": "application/json",
-        "x-hub-signature-256": signature,
-        "x-github-delivery": id,
-        "x-github-event": event,
-        ...headers,
-      },
-    });
-  }
-  return {
-    root,
-    path,
-    github,
-    loaded,
-    store,
-    service,
-    services,
-    stores,
-    logger,
-    logs,
-    app,
-    address,
-    send,
-  };
+  return { github, loaded, store, service };
 }
-const issueEvent = (number = 1) => ({
-  repository: { id: 42 },
-  issue: { id: 1000 + number, number },
-  action: "opened",
-});
 
-describe("durable GitHub intake", () => {
-  it("refreshes validation scope and reconciles pending writes without waking itself", async () => {
-    let wakeups = 0,
-      reconciliations = 0;
-    const f = await setup(true, {
-      changed: () => {
-        wakeups++;
-      },
-      beforeIssue: async () => {
-        reconciliations++;
-      },
-    });
-    wakeups = 0;
-    reconciliations = 0;
-    f.github.state.issues[1].body = "Edited while a notification was queued";
-    await f.service.refresh(1, new AbortController().signal, false);
-    expect(f.store.job(1)!.input_json).toContain(
-      "Edited while a notification was queued",
+describe("selected-issue intake", () => {
+  it("enrolls only the selected issue without scanning backlog", async () => {
+    const f = await setup();
+    f.github.state.issues[2] = makeIssue(2);
+    expect(f.service.enrolled()).toBe(false);
+    await expect(f.service.refresh(1, signal())).rejects.toThrow(
+      "enrollment_pending",
     );
-    expect(reconciliations).toBe(1);
-    expect(wakeups).toBe(0);
-    await f.service.refresh(1, new AbortController().signal);
-    expect(wakeups).toBe(1);
-  });
-
-  it("revalidates an unchanged backlog and still observes changed comments", async () => {
-    const { github, store, service } = await setup(false);
-    for (let number = 2; number <= 141; number++)
-      github.state.issues[number] = makeIssue(number);
-    await service.reconcile();
-    const firstScan = github.requests.length;
-    await service.reconcile();
-    const repeated = github.requests.slice(firstScan);
-    expect(repeated.length).toBeGreaterThan(0);
+    await f.service.enrollIssue(1, signal());
+    expect(f.service.enrolled()).toBe(true);
+    expect(f.store.jobs().map((job) => job.issue_number)).toEqual([1]);
     expect(
-      repeated.every(
-        (request) =>
-          request.status === 304 && typeof request.ifNoneMatch === "string",
+      f.github.requests.some((request) =>
+        request.url?.match(/\/issues(?:\?|$)/),
       ),
-    ).toBe(true);
-    expect(store.jobs()).toHaveLength(141);
-    const revision = store.job(1)!.revision;
-    github.state.comments[1] = [
-      {
-        id: 9009,
-        body: "Fresh human comment",
-        updated_at: "2026-10-15T03:00:00Z",
-        user: { id: 7, login: "maintainer" },
-      },
-    ];
-    await service.reconcile();
-    expect(store.job(1)!.revision).toBe(revision + 1);
-    expect(store.job(1)!.input_json).toContain("Fresh human comment");
-  }, 20_000);
-  it("accepts SMTP usernames matching GitHub metadata while blocking authenticating secrets", async () => {
-    const config = fixtureConfiguration();
-    config.notifications.smtp = {
-      enabled: true,
-      host: "smtp.example.invalid",
-      port: 465,
-      secure: true,
-      username: "open",
-      password: "smtp-password-canary",
-      from: "orm@example.invalid",
-      to: ["maintainer@example.invalid"],
-    };
-    const loaded = await fixtureSnapshot("fixture-model", config);
-    const { github, store, services, logger } = await setup(false);
-    const service = new IntakeService(
-      store,
-      github.reader,
-      loaded.snapshot,
-      loaded.secrets,
-      logger,
-    );
-    services.push(service);
-    await service.reconcile();
-    expect(store.job(1)?.status).toBe("pending");
-    expect(loaded.secrets.redact("open")).toBe("[redacted]");
-    github.state.issues[2] = makeIssue(2);
-    github.state.issues[2].body = loaded.secrets.get("github.token");
-    await service.reconcile();
-    expect(store.job(2)).toBeUndefined();
-    expect(service.status()).toMatchObject({
-      reason: "secret_in_input",
-      failed: 1,
-    });
-    github.state.repository.default_branch = loaded.secrets.get("github.token");
-    await service.reconcile();
-    expect(store.job(1)!.input_json).not.toContain(
-      loaded.secrets.get("github.token"),
-    );
-    expect(service.status().failed).toBe(2);
+    ).toBe(false);
   });
-  it.each([
-    ["gone", "github_not_found"],
-    ["unavailable", "github_read_failed"],
-    ["invalid", "github_response_invalid"],
-    ["identity", "issue_identity_changed"],
-  ])(
-    "isolates %s input failures from other queued issues",
-    async (mode, code) => {
-      const { github, store, service } = await setup(false);
-      github.state.issues[2] = makeIssue(2);
-      if (mode === "gone" || mode === "unavailable")
-        github.state.failures["/repos/owner/repo/issues/1"] = {
-          status: mode === "gone" ? 410 : 500,
-        };
-      github.beforeRequest(async (url) => {
-        if (url !== "/repos/owner/repo/issues/1") return;
-        if (mode === "invalid")
-          Reflect.deleteProperty(github.state.issues[1], "title");
-        if (mode === "identity") github.state.issues[1].number = 99;
-      });
-      await service.reconcile();
-      expect(store.job(2)?.status).toBe("pending");
-      expect(service.status()).toMatchObject({
-        state: "degraded",
-        reason: code,
-        failed: 1,
-      });
-    },
-  );
-  it.each(["authentication", "storage"])(
-    "keeps %s failures global instead of suppressing them as target deferrals",
-    async (mode) => {
-      const { github, store, service } = await setup(false);
-      github.state.issues[2] = makeIssue(2);
-      if (mode === "authentication")
-        github.state.failures["/repos/owner/repo/issues/1"] = { status: 401 };
-      else
-        store.db.exec(
-          "CREATE TRIGGER fail_jobs BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT,'storage-failure-canary'); END",
-        );
-      await service.reconcile();
-      expect(store.jobs()).toHaveLength(0);
-      expect(service.status()).toMatchObject({
-        state: "degraded",
-        reason:
-          mode === "authentication" ? "github_authentication" : "intake_failed",
-        failed: 0,
-      });
-    },
-  );
-  it("verifies signed raw HTTP requests and rejects invalid or excessive input safely", async () => {
-    const { send, store, address } = await setup();
-    expect((await send(issueEvent())).status).toBe(202);
-    expect(
-      (
-        await send(issueEvent(), "issues", randomUUID(), {
-          "x-hub-signature-256": "sha256=" + "0".repeat(64),
-        })
-      ).status,
-    ).toBe(401);
-    expect(
-      (await send({ ...issueEvent(), repository: { id: 99 } })).status,
-    ).toBe(403);
-    expect((await send("{broken json")).status).toBe(400);
-    expect((await send({ repository: { id: 42 } })).status).toBe(400);
-    expect(
-      (
-        await send(issueEvent(), "issues", randomUUID(), {
-          "x-github-event": "secret-invalid-input",
-        })
-      ).status,
-    ).toBe(400);
-    expect(
-      (
-        await fetch(address + "/webhooks/github", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: "{}",
-        })
-      ).status,
-    ).toBe(401);
-    const oversized = await send({
-      repository: { id: 42 },
-      body: "x".repeat(1024 * 1024),
-    });
-    expect(oversized.status).toBe(413);
-    expect(await oversized.text()).not.toContain("xxxx");
-    expect(store.db.prepare("SELECT count(*) AS n FROM inbox").get()).toEqual({
-      n: 1,
-    });
-  });
-  it("acknowledges only durable commits and makes delivery replay idempotent", async () => {
-    const { send, store } = await setup();
-    const id = randomUUID();
-    expect((await send(issueEvent(), "issues", id)).status).toBe(202);
-    expect((await send(issueEvent(), "issues", id)).status).toBe(202);
-    expect(
-      (await send({ ...issueEvent(), action: "closed" }, "issues", id)).status,
-    ).toBe(409);
-    store.db.exec(
-      "CREATE TRIGGER fail_inbox BEFORE INSERT ON dirty BEGIN SELECT RAISE(ABORT,'fixture-only-secret-error'); END",
-    );
-    const failed = await send(issueEvent());
-    expect(failed.status).toBe(503);
-    expect(await failed.text()).not.toContain("fixture-only-secret-error");
-    expect(store.db.prepare("SELECT count(*) AS n FROM inbox").get()).toEqual({
-      n: 1,
-    });
-  });
-  it("uses authoritative issue state for out-of-order events, closure and reopening", async () => {
-    const { send, service, store, github } = await setup();
-    const initial = store.job(1)!;
-    github.state.issues[1].state = "closed";
-    await send(issueEvent());
-    await service.reconcile();
-    const closed = store.job(1)!;
+  it("uses current GitHub state for closure and reopening without resetting budgets or snapshots", async () => {
+    const f = await setup();
+    await f.service.enrollIssue(1, signal());
+    const initial = f.store.job(1)!;
+    f.store.db
+      .prepare(
+        "UPDATE jobs SET budget_json=json_set(budget_json,'$.model_requests',17)",
+      )
+      .run();
+    f.github.state.issues[1].state = "closed";
+    await f.service.refresh(1, signal());
+    const closed = f.store.job(1)!;
     expect(closed.status).toBe("closed");
-    await send(issueEvent());
-    await service.reconcile();
-    expect(store.job(1)!.revision).toBe(closed.revision);
-    github.state.issues[1].state = "open";
-    await send({ ...issueEvent(), action: "reopened" });
-    await service.reconcile();
-    expect(store.jobs()).toHaveLength(1);
-    expect(store.job(1)).toMatchObject({
+    await f.service.refresh(1, signal());
+    expect(f.store.job(1)!.revision).toBe(closed.revision);
+    f.github.state.issues[1].state = "open";
+    await f.service.refresh(1, signal());
+    expect(f.store.job(1)).toMatchObject({
       id: initial.id,
-      status: "pending",
-      phase: "investigation",
       revision: closed.revision + 1,
+      snapshot_digest: initial.snapshot_digest,
     });
-    expect(store.counts().inbox).toBe(0);
+    expect(JSON.parse(f.store.job(1)!.budget_json).model_requests).toBe(17);
   });
-  it("ignores recorded comments while preserving genuine comments by the same PAT owner", async () => {
-    const { send, service, store, github } = await setup();
-    const job = store.job(1)!;
-    store.recordPublication({
-      operation_key: "comment",
+  it("filters only recorded automation comments, preserving human replies by the same account", async () => {
+    const f = await setup();
+    await f.service.enrollIssue(1, signal());
+    const job = f.store.job(1)!;
+    f.store.recordPublication({
+      operation_key: "owned",
       job_id: job.id,
       revision: job.revision,
       kind: "issue_comment",
@@ -337,311 +90,92 @@ describe("durable GitHub intake", () => {
       head_sha: null,
       receipt_json: "{}",
     });
-    github.state.comments[1] = [
-      {
-        id: 9001,
-        body: "Instance-generated comment",
-        updated_at: "2026-10-15T01:00:00Z",
-        user: { id: 7, login: "pat-owner" },
-      },
-    ];
-    github.state.issues[1].updated_at = "2026-10-15T01:00:00Z";
-    await send({ ...issueEvent(), comment: { id: 9001 } }, "issue_comment");
-    expect(store.counts().inbox).toBe(0);
-    await service.reconcile();
-    expect(store.job(1)!.revision).toBe(job.revision);
-    github.state.comments[1].push({
-      id: 9002,
-      body: "Human response from the PAT owner",
-      updated_at: "2026-10-15T01:01:00Z",
+    f.github.state.comments[1] = [9001, 9002].map((id) => ({
+      id,
+      body: String(id),
+      updated_at: "2026-11-02T00:00:00Z",
       user: { id: 7, login: "pat-owner" },
-    });
-    await send({ ...issueEvent(), comment: { id: 9002 } }, "issue_comment");
-    await service.reconcile();
-    expect(JSON.parse(store.job(1)!.input_json).comments).toEqual([
-      github.state.comments[1][1],
-    ]);
-    expect(store.job(1)!.input_json).not.toContain(github.state.token);
-  });
-  it("processes only recorded owned PRs and their matching current-head check events", async () => {
-    const { send, service, store, github } = await setup();
-    const job = store.job(1)!;
-    github.state.pulls[5] = {
-      id: 5005,
-      number: 5,
-      state: "open",
-      updated_at: "2026-10-15T01:00:00Z",
-      head: { sha: "c".repeat(40) },
-    };
-    store.recordPublication({
-      operation_key: "pull",
-      job_id: job.id,
-      revision: job.revision,
-      kind: "pull_request",
-      object_id: "5005",
-      number: 5,
-      head_sha: "c".repeat(40),
-      receipt_json: "{}",
-    });
-    await send(
-      { repository: { id: 42 }, pull_request: { id: 5006, number: 6 } },
-      "pull_request",
-    );
-    expect(store.counts().inbox).toBe(0);
-    await send(
-      {
-        repository: { id: 42 },
-        check_run: {
-          head_sha: "c".repeat(40),
-          pull_requests: [
-            { id: 5005, number: 5 },
-            { id: 5006, number: 6 },
-          ],
-        },
-      },
-      "check_run",
-    );
-    await service.reconcile();
-    expect(store.ownedPull(5)?.context_json).toContain("cccc");
-    const revision = store.job(1)!.revision;
-    store.recordPublication({
-      operation_key: "pull-comment",
-      job_id: job.id,
-      revision,
-      kind: "issue_comment",
-      object_id: "9003",
-      number: null,
-      head_sha: null,
-      receipt_json: "{}",
-    });
-    github.state.pulls[5].updated_at = "2026-10-15T02:00:00Z";
-    github.state.comments[5] = [
-      {
-        id: 9003,
-        body: "Owned PR comment",
-        updated_at: "2026-10-15T02:00:00Z",
-        user: { id: 7, login: "pat-owner" },
-      },
-    ];
-    await send(
-      {
-        repository: { id: 42 },
-        issue: { id: 9905, number: 5, pull_request: {} },
-        comment: { id: 9003 },
-      },
-      "issue_comment",
-    );
-    await service.reconcile();
-    expect(store.job(1)!.revision).toBe(revision);
-    github.state.comments[5].push({
-      id: 9004,
-      body: "Human PR comment",
-      updated_at: "2026-10-15T02:01:00Z",
-      user: { id: 7, login: "pat-owner" },
-    });
-    await send(
-      {
-        repository: { id: 42 },
-        issue: { id: 9905, number: 5, pull_request: {} },
-        comment: { id: 9004 },
-      },
-      "issue_comment",
-    );
-    await service.reconcile();
-    expect(store.job(1)!.revision).toBe(revision);
-    expect(store.ownedPull(5)!.context_json).toContain("Human PR comment");
-    github.state.pulls[5].head.sha = "d".repeat(40);
-    await send(
-      { repository: { id: 42 }, pull_request: { id: 5005, number: 5 } },
-      "pull_request",
-    );
-    await service.reconcile();
-    expect(store.ownedPull(5)!.head_sha).toBe("d".repeat(40));
-    await send({ repository: { id: 42 }, sha: "c".repeat(40) }, "status");
-    expect(store.counts().inbox).toBe(0);
-    expect(github.requests.every((request) => request.method === "GET")).toBe(
-      true,
-    );
-  });
-  it("resumes interrupted paginated backfill from durable state and preserves old job snapshots", async () => {
-    const fixture = await setup(false);
-    const { github, store, service, path, stores, services, loaded, logger } =
-      fixture;
-    for (let number = 2; number <= 101; number++)
-      github.state.issues[number] = {
-        ...makeIssue(number),
-        ...(number <= 100 ? { pull_request: { url: "ignored" } } : {}),
-      };
-    github.beforeRequest(async (url) => {
-      if (
-        new URL(url, "http://fixture").searchParams.get("page") === "2" &&
-        url.includes("/issues?")
-      )
-        github.state.failures[url] = { status: 500 };
-    });
-    await service.reconcile();
-    expect(service.status().state).toBe("degraded");
-    expect(store.cursor().page).toBe(2);
-    expect(store.jobs()).toHaveLength(1);
-    await service.stop();
-    store.close();
-    github.beforeRequest(undefined);
-    github.state.failures = {};
-    const reopened = new Store(path);
-    stores.push(reopened);
-    const changed = await fixtureSnapshot("new-model");
-    const resumed = new IntakeService(
-      reopened,
-      github.reader,
-      changed.snapshot,
-      loaded.secrets,
-      logger,
-    );
-    services.push(resumed);
-    await resumed.reconcile();
-    expect(reopened.cursor().page).toBe(1);
-    expect(reopened.jobs().map((job) => job.issue_number)).toEqual([1, 101]);
-    expect(reopened.job(1)!.snapshot_digest).toBe(loaded.snapshot.digest);
-    expect(reopened.job(101)!.snapshot_digest).toBe(changed.snapshot.digest);
+    }));
+    await f.service.refresh(1, signal());
     expect(
-      reopened.snapshot(loaded.snapshot.digest).roles.investigation.profile
-        .model,
-    ).toBe("fixture-model");
+      JSON.parse(f.store.job(1)!.input_json).comments.map(
+        (comment: { id: number }) => comment.id,
+      ),
+    ).toEqual([9002]);
   });
-  it("recovers missed events and leaves secret-bearing input pending without blocking other issues", async () => {
-    const { service, store, github, loaded } = await setup();
-    github.state.issues[1].state = "closed";
-    github.state.issues[2] = makeIssue(2);
-    github.state.issues[2].body = loaded.secrets.get("github.token");
-    github.state.issues[3] = makeIssue(3);
-    await service.reconcile();
-    expect(store.job(1)!.status).toBe("closed");
-    expect(store.job(2)).toBeUndefined();
-    expect(store.job(3)!.status).toBe("pending");
-    expect(service.status()).toMatchObject({
-      state: "degraded",
-      reason: "secret_in_input",
-      failed: 1,
+  it("fences a completed old read when a newer refresh applies first", async () => {
+    let entered!: () => void, release!: () => void;
+    const entering = new Promise<void>((resolve) => {
+      entered = resolve;
     });
+    const releasing = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const f = await setup({
+      beforeIssue: async (context) => {
+        if (context.body === "stale") {
+          entered();
+          await releasing;
+        }
+      },
+    });
+    await f.service.enrollIssue(1, signal());
+    f.github.state.issues[1].body = "stale";
+    const stale = f.service.refresh(1, signal());
+    await entering;
+    try {
+      f.github.state.issues[1].body = "current";
+      await f.service.refresh(1, signal());
+    } finally {
+      release();
+    }
+    await stale;
+    expect(JSON.parse(f.store.job(1)!.input_json).body).toBe("current");
+    expect(f.store.job(1)!.revision).toBe(2);
   });
-  it("keeps intake unavailable until enrollment succeeds and stops on repository replacement", async () => {
-    const fixture = await setup(false);
-    const { send, github, service, store, services, loaded, logger } = fixture;
-    expect((await send(issueEvent())).status).toBe(503);
-    github.state.failures["/repos/owner/repo"] = { status: 401 };
-    await service.reconcile();
-    expect(service.status()).toMatchObject({
-      state: "degraded",
-      reason: "github_authentication",
-    });
-    github.state.failures = {};
-    const fresh = new IntakeService(
-      store,
-      github.reader,
-      loaded.snapshot,
-      loaded.secrets,
-      logger,
+  it("refuses secret-bearing input and preserves the last accepted issue", async () => {
+    const f = await setup();
+    await f.service.enrollIssue(1, signal());
+    const before = f.store.job(1);
+    f.github.state.issues[1].body = f.loaded.secrets.get("github.token");
+    await expect(f.service.refresh(1, signal())).rejects.toThrow(
+      "secret_in_input",
     );
-    services.push(fresh);
-    await fresh.reconcile();
-    github.state.repository.id = 99;
-    await fresh.reconcile();
-    expect(fresh.status()).toMatchObject({
-      state: "degraded",
-      reason: "repository_changed",
-    });
-    expect(store.repository()!.id).toBe(42);
-    expect(store.jobs()).toHaveLength(1);
+    expect(f.store.job(1)).toEqual(before);
   });
-  it("reports intake status while keeping automation readiness unavailable", async () => {
-    const { address, store } = await setup();
-    const response = await fetch(address + "/readyz");
-    expect(response.status).toBe(503);
-    const status = await response.json();
-    expect(status).toMatchObject({
-      reason: "automation_not_implemented",
-      intake: { state: "ready", pending: 1 },
-    });
-    expect(JSON.stringify(status)).not.toMatch(
-      /owner\/repo|github-fixture-token|maintenance problem/,
-    );
-    expect(store.job(1)!.status).toBe("pending");
-  });
-
-  it("processes a fresh signed signal before the obsolete secret-input retry deadline", async () => {
-    const { github, send, service, store, loaded, path, stores } =
-      await setup();
-    github.state.issues[2] = {
-      ...makeIssue(2),
-      body: loaded.secrets.get("github.token"),
-    };
-    const event = issueEvent(2),
-      delivery = randomUUID();
-    expect((await send(event, "issues", delivery)).status).toBe(202);
-    await service.reconcile();
-    const obsolete = store.nextRetry()!;
-    expect(obsolete).toBeGreaterThan(Date.now() + 250_000);
-    expect((await send(event, "issues", delivery)).status).toBe(202);
-    expect(store.nextRetry()).toBe(obsolete);
-    github.state.issues[2].body = "credential removed";
-    service.start();
-    expect((await send({ ...event, action: "edited" })).status).toBe(202);
-    const deadline = Date.now() + 3000;
-    while ((!store.job(2) || store.counts().inbox) && Date.now() < deadline)
-      await delay(10);
-    expect(Date.now()).toBeLessThan(obsolete);
-    expect(store.job(2)?.input_json).toContain("credential removed");
-    expect(store.counts()).toMatchObject({ inbox: 0, failed: 0 });
-    const reopened = new Store(path);
-    stores.push(reopened);
-    expect(reopened.counts().inbox).toBe(0);
-    expect(reopened.job(2)?.input_json).toContain("credential removed");
-    expect(
-      store.db
-        .prepare("SELECT processed FROM inbox")
-        .all()
-        .every((row) => (row as { processed: number }).processed === 1),
-    ).toBe(true);
-  });
-
-  it("fences an authoritative read interrupted by another signed generation", async () => {
-    const { github, send, service, store } = await setup();
-    await send({ ...issueEvent(), action: "edited" });
-    let interrupted = false;
-    github.beforeRequest(async (url) => {
-      if (url !== "/repos/owner/repo/issues/1" || interrupted) return;
-      interrupted = true;
-      github.state.issues[1].body = "new authoritative input";
-      expect((await send({ ...issueEvent(), action: "edited" })).status).toBe(
-        202,
-      );
-    });
-    await service.reconcile();
-    expect(interrupted).toBe(true);
-    expect(store.job(1)?.revision).toBe(2);
-    expect(store.job(1)?.input_json).toContain("new authoritative input");
-    expect(store.counts().inbox).toBe(0);
-  });
-
-  it.each([401, 429])(
-    "retains repository-wide %s backoff after a fresh signed webhook",
-    async (status) => {
-      const { github, send, service, store } = await setup();
-      github.state.failures["/repos/owner/repo/issues/1"] = { status };
-      await send({ ...issueEvent(), action: "edited" });
-      await service.reconcile();
-      expect(service.status().reason).toBe(
-        status === 401 ? "github_authentication" : "github_rate_limited",
-      );
-      github.state.failures = {};
-      expect((await send({ ...issueEvent(), action: "edited" })).status).toBe(
-        202,
-      );
-      const count = github.requests.length;
-      await service.reconcile();
-      expect(github.requests).toHaveLength(count);
-      expect(store.nextDirty()).toBeDefined();
-      expect(store.counts().inbox).toBeGreaterThan(0);
+  it.each([
+    [401, "github_authentication"],
+    [429, "github_rate_limited"],
+    [500, "github_read_failed"],
+  ] as const)(
+    "propagates %i provider failures without accepting input",
+    async (status, code) => {
+      const f = await setup();
+      f.github.state.failures["/repos/owner/repo/issues/1"] = { status };
+      await expect(f.service.enrollIssue(1, signal())).rejects.toThrow(code);
+      expect(f.store.jobs()).toEqual([]);
     },
   );
+  it("propagates storage failures instead of acknowledging uncommitted work", async () => {
+    const f = await setup();
+    f.store.db.exec(
+      "CREATE TRIGGER reject_job BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT,'storage failure'); END",
+    );
+    await expect(f.service.enrollIssue(1, signal())).rejects.toThrow(
+      "storage failure",
+    );
+    expect(f.store.jobs()).toEqual([]);
+  });
+  it("rejects repository replacement and stops accepting refreshes after cancellation", async () => {
+    const f = await setup();
+    await f.service.enrollIssue(1, signal());
+    f.github.state.repository.id = 99;
+    await expect(f.service.enrollIssue(1, signal())).rejects.toThrow(
+      "repository_changed",
+    );
+    expect(f.store.repository()!.id).toBe(42);
+    await f.service.stop();
+    expect(f.service.enrolled()).toBe(false);
+    await expect(f.service.refresh(1, signal())).rejects.toThrow();
+  });
 });

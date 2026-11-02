@@ -3,10 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Octokit } from "@octokit/rest";
-import Database from "better-sqlite3";
 import { OctokitReader } from "../src/adapters/github/reader.ts";
 import { OctokitWriter } from "../src/adapters/github/writer.ts";
-import { prMonitorPolicy, parseConfiguration } from "../src/config/schema.ts";
+import {
+  prMonitorPolicy,
+  parseActionsConfiguration,
+} from "../src/config/schema.ts";
 import { digest } from "../src/domain/agents.ts";
 import { Store } from "../src/repositories/store.ts";
 import { PrMonitorRepository } from "../src/repositories/pr-monitor.ts";
@@ -521,12 +523,12 @@ describe("current-head PR readiness policy", () => {
     config.pr_monitor.automated_reviewers = [
       { login: "human", signal: "codex" },
     ];
-    expect(() => parseConfiguration(stringify(config))).toThrow(
+    expect(() => parseActionsConfiguration(stringify(config))).toThrow(
       "schema_invalid",
     );
     config.pr_monitor.automated_reviewers = [];
     config.pr_monitor.local_checks_only = true;
-    expect(() => parseConfiguration(stringify(config))).toThrow(
+    expect(() => parseActionsConfiguration(stringify(config))).toThrow(
       "schema_invalid",
     );
   });
@@ -721,37 +723,19 @@ describe("monitor persistence and published-job revision boundaries", () => {
     return { path, store, snapshot, input };
   }
 
-  it("keeps coding scope/revision while recording new issue/PR observation generations", async () => {
+  it("keeps coding scope/revision while recording new issue observation generations", async () => {
     const f = await database(),
       before = f.store.job(1)!;
     f.input.source.sha = "c".repeat(40);
     f.store.applyIssue(f.store.refreshIssue(1), f.input, f.snapshot);
-    f.store.accept("pull-update", "digest", "pull_request", [
-      { kind: "pull", number: 77 },
-    ]);
-    f.store.applyPull(f.store.nextDirty()!, {
-      id: 77,
-      number: 77,
-      state: "open",
-      head_sha: "d".repeat(40),
-      updated_at: new Date().toISOString(),
-      comments: [],
-      reviews: [],
-      review_comments: [],
-      checks: [],
-      statuses: [],
-    });
     expect(f.store.job(1)!.revision).toBe(before.revision);
     expect(f.store.job(1)!.input_json).toBe(before.input_json);
-    expect(f.store.ownedPull(77)!.head_sha).toBe("d".repeat(40));
+    expect(f.store.ownedPull(77)!.head_sha).toBe(head);
     expect(
       f.store.db
         .prepare("SELECT kind,generation FROM pr_observations ORDER BY kind")
         .all(),
-    ).toEqual([
-      { kind: "issue", generation: 1 },
-      { kind: "pull", generation: 1 },
-    ]);
+    ).toEqual([{ kind: "issue", generation: 1 }]);
   });
 
   it("persists wait accounting across restart without taking a coding slot", async () => {
@@ -773,8 +757,7 @@ describe("monitor persistence and published-job revision boundaries", () => {
       assessment_digest: null,
       findings: [],
       pending_agent: null,
-      recovery_attempts: [],
-      mcp_done_for: null,
+
       readiness_id: null,
       status_operation: null,
       status_text: null,
@@ -814,31 +797,5 @@ describe("monitor persistence and published-job revision boundaries", () => {
     f.store.applyIssue(f.store.refreshIssue(1), f.input, f.snapshot);
     expect(f.store.job(1)!.revision).toBe(1);
     expect(() => f.store.assertPublishedScope(1)).toThrow("pr_scope_changed");
-  });
-
-  it("migrates schema 9 additively and rolls back a conflicting migration", async () => {
-    const f = await database(),
-      before = f.store.job(1)!;
-    f.store.db.exec(
-      "DROP TABLE agent_conversations; DROP TABLE pr_monitors; DROP TABLE pr_monitor_evidence; DROP TABLE pr_observations; PRAGMA user_version=9",
-    );
-    f.store.close();
-    const migrated = new Store(f.path);
-    expect(migrated.db.pragma("user_version", { simple: true })).toBe(11);
-    expect(migrated.job(1)).toEqual(before);
-    expect(migrated.ownedPull(77)!.object_id).toBe("77");
-    migrated.db.exec(
-      "DROP TABLE agent_conversations; DROP TABLE pr_monitors; DROP TABLE pr_observations; PRAGMA user_version=9",
-    );
-    migrated.close();
-    expect(() => new Store(f.path)).toThrow();
-    const raw = new Database(f.path);
-    expect(raw.pragma("user_version", { simple: true })).toBe(9);
-    expect(
-      raw
-        .prepare("SELECT name FROM sqlite_master WHERE name='pr_monitors'")
-        .get(),
-    ).toBeUndefined();
-    raw.close();
   });
 });

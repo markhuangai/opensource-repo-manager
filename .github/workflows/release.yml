@@ -133,6 +133,24 @@ jobs:
             assert.equal(`${inspected.Os}/${inspected.Architecture}`, PLATFORM);
             assert.equal(inspected.Config.Labels["org.opencontainers.image.revision"], SOURCE_SHA);
             assert.equal(inspected.Config.Labels["org.opencontainers.image.version"], VERSION);
+            assert.deepEqual(inspected.Config.Entrypoint, ["/usr/bin/tini", "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/main.js"]);
+            assert(!inspected.Config.Healthcheck && !inspected.Config.ExposedPorts);
+            const name = `orm-release-smoke-${require("node:crypto").randomUUID()}`;
+            const label = "org.opensource-repo-manager.release-smoke";
+            try {
+              const bounded = await exec.getExecOutput("timeout", ["--kill-after=15s", "30s", "docker", "run", "--rm",
+                "--name", name, "--label", `${label}=${name}`, "--network", "none", "--platform", PLATFORM, reference, "1"],
+                { silent: true, ignoreReturnCode: true });
+              assert.equal(bounded.exitCode, 1, "Default entrypoint must fail promptly without credentials.");
+              assert.deepEqual(JSON.parse(bounded.stdout.trim()), { version: 1, outcome: "failed", reason: "configuration_invalid" });
+            } finally {
+              const remaining = await exec.getExecOutput("docker", ["container", "inspect", name], { silent: true, ignoreReturnCode: true });
+              if (remaining.exitCode === 0) {
+                const container = JSON.parse(remaining.stdout)[0];
+                assert.equal(container.Config.Labels[label], name, "Smoke container ownership changed.");
+                await exec.exec("docker", ["container", "rm", "--force", container.Id]);
+              }
+            }
             await exec.exec("docker", ["run", "--rm", "--network", "none", "--platform", PLATFORM,
               "--entrypoint", "/opt/orm-runtime/bin/node", reference, "-e",
               `const assert = require('node:assert/strict'); assert.equal(process.arch, '${architecture === "amd64" ? "x64" : "arm64"}'); const db = require('better-sqlite3')(':memory:'); assert.equal(db.prepare('SELECT 1 AS value').get().value, 1); db.close();`]);

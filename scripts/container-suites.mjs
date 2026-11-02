@@ -140,7 +140,6 @@ export const implementationScenarios = {
     "lost-pull-response",
     "issue-closed",
     "issue-revised",
-    "mcp-milestone-recovery",
     "pre-monitor-readiness",
   ],
   "implementation-monitor-repair": [
@@ -157,12 +156,8 @@ export const implementationScenarios = {
     "restart-thread_reply",
     "restart-thread_resolution",
     "repair-budget-and-ci-failure",
-    "stale-notification",
-    "wait-budget-and-legacy-receipts",
-  ],
-  "implementation-monitor-mcp": [
-    "readiness-mcp-generic",
-    "readiness-mcp-dense",
+    "stale-readiness-comment",
+    "wait-budget-and-required-receipts",
   ],
 };
 
@@ -331,7 +326,7 @@ export function verifyActionsReceipts(receipts, identity) {
       assert.equal(receipt.suite, "actions");
       assert.equal(receipt.cleanup, "passed");
       assert.equal(
-        receipt.protected_configuration_and_service_startup,
+        receipt.protected_configuration_and_bounded_startup,
         "parent-image-verified",
       );
       assert.equal(proof.actions, "passed");
@@ -352,7 +347,8 @@ export function verifyActionsReceipts(receipts, identity) {
         "Missing Actions scenario timing",
       );
       assert(
-        Array.isArray(proof.resource_samples),
+        Array.isArray(proof.resource_samples) &&
+          proof.resource_samples.length > 0,
         "Missing Actions resource observations",
       );
       if (group === "lifecycle") {

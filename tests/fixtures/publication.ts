@@ -167,6 +167,7 @@ export async function createPublicationFixture(root: string) {
     ]),
     repository_id: 42,
     default_branch: "main",
+    truncatedTree: false,
     closed: new Set<number>(),
     labels: new Set<string>(),
     issueLabels: new Map<number, string[]>(),
@@ -519,7 +520,7 @@ export async function createPublicationFixture(root: string) {
       /^\/repos\/owner\/repo\/git\/trees\/([a-f0-9]{40})$/,
     );
     if (tree && req.method === "GET") {
-      const entries = git(["ls-tree", "-rlz", tree[1]])
+      const entries = git(["ls-tree", "-rtlz", tree[1]])
         .split("\0")
         .filter(Boolean)
         .map((line) => {
@@ -529,11 +530,11 @@ export async function createPublicationFixture(root: string) {
             mode: match[1],
             type: match[2],
             sha: match[3],
-            size: Number(match[4]),
+            ...(match[4] === "-" ? {} : { size: Number(match[4]) }),
             path: match[5],
           };
         });
-      send({ sha: tree[1], truncated: false, tree: entries });
+      send({ sha: tree[1], truncated: state.truncatedTree, tree: entries });
       return;
     }
     const blob = path.match(

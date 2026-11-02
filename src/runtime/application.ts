@@ -8,7 +8,6 @@ import { IntakeService } from "../services/intake.ts";
 import { InvestigationService } from "../services/investigation/index.ts";
 import { ImplementationService } from "../services/implementation/index.ts";
 import { PrMonitorService } from "../services/pr-monitor/index.ts";
-import { McpGateway } from "../services/mcp/index.ts";
 import { Supervisor } from "./supervisor.ts";
 import type { GitHubWriter } from "../adapters/github/writer.ts";
 
@@ -17,15 +16,10 @@ export async function createApplication(
   loaded: { snapshot: RunSnapshot; secrets: SecretAccessor },
   logger: SafeLogger,
   options: {
-    mode: "service" | "actions";
     root?: string;
     publicationWriter?: (ready: () => void) => GitHubWriter;
   },
 ) {
-  const mcp =
-    options.mode === "service"
-      ? new McpGateway(store, loaded.snapshot, loaded.secrets)
-      : undefined;
   let supervisor: Supervisor | undefined;
   let intake: IntakeService | undefined;
   let investigation: InvestigationService | undefined;
@@ -50,19 +44,11 @@ export async function createApplication(
         try {
           await supervisor?.close();
         } finally {
-          try {
-            await mcp?.close();
-          } finally {
-            if (store.db.open) {
-              try {
-                if (store.durability)
-                  await store.checkpoint(
-                    AbortSignal.timeout(9000),
-                    options.mode === "actions",
-                  );
-              } finally {
-                store.close();
-              }
+          if (store.db.open) {
+            try {
+              await store.checkpoint(AbortSignal.timeout(9000), true);
+            } finally {
+              store.close();
             }
           }
         }
@@ -76,7 +62,6 @@ export async function createApplication(
       {
         root: options.root,
         publicationWriter: options.publicationWriter,
-        mcp,
         workers: {
           claude: fileURLToPath(
             new URL("../adapters/agents/claude.js", import.meta.url),
@@ -87,30 +72,14 @@ export async function createApplication(
         },
       },
     );
-    if (mcp) {
-      mcp.setWriteDispatcher(supervisor.mcpWrites);
-      mcp.setReadResultScanner(supervisor.publication.outputReview.scanner);
-      await mcp.start();
-    }
     const reader = createGitHubReader(
       loaded.snapshot.settings.github.repository,
       loaded.secrets.get("github.token"),
     );
-    intake = new IntakeService(
-      store,
-      reader,
-      loaded.snapshot,
-      loaded.secrets,
-      logger,
-      {
-        beforeIssue: async (context, signal) =>
-          investigation?.beforeIssue(context, signal),
-        changed: () => {
-          investigation?.wake();
-          monitor?.wake();
-        },
-      },
-    );
+    intake = new IntakeService(store, reader, loaded.snapshot, loaded.secrets, {
+      beforeIssue: async (context, signal) =>
+        investigation?.beforeIssue(context, signal),
+    });
     const implementation = new ImplementationService(
       store,
       intake,
@@ -137,7 +106,6 @@ export async function createApplication(
       undefined,
       implementation,
     );
-    monitor.setCoordinatorWake(() => investigation?.wake());
     return {
       store,
       supervisor,

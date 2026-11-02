@@ -30,15 +30,6 @@ const request: WorkerRequest = {
     selected: [],
   },
   relay: { url: "http://127.0.0.1:1234/v1", authorization: "short-lived" },
-  mcp: [
-    {
-      alias: "context",
-      url: "http://127.0.0.1:5678/mcp",
-      authorization: "scoped",
-      tools: ["read"],
-      deadline: Date.now() + 900000,
-    },
-  ],
 };
 
 async function collect(iterable: ReturnType<typeof run>) {
@@ -48,7 +39,7 @@ async function collect(iterable: ReturnType<typeof run>) {
 }
 
 describe("Codex worker policy", () => {
-  it("builds isolated provider and shell environments with exact MCP grants", () => {
+  it("builds isolated provider and shell environments with external MCP disabled", () => {
     const { options, thread } = codexOptions(request);
     expect(options.env).not.toHaveProperty("GH_TOKEN");
     expect(options.env?.ORM_RELAY_AUTH).toBe("short-lived");
@@ -61,7 +52,7 @@ describe("Codex worker policy", () => {
     expect(
       JSON.stringify(options.config?.shell_environment_policy),
     ).not.toContain("scoped");
-    expect(options.configOverrides?.[1]).toContain('"enabled_tools"=["read"]');
+    expect(options.configOverrides?.[1]).toBe("mcp_servers={}");
     expect(options.configOverrides?.[1]).not.toContain("scoped");
     expect(thread).toMatchObject({
       model: "gpt-5.5",
@@ -81,7 +72,6 @@ describe("Codex worker policy", () => {
     const { options, thread } = codexOptions({
       ...request,
       role: "output_review",
-      mcp: [],
     });
     expect(thread.sandboxMode).toBe("read-only");
     expect(options.config?.features).toMatchObject({
@@ -89,9 +79,6 @@ describe("Codex worker policy", () => {
       multi_agent: false,
       hooks: false,
     });
-    expect(() => codexOptions({ ...request, role: "output_review" })).toThrow(
-      /codex_review_tools_forbidden/,
-    );
   });
   it("returns an explicit failure when ephemeral authorization is missing", async () => {
     const events = await collect(

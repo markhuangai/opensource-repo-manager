@@ -369,10 +369,25 @@ describe("trusted repository Actions configuration", () => {
       {
         ".github/orm.yml": stringify(operatorConfiguration()),
         ".github/orm/prompts/user.md": "Reviewed operator prompt\n",
+        ".github/orm/skills/example/SKILL.md": "Reviewed operator skill\n",
       },
       f.remote.source.sha,
     );
     f.remote.git(["update-ref", "refs/heads/main", pinned.sha]);
+    const tree = await f.source.files(
+      await f.source.repository(signal()),
+      signal(),
+    );
+    for (const path of [
+      ".github/orm",
+      ".github/orm/prompts",
+      ".github/orm/skills",
+      ".github/orm/skills/example",
+    ]) {
+      const directory = tree.files.find((entry) => entry.path === path);
+      expect(directory).toMatchObject({ type: "tree", mode: "040000" });
+      expect(directory).not.toHaveProperty("size");
+    }
     const roots = {
       config: join(f.root, "config"),
       prompts: join(f.root, "prompts"),
@@ -394,12 +409,32 @@ describe("trusted repository Actions configuration", () => {
     const { settings, secrets } = separateSecrets(config);
     const bundles = await loadWorkflowBundles(settings, secrets, roots);
     expect(bundles.implementation.user).toBe("Reviewed operator prompt\n");
+    expect(
+      Buffer.from(
+        bundles.implementation.skills.find(
+          (file) => file.path === "example/SKILL.md",
+        )!.content_base64,
+        "base64",
+      ).toString(),
+    ).toBe("Reviewed operator skill\n");
     expect(secrets.containsCredentials(bundles)).toBe(false);
     expect(config.github.repository).toBe("owner/repo");
     expect(config.roles.audit.profile).toBe("review");
     await expect(
       prepareActionsConfiguration(f.source, credentials, signal(), roots),
     ).rejects.toThrow();
+  });
+  it("rejects a truncated recursive Git-tree response at the transport boundary", async () => {
+    const f = await setup();
+    f.remote.state.truncatedTree = true;
+    await expect(
+      f.source.files(await f.source.repository(signal()), signal()),
+    ).rejects.toThrow("state_size_limit");
+    expect(
+      f.remote.state.requests.some((request) =>
+        request.path.includes("/git/trees/"),
+      ),
+    ).toBe(true);
   });
   it("rejects repository-stored credentials and service-only configuration", () => {
     for (const extra of [

@@ -47,7 +47,6 @@ const application = await createApplication(
     },
   },
   {
-    mode: "actions",
     root: join(root, "runtime"),
     publicationWriter: () => state.writer,
   },

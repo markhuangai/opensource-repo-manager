@@ -8,12 +8,7 @@ import {
 import { ConfigurationError } from "./errors.ts";
 import { readRegularFile } from "./files.ts";
 import { captureActionsContext } from "../actions/context.ts";
-import {
-  parseActionsConfiguration,
-  parseConfiguration,
-  roleNames,
-  type Role,
-} from "./schema.ts";
+import { parseActionsConfiguration, roleNames, type Role } from "./schema.ts";
 import {
   separateSecrets,
   type SecretAccessor,
@@ -31,19 +26,6 @@ export function createRunSnapshot(
       {
         profile: settings.profiles[settings.roles[role].profile],
         bundle: bundles[role],
-        mcp: Object.fromEntries(
-          Object.entries(settings.roles[role].mcp).map(([alias, grant]) => [
-            alias,
-            {
-              tools: Object.fromEntries(
-                grant.tools.map((name) => [
-                  name,
-                  settings.mcp.servers[alias].tools[name],
-                ]),
-              ),
-            },
-          ]),
-        ),
       },
     ]),
   ) as Record<
@@ -51,10 +33,6 @@ export function createRunSnapshot(
     {
       profile: SupervisorSettings["profiles"][string];
       bundle: WorkflowBundles[Role];
-      mcp: Record<
-        string,
-        { tools: SupervisorSettings["mcp"]["servers"][string]["tools"] }
-      >;
     }
   >;
   const snapshot = structuredClone({ version: 1 as const, settings, roles });
@@ -68,9 +46,8 @@ export function createRunSnapshot(
 
 export type RunSnapshot = ReturnType<typeof createRunSnapshot>;
 
-async function loadConfiguration(
-  path: string,
-  parse: typeof parseConfiguration | typeof parseActionsConfiguration,
+export async function loadProtectedConfiguration(
+  path = "/config/actions.yml",
   sessionKey?: string,
   runtimeToken?: string,
 ) {
@@ -82,7 +59,7 @@ async function loadConfiguration(
     throw new ConfigurationError("yaml_invalid");
   }
   const { settings, secrets } = separateSecrets(
-    parse(source),
+    parseActionsConfiguration(source),
     sessionKey,
     runtimeToken,
   );
@@ -91,10 +68,6 @@ async function loadConfiguration(
     snapshot: createRunSnapshot(settings, bundles, secrets),
     secrets,
   });
-}
-
-export function loadProtectedConfiguration(path = "/config/config.yml") {
-  return loadConfiguration(path, parseConfiguration);
 }
 
 export function loadProtectedActionsConfiguration(
@@ -110,14 +83,12 @@ export function loadProtectedActionsConfiguration(
     throw new ConfigurationError("session_key_invalid");
   delete process.env.ORM_SESSION_KEY;
   const { context, token } = captureActionsContext();
-  return loadConfiguration(path, parseActionsConfiguration, key, token).then(
-    (loaded) => {
-      if (
-        loaded.snapshot.settings.github.repository.toLowerCase() !==
-        context.repository.toLowerCase()
-      )
-        throw new ConfigurationError("actions_context_invalid");
-      return { ...loaded, actions: context };
-    },
-  );
+  return loadProtectedConfiguration(path, key, token).then((loaded) => {
+    if (
+      loaded.snapshot.settings.github.repository.toLowerCase() !==
+      context.repository.toLowerCase()
+    )
+      throw new ConfigurationError("actions_context_invalid");
+    return { ...loaded, actions: context };
+  });
 }

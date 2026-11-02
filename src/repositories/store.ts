@@ -21,20 +21,18 @@ import {
   RuntimeError,
   type AgentRunRecord,
   type ArtifactManifest,
-  type McpCallReceipt,
 } from "../domain/agents.ts";
 import {
   budgetUsage,
   initialBudget,
   IntakeError,
   type BudgetUsage,
-  type DirtyTarget,
+  type IssueRefresh,
   type IssueContext,
   type Job,
   type Publication,
   type PullContext,
   type RepositoryIdentity,
-  type Target,
 } from "../domain/jobs.ts";
 
 function inputJson(context: IssueContext | PullContext) {
@@ -93,22 +91,22 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(version as number))
+      if (version !== 0 && version !== 12)
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("synchronous = FULL");
       if (version === 0)
         this.db
-          .transaction(() =>
+          .transaction(() => {
             this.db.exec(`
-        CREATE TABLE repository (
+CREATE TABLE repository (
           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
           id INTEGER NOT NULL UNIQUE, full_name TEXT NOT NULL,
           default_branch TEXT NOT NULL, private INTEGER NOT NULL
         );
-        CREATE TABLE snapshots (digest TEXT PRIMARY KEY, content TEXT NOT NULL);
-        CREATE TABLE jobs (
+CREATE TABLE snapshots (digest TEXT PRIMARY KEY, content TEXT NOT NULL);
+CREATE TABLE jobs (
           id INTEGER PRIMARY KEY, issue_id INTEGER NOT NULL UNIQUE,
           issue_number INTEGER NOT NULL UNIQUE, revision INTEGER NOT NULL DEFAULT 1,
           phase TEXT NOT NULL DEFAULT 'investigation',
@@ -117,48 +115,21 @@ export class Store {
           snapshot_digest TEXT NOT NULL REFERENCES snapshots(digest),
           budget_json TEXT NOT NULL
         );
-        CREATE TABLE inbox (
-          delivery_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL,
-          event TEXT NOT NULL, received_at INTEGER NOT NULL, processed INTEGER NOT NULL
-        );
-        CREATE TABLE dirty (
-          kind TEXT NOT NULL CHECK(kind IN ('issue','pull')), number INTEGER NOT NULL,
-          generation INTEGER NOT NULL, retry_at INTEGER NOT NULL DEFAULT 0,
-          failure_code TEXT, PRIMARY KEY(kind,number)
-        );
-        CREATE TABLE delivery_targets (
-          delivery_id TEXT NOT NULL REFERENCES inbox(delivery_id),
-          kind TEXT NOT NULL, number INTEGER NOT NULL, generation INTEGER NOT NULL,
-          done INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(delivery_id,kind,number)
-        );
-        CREATE TABLE reconciliation (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1), page INTEGER NOT NULL,
-          last_completed_at INTEGER, generation INTEGER NOT NULL DEFAULT 0
-        );
-        INSERT INTO reconciliation(singleton,page) VALUES(1,1);
-        CREATE TABLE coding_lease (
+CREATE TABLE coding_lease (
           slot INTEGER PRIMARY KEY CHECK(slot=1), job_id INTEGER NOT NULL REFERENCES jobs(id),
           revision INTEGER NOT NULL, token TEXT NOT NULL UNIQUE
         );
-        CREATE TABLE publications (
+CREATE TABLE publications (
           operation_key TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
           revision INTEGER NOT NULL, kind TEXT NOT NULL, object_id TEXT NOT NULL,
           number INTEGER, head_sha TEXT, receipt_json TEXT NOT NULL, context_json TEXT,
           UNIQUE(kind,object_id)
         );
-        PRAGMA user_version = 1;
-      `),
-          )
-          .immediate();
-      if (version === 0 || version === 1)
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE runtime_leases (
+CREATE TABLE runtime_leases (
             token TEXT PRIMARY KEY REFERENCES coding_lease(token) ON DELETE CASCADE,
             deadline INTEGER NOT NULL, accounted_at INTEGER NOT NULL
           );
-          CREATE TABLE agent_runs (
+CREATE TABLE agent_runs (
             id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
             revision INTEGER NOT NULL, role TEXT NOT NULL, uid INTEGER NOT NULL,
             parent_id TEXT REFERENCES agent_runs(id), lease_token TEXT NOT NULL,
@@ -166,170 +137,66 @@ export class Store {
             session_id TEXT, artifact_digest TEXT,
             started_at INTEGER NOT NULL, finished_at INTEGER
           );
-          CREATE UNIQUE INDEX occupied_agent_user ON agent_runs(uid) WHERE finished_at IS NULL;
-          CREATE TABLE artifacts (
+CREATE UNIQUE INDEX occupied_agent_user ON agent_runs(uid) WHERE finished_at IS NULL;
+CREATE TABLE artifacts (
             digest TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES agent_runs(id),
             job_id INTEGER NOT NULL REFERENCES jobs(id), revision INTEGER NOT NULL,
             manifest_json TEXT NOT NULL
           );
-          PRAGMA user_version = 2;
-        `),
-          )
-          .immediate();
-      if (version === 0 || version === 1 || version === 2)
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE mcp_calls (
-            id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES agent_runs(id),
-            job_id INTEGER NOT NULL REFERENCES jobs(id), revision INTEGER NOT NULL,
-            role TEXT NOT NULL, alias TEXT NOT NULL, tool TEXT NOT NULL,
-            credential_binding TEXT NOT NULL, policy_identity TEXT NOT NULL,
-            catalog_identity TEXT NOT NULL, request_digest TEXT NOT NULL,
-            result_digest TEXT, started_at INTEGER NOT NULL, finished_at INTEGER,
-            outcome TEXT NOT NULL CHECK(outcome IN ('running','completed','tool_error','failed','cancelled','interrupted'))
-          );
-          PRAGMA user_version = 3;
-        `),
-          )
-          .immediate();
-      if ([0, 1, 2, 3].includes(version as number))
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE bootstrap_attempts (
+CREATE TABLE bootstrap_attempts (
             id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
             revision INTEGER NOT NULL, status TEXT NOT NULL, receipt_json TEXT NOT NULL
           );
-          CREATE TABLE bootstrap_commands (
+CREATE TABLE bootstrap_commands (
             id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES bootstrap_attempts(id),
             run_id TEXT, receipt_json TEXT NOT NULL
           );
-          PRAGMA user_version = 4;
-        `),
-          )
-          .immediate();
-      if ([0, 1, 2, 3, 4].includes(version as number))
-        this.db
-          .transaction(() => {
-            this.db.exec(`
-            CREATE TABLE publication_instance (id TEXT PRIMARY KEY, retry_at INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE publication_evidence (id TEXT PRIMARY KEY, content TEXT NOT NULL);
-            CREATE TABLE output_reviews (id TEXT PRIMARY KEY, content TEXT NOT NULL);
-            CREATE TABLE publication_targets (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), content TEXT NOT NULL);
-            CREATE TABLE publication_operations (
+CREATE TABLE publication_instance (id TEXT PRIMARY KEY, retry_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE publication_evidence (id TEXT PRIMARY KEY, content TEXT NOT NULL);
+CREATE TABLE output_reviews (id TEXT PRIMARY KEY, content TEXT NOT NULL);
+CREATE TABLE publication_targets (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), content TEXT NOT NULL);
+CREATE TABLE publication_operations (
               id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), status TEXT NOT NULL, content TEXT NOT NULL
             );
-            CREATE UNIQUE INDEX pending_publication ON publication_operations(job_id)
+CREATE UNIQUE INDEX pending_publication ON publication_operations(job_id)
               WHERE status NOT IN ('confirmed','blocked');
-            PRAGMA user_version = 5;
+CREATE TABLE investigations (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL,
+            UNIQUE(job_id,revision)
+          );
+CREATE TABLE investigation_evidence (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, content TEXT NOT NULL
+          );
+CREATE TABLE implementations (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL,
+            UNIQUE(job_id,revision)
+          );
+CREATE TABLE pr_monitors (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id),
+            state TEXT NOT NULL, content TEXT NOT NULL
+          );
+CREATE TABLE pr_monitor_evidence (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), content TEXT NOT NULL
+          );
+CREATE TABLE pr_observations (
+            job_id INTEGER NOT NULL REFERENCES jobs(id), kind TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 1, content TEXT NOT NULL,
+            PRIMARY KEY(job_id,kind)
+          );
+CREATE TABLE agent_conversations (
+            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
+            revision INTEGER NOT NULL, content TEXT NOT NULL
+          );
+CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT NULL);
+            PRAGMA user_version = 12;
           `);
             this.db
               .prepare("INSERT INTO publication_instance(id) VALUES(?)")
               .run(randomUUID());
           })
-          .immediate();
-      if ([0, 1, 2, 3, 4, 5].includes(version as number))
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE notification_events (id TEXT PRIMARY KEY, content TEXT NOT NULL, review_id TEXT);
-          CREATE TABLE notification_deliveries (
-            event_id TEXT NOT NULL REFERENCES notification_events(id), channel TEXT NOT NULL,
-            state TEXT NOT NULL CHECK(state IN ('pending','dispatching','confirmed','failed','uncertain','held')),
-            retry_at INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(event_id,channel)
-          );
-          CREATE INDEX notification_pending ON notification_deliveries(state,retry_at);
-          CREATE TABLE notification_backoff (channel TEXT NOT NULL, binding TEXT NOT NULL, retry_at INTEGER NOT NULL, PRIMARY KEY(channel,binding));
-          PRAGMA user_version = 6;
-        `),
-          )
-          .immediate();
-      if ((version as number) < 7)
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE mcp_write_operations (
-            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), revision INTEGER NOT NULL,
-            state TEXT NOT NULL CHECK(state IN ('proposed','rejected','dispatching','response_recorded','uncertain')),
-            content TEXT NOT NULL
-          );
-          CREATE UNIQUE INDEX pending_mcp_write ON mcp_write_operations(job_id)
-            WHERE state IN ('proposed','dispatching','uncertain');
-          CREATE TABLE mcp_write_attempts (
-            operation_id TEXT NOT NULL REFERENCES mcp_write_operations(id), number INTEGER NOT NULL,
-            content TEXT NOT NULL, PRIMARY KEY(operation_id,number)
-          );
-          CREATE TABLE mcp_write_recovery_leases (
-            token TEXT PRIMARY KEY REFERENCES coding_lease(token) ON DELETE CASCADE,
-            operation_id TEXT NOT NULL UNIQUE REFERENCES mcp_write_operations(id)
-          );
-          PRAGMA user_version = 7;
-        `),
-          )
-          .immediate();
-      if ((version as number) < 8)
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE investigations (
-            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
-            revision INTEGER NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL,
-            UNIQUE(job_id,revision)
-          );
-          CREATE TABLE investigation_evidence (
-            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
-            revision INTEGER NOT NULL, content TEXT NOT NULL
-          );
-          CREATE TABLE mcp_read_results (id TEXT PRIMARY KEY REFERENCES mcp_calls(id), content TEXT NOT NULL);
-          PRAGMA user_version = 8;
-        `),
-          )
-          .immediate();
-      if ((version as number) < 9)
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE implementations (
-            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
-            revision INTEGER NOT NULL, state TEXT NOT NULL, content TEXT NOT NULL,
-            UNIQUE(job_id,revision)
-          );
-          PRAGMA user_version = 9;
-        `),
-          )
-          .immediate();
-      if ((version as number) < 10)
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE pr_monitors (
-            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id),
-            state TEXT NOT NULL, content TEXT NOT NULL
-          );
-          CREATE TABLE pr_monitor_evidence (
-            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), content TEXT NOT NULL
-          );
-          CREATE TABLE pr_observations (
-            job_id INTEGER NOT NULL REFERENCES jobs(id), kind TEXT NOT NULL,
-            generation INTEGER NOT NULL DEFAULT 1, content TEXT NOT NULL,
-            PRIMARY KEY(job_id,kind)
-          );
-          PRAGMA user_version = 10;
-        `),
-          )
-          .immediate();
-      if ((version as number) < 11)
-        this.db
-          .transaction(() =>
-            this.db.exec(`
-          CREATE TABLE agent_conversations (
-            id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
-            revision INTEGER NOT NULL, content TEXT NOT NULL
-          );
-          PRAGMA user_version = 11;
-        `),
-          )
           .immediate();
     } catch (error) {
       this.db.close();
@@ -459,170 +326,25 @@ export class Store {
     return immutable(JSON.parse(row.content) as RunSnapshot);
   }
 
-  private markDirty(
-    target: Target,
-    origin: "webhook" | "reconciliation",
-  ): number {
-    const { generation } = this.db
-      .prepare(
-        "UPDATE reconciliation SET generation=generation+1 WHERE singleton=1 RETURNING generation",
-      )
-      .get() as { generation: number };
-    this.db
-      .prepare(
-        `INSERT INTO dirty(kind,number,generation) VALUES(@kind,@number,@generation)
-      ON CONFLICT(kind,number) DO UPDATE SET generation=excluded.generation,
-      retry_at=CASE WHEN @fresh THEN 0 ELSE dirty.retry_at END,
-      failure_code=CASE WHEN @fresh THEN NULL ELSE dirty.failure_code END`,
-      )
-      .run({ ...target, generation, fresh: Number(origin === "webhook") });
-    return generation;
-  }
-
-  accept(
-    delivery: string,
-    payloadDigest: string,
-    event: string,
-    targets: Target[],
-  ) {
-    return this.db
-      .transaction(() => {
-        const previous = this.db
-          .prepare("SELECT payload_digest,event FROM inbox WHERE delivery_id=?")
-          .get(delivery) as
-          { payload_digest: string; event: string } | undefined;
-        if (previous) {
-          const sameEvent =
-            previous.event === event ||
-            [previous.event, event].every(
-              (value) => value === "issues" || value === "issues.reopened",
-            );
-          if (previous.payload_digest !== payloadDigest || !sameEvent)
-            throw new IntakeError("delivery_conflict");
-          return false;
-        }
-        this.db
-          .prepare("INSERT INTO inbox VALUES(?,?,?,?,?)")
-          .run(
-            delivery,
-            payloadDigest,
-            event,
-            Date.now(),
-            Number(targets.length === 0),
-          );
-        for (const target of targets) {
-          const generation = this.markDirty(target, "webhook");
-          this.db
-            .prepare(
-              "INSERT OR IGNORE INTO delivery_targets(delivery_id,kind,number,generation) VALUES(?,?,?,?)",
-            )
-            .run(delivery, target.kind, target.number, generation);
-        }
-        return true;
-      })
-      .immediate();
-  }
-
-  cursor() {
+  refreshIssue(number: number): IssueRefresh {
     return this.db
       .prepare(
-        "SELECT page,last_completed_at FROM reconciliation WHERE singleton=1",
+        `INSERT INTO issue_refreshes VALUES(?,1)
+      ON CONFLICT(number) DO UPDATE SET generation=issue_refreshes.generation+1
+      RETURNING number,generation`,
       )
-      .get() as { page: number; last_completed_at: number | null };
+      .get(number) as IssueRefresh;
   }
 
-  discover(issues: number[], page: number, finished: boolean) {
-    this.db
-      .transaction(() => {
-        for (const number of issues)
-          this.markDirty({ kind: "issue", number }, "reconciliation");
-        this.db
-          .prepare(
-            "UPDATE reconciliation SET page=?,last_completed_at=CASE WHEN ? THEN ? ELSE last_completed_at END WHERE singleton=1",
-          )
-          .run(finished ? 1 : page + 1, Number(finished), Date.now());
-      })
-      .immediate();
-  }
-
-  reconcileKnown() {
-    this.db
-      .transaction(() => {
-        for (const job of this.jobs())
-          this.markDirty(
-            { kind: "issue", number: job.issue_number },
-            "reconciliation",
-          );
-        for (const pull of this.ownedPulls())
-          this.markDirty(
-            { kind: "pull", number: pull.number! },
-            "reconciliation",
-          );
-      })
-      .immediate();
-  }
-
-  nextDirty(): DirtyTarget | undefined {
-    return this.db
-      .prepare(
-        "SELECT kind,number,generation FROM dirty WHERE retry_at<=? ORDER BY rowid LIMIT 1",
-      )
-      .get(Date.now()) as DirtyTarget | undefined;
-  }
-
-  refreshIssue(number: number): DirtyTarget {
-    return {
-      kind: "issue",
-      number,
-      generation: this.markDirty({ kind: "issue", number }, "reconciliation"),
-    };
-  }
-
-  defer(target: DirtyTarget, code: string, retryAt: number) {
-    this.db
-      .prepare(
-        "UPDATE dirty SET retry_at=@retryAt,failure_code=@code WHERE kind=@kind AND number=@number AND generation=@generation",
-      )
-      .run({ ...target, code, retryAt });
-  }
-
-  nextRetry(): number | undefined {
+  private isCurrent(target: IssueRefresh) {
     const row = this.db
-      .prepare("SELECT min(retry_at) AS retry_at FROM dirty WHERE retry_at>0")
-      .get() as { retry_at: number | null };
-    return row.retry_at ?? undefined;
-  }
-
-  private complete(target: DirtyTarget) {
-    this.db
-      .prepare(
-        "DELETE FROM dirty WHERE kind=@kind AND number=@number AND generation=@generation",
-      )
-      .run(target);
-    this.db
-      .prepare(
-        "UPDATE delivery_targets SET done=1 WHERE kind=@kind AND number=@number AND generation<=@generation",
-      )
-      .run(target);
-    this.db
-      .prepare(
-        `UPDATE inbox SET processed=1 WHERE processed=0 AND NOT EXISTS
-      (SELECT 1 FROM delivery_targets WHERE delivery_targets.delivery_id=inbox.delivery_id AND done=0)`,
-      )
-      .run();
-  }
-
-  private isCurrent(target: DirtyTarget) {
-    const row = this.db
-      .prepare(
-        "SELECT generation FROM dirty WHERE kind=@kind AND number=@number",
-      )
+      .prepare("SELECT generation FROM issue_refreshes WHERE number=@number")
       .get(target) as { generation: number } | undefined;
     return row?.generation === target.generation;
   }
 
   applyIssue(
-    target: DirtyTarget,
+    target: IssueRefresh,
     context: IssueContext,
     snapshot: RunSnapshot,
   ) {
@@ -643,7 +365,6 @@ export class Store {
             original.body === context.body &&
             JSON.stringify(original.source) === JSON.stringify(context.source)
           ) {
-            this.complete(target);
             return true;
           }
         }
@@ -658,19 +379,10 @@ export class Store {
             .get(previous.id)
         ) {
           this.observePullJob(previous.id, "issue", context);
-          this.complete(target);
           return true;
         }
-        const reopened = Boolean(
-          context.state === "open" &&
-          this.db
-            .prepare(
-              `SELECT 1 FROM delivery_targets AS target JOIN inbox USING(delivery_id)
-              WHERE target.kind='issue' AND target.number=? AND target.generation<=?
-                AND target.done=0 AND inbox.event='issues.reopened'`,
-            )
-            .get(context.number, target.generation),
-        );
+        const reopened =
+          previous?.status === "closed" && context.state === "open";
         if (
           previous &&
           previous.status === "pending" &&
@@ -689,7 +401,6 @@ export class Store {
             inputJson({ ...context, source: prior.source }) ===
               previous.input_json
           ) {
-            this.complete(target);
             return true;
           }
         }
@@ -717,29 +428,6 @@ export class Store {
               Number(reopened),
             );
         }
-        this.complete(target);
-        return true;
-      })
-      .immediate();
-  }
-
-  applyPull(target: DirtyTarget, context: PullContext) {
-    return this.db
-      .transaction(() => {
-        if (!this.isCurrent(target)) return false;
-        const previous = this.ownedPull(target.number);
-        if (!previous || previous.object_id !== String(context.id))
-          throw new IntakeError("pull_not_owned");
-        const input = inputJson(context);
-        if (input !== previous.context_json) {
-          this.db
-            .prepare(
-              "UPDATE publications SET head_sha=?,context_json=? WHERE operation_key=?",
-            )
-            .run(context.head_sha, input, previous.operation_key);
-          this.observePullJob(previous.job_id, "pull", context);
-        }
-        this.complete(target);
         return true;
       })
       .immediate();
@@ -837,9 +525,7 @@ export class Store {
           `SELECT 1 FROM coding_lease JOIN jobs
       ON jobs.id=coding_lease.job_id AND jobs.revision=coding_lease.revision
       JOIN runtime_leases ON runtime_leases.token=coding_lease.token
-      WHERE coding_lease.token=? AND jobs.status='pending' AND runtime_leases.deadline>?
-      AND NOT EXISTS (SELECT 1 FROM mcp_write_operations w WHERE w.job_id=jobs.id AND w.state='uncertain'
-        AND NOT EXISTS (SELECT 1 FROM mcp_write_recovery_leases r WHERE r.token=coding_lease.token AND r.operation_id=w.id))`,
+      WHERE coding_lease.token=? AND jobs.status='pending' AND runtime_leases.deadline>?`,
         )
         .get(token, Date.now()),
     );
@@ -928,10 +614,6 @@ export class Store {
       .transaction(() => {
         if (
           !this.runtimeCurrent(record.lease_token) ||
-          (record.role !== "output_review" &&
-            this.db
-              .prepare("SELECT 1 FROM mcp_write_recovery_leases WHERE token=?")
-              .get(record.lease_token)) ||
           !this.db
             .prepare(
               "SELECT 1 FROM coding_lease WHERE token=? AND job_id=? AND revision=?",
@@ -972,75 +654,6 @@ export class Store {
        ORDER BY started_at DESC,rowid DESC LIMIT 1`,
       )
       .get(job, revision, role, session) as AgentRunRecord | undefined;
-  }
-
-  startMcpCall(
-    receipt: Omit<McpCallReceipt, "result_digest" | "finished_at" | "outcome">,
-  ) {
-    this.db
-      .transaction(() => {
-        const run = this.run(receipt.run_id);
-        if (
-          !run ||
-          run.finished_at !== null ||
-          run.job_id !== receipt.job_id ||
-          run.revision !== receipt.revision ||
-          run.role !== receipt.role ||
-          !this.runtimeCurrent(run.lease_token)
-        )
-          throw new RuntimeError("revision_stale");
-        this.db
-          .prepare(
-            `INSERT INTO mcp_calls
-        (id,run_id,job_id,revision,role,alias,tool,credential_binding,policy_identity,catalog_identity,request_digest,started_at,outcome)
-        VALUES(@id,@run_id,@job_id,@revision,@role,@alias,@tool,@credential_binding,@policy_identity,@catalog_identity,@request_digest,@started_at,'running')`,
-          )
-          .run(receipt);
-      })
-      .immediate();
-  }
-
-  finishMcpCall(
-    id: string,
-    outcome: Exclude<McpCallReceipt["outcome"], "running">,
-    result: string | null,
-  ) {
-    if (
-      this.db
-        .prepare(
-          "UPDATE mcp_calls SET outcome=?,result_digest=?,finished_at=? WHERE id=? AND outcome='running'",
-        )
-        .run(outcome, result, Date.now(), id).changes !== 1
-    )
-      throw new RuntimeError("mcp_receipt_not_active");
-  }
-
-  interruptMcpCalls() {
-    this.db
-      .prepare(
-        "UPDATE mcp_calls SET outcome='interrupted',finished_at=? WHERE outcome='running'",
-      )
-      .run(Date.now());
-  }
-
-  mcpCalls(): McpCallReceipt[] {
-    return this.db
-      .prepare("SELECT * FROM mcp_calls ORDER BY started_at,rowid")
-      .all() as McpCallReceipt[];
-  }
-
-  saveMcpReadResult(id: string, result: unknown) {
-    this.db
-      .prepare("INSERT INTO mcp_read_results VALUES(?,?)")
-      .run(id, JSON.stringify(result));
-  }
-
-  mcpReadResult(id: string): unknown {
-    const row = this.db
-      .prepare("SELECT content FROM mcp_read_results WHERE id=?")
-      .get(id) as { content: string } | undefined;
-    if (!row) throw new RuntimeError("mcp_read_result_missing");
-    return JSON.parse(row.content) as unknown;
   }
 
   bindRun(id: string, binding: string) {
@@ -1130,54 +743,10 @@ export class Store {
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO coding_lease SELECT 1,id,revision,?
-      FROM jobs WHERE id=? AND revision=? AND status='pending'
-      AND NOT EXISTS (SELECT 1 FROM mcp_write_operations WHERE job_id=jobs.id AND state IN ('proposed','dispatching','uncertain'))`,
+      FROM jobs WHERE id=? AND revision=? AND status='pending'`,
       )
       .run(token, jobId, revision);
     return result.changes ? token : undefined;
-  }
-
-  hasUncertainMcpWrite(jobId: number) {
-    return Boolean(
-      this.db
-        .prepare(
-          "SELECT 1 FROM mcp_write_operations WHERE job_id=? AND state='uncertain'",
-        )
-        .get(jobId),
-    );
-  }
-
-  acquireMcpWriteRecovery(operationId: string): string | undefined {
-    return this.db
-      .transaction(() => {
-        const token = randomUUID();
-        const result = this.db
-          .prepare(
-            `INSERT OR IGNORE INTO coding_lease
-        SELECT 1,j.id,j.revision,? FROM jobs j JOIN mcp_write_operations w ON w.job_id=j.id AND w.revision=j.revision
-        WHERE w.id=? AND w.state='uncertain' AND j.status='pending'`,
-          )
-          .run(token, operationId);
-        if (!result.changes) return undefined;
-        this.db
-          .prepare("INSERT INTO mcp_write_recovery_leases VALUES(?,?)")
-          .run(token, operationId);
-        return token;
-      })
-      .immediate();
-  }
-
-  mcpWriteRecoveryCurrent(token: string, operationId: string) {
-    return (
-      this.runtimeCurrent(token) &&
-      Boolean(
-        this.db
-          .prepare(
-            "SELECT 1 FROM mcp_write_recovery_leases WHERE token=? AND operation_id=?",
-          )
-          .get(token, operationId),
-      )
-    );
   }
 
   releaseLease(token: string) {
@@ -1256,26 +825,5 @@ export class Store {
     return this.db
       .prepare("SELECT * FROM publications WHERE kind='pull_request'")
       .all() as Publication[];
-  }
-  counts() {
-    return {
-      pending: (
-        this.db
-          .prepare("SELECT count(*) AS n FROM jobs WHERE status='pending'")
-          .get() as { n: number }
-      ).n,
-      inbox: (
-        this.db
-          .prepare("SELECT count(*) AS n FROM inbox WHERE processed=0")
-          .get() as { n: number }
-      ).n,
-      failed: (
-        this.db
-          .prepare(
-            "SELECT count(*) AS n FROM dirty WHERE failure_code IS NOT NULL",
-          )
-          .get() as { n: number }
-      ).n,
-    };
   }
 }

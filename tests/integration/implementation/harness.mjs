@@ -12,15 +12,13 @@ import { IntakeService } from "/opt/orm/app/dist/services/intake.js";
 import { InvestigationService } from "/opt/orm/app/dist/services/investigation/index.js";
 import { ImplementationService } from "/opt/orm/app/dist/services/implementation/index.js";
 import { verifyCandidate } from "/opt/orm/app/dist/services/implementation/verify.js";
-import { McpGateway } from "/opt/orm/app/dist/services/mcp/index.js";
 import { OctokitReader } from "/opt/orm/app/dist/adapters/github/reader.js";
 import { OctokitWriter } from "/opt/orm/app/dist/adapters/github/writer.js";
-import { createApp } from "/opt/orm/app/dist/http/app.js";
 import {
   loadProtectedConfiguration,
   createRunSnapshot,
 } from "/opt/orm/app/dist/config/load.js";
-import { parseConfiguration } from "/opt/orm/app/dist/config/schema.js";
+import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
 import {
   sourceProcesses,
@@ -40,9 +38,7 @@ import {
   bundlesWithCanaries,
   modelFixture,
   maintenanceCommand,
-  taskInput,
 } from "/investigation-fixtures/protocol.mjs";
-import { contextServer } from "/investigation-fixtures/mcp.mjs";
 import { performance } from "node:perf_hooks";
 import {
   implementationScenarios,
@@ -60,11 +56,8 @@ export async function runImplementationTests(sdks, suite) {
   const completedScenarios = [];
   const root = "/data/implementation-proof";
   await mkdir(root, { mode: 0o711 });
-  const loaded = await loadProtectedConfiguration(),
-    context = await contextServer();
-  const notifications = [],
-    discordRequests = [],
-    logs = [],
+  const loaded = await loadProtectedConfiguration();
+  const logs = [],
     errors = [],
     cleanupFailures = [],
     proof = [];
@@ -72,41 +65,17 @@ export async function runImplementationTests(sdks, suite) {
     sdk,
     store,
     supervisor,
-    gateway,
     intake,
     investigation,
     implementation,
     monitor,
-    app,
     remote,
     receipt;
   const controls = {};
   const model = createServer((req, res) =>
     (sdk === "claude" ? claude : codex)(req, res, fixture),
   );
-  const notifier = createServer(async (req, res) => {
-    let body = "";
-    for await (const chunk of req) body += chunk;
-    const event = JSON.parse(body);
-    if (req.url === "/discord") {
-      discordRequests.push(event);
-      res.end("accepted");
-      return;
-    }
-    notifications.push(event);
-    if (controls.deferReady && event.outcome === "ready_for_review") {
-      res.writeHead(429, { "retry-after": "1" });
-      res.end("deferred");
-      return;
-    }
-    if (controls.loseReady && event.outcome === "ready_for_review") {
-      res.destroy();
-      return;
-    }
-    res.end("accepted");
-  });
   await new Promise((resolve) => model.listen(0, "127.0.0.1", resolve));
-  await new Promise((resolve) => notifier.listen(0, "127.0.0.1", resolve));
   const logger = {
     info: (message) => logs.push(message),
     error: (message) => logs.push(message),
@@ -142,17 +111,13 @@ export async function runImplementationTests(sdks, suite) {
     await monitor?.stop();
     await investigation?.stop();
     await intake?.stop();
-    await app?.close();
     await supervisor?.close();
-    await gateway?.close();
     if (fixture) errors.push(...fixture.errors.splice(0));
     if (store?.db.open) store.close();
     investigation = undefined;
     monitor = undefined;
     intake = undefined;
-    app = undefined;
     supervisor = undefined;
-    gateway = undefined;
     store = undefined;
     fixture = undefined;
   };
@@ -169,22 +134,13 @@ export async function runImplementationTests(sdks, suite) {
       remote = await createPublicationFixture(join(sdkRoot, "git"));
       const source = remote.commit(sourceFiles);
       remote.git(["update-ref", "refs/heads/main", source.sha]);
-      const config = parseConfiguration(
-        await readFile("/config/config.yml", "utf8"),
+      const config = parseActionsConfiguration(
+        await readFile("/config/actions.yml", "utf8"),
       );
       config.github.repository = "owner/repo";
       config.github.token = remote.state.token;
       config.proxy.url = `http://127.0.0.1:${model.address().port}/v1`;
       config.proxy.key = `implementation-proxy-${randomUUID()}`;
-      config.notifications = {
-        discord: { enabled: false },
-        smtp: { enabled: false },
-        webhook: {
-          enabled: true,
-          url: `http://127.0.0.1:${notifier.address().port}`,
-          headers: {},
-        },
-      };
       config.profiles = {
         worker:
           sdk === "codex"
@@ -198,32 +154,9 @@ export async function runImplementationTests(sdks, suite) {
       };
       for (const role of Object.keys(config.roles)) {
         config.roles[role].profile = "worker";
-        config.roles[role].mcp = {};
       }
-      config.mcp.servers = {};
-      config.mcp.credentials = {};
       let snapshot, secrets;
-      const configure = (mcp) => {
-        config.mcp.servers = mcp
-          ? {
-              context: {
-                transport: "streamable_http",
-                url: context.url,
-                allow_plain_http: true,
-                review_required_tools: ["store_record"],
-                tools: {
-                  lookup_record: { effect: "read" },
-                  store_record: {
-                    effect: "write",
-                    idempotency_argument: "key",
-                  },
-                },
-              },
-            }
-          : {};
-        config.roles.implementation.mcp = mcp
-          ? { context: { tools: ["lookup_record", "store_record"] } }
-          : {};
+      const configure = () => {
         const separated = separateSecrets(config);
         secrets = separated.secrets;
         snapshot = createRunSnapshot(
@@ -232,7 +165,7 @@ export async function runImplementationTests(sdks, suite) {
           secrets,
         );
       };
-      configure(false);
+      configure();
       const database = join(sdkRoot, "state", "manager.sqlite"),
         runtimeRoot = join(sdkRoot, "runtime");
       const start = async () => {
@@ -243,14 +176,12 @@ export async function runImplementationTests(sdks, suite) {
             baseUrl: remote.url,
             log: { debug: silent, info: silent, warn: silent, error: silent },
           });
-        gateway = new McpGateway(store, snapshot, secrets);
         supervisor = await Supervisor.create(store, snapshot, secrets, {
           root: runtimeRoot,
           workers: { [sdk]: `/opt/orm/app/dist/adapters/agents/${sdk}.js` },
           sourceUrl: () => remote.url + "/owner/repo.git",
           publicationWriter: (ready) =>
             new OctokitWriter("owner/repo", client, ready),
-          mcp: gateway,
         });
         for (const [method, requestIndex] of [
           ["run", 0],
@@ -283,17 +214,11 @@ export async function runImplementationTests(sdks, suite) {
             }
           };
         }
-        gateway.setWriteDispatcher(supervisor.mcpWrites);
-        gateway.setReadResultScanner(
-          supervisor.publication.outputReview.scanner,
-        );
-        await gateway.start();
         intake = new IntakeService(
           store,
           new OctokitReader("owner/repo", client),
           snapshot,
           secrets,
-          logger,
           {
             beforeIssue: (value, signal) =>
               investigation.beforeIssue(value, signal),
@@ -315,16 +240,9 @@ export async function runImplementationTests(sdks, suite) {
           () => remote.url + "/owner/repo.git",
           implementation,
         );
-        app = createApp(
-          intake,
-          config.github.webhook_secret,
-          supervisor.notifications,
-          supervisor.mcpWrites,
-          investigation,
-        );
         fixture = modelFixture(config, store, runtimeRoot, controls);
-        supervisor.notifications.start();
-        await intake.reconcile();
+        for (const number of remote.state.issues.keys())
+          await intake.enrollIssue(number, AbortSignal.timeout(10000));
       };
       await start();
       let number = 200;
@@ -337,7 +255,7 @@ export async function runImplementationTests(sdks, suite) {
           body: "Fix only the documented existing maintenance defect.",
           updated_at: "2026-10-21T00:00:00Z",
         });
-        await intake.reconcile();
+        await intake.enrollIssue(n, AbortSignal.timeout(10000));
         await investigation.reconcile();
         return store.job(n);
       };
@@ -837,177 +755,14 @@ export async function runImplementationTests(sdks, suite) {
         complete("issue-revised");
         remote.state.closed.add(revised.issue_number);
         await intake.refresh(revised.issue_number, AbortSignal.timeout(10000));
-
-        await closeRuntime();
-        configure(true);
-        await start();
-        controls.implementation = (task, value) => {
-          if (task !== "implementation_milestone") return;
-          const read = store
-            .mcpCalls()
-            .find((item) => item.run_id === value.run.id);
-          if (!read)
-            return {
-              tool: "mcp__context__lookup_record",
-              arguments: {
-                query: "Verify current source rather than stale knowledge",
-              },
-            };
-          const write = supervisor.mcpWrites.repository
-            .all()
-            .find((item) => item.binding.run_id === value.run.id);
-          if (!write)
-            return {
-              tool: "mcp__context__store_record",
-              arguments: {
-                arguments: {
-                  text: "An audited candidate passed actual local checks; PR publication and remote validation remain pending.",
-                },
-                purpose: "Record only the verified tested-candidate milestone",
-                evidence: [
-                  value.record.audits.find(
-                    (item) => item.id === value.record.audit_id,
-                  ).evidence_id,
-                  value.record.tests.find(
-                    (item) => item.id === value.record.test_id,
-                  ).evidence_id,
-                ].map((id) => ({ kind: "publication_evidence", id })),
-              },
-            };
-        };
-        const mcpJob = await add("implementation_mcp");
-        let publicationLimited = false;
-        controls.review = (text) => {
-          if (publicationLimited || !text.includes('"kind":"change"')) return;
-          publicationLimited = true;
-          remote.state.rateLimit = {
-            method: "GET",
-            path: "/repos/owner/repo",
-            seconds: 1,
-          };
-        };
-        const mcpCheckpoint = await advance(mcpJob);
-        controls.review = undefined;
-        assert(
-          publicationLimited,
-          "Publication read failure was not exercised",
-        );
-        assert.equal(mcpCheckpoint.stage, "blocked");
-        assert.equal(mcpCheckpoint.failure, "github_rate_limited");
-        assert.equal(mcpCheckpoint.retry_stage, "publishing");
-        assert.equal(mcpCheckpoint.milestone_done, true);
-        assert.equal(mcpCheckpoint.agent_pending, null);
-        noPull(mcpJob);
-        const implementationRuns = store
-            .runs()
-            .filter(
-              (run) =>
-                run.job_id === mcpJob.id && run.role === "implementation",
-            )
-            .map((run) => run.id),
-          checkpointEffects = context.effects.size;
-        await closeRuntime();
-        await start();
-        await delay(Math.max(0, mcpCheckpoint.retry_at - Date.now()) + 100);
-        const mcpResult = await advance(mcpJob);
-        assert.equal(
-          mcpResult.stage,
-          "remote_review",
-          JSON.stringify(mcpResult),
-        );
-        assert.equal(mcpResult.test_id, mcpCheckpoint.test_id);
-        assert.equal(mcpResult.audit_id, mcpCheckpoint.audit_id);
-        assert.equal(mcpResult.publication_id, mcpCheckpoint.publication_id);
-        assert.deepEqual(
-          store
-            .runs()
-            .filter(
-              (run) =>
-                run.job_id === mcpJob.id && run.role === "implementation",
-            )
-            .map((run) => run.id),
-          implementationRuns,
-        );
-        assert.equal(context.effects.size, checkpointEffects);
-        const mcpTarget = supervisor.publication.repository.target(mcpJob.id);
-        assert.equal(
-          remote.state.pulls.filter((pull) => pull.branch === mcpTarget.branch)
-            .length,
-          1,
-        );
-        const writes = supervisor.mcpWrites.repository
-          .all()
-          .filter((item) => item.job_id === mcpJob.id);
-        assert.equal(writes.length, 1);
-        assert.equal(writes[0].state, "response_recorded");
-        assert.equal(writes[0].review, "required");
-        assert.equal(writes[0].response.value.structuredContent.accepted, true);
-        assert(context.effects.size > 0);
-        controls.rejectWrite = true;
-        const denied = await add("implementation_denied");
-        await advance(denied);
-        controls.rejectWrite = false;
-        const deniedWrite = supervisor.mcpWrites.repository
-          .all()
-          .find((item) => item.job_id === denied.id);
-        assert.equal(deniedWrite.state, "rejected");
-        assert.equal(deniedWrite.failure, "output_review_rejected");
-        assert.equal(record(denied).stage, "remote_review");
-        context.state.fail = true;
-        const failedWrite = await add("implementation_provider_error");
-        await advance(failedWrite);
-        context.state.fail = false;
-        const failedOperation = supervisor.mcpWrites.repository
-          .all()
-          .find((item) => item.job_id === failedWrite.id);
-        assert.equal(failedOperation.state, "response_recorded");
-        assert.equal(failedOperation.response.value.isError, true);
-        assert.equal(
-          failedOperation.response.value.structuredContent.accepted,
-          false,
-        );
-        assert.equal(record(failedWrite).stage, "remote_review");
-        const priorEffects = context.effects.size;
-        context.state.drop = true;
-        const uncertain = await add("implementation_uncertain");
-        await advance(uncertain);
-        assert.equal(record(uncertain).stage, "blocked");
-        noPull(uncertain);
-        assert.equal(record(uncertain).failure, "mcp_write_uncertain");
-        await closeRuntime();
-        await start();
-        await advance(uncertain);
-        assert.equal(record(uncertain).stage, "blocked");
-        noPull(uncertain);
-        assert.equal(context.effects.size, priorEffects + 1);
-        assert(record(uncertain).tests.some((item) => item.state === "passed"));
-        assert.equal(
-          record(uncertain).failure,
-          "implementation_interrupted_after_write",
-        );
-        controls.implementation = undefined;
-        proof.push({
-          sdk,
-          generic_reviewed_mcp_tested_milestone: "passed",
-          publication_retry_after_completed_mcp: "passed",
-          uncertain_write_restart_preserves_tests: "passed",
-          disabled_mcp: "passed",
-        });
-
-        complete("mcp-milestone-recovery");
       }
       if (!suite.startsWith("implementation-monitor-")) {
-        const ready = await app.inject({ method: "GET", url: "/readyz" });
-        assert.equal(ready.statusCode, 503);
-        assert(ready.json().implementation.awaiting_remote_validation > 0);
-        assert(!ready.body.includes("owner/repo"));
-        assert(!logs.join("\n").includes(config.github.token));
-        assert(!logs.join("\n").includes(config.proxy.key));
         assert(
-          notifications.every(
-            (item) =>
-              !JSON.stringify(item).includes('"outcome":"ready_for_review"'),
-          ),
+          ![...remote.state.comments.values()]
+            .flat()
+            .some((comment) =>
+              comment.body.includes("Automation clean; awaiting human review"),
+            ),
         );
 
         complete("pre-monitor-readiness");
@@ -1024,7 +779,7 @@ export async function runImplementationTests(sdks, suite) {
           ],
           local_checks_only: false,
         };
-        configure(false);
+        configure();
         await start();
         const attachMonitor = () => {
           monitor = new PrMonitorService(
@@ -1266,12 +1021,12 @@ export async function runImplementationTests(sdks, suite) {
             "ready",
           );
           assert(
-            !supervisor.notifications.repository
-              .receipts()
-              .some(
-                (item) =>
-                  supervisor.notifications.repository.event(item.event_id)
-                    ?.prepared.event.job_id === monitored.job.id,
+            !remote.state.comments
+              .get(monitored.job.issue_number)
+              .some((comment) =>
+                comment.body.includes(
+                  "Automation clean; awaiting human review",
+                ),
               ),
           );
           const repairRecord = record(monitored.job);
@@ -1326,15 +1081,13 @@ export async function runImplementationTests(sdks, suite) {
             new globalThis.AbortController().signal,
           );
           await delay(50);
-          assert(
-            supervisor.notifications.repository
-              .receipts()
-              .some((item) => item.event_id === clean.notification_id),
+          const readyComments = remote.state.comments.get(
+            monitored.job.issue_number,
           );
-          assert.equal(
-            remote.state.comments.get(monitored.job.issue_number).length,
-            1,
-          );
+          assert(readyComments.length >= 2);
+          const commentCount = readyComments.length;
+          await monitor.reconcile();
+          assert.equal(readyComments.length, commentCount);
           assert(
             remote.state.comments
               .get(monitored.job.issue_number)[0]
@@ -1407,7 +1160,7 @@ export async function runImplementationTests(sdks, suite) {
             automated_reviewers: [],
             local_checks_only: true,
           };
-          configure(false);
+          configure();
           await start();
           attachMonitor();
           const localOnly = await run("monitor_local_only"),
@@ -1438,7 +1191,7 @@ export async function runImplementationTests(sdks, suite) {
           complete("local-checks-only");
           await closeRuntime();
           config.pr_monitor = regularPolicy;
-          configure(false);
+          configure();
           await start();
           attachMonitor();
 
@@ -1459,7 +1212,7 @@ export async function runImplementationTests(sdks, suite) {
           ).repair_cycles;
           await closeRuntime();
           config.pr_monitor.enabled = false;
-          configure(false);
+          configure();
           await start();
           attachMonitor();
           await monitor.reconcile();
@@ -1482,7 +1235,7 @@ export async function runImplementationTests(sdks, suite) {
           );
           await closeRuntime();
           config.pr_monitor.enabled = true;
-          configure(false);
+          configure();
           await start();
           attachMonitor();
           await pump(
@@ -1507,7 +1260,7 @@ export async function runImplementationTests(sdks, suite) {
           ).snapshot_digest;
           await closeRuntime();
           config.pr_monitor.required_checks.push("Additional CI");
-          configure(false);
+          configure();
           await start();
           attachMonitor();
           await monitor.reconcile();
@@ -1525,7 +1278,7 @@ export async function runImplementationTests(sdks, suite) {
           await pump(monitored.job, (item) => item.stage === "ready");
           await closeRuntime();
           config.pr_monitor.required_checks = ["Fixture CI"];
-          configure(false);
+          configure();
           await start();
           attachMonitor();
           clean = await pump(monitored.job, (item) => item.stage === "ready");
@@ -1575,325 +1328,55 @@ export async function runImplementationTests(sdks, suite) {
         }
         if (suite === "implementation-monitor-state") {
           {
-            await closeRuntime();
-            config.notifications.discord = {
-              enabled: true,
-              webhook_url: `http://127.0.0.1:${notifier.address().port}/discord`,
-            };
-            configure(false);
-            await start();
-            attachMonitor();
-            const transientReady = await run("source_only");
-            certify(transientReady.job);
-            controls.deferReady = true;
-            const readyEvent = await pump(
-              transientReady.job,
+            const transient = await run("source_only");
+            certify(transient.job);
+            const ready = await pump(
+              transient.job,
               (item) => item.stage === "ready",
-            );
-            const eventId = readyEvent.notification_id,
-              readinessId = readyEvent.readiness_id,
-              verificationGeneration = readyEvent.policy_generation,
-              receipt = (channel) =>
-                supervisor.notifications
-                  .receipt(eventId)
-                  .find((item) => item.channel === channel),
-              wakeNotifications = async () => {
-                const event = supervisor.notifications.prepare({
-                  id: `wake-${readyEvent.id}`,
-                  job_id: transientReady.job.id,
-                  revision: transientReady.job.revision,
-                  repository_id: 42,
-                  issue_number: transientReady.job.issue_number,
-                  occurred_at: readyEvent.started_at,
-                  outcome: "needs_attention",
-                  reason: "workflow_blocked",
-                });
-                await supervisor.notifications.enqueue(
-                  event,
-                  {},
-                  new globalThis.AbortController().signal,
-                );
-              },
-              expediteWebhook = () => {
-                const pending = globalThis.structuredClone(receipt("webhook"));
-                pending.retry_at = 0;
-                supervisor.notifications.repository.save(pending);
-              },
-              releaseObservation = () => {
-                const current = monitor.repository.get(transientReady.job.id);
-                current.retry_at = 0;
-                monitor.repository.save(current);
-              };
-            await until(
-              () =>
-                receipt("discord")?.state === "confirmed" &&
-                receipt("webhook")?.state === "pending" &&
-                receipt("webhook")?.attempts.length === 1,
-              "Two-channel ready delivery did not reach its partial checkpoint",
-            );
-            controls.deferReady = false;
-            const confirmedDiscord = globalThis.structuredClone(
-                receipt("discord"),
-              ),
-              discordCount = () =>
-                discordRequests.filter((event) =>
-                  event.content.includes(`Event: ${eventId}`),
-                ).length,
-              webhookCount = () =>
-                notifications.filter((event) => event.event_id === eventId)
-                  .length,
-              originalBudget = store.jobById(transientReady.job.id).budget_json;
-            assert.equal(discordCount(), 1);
-            assert.equal(webhookCount(), 1);
-            remote.state.rateLimit = {
-              method: "GET",
-              path: `/repos/owner/repo/issues/${transientReady.job.issue_number}`,
-              seconds: 60,
-            };
-            expediteWebhook();
-            await wakeNotifications();
-            await until(
-              () => receipt("webhook")?.reason === "readiness_unavailable",
-              "Delivery-time readiness outage was not retained as pending",
-            );
-            const suspended = monitor.repository.get(transientReady.job.id);
-            assert.equal(suspended.stage, "waiting");
-            assert.equal(suspended.failure, "github_rate_limited");
-            assert(suspended.retry_at > Date.now() + 55_000);
-            assert.equal(suspended.readiness_id, readinessId);
-            assert.equal(suspended.notification_id, eventId);
-            assert.equal(suspended.policy_generation, verificationGeneration);
-            assert.throws(
-              () => monitor.repository.readiness(readinessId),
-              /pr_readiness_unavailable/,
-            );
-            assert.deepEqual(receipt("discord"), confirmedDiscord);
-            assert.equal(receipt("webhook").attempts.length, 1);
-            assert.equal(
-              store.jobById(transientReady.job.id).budget_json,
-              originalBudget,
-            );
-            const requestsBeforeRetry = remote.state.requests.length;
-            expediteWebhook();
-            await wakeNotifications();
-            await until(
-              () => receipt("webhook").retry_at > Date.now() + 29_000,
-              "Suspended validation did not defer its retry",
-            );
-            assert.equal(
-              remote.state.requests.length,
-              requestsBeforeRetry,
-              "Readiness retry ignored the retained GitHub backoff",
-            );
-            assert.equal(receipt("webhook").state, "pending");
-            assert.equal(receipt("webhook").attempts.length, 1);
-            assert.equal(webhookCount(), 1);
-            assert.equal(discordCount(), 1);
-            const deferredWebhook = globalThis.structuredClone(
-              receipt("webhook"),
-            );
-            deferredWebhook.retry_at = Date.now() + 3_600_000;
-            supervisor.notifications.repository.save(deferredWebhook);
-            await closeRuntime();
-            await start();
-            attachMonitor();
-            assert.deepEqual(receipt("discord"), confirmedDiscord);
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).readiness_id,
-              readinessId,
-            );
-            releaseObservation();
-            await monitor.reconcile();
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).stage,
-              "ready",
-            );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).readiness_id,
-              readinessId,
-            );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).notification_id,
-              eventId,
-            );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).policy_generation,
-              verificationGeneration,
             );
             const target = supervisor.publication.repository.target(
-                transientReady.job.id,
-              ),
-              retriesBefore = JSON.parse(
-                store.jobById(transientReady.job.id).budget_json,
-              ).infrastructure_retries;
-            remote.state.readFailure = {
+              transient.job.id,
+            );
+            const comments = remote.state.comments.get(
+              transient.job.issue_number,
+            );
+            const commentId = comments[0].id;
+            remote.state.rateLimit = {
+              method: "GET",
               path: `/repos/owner/repo/pulls/${target.pull.number}`,
-              status: 503,
-            };
-            await monitor.reconcile();
-            const periodicallySuspended = monitor.repository.get(
-              transientReady.job.id,
-            );
-            assert.equal(periodicallySuspended.stage, "waiting");
-            assert.equal(periodicallySuspended.failure, "github_read_failed");
-            assert.equal(periodicallySuspended.readiness_id, readinessId);
-            assert.equal(
-              periodicallySuspended.policy_generation,
-              verificationGeneration,
-            );
-            assert.equal(
-              JSON.parse(store.jobById(transientReady.job.id).budget_json)
-                .infrastructure_retries,
-              retriesBefore + 1,
-            );
-            assert.deepEqual(receipt("discord"), confirmedDiscord);
-            assert.equal(discordCount(), 1);
-            assert.equal(webhookCount(), 1);
-            releaseObservation();
-            await monitor.reconcile();
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).stage,
-              "ready",
-            );
-            const cancellation = new globalThis.AbortController();
-            cancellation.abort(new Error("fixture validation cancellation"));
-            await assert.rejects(() =>
-              monitor.validateReadiness(readinessId, cancellation.signal),
-            );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).readiness_id,
-              readinessId,
-            );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).policy_generation,
-              verificationGeneration,
-            );
-            expediteWebhook();
-            await wakeNotifications();
-            await until(
-              () => receipt("webhook").state === "confirmed",
-              "Recovered readiness did not resume the pending channel",
-            );
-            assert.deepEqual(receipt("discord"), confirmedDiscord);
-            assert.equal(discordCount(), 1);
-            assert.equal(webhookCount(), 2);
-            assert.equal(receipt("webhook").attempts.length, 2);
-            assert.equal(
-              new Set(
-                supervisor.notifications.repository
-                  .receipts()
-                  .filter(
-                    (item) =>
-                      supervisor.notifications.repository.event(item.event_id)
-                        ?.prepared.event.job_id === transientReady.job.id &&
-                      supervisor.notifications.repository.event(item.event_id)
-                        ?.prepared.event.outcome === "ready_for_review",
-                  )
-                  .map((item) => item.event_id),
-              ).size,
-              1,
-            );
-            remote.state.readFailure = {
-              path: `/repos/owner/repo/pulls/${target.pull.number}`,
-              status: 200,
-              body: {},
-            };
-            await assert.rejects(() =>
-              monitor.validateReadiness(
-                readinessId,
-                new globalThis.AbortController().signal,
-              ),
-            );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).readiness_id,
-              null,
-            );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).policy_generation,
-              verificationGeneration + 1,
-            );
-            controls.deferReady = true;
-            const replacement = await pump(
-              transientReady.job,
-              (item) => item.stage === "ready",
-            );
-            const replacementId = replacement.notification_id,
-              replacementReceipt = (channel) =>
-                supervisor.notifications
-                  .receipt(replacementId)
-                  .find((item) => item.channel === channel);
-            await until(
-              () =>
-                replacementReceipt("discord")?.state === "confirmed" &&
-                replacementReceipt("webhook")?.state === "pending" &&
-                replacementReceipt("webhook")?.attempts.length === 1,
-              "Replacement ready event did not reach its partial checkpoint",
-            );
-            controls.deferReady = false;
-            remote.state.readFailure = {
-              path: `/repos/owner/repo/issues/${transientReady.job.issue_number}`,
-              status: 503,
+              seconds: 1,
             };
             await assert.rejects(
               () =>
                 monitor.validateReadiness(
-                  replacement.readiness_id,
-                  new globalThis.AbortController().signal,
+                  ready.readiness_id,
+                  AbortSignal.timeout(10000),
                 ),
-              /github_read_failed/,
+              /github_rate_limited/,
             );
-            const originalWebhookUrl = config.notifications.webhook.url;
+            remote.state.rateLimit = undefined;
             await closeRuntime();
-            config.notifications.webhook.url = originalWebhookUrl + "/changed";
-            configure(false);
             await start();
             attachMonitor();
-            assert.equal(replacementReceipt("webhook").state, "held");
-            assert.equal(
-              replacementReceipt("webhook").reason,
-              "destination_changed",
+            const recovered = await pump(
+              transient.job,
+              (item) => item.stage === "ready",
             );
-            assert.equal(replacementReceipt("discord").state, "confirmed");
-            store.db
-              .prepare(
-                "UPDATE jobs SET budget_json=json_set(budget_json,'$.infrastructure_retries',?) WHERE id=?",
-              )
-              .run(
-                snapshot.settings.limits.infrastructure_retries,
-                transientReady.job.id,
-              );
-            releaseObservation();
-            remote.state.readFailure = {
-              path: `/repos/owner/repo/pulls/${target.pull.number}`,
-              status: 503,
-            };
-            await monitor.reconcile();
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).stage,
-              "blocked",
+            await monitor.validateReadiness(
+              recovered.readiness_id,
+              AbortSignal.timeout(10000),
             );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).failure,
-              "github_read_failed",
-            );
-            assert.equal(
-              monitor.repository.get(transientReady.job.id).readiness_id,
-              null,
+            assert.equal(comments[0].id, commentId);
+            assert.equal(comments.length, 2);
+            assert(
+              comments[0].body.includes(
+                "Automation clean; awaiting human review",
+              ),
             );
             proof.push({
               sdk,
-              readiness_partial_channels_transient_delivery_and_periodic_reads:
-                "passed",
-              readiness_transient_restart_same_event: "passed",
-              readiness_cancellation_preserves_identity: "passed",
-              readiness_unknown_response_invalidates: "passed",
+              readiness_read_failure_and_restart_deduplication: "passed",
             });
-            await closeRuntime();
-            config.notifications.webhook.url = originalWebhookUrl;
-            config.notifications.discord = { enabled: false };
-            configure(false);
-            await start();
-            attachMonitor();
           }
 
           complete("readiness-transient-recovery");
@@ -2123,21 +1606,14 @@ export async function runImplementationTests(sdks, suite) {
           complete("repair-budget-and-ci-failure");
           const stale = await run("source_only");
           certify(stale.job);
-          controls.loseReady = true;
           const staleClean = await pump(
             stale.job,
             (item) => item.stage === "ready",
           );
-          await until(
-            () =>
-              supervisor.notifications
-                .receipt(staleClean.notification_id)
-                .some(
-                  (item) =>
-                    item.attempts.length === 1 && item.state === "pending",
-                ),
-            "Ready delivery did not record its ambiguous first attempt",
+          const staleComments = remote.state.comments.get(
+            stale.job.issue_number,
           );
+          const staleCommentCount = staleComments.length;
           const staleTarget = supervisor.publication.repository.target(
               stale.job.id,
             ),
@@ -2148,26 +1624,28 @@ export async function runImplementationTests(sdks, suite) {
             staleHuman.sha,
           ]);
           await monitor.reconcile();
-          await until(
-            () =>
-              supervisor.notifications
-                .receipt(staleClean.notification_id)
-                .every((item) => item.state === "held"),
-            "Stale ready notification was not held",
+          await assert.rejects(() =>
+            monitor.validateReadiness(
+              staleClean.readiness_id,
+              AbortSignal.timeout(10000),
+            ),
           );
-          controls.loseReady = false;
           assert.equal(
-            notifications.filter(
-              (item) => item.event_id === staleClean.notification_id,
-            ).length,
-            1,
+            monitor.repository.get(stale.job.id).failure,
+            "pr_head_changed",
+          );
+          assert.equal(staleComments.length, staleCommentCount);
+          assert(
+            !staleComments[0].body.includes(
+              "Automation clean; awaiting human review",
+            ),
           );
           proof.push({
             sdk,
             stale_ready_retry_suppressed_after_human_head_change: "passed",
           });
 
-          complete("stale-notification");
+          complete("stale-readiness-comment");
           const timeoutJob = await run("source_only");
           await monitor.reconcile();
           store.db
@@ -2221,244 +1699,15 @@ export async function runImplementationTests(sdks, suite) {
           await monitor.reconcile();
           assert.equal(monitor.repository.get(legacy.job.id), undefined);
           assert.equal(monitor.status().reason, "pr_handoff_invalid");
-          const handoff = supervisor.notifications.repository.event(
-            `pr-handoff-${legacyImplementation.id}`,
-          );
-          assert.equal(handoff.prepared.event.outcome, "needs_attention");
           assert.equal(record(legacy.job).scope, null);
           legacyImplementation.scope = savedScope;
           implementation.repository.save(legacyImplementation);
           proof.push({
             sdk,
             wait_budget_rechecked_after_remote_read: "passed",
-            legacy_missing_receipts_visible_handoff: "passed",
+            missing_receipts_visible_handoff: "passed",
           });
-          complete("wait-budget-and-legacy-receipts");
-        }
-        if (suite === "implementation-monitor-mcp") {
-          for (const denseMem of [false, true]) {
-            const tools = await contextServer({ denseMem });
-            try {
-              await closeRuntime();
-              const readTool = denseMem ? "recall_memory" : "lookup_record",
-                writeTool = denseMem ? "remember" : "store_record",
-                key = denseMem ? "idempotency_key" : "key";
-              tools.state.expectedAuthorization =
-                "Bearer monitor-project-scope-canary";
-              config.mcp.credentials = {
-                project: {
-                  headers: { Authorization: tools.state.expectedAuthorization },
-                },
-              };
-              config.mcp.servers = {
-                context: {
-                  transport: "streamable_http",
-                  url: tools.url,
-                  allow_plain_http: true,
-                  credential_ref: "project",
-                  review_required_tools: [writeTool],
-                  tools: {
-                    [readTool]: { effect: "read" },
-                    [writeTool]: { effect: "write", idempotency_argument: key },
-                  },
-                },
-              };
-              config.roles.implementation.mcp = {
-                context: { tools: [readTool, writeTool] },
-              };
-              const separated = separateSecrets(config);
-              secrets = separated.secrets;
-              snapshot = createRunSnapshot(
-                separated.settings,
-                bundlesWithCanaries(loaded),
-                secrets,
-              );
-              await start();
-              attachMonitor();
-              const noteHandler = async (task, { run, text }) => {
-                if (task !== "implementation_review_readiness") return;
-                const input = taskInput(text),
-                  calls = store
-                    .mcpCalls()
-                    .filter((item) => item.run_id === run.id);
-                if (!calls.some((item) => item.tool === readTool))
-                  return {
-                    tool: `mcp__context__${readTool}`,
-                    arguments: { query: "Current PR readiness evidence" },
-                  };
-                const write = supervisor.mcpWrites.repository
-                  .all()
-                  .find((item) => item.binding.run_id === run.id);
-                if (!write)
-                  return {
-                    tool: `mcp__context__${writeTool}`,
-                    arguments: {
-                      arguments: denseMem
-                        ? {
-                            target_space: "team_shared",
-                            evidence: [
-                              {
-                                content: `Current-head readiness ${input.receipt.head_sha}; human review required.`,
-                              },
-                            ],
-                            relationships: [],
-                          }
-                        : {
-                            text: `Current-head readiness ${input.receipt.head_sha}; human review required.`,
-                          },
-                      purpose:
-                        "Record only the controller-proven current-head readiness milestone.",
-                      evidence: [
-                        { kind: "pr_monitor_evidence", id: input.readiness_id },
-                      ],
-                    },
-                  };
-                return {
-                  result: {
-                    summary: `Read outcome and write receipt ${write.state} are retained; a recorded provider response does not prove persistence.`,
-                  },
-                };
-              };
-              controls.implementation = noteHandler;
-              let reviewed = 0;
-              controls.review = async (text) => {
-                if (
-                  text.includes('"type":"mcp_write"') &&
-                  text.includes('"kind":"pr_monitor_evidence"')
-                )
-                  reviewed++;
-              };
-              const notes = await run("source_only", noteHandler);
-              controls.implementation = noteHandler;
-              certify(notes.job);
-              const noted = await pump(
-                notes.job,
-                (item) => item.stage === "ready",
-              );
-              assert.equal(tools.effects.size, 1);
-              assert(reviewed > 0);
-              const written = supervisor.mcpWrites.repository
-                .all()
-                .find((item) => item.job_id === notes.job.id);
-              assert.equal(written.state, "response_recorded");
-              assert.equal(written.review, "required");
-              assert.equal(
-                written.evidence[0].receipt.head_sha,
-                noted.expected_head,
-              );
-              tools.state.denyRead = true;
-              controls.rejectWrite = true;
-              const denied = await run("source_only", noteHandler);
-              controls.implementation = noteHandler;
-              certify(denied.job);
-              await pump(denied.job, (item) => item.stage === "ready");
-              assert.equal(
-                supervisor.mcpWrites.repository
-                  .all()
-                  .find((item) => item.job_id === denied.job.id).state,
-                "rejected",
-              );
-              assert.equal(tools.effects.size, 1);
-              controls.rejectWrite = false;
-              tools.state.denyRead = false;
-              const ambiguousHandler = async (task, context) => {
-                if (task !== "implementation_review_readiness") return;
-                const input = taskInput(context.text),
-                  write = supervisor.mcpWrites.repository
-                    .all()
-                    .find((item) => item.binding.run_id === context.run.id);
-                if (!write)
-                  return {
-                    tool: `mcp__context__${writeTool}`,
-                    arguments: {
-                      arguments: denseMem
-                        ? {
-                            target_space: "team_shared",
-                            evidence: [
-                              {
-                                content: `Current head ${input.receipt.head_sha}, human review pending.`,
-                              },
-                            ],
-                            relationships: [],
-                          }
-                        : {
-                            text: `Current head ${input.receipt.head_sha}, human review pending.`,
-                          },
-                      purpose: "Record the actual readiness receipt once.",
-                      evidence: [
-                        { kind: "pr_monitor_evidence", id: input.readiness_id },
-                      ],
-                    },
-                  };
-                return {
-                  result: {
-                    summary:
-                      "The actual write response is retained; persistence is not inferred from transport success.",
-                  },
-                };
-              };
-              controls.implementation = ambiguousHandler;
-              const uncertain = await run("source_only", ambiguousHandler);
-              controls.implementation = ambiguousHandler;
-              certify(uncertain.job);
-              await monitor.reconcile();
-              const effectsBefore = tools.effects.size;
-              tools.state.hold = true;
-              const stop = new globalThis.AbortController(),
-                advancing = monitor.advance(
-                  store.jobById(uncertain.job.id),
-                  stop.signal,
-                );
-              const deadline = Date.now() + 30000;
-              while (tools.effects.size === effectsBefore) {
-                assert(
-                  Date.now() < deadline,
-                  "readiness write was not dispatched",
-                );
-                await delay(20);
-              }
-              stop.abort(new Error("planned readiness cancellation"));
-              await advancing;
-              tools.state.hold = false;
-              tools.state.release?.();
-              await closeRuntime();
-              await start();
-              attachMonitor();
-              const recovered = await pump(
-                uncertain.job,
-                (item) => item.stage === "ready",
-              );
-              assert.equal(tools.effects.size, effectsBefore + 1);
-              assert.equal(
-                supervisor.publication.repository.target(uncertain.job.id).head,
-                recovered.expected_head,
-              );
-              assert.equal(
-                record(uncertain.job).tests.filter(
-                  (item) => item.state === "passed",
-                ).length,
-                1,
-              );
-              proof.push({
-                sdk,
-                provider: denseMem ? "Dense-Mem example" : "generic MCP",
-                readiness_reviewed_write: "passed",
-                read_denial_and_write_rejection: "passed",
-                cancelled_ambiguous_write_recovery_preserves_github: "passed",
-              });
-              complete(`readiness-mcp-${denseMem ? "dense" : "generic"}`);
-            } catch (error) {
-              errors.push(error);
-              recordWorkflowFailure();
-              throw error;
-            } finally {
-              controls.implementation = undefined;
-              controls.review = undefined;
-              controls.rejectWrite = false;
-              await closeRuntime();
-              await tools.close();
-            }
-          }
+          complete("wait-budget-and-required-receipts");
         }
       }
       assert(!logs.join("\n").includes(config.github.token));
@@ -2517,8 +1766,7 @@ export async function runImplementationTests(sdks, suite) {
     for (const cleanup of [
       () => closeRuntime(),
       () => remote?.close(),
-      () => context.close(),
-      ...[model, notifier].map((server) => async () => {
+      ...[model].map((server) => async () => {
         server.closeAllConnections();
         await new Promise((resolve) => server.close(resolve));
       }),

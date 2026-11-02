@@ -665,13 +665,13 @@ export class ActionsRepository {
             result: null,
             bootstrap_receipt: null,
             candidate_bootstrap: null,
-            milestone_done: false,
+
             audit_id: null,
             test_id: null,
             audits: [],
             tests: [],
             agent_pending: null,
-            recovery_attempts: [],
+
             publication_id: pr.publication_id,
             status_operation: null,
             status_generation: 0,
@@ -727,8 +727,7 @@ export class ActionsRepository {
               snapshot_digest: null,
               assessment_digest: null,
               pending_agent: null,
-              recovery_attempts: [],
-              mcp_done_for: null,
+
               readiness_id: null,
               status_operation: null,
               status_text: null,

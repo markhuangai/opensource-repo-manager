@@ -4,8 +4,7 @@ import { join } from "node:path";
 import { verifyAgent } from "./conformance.mjs";
 
 export async function respond(req, res, fixture) {
-  const { config, mcpCredential, store, root, requests, histories, errors } =
-    fixture;
+  const { config, store, root, requests, histories, errors } = fixture;
   try {
     let data = "";
     for await (const chunk of req) data += chunk;
@@ -21,7 +20,6 @@ export async function respond(req, res, fixture) {
     assert.equal(body.output_config.effort, "xhigh");
     assert(!JSON.stringify(body).includes(config.proxy.key));
     assert(!JSON.stringify(body).includes(config.github.token));
-    assert(!JSON.stringify(body).includes(mcpCredential));
     const text = body.messages
       .flatMap((message) =>
         typeof message.content === "string"
@@ -139,13 +137,6 @@ export async function respond(req, res, fixture) {
               .content.map((block) => block.text ?? "")
               .join("\n");
       assert(/(?:^|\n)BOOTSTRAP_TESTS_PASSED(?:\n|$)/.test(latest), latest);
-    } else if (scenario === "mcp_write") {
-      if (!results.length)
-        use(
-          `mcp__${fixture.writeAlias}__${fixture.writeTool}`,
-          fixture.writeInput,
-        );
-      else fixture.writeResults.push(results.at(-1));
     } else if (scenario === "crash") {
       use("Bash", {
         command: 'kill -ABRT "$PPID"',
@@ -170,32 +161,6 @@ export async function respond(req, res, fixture) {
         });
       }
     } else if (
-      ["mcp", "expiry", "cancel_mcp"].includes(scenario) &&
-      !results.length
-    )
-      use("mcp__context__read", {});
-    else if (scenario === "mcp" && results[0].tool_use_id.includes("context")) {
-      assert(!results[0].is_error);
-      const script = `import fs from 'node:fs';
-          let pid=process.ppid, setting;
-          for(let i=0;i<6&&!setting;i++){
-            const args=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split('\\0');
-            const idx=args.findIndex(a=>a==='--mcp-config'||a.startsWith('--mcp-config='));
-            if(idx>=0) setting=JSON.parse(args[idx].includes('=')?args[idx].slice(args[idx].indexOf('=')+1):args[idx+1]);
-            else pid=Number(/^PPid:\\s+(\\d+)/m.exec(fs.readFileSync('/proc/'+pid+'/status','utf8'))[1]);
-          }
-          if(!setting) throw Error('no SDK descriptor');
-          const c=setting.mcpServers.context;
-          const r=await fetch(c.url,{method:'POST',headers:{...c.headers,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':${JSON.stringify(fixture.downstreamId)}},
-            body:JSON.stringify({jsonrpc:'2.0',id:99123,method:'tools/call',params:{name:'hidden',arguments:{}}})});
-          const text=await r.text();
-          if(r.ok&&!text.includes('"error"')&&!text.includes('"isError":true')) throw Error('raw grant bypass');
-          fs.writeFileSync('raw-denied','yes');console.log('raw-denied');`;
-      use("Bash", {
-        command: `/opt/orm-runtime/bin/node --input-type=module -e '${script.replaceAll("'", "'\\''")}'`,
-        description: "Probe raw MCP authorization",
-      });
-    } else if (
       ["tools", "hostile", "limited", "cancel"].includes(scenario) &&
       !results.length
     ) {
@@ -214,7 +179,7 @@ export async function respond(req, res, fixture) {
       const command = [
         "set -eu",
         'test "$(id -u)" = 10001',
-        "test ! -r /config/config.yml",
+        "test ! -r /config/actions.yml",
         `test ! -r /proc/${process.pid}/environ`,
         "test ! -r /data/state/manager.sqlite",
         "grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status",
@@ -249,15 +214,9 @@ export async function respond(req, res, fixture) {
     if (initial) content.unshift({ type: "text", text: history.marker });
     if (
       results.length &&
-      ![
-        "limited",
-        "malformed",
-        "expiry",
-        "mcp_write",
-        "investigation_plan",
-        "implementation_milestone",
-        "implementation_review_readiness",
-      ].includes(scenario)
+      !["limited", "malformed", "expiry", "investigation_plan"].includes(
+        scenario,
+      )
     )
       assert(
         results.every((result) => !result.is_error),

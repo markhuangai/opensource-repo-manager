@@ -1,14 +1,8 @@
 import { z } from "zod";
 import { githubId, sha } from "../../domain/jobs.ts";
-import type { Configuration } from "../../config/schema.ts";
+import type { ActionsConfiguration } from "../../config/schema.ts";
 
-export type PrMonitorPolicy = Configuration["pr_monitor"];
-export const readinessReadFailures = new Set([
-  "github_read_failed",
-  "github_graphql_failed",
-  "github_rate_limited",
-  "enrollment_pending",
-]);
+export type PrMonitorPolicy = ActionsConfiguration["pr_monitor"];
 const actor = z.object({ id: githubId, login: z.string() });
 export const prReview = z.object({
   id: githubId,
@@ -180,11 +174,9 @@ export type PrMonitor = {
   assessment_digest: string | null;
   findings: FindingDisposition[];
   pending_agent: {
-    task: "assessment" | "readiness";
-    prior_runs: string[];
+    task: "assessment";
   } | null;
-  recovery_attempts: string[];
-  mcp_done_for: string | null;
+
   readiness_id: string | null;
   status_operation: string | null;
   status_text: string | null;

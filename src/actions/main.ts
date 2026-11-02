@@ -95,7 +95,6 @@ try {
   if (state.result()) result = state.result()!;
   else {
     application = await createApplication(store, loaded, logger, {
-      mode: "actions",
       root: join(root, "runtime"),
       publicationWriter: () => state!.writer,
     });

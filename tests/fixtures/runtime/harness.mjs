@@ -25,13 +25,6 @@ import {
 } from "/opt/orm/app/dist/config/load.js";
 import { Store } from "/opt/orm/app/dist/repositories/store.js";
 import { Supervisor } from "/opt/orm/app/dist/runtime/supervisor.js";
-import { Octokit } from "/opt/orm/app/node_modules/@octokit/rest/dist-src/index.js";
-import { OctokitReader } from "/opt/orm/app/dist/adapters/github/reader.js";
-import { IntakeService } from "/opt/orm/app/dist/services/intake.js";
-import { InvestigationService } from "/opt/orm/app/dist/services/investigation/index.js";
-import { ImplementationService } from "/opt/orm/app/dist/services/implementation/index.js";
-import { PrMonitorService } from "/opt/orm/app/dist/services/pr-monitor/index.js";
-import { createApp } from "/opt/orm/app/dist/http/app.js";
 import {
   cleanEnvironment,
   cleanSource,
@@ -42,7 +35,6 @@ import {
   userProcesses,
 } from "/opt/orm/app/dist/runtime/process.js";
 import { treeBytes } from "/opt/orm/app/dist/services/workspaces/files.js";
-import { verifyMcp } from "./mcp.mjs";
 import { verifyClaude } from "/agent-fixtures/claude.mjs";
 import { verifyCodex } from "/agent-fixtures/codex.mjs";
 
@@ -289,53 +281,6 @@ export async function runRuntimeTests() {
     res.end('data: {"type":"fixture_done"}\n\n');
   });
   const proxy = (await listen(modelServer)) + "/v1";
-  const tokens = new Map(),
-    issued = [];
-  let descriptorFault = "",
-    closeFault = false;
-  let catalog = "catalog-one",
-    closedSessions = 0;
-  const mcpServer = createServer((req, res) => {
-    const connection = tokens.get(req.headers.authorization);
-    if (!connection) {
-      res.writeHead(401);
-      res.end();
-      return;
-    }
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ role: connection.role }));
-  });
-  const gateway = (await listen(mcpServer)) + "/mcp";
-  const provider = {
-    async open(request) {
-      const authorization = randomBytes(32).toString("base64url"),
-        key = `Bearer ${authorization}`;
-      tokens.set(key, request);
-      const connection = {
-        alias: "fixture",
-        url: gateway,
-        authorization,
-        tools: ["read"],
-        deadline: request.deadline,
-      };
-      if (descriptorFault === "upstream")
-        connection.url = "https://upstream-mcp.example.invalid/mcp";
-      if (descriptorFault === "extra")
-        connection.upstream_key = "not-a-worker-field";
-      issued.push(connection);
-      return {
-        connections: [connection],
-        policy_identity: "policy-one",
-        catalog_identity: catalog,
-        async close() {
-          tokens.delete(key);
-          closedSessions++;
-          if (closeFault && request.role === "audit")
-            throw new Error("fixture close failure");
-        },
-      };
-    },
-  };
   const hook = join(base, "root-hook-ran"),
     inspect = {
       mode: "inspect",
@@ -344,20 +289,10 @@ export async function runRuntimeTests() {
       artifact_root: join(root, "private", "manifests"),
       hook,
     };
-  function snapshotFor(limits = {}, mcp = false) {
+  function snapshotFor(limits = {}) {
     const settings = globalThis.structuredClone(loaded.snapshot.settings);
     settings.proxy.url = proxy;
     Object.assign(settings.limits, limits);
-    if (mcp) {
-      settings.mcp.servers.fixture = {
-        transport: "streamable_http",
-        url: "https://upstream-mcp.example.invalid/mcp",
-        allow_plain_http: false,
-        tools: { read: { effect: "read" } },
-      };
-      settings.roles.investigation.mcp = { fixture: { tools: ["read"] } };
-      settings.roles.audit.mcp = { fixture: { tools: ["read"] } };
-    }
     return createRunSnapshot(settings, bundles, loaded.secrets);
   }
   const snapshot = snapshotFor(),
@@ -365,7 +300,6 @@ export async function runRuntimeTests() {
       root,
       workers: { claude: worker, codex: worker },
       sourceUrl: () => sourceUrl,
-      mcp: provider,
     };
   let supervisor = await Supervisor.create(
       store,
@@ -376,11 +310,10 @@ export async function runRuntimeTests() {
     number = 0;
   function seed({
     limits = {},
-    mcp = false,
     source = { sha, tree_sha: tree, default_branch: "main" },
   } = {}) {
     number++;
-    const selected = snapshotFor(limits, mcp);
+    const selected = snapshotFor(limits);
     store.saveSnapshot(selected);
     const context = {
       id: 1000 + number,
@@ -392,8 +325,7 @@ export async function runRuntimeTests() {
       comments: [],
       source,
     };
-    store.discover([number], 1, true);
-    store.applyIssue(store.nextDirty(), context, selected);
+    store.applyIssue(store.refreshIssue(number), context, selected);
     return { job: store.job(number), context, snapshot: selected };
   }
   const run = async (fixture, mode, role = "implementation", extra = {}) =>
@@ -406,7 +338,6 @@ export async function runRuntimeTests() {
       ),
     );
   let tests = 0,
-    mcpProof,
     claudeProof,
     codexProof,
     storageProbe;
@@ -1139,11 +1070,8 @@ int main(int count, char **values) {
         ),
       );
     await staleIterator.next();
-    store.accept("new-runtime-generation", "digest", "issues", [
-      { kind: "issue", number: stale.job.issue_number },
-    ]);
     store.applyIssue(
-      store.nextDirty(),
+      store.refreshIssue(stale.job.issue_number),
       { ...stale.context, body: "new revision" },
       stale.snapshot,
     );
@@ -1289,161 +1217,58 @@ int main(int count, char **values) {
     assert(!store.runs().some((run) => run.finished_at === null));
     tests++;
 
-    const cleanupFailure = seed({ mcp: true });
-    const healthPhases = store
-      .jobs()
-      .map((job) => ({ id: job.id, phase: job.phase }));
-    store.db.prepare("UPDATE jobs SET phase='remote_review'").run();
-    let healthSource = { sha, tree_sha: tree };
-    const healthServer = createServer((req, res) => {
-      const path = new URL(req.url, "http://fixture").pathname;
-      const prefix = `/repos/${snapshot.settings.github.repository}`;
-      const number = Number(path.slice(`${prefix}/issues/`.length));
-      const value =
-        path === prefix
-          ? {
-              id: 42,
-              full_name: snapshot.settings.github.repository,
-              default_branch: "main",
-              private: false,
-            }
-          : path === `${prefix}/commits/main`
-            ? {
-                sha: healthSource.sha,
-                commit: { tree: { sha: healthSource.tree_sha } },
-              }
-            : path === `${prefix}/issues` || path.endsWith("/comments")
-              ? []
-              : store.job(number)
-                ? {
-                    ...JSON.parse(store.job(number).input_json),
-                    updated_at: "2026-10-15T00:00:00Z",
-                  }
-                : null;
-      if (value?.source) healthSource = value.source;
-      res.setHeader("content-type", "application/json");
-      res.statusCode = value === null ? 404 : 200;
-      res.end(JSON.stringify(value));
-    });
-    const healthUrl = await listen(healthServer),
-      healthReader = new OctokitReader(
-        snapshot.settings.github.repository,
-        new Octokit({ baseUrl: healthUrl }),
+    const cleanupFailure = seed();
+    const failureParent = iterate(
+      supervisor.run(
+        supervisor.request(cleanupFailure.job.id, "implementation", {
+          mode: "nested",
+        }),
+        new globalThis.AbortController().signal,
       ),
-      healthLog = { info() {}, error() {} },
-      healthIntake = new IntakeService(
-        store,
-        healthReader,
-        snapshot,
-        loaded.secrets,
-        healthLog,
-      ),
-      healthImplementation = new ImplementationService(
-        store,
-        healthIntake,
-        supervisor,
-        loaded.secrets,
-        healthLog,
-      ),
-      healthMonitor = new PrMonitorService(
-        store,
-        healthIntake,
-        healthReader,
-        healthImplementation,
-        supervisor,
-        snapshot,
-        loaded.secrets,
-        healthLog,
-      ),
-      healthCoordinator = new InvestigationService(
-        store,
-        healthIntake,
-        supervisor,
-        loaded.secrets,
-        healthLog,
-        undefined,
-        healthImplementation,
-      ),
-      healthApp = createApp(
-        healthIntake,
-        undefined,
-        supervisor.notifications,
-        supervisor.mcpWrites,
-        healthCoordinator,
-      );
-    await healthIntake.reconcile();
-    supervisor.notifications.start();
-    healthCoordinator.start();
-    healthMonitor.start();
-    await healthCoordinator.reconcile();
-    await healthMonitor.reconcile();
-    try {
-      const healthy = await healthApp.inject("/readyz");
-      assert.equal(healthy.statusCode, 200, healthy.body);
-      const failureParent = iterate(
-        supervisor.run(
-          supervisor.request(cleanupFailure.job.id, "implementation", {
-            mode: "nested",
+    );
+    await failureParent.next();
+    const failureRun = store.runs().find((run) => run.finished_at === null),
+      failureAbort = new globalThis.AbortController(),
+      failureReview = iterate(
+        supervisor.runReview(
+          failureRun.id,
+          supervisor.request(cleanupFailure.job.id, "audit", {
+            mode: "review",
+            hang: true,
           }),
-          new globalThis.AbortController().signal,
+          failureAbort.signal,
         ),
       );
-      await failureParent.next();
-      const failureRun = store.runs().find((run) => run.finished_at === null),
-        failureAbort = new globalThis.AbortController(),
-        failureReview = iterate(
-          supervisor.runReview(
-            failureRun.id,
-            supervisor.request(cleanupFailure.job.id, "audit", {
-              mode: "mcp-hang",
-            }),
-            failureAbort.signal,
-          ),
-        );
-      let failureEvent;
-      do {
-        failureEvent = (await failureReview.next()).value;
-      } while (failureEvent?.type !== "progress");
-      closeFault = true;
-      const rejectedParent = assert.rejects(
-          remaining(failureParent),
-          /cleanup_failed/,
-        ),
-        rejectedReview = assert.rejects(
-          remaining(failureReview),
-          /cleanup_failed/,
-        );
-      failureAbort.abort();
-      await Promise.all([rejectedParent, rejectedReview]);
-      assert.equal(store.leases().length, 1);
-      assert.equal(
-        store.acquireLease(blocked.job.id, blocked.job.revision),
-        undefined,
+    let failureEvent;
+    do {
+      failureEvent = (await failureReview.next()).value;
+    } while (failureEvent?.type !== "progress");
+    store.db.exec(
+      "CREATE TRIGGER fail_audit_cleanup BEFORE UPDATE OF finished_at ON agent_runs WHEN OLD.role='audit' BEGIN SELECT RAISE(ABORT,'cleanup receipt unavailable'); END",
+    );
+    const rejectedParent = assert.rejects(
+        remaining(failureParent),
+        /cleanup_failed/,
+      ),
+      rejectedReview = assert.rejects(
+        remaining(failureReview),
+        /cleanup_failed/,
       );
-      assert.equal((await userProcesses(10001)).length, 0);
-      assert.deepEqual(supervisor.status(), {
-        state: "unavailable",
-        reason: "cleanup_failed",
-      });
-      const unhealthy = await healthApp.inject("/readyz");
-      assert.equal(unhealthy.statusCode, 503);
-      assert.equal(
-        unhealthy.json().implementation.runtime.reason,
-        "cleanup_failed",
-      );
-    } finally {
-      await healthMonitor.stop();
-      await healthCoordinator.stop();
-      await healthIntake.stop();
-      await healthApp.close();
-      await close(healthServer);
-      for (const job of healthPhases)
-        store.db
-          .prepare("UPDATE jobs SET phase=? WHERE id=?")
-          .run(job.phase, job.id);
-    }
+    failureAbort.abort();
+    await Promise.all([rejectedParent, rejectedReview]);
+    assert.equal(store.leases().length, 1);
+    assert.equal(
+      store.acquireLease(blocked.job.id, blocked.job.revision),
+      undefined,
+    );
+    for (const uid of [10001, 10002, 10003])
+      assert.equal((await userProcesses(uid)).length, 0);
+    assert.deepEqual(supervisor.status(), {
+      state: "unavailable",
+      reason: "cleanup_failed",
+    });
     await assert.rejects(supervisor.close(), /cleanup_failed/);
-    closeFault = false;
+    store.db.exec("DROP TRIGGER fail_audit_cleanup");
     supervisor = await Supervisor.create(
       store,
       snapshot,
@@ -1456,99 +1281,9 @@ int main(int count, char **values) {
     assert(!store.runs().some((run) => run.finished_at === null));
     tests++;
 
-    const unavailable = seed({ mcp: true }),
-      withoutProvider = await Supervisor.create(
-        store,
-        snapshot,
-        loaded.secrets,
-        { ...options, mcp: undefined },
-      );
-    await assert.rejects(
-      collect(
-        withoutProvider.run(
-          withoutProvider.request(unavailable.job.id, "investigation", {
-            mode: "mcp",
-          }),
-          new globalThis.AbortController().signal,
-        ),
-      ),
-      /mcp_unavailable/,
-    );
-    await withoutProvider.close();
-    for (const fault of ["upstream", "extra"]) {
-      descriptorFault = fault;
-      assert.equal(
-        (await run(seed({ mcp: true }), { mode: "mcp" }, "investigation"))
-          .outcome,
-        "failed",
-      );
-    }
-    descriptorFault = "";
-    const mcpFixture = seed({ mcp: true }),
-      mcpResult = await run(mcpFixture, { mode: "mcp" }, "investigation");
-    assert.equal(mcpResult.outcome, "completed");
-    const old = issued.at(-1);
-    assert.equal(
-      (
-        await fetch(old.url, {
-          headers: { authorization: `Bearer ${old.authorization}` },
-        })
-      ).status,
-      401,
-    );
-    catalog = "catalog-two";
-    assert.equal(
-      (
-        await run(mcpFixture, { mode: "mcp" }, "investigation", {
-          resume: { id: "mcp-session", binding: mcpResult.result.binding },
-        })
-      ).outcome,
-      "failed",
-    );
-    for (const mode of ["cancel", "stale"]) {
-      const bound = seed({ mcp: true }),
-        cancel = new globalThis.AbortController(),
-        stream = iterate(
-          supervisor.run(
-            supervisor.request(bound.job.id, "investigation", {
-              mode: "mcp-hang",
-            }),
-            cancel.signal,
-          ),
-        );
-      let event;
-      do {
-        event = (await stream.next()).value;
-      } while (event.type !== "progress");
-      const connection = issued.at(-1);
-      if (mode === "cancel") cancel.abort();
-      else {
-        store.discover([bound.job.issue_number], 1, true);
-        store.applyIssue(
-          store.nextDirty(),
-          { ...bound.context, body: "changed" },
-          bound.snapshot,
-        );
-      }
-      assert.equal(
-        terminal(await remaining(stream)).outcome,
-        mode === "cancel" ? "cancelled" : "stale",
-      );
-      assert.equal(
-        (
-          await fetch(connection.url, {
-            headers: { authorization: `Bearer ${connection.authorization}` },
-          })
-        ).status,
-        401,
-      );
-    }
-    assert(closedSessions >= 4);
-    tests++;
-
-    for (const credential of ["relay", "mcp"]) {
+    for (const credential of ["relay"]) {
       for (const event of ["progress", "terminal"]) {
-        const fixture = seed({ mcp: true }),
+        const fixture = seed(),
           events = await collect(
             supervisor.run(
               supervisor.request(fixture.job.id, "investigation", {
@@ -1562,20 +1297,11 @@ int main(int count, char **values) {
         assert.deepEqual(events, [{ type: "terminal", outcome: "failed" }]);
         assert.equal(store.leases().length, 0);
         assert.equal((await userProcesses(10001)).length, 0);
-        const connection = issued.at(-1);
-        assert.equal(
-          (
-            await fetch(connection.url, {
-              headers: { authorization: `Bearer ${connection.authorization}` },
-            })
-          ).status,
-          401,
-        );
       }
     }
     tests++;
-    for (const credential of ["relay", "mcp"]) {
-      const fixture = seed({ mcp: true }),
+    for (const credential of ["relay"]) {
+      const fixture = seed(),
         stream = iterate(
           supervisor.run(
             supervisor.request(fixture.job.id, "investigation", {
@@ -1591,16 +1317,6 @@ int main(int count, char **values) {
         const first = (await stream.next()).value;
         assert.equal(first.type, "progress");
         assert(first.message.length > 0);
-        const connection = issued.at(-1);
-        assert.equal(
-          (
-            await fetch(connection.url, {
-              headers: { authorization: `Bearer ${connection.authorization}` },
-              signal: AbortSignal.timeout(2000),
-            })
-          ).status,
-          200,
-        );
         const run = store
           .runs()
           .find(
@@ -1614,27 +1330,12 @@ int main(int count, char **values) {
         assert.deepEqual(await remaining(stream), [
           { type: "terminal", outcome: "failed" },
         ]);
-        assert.equal(
-          (
-            await fetch(connection.url, {
-              headers: { authorization: `Bearer ${connection.authorization}` },
-            })
-          ).status,
-          401,
-        );
         assert.equal(store.leases().length, 0);
         assert.equal((await userProcesses(10001)).length, 0);
       } finally {
         await stream.return?.();
       }
     }
-    assert.equal(
-      (await run(seed({ mcp: true }), { mode: "mcp" }, "investigation"))
-        .outcome,
-      "completed",
-    );
-    tests++;
-
     const shutdown = seed(),
       shutdownIterator = iterate(
         supervisor.run(
@@ -1713,15 +1414,6 @@ int main(int count, char **values) {
       }
     }
     await supervisor.close();
-    mcpProof = await verifyMcp({
-      store,
-      worker,
-      root,
-      sourceUrl,
-      source: { sha, tree_sha: tree, default_branch: "main" },
-      proxy,
-      bundles,
-    });
     codexProof = await verifyCodex({
       store,
       root,
@@ -1862,7 +1554,6 @@ int main(int count, char **values) {
       () => store.close(),
       () => close(sourceServer),
       () => close(modelServer),
-      () => close(mcpServer),
     ]) {
       try {
         await cleanup();
@@ -1884,7 +1575,6 @@ int main(int count, char **values) {
       history: "full",
       nested_review: "one_lease",
       crash_recovery: "passed",
-      mcp_gateway: mcpProof,
       claude_sdk: claudeProof,
       codex_sdk: codexProof,
       cleanup: "passed",

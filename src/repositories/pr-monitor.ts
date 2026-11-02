@@ -10,7 +10,6 @@ import type {
   PrReadiness,
   PrSnapshot,
 } from "../services/pr-monitor/contracts.ts";
-import { readinessReadFailures } from "../services/pr-monitor/contracts.ts";
 
 export class PrMonitorRepository {
   private readonly store: Store;
@@ -75,8 +74,7 @@ export class PrMonitorRepository {
       assessment_digest: null,
       findings: [],
       pending_agent: null,
-      recovery_attempts: [],
-      mcp_done_for: null,
+
       readiness_id: null,
       status_operation: null,
       status_text: null,
@@ -111,8 +109,6 @@ export class PrMonitorRepository {
     const job = this.store.jobById(record.job_id);
     if (!job || job.status !== "pending" || job.revision !== record.revision)
       throw new RuntimeError("revision_stale");
-    if (this.store.hasUncertainMcpWrite(job.id))
-      throw new RuntimeError("mcp_write_uncertain");
     const implementation = this.implementation(record);
     if (
       !implementation.scope ||
@@ -173,11 +169,6 @@ export class PrMonitorRepository {
     )
       throw new RuntimeError("pr_readiness_stale");
     this.current(record);
-    if (
-      ["waiting", "queued"].includes(record.stage) &&
-      readinessReadFailures.has(record.failure ?? "")
-    )
-      throw new RuntimeError("pr_readiness_unavailable");
     if (!["ready", "queued"].includes(record.stage) || record.failure)
       throw new RuntimeError("pr_readiness_stale");
     return evidence;
