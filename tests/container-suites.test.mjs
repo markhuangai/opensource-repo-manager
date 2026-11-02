@@ -5,6 +5,10 @@ import {
   implementationSdks,
   selectContainerSuites,
   verifyImplementationReceipts,
+  actionsScenarios,
+  actionsGroups,
+  verifyActionsReceipts,
+  selectActionsCpuSet,
 } from "../scripts/container-suites.mjs";
 
 describe("container suite selection", () => {
@@ -51,6 +55,226 @@ describe("container suite selection", () => {
       expect(() => selectContainerSuites(args)).toThrow();
     });
   }
+});
+
+describe("Actions worker CPU selection", () => {
+  for (const [available, expected] of [
+    ["0-31", "0,1,2,3"],
+    ["0-1", "0,1"],
+    ["8", "8"],
+    ["4,8-9,16-20", "4,8,9,16"],
+    ["1,1-2,2-3", "1,2,3"],
+    [" 8-11\n", "8,9,10,11"],
+  ])
+    it(`selects only allowed CPUs from ${JSON.stringify(available)}`, () => {
+      expect(selectActionsCpuSet(available)).toBe(expected);
+    });
+
+  for (const available of [
+    undefined,
+    "",
+    "1-0",
+    "-1",
+    "0-3,invalid",
+    "9007199254740992",
+  ])
+    it(`rejects invalid allowed CPUs ${JSON.stringify(available)}`, () => {
+      expect(() => selectActionsCpuSet(available)).toThrow();
+    });
+});
+
+describe("Actions lane coverage and identity", () => {
+  const identity = {
+    source_sha: "a".repeat(40),
+    pr_head_sha: "b".repeat(40),
+    platform: "linux/arm64",
+    image_id: `sha256:${"c".repeat(64)}`,
+    input_digest: "d".repeat(64),
+    dirty_worktree: false,
+    actions_cpu_set: "0,1,2,3",
+  };
+  const lanes = () =>
+    actionsGroups.flatMap((group) =>
+      implementationSdks.map((sdk) => ({
+        ...identity,
+        suite: "actions",
+        cleanup: "passed",
+        bounded_actions: [
+          {
+            sdk,
+            group,
+            actions: "passed",
+            cpu_set: identity.actions_cpu_set,
+            toolchain_cache: {
+              seeded_installation: "verified",
+              corrupted_archive: "rejected",
+              digest: "e".repeat(64),
+              node_signature: "f".repeat(64),
+              installation_integrity: "a".repeat(64),
+            },
+            resource_samples: [],
+            completed_scenarios: actionsScenarios[group].map((id) => ({
+              id,
+              duration_ms: 1,
+            })),
+            credential_exclusion: "passed",
+            no_public_listener: "passed",
+            unrelated_issue: "untouched",
+            native_session_artifacts: "passed",
+          },
+        ],
+      })),
+    );
+  it("preserves the complete original scenario inventory in five independent chains", () => {
+    expect(
+      Object.fromEntries(
+        actionsGroups.map((group) => [group, actionsScenarios[group].length]),
+      ),
+    ).toEqual({
+      lifecycle: 29,
+      sessions: 8,
+      "pr-recovery": 16,
+      clarification: 19,
+      "clarification-recovery": 27,
+    });
+    const all = Object.values(actionsScenarios).flat();
+    expect(all.filter((id) => !id.startsWith("controller-"))).toHaveLength(94);
+    expect(all).toHaveLength(99);
+    expect(new Set(all).size).toBe(99);
+    expect(() => verifyActionsReceipts(lanes(), identity)).not.toThrow();
+  });
+  it("supports a serial profiling mode and bounded parallelism", () => {
+    for (const count of [1, 2, 3, 4])
+      expect(
+        selectContainerSuites([
+          "--suite",
+          "actions",
+          "--actions-concurrency",
+          String(count),
+        ]),
+      ).toMatchObject({ actionsConcurrency: count });
+    expect(
+      selectContainerSuites([
+        "--suite",
+        "actions",
+        "--actions-sdk",
+        "codex",
+        "--actions-group",
+        "sessions",
+      ]),
+    ).toMatchObject({ actionsSdk: "codex", actionsGroup: "sessions" });
+    for (const args of [
+      ["--actions-concurrency", "1"],
+      ["--suite", "core", "--actions-concurrency", "1"],
+      ["--suite", "actions", "--actions-concurrency", "5"],
+      ["--suite", "actions", "--actions-concurrency", "0"],
+      ["--suite", "actions", "--actions-sdk", "codex"],
+      ["--suite", "actions", "--actions-group", "sessions"],
+      [
+        "--suite",
+        "actions",
+        "--actions-sdk",
+        "other",
+        "--actions-group",
+        "sessions",
+      ],
+    ])
+      expect(() => selectContainerSuites(args)).toThrow();
+  });
+  for (const [name, corrupt] of [
+    [
+      "wrong worker CPU affinity",
+      (rows) => {
+        rows[0].bounded_actions[0].cpu_set = "4";
+      },
+    ],
+    [
+      "wrong lane CPU affinity",
+      (rows) => {
+        rows[0].actions_cpu_set = "4";
+      },
+    ],
+    ["missing lane", (rows) => rows.pop()],
+    ["duplicate lane", (rows) => rows.push(rows[0])],
+    [
+      "unverified cached installation",
+      (rows) => {
+        rows[0].bounded_actions[0].toolchain_cache.seeded_installation =
+          "failed";
+      },
+    ],
+    [
+      "accepted corrupted archive",
+      (rows) => {
+        rows[0].bounded_actions[0].toolchain_cache.corrupted_archive =
+          "accepted";
+      },
+    ],
+    [
+      "missing archive identity",
+      (rows) => {
+        delete rows[0].bounded_actions[0].toolchain_cache.digest;
+      },
+    ],
+    [
+      "substituted lane",
+      (rows) => {
+        rows[0] = rows[1];
+      },
+    ],
+    [
+      "missing scenario",
+      (rows) => rows[0].bounded_actions[0].completed_scenarios.pop(),
+    ],
+    [
+      "duplicate scenario",
+      (rows) =>
+        rows[0].bounded_actions[0].completed_scenarios.push(
+          rows[0].bounded_actions[0].completed_scenarios[0],
+        ),
+    ],
+    [
+      "failed lane",
+      (rows) => {
+        rows[0].bounded_actions[0].actions = "failed";
+      },
+    ],
+    [
+      "failed cleanup",
+      (rows) => {
+        rows[0].cleanup = "failed";
+      },
+    ],
+    [
+      "missing timing",
+      (rows) => {
+        delete rows[0].bounded_actions[0].completed_scenarios[0].duration_ms;
+      },
+    ],
+    [
+      "missing resource observations",
+      (rows) => {
+        delete rows[0].bounded_actions[0].resource_samples;
+      },
+    ],
+    [
+      "missing credential proof",
+      (rows) => {
+        delete rows[0].bounded_actions[0].credential_exclusion;
+      },
+    ],
+    ...Object.keys(identity).map((key) => [
+      `stale ${key}`,
+      (rows) => {
+        rows[0][key] = "stale";
+      },
+    ]),
+  ])
+    it(`rejects ${name}`, () => {
+      const rows = lanes();
+      corrupt(rows);
+      expect(() => verifyActionsReceipts(rows, identity)).toThrow();
+    });
 });
 
 function receipt(suite, sdk) {

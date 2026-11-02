@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 export function artifactFixture(config) {
   const artifacts = [],
@@ -38,11 +39,30 @@ export function artifactFixture(config) {
       !url.pathname.startsWith("/repos/owner/repo/actions/")
     )
       return false;
+    const started = performance.now();
+    const receipt = {
+      method: req.method,
+      path: url.pathname,
+      started_at: new Date().toISOString(),
+      duration_ms: null,
+      request_bytes: 0,
+      status: null,
+      interrupted: false,
+    };
+    requests.push(receipt);
+    const completed = () => {
+      if (receipt.duration_ms !== null) return;
+      receipt.duration_ms = performance.now() - started;
+      receipt.status = res.statusCode;
+      receipt.interrupted = !res.writableFinished;
+    };
+    res.once("finish", completed);
+    res.once("close", completed);
     try {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const bytes = Buffer.concat(chunks);
-      requests.push({ method: req.method, path: url.pathname });
+      receipt.request_bytes = bytes.length;
       res.setHeader("content-type", "application/json");
       if (url.pathname.startsWith("/twirp/")) {
         const current = Object.entries(config.artifact_tokens).find(

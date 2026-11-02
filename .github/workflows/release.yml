@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.repository }}
+  group: release-${{ github.repository }}-${{ github.event.release.id }}
   cancel-in-progress: false
 
 env:
@@ -181,14 +181,13 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           VERSION: ${{ needs.resolve.outputs.version }}
-          IS_PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
           RECEIPTS: ${{ runner.temp }}/digests
         with:
           script: |
             const assert = require("node:assert/strict");
             const { readdir, readFile } = require("node:fs/promises");
             const { join } = require("node:path");
-            const { IMAGE, SOURCE_SHA, VERSION, IS_PRERELEASE, RECEIPTS } = process.env;
+            const { IMAGE, SOURCE_SHA, VERSION, RECEIPTS } = process.env;
             const architectures = ["amd64", "arm64"];
             assert.deepEqual((await readdir(RECEIPTS)).sort(), architectures.map(arch => `image-${arch}.json`),
               "Both architecture receipts are required.");
@@ -230,22 +229,25 @@ jobs:
             }
             await recheckSource();
             const tags = [`${IMAGE}:${VERSION}`, `${IMAGE}:sha-${SOURCE_SHA}`];
+            const publication = {
+              version: 1, release_id: context.payload.release.id, source_sha: SOURCE_SHA, release_version: VERSION,
+              platforms: receipts.map(({ platform, platform_digest }) => ({ platform, platform_digest })),
+            };
             await exec.exec("docker", ["buildx", "imagetools", "create", ...tags.flatMap(tag => ["--tag", tag]),
+              "--annotation", `index:org.opensource-repo-manager.publication=${JSON.stringify(publication)}`,
               ...receipts.map(receipt => `${IMAGE}@${receipt.digest}`)]);
             const combined = await inspect(tags[0]);
             assert(/^sha256:[0-9a-f]{64}$/.test(combined.digest), "Invalid combined digest.");
             verifyPlatforms(combined, receipts);
-            assert.equal((await inspect(tags[1])).digest, combined.digest);
-            const release = await recheckSource();
-            if (IS_PRERELEASE === "false" && !release.prerelease && !VERSION.includes("-")) {
-              const { data: latest } = await github.rest.repos.getLatestRelease(context.repo);
-              if (latest.id === release.id && !latest.prerelease && !latest.draft) {
-                const tag = `${IMAGE}:latest`;
-                await exec.exec("docker", ["buildx", "imagetools", "create", "--tag", tag, `${IMAGE}@${combined.digest}`]);
-                assert.equal((await inspect(tag)).digest, combined.digest);
-                tags.push(tag);
-              }
+            const sourceTag = await inspect(tags[1]);
+            if (sourceTag.digest !== combined.digest) {
+              const other = JSON.parse(sourceTag.annotations?.["org.opensource-repo-manager.publication"] ?? "null");
+              assert(other?.version === 1 && other.source_sha === SOURCE_SHA, "Source tag does not identify this source.");
+              assert.deepEqual(other.platforms?.map(item => item.platform).sort(), ["linux/amd64", "linux/arm64"]);
+              assert(other.platforms.every(item => /^sha256:[0-9a-f]{64}$/.test(item.platform_digest)));
+              verifyPlatforms(sourceTag, other.platforms);
             }
+            await recheckSource();
             const receipt = {
               repository: IMAGE, version: VERSION, source_sha: SOURCE_SHA, digest: combined.digest, tags,
               platforms: receipts.map(({ platform, digest, platform_digest }) => ({ platform, digest, platform_digest })),
@@ -253,3 +255,92 @@ jobs:
             };
             core.info(JSON.stringify(receipt));
             await core.summary.addHeading("Image publication receipt").addCodeBlock(JSON.stringify(receipt, null, 2), "json").write();
+
+  promote_latest:
+    name: Reconcile latest image
+    needs: [resolve, publish]
+    if: needs.resolve.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote the current verified stable release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            const { IMAGE } = process.env;
+            let release;
+            try {
+              release = (await github.rest.repos.getLatestRelease(context.repo)).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              core.notice("No stable release is available for latest promotion.");
+              return;
+            }
+            assert(!release.draft && !release.prerelease && release.published_at &&
+              /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(release.tag_name), "Invalid latest stable release.");
+            const version = release.tag_name.slice(1);
+            const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${release.tag_name}` });
+            assert(/^[0-9a-f]{40}$/.test(commit.sha), "Invalid latest source.");
+            const { data: main } = await github.rest.repos.getBranch({ ...context.repo, branch: "main" });
+            const { data: comparison } = await github.rest.repos.compareCommits({
+              ...context.repo, base: commit.sha, head: main.commit.sha,
+            });
+            assert(["ahead", "identical"].includes(comparison.status), "Latest source must belong to main.");
+            for (const workflow_id of ["ci.yml", "codeql.yml"]) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                ...context.repo, workflow_id, head_sha: commit.sha, branch: "main", event: "push", per_page: 1,
+              });
+              const run = data.workflow_runs[0];
+              assert(run && run.head_sha === commit.sha && run.head_branch === "main" && run.event === "push" &&
+                run.status === "completed" && run.conclusion === "success", "Latest source requires successful main-push CI.");
+            }
+            async function inspect(reference, optional = false) {
+              const output = await exec.getExecOutput("docker", ["buildx", "imagetools", "inspect",
+                reference, "--format", "{{json .Manifest}}"], { silent: true, ignoreReturnCode: optional });
+              if (output.exitCode && optional && /manifest unknown|not found|404/i.test(output.stderr)) return null;
+              assert(!output.exitCode, "Registry manifest inspection failed.");
+              return JSON.parse(output.stdout);
+            }
+            const combined = await inspect(`${IMAGE}:${version}`, true);
+            if (!combined) {
+              core.notice("The latest release image is not published yet; its publication will reconcile latest.");
+              return;
+            }
+            assert(/^sha256:[0-9a-f]{64}$/.test(combined.digest), "Invalid latest digest.");
+            const proof = JSON.parse(combined.annotations?.["org.opensource-repo-manager.publication"] ?? "null");
+            assert(proof?.version === 1 && proof.release_id === release.id && proof.source_sha === commit.sha &&
+              proof.release_version === version, "Latest image has no matching verified publication.");
+            assert.deepEqual(proof.platforms?.map(item => item.platform).sort(), ["linux/amd64", "linux/arm64"]);
+            assert(proof.platforms.every(item => /^sha256:[0-9a-f]{64}$/.test(item.platform_digest)));
+            const runnable = combined.manifests.filter(item => item.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest");
+            assert.deepEqual(runnable.map(item => ({
+              platform: `${item.platform?.os}/${item.platform?.architecture}`, platform_digest: item.digest,
+            })).sort((a, b) => a.platform.localeCompare(b.platform)), proof.platforms,
+              "Latest manifest differs from the smoke-tested publication.");
+            const current = (await github.rest.repos.getLatestRelease(context.repo)).data;
+            const source = (await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${release.tag_name}` })).data;
+            if (current.id !== release.id || current.tag_name !== release.tag_name || current.draft || current.prerelease ||
+              !current.published_at || source.sha !== commit.sha) {
+              core.notice("Latest release changed during inspection; a subsequent publication will reconcile it.");
+              return;
+            }
+            await exec.exec("docker", ["buildx", "imagetools", "create", "--tag", `${IMAGE}:latest`, `${IMAGE}@${combined.digest}`]);
+            assert.equal((await inspect(`${IMAGE}:latest`)).digest, combined.digest);
+            await core.summary.addHeading("Latest promotion receipt").addCodeBlock(JSON.stringify({
+              release_id: release.id, version, source_sha: commit.sha, digest: combined.digest,
+              run_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            }, null, 2), "json").write();

@@ -1,0 +1,33 @@
+name: Repository maintenance
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [synchronize, closed]
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      issue-number:
+        description: Existing issue to enroll or resume
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  maintenance:
+    uses: markhuangai/opensource-repo-manager/.github/workflows/maintenance.yml@REPLACE_WITH_FULL_COMMIT_SHA
+    with:
+      runtime-image: ghcr.io/markhuangai/opensource-repo-manager@sha256:REPLACE_WITH_64_HEX_DIGEST
+      runner: ubuntu-24.04
+      issue-number: ${{ inputs.issue-number || '' }}
+    secrets:
+      ORM_GITHUB_TOKEN: ${{ secrets.ORM_GITHUB_TOKEN }}
+      ORM_PROXY_KEY: ${{ secrets.ORM_PROXY_KEY }}
+      ORM_SESSION_KEY: ${{ secrets.ORM_SESSION_KEY }}

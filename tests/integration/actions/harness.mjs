@@ -1,9 +1,13 @@
+import { performance } from "node:perf_hooks";
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 
 export async function runActionsTests({
   sdk,
+  group = "all",
+  cpuSet,
   manager,
   upstreamName,
   data,
@@ -21,9 +25,16 @@ export async function runActionsTests({
 }) {
   const node = "/opt/orm-runtime/bin/node";
   const completed = [];
+  const started = new Map();
+  const resourceSamples = [];
+  const checkpointTimings = [];
+  let lastSample = 0;
   let resets = 0;
   const config = JSON.parse(
     await readFile(join(directory, "configuration.json"), "utf8"),
+  );
+  const toolchainCache = JSON.parse(
+    await readFile(join(directory, "toolchain-cache.json"), "utf8"),
   );
   const upstream = (path, method = "GET") =>
     docker([
@@ -53,10 +64,38 @@ export async function runActionsTests({
     }).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
   }
   function launch(name, number, fresh = false, options = {}) {
+    started.set(name, performance.now());
     upstream(
       `/select?issue=${number}&fresh=${fresh}&session=${options.session ?? "seed"}`,
       "POST",
     );
+    if (Number.isSafeInteger(number) && number > 0) {
+      const cache = `${name}-cache`;
+      register("container", cache);
+      docker([
+        "run",
+        "--rm",
+        "--name",
+        cache,
+        "--label",
+        `${label}=${id}`,
+        "--network",
+        "none",
+        "--no-healthcheck",
+        "--mount",
+        `type=volume,src=${fresh ? freshData : data},dst=/data`,
+        "--mount",
+        `type=bind,src=${directory},dst=/fixture,readonly`,
+        "--mount",
+        `type=bind,src=${sessionFixtures},dst=/actions-fixtures,readonly`,
+        "--entrypoint",
+        node,
+        image,
+        "/actions-fixtures/toolchain-cache.mjs",
+        "seed",
+        String(number),
+      ]);
+    }
     register("container", name);
     docker([
       "run",
@@ -67,6 +106,8 @@ export async function runActionsTests({
       `${label}=${id}`,
       "--network",
       net,
+      "--cpuset-cpus",
+      cpuSet,
       "--no-healthcheck",
       "--mount",
       `type=volume,src=${fresh ? freshData : data},dst=/data`,
@@ -77,28 +118,91 @@ export async function runActionsTests({
       "--env",
       `ORM_SESSION_KEY=${config.session_key}`,
       ...runtimeEnvironment(fresh),
+      ...(options.controller
+        ? [
+            "--env",
+            `ORM_GITHUB_TOKEN=${config.github.token}`,
+            "--env",
+            `ORM_PROXY_KEY=${config.proxy.key}`,
+          ]
+        : []),
       ...Object.entries(options.environment ?? {}).flatMap(([key, value]) => [
         "--env",
         `${key}=${value}`,
       ]),
       "--mount",
       `type=bind,src=${sessionFixtures},dst=/actions-fixtures,readonly`,
-      ...["config", "skills", "prompts"].flatMap((name) => [
-        "--mount",
-        `type=bind,src=${join(directory, name === "prompts" && options.changedPrompts ? "prompts-incompatible" : name)},dst=/${name},readonly`,
-      ]),
+      ...(options.controller ? [] : ["config", "skills", "prompts"]).flatMap(
+        (name) => [
+          "--mount",
+          `type=bind,src=${join(directory, name === "prompts" && options.changedPrompts ? "prompts-incompatible" : name)},dst=/${name},readonly`,
+        ],
+      ),
       "--entrypoint",
       "/usr/bin/tini",
       image,
       "--",
       node,
-      options.session
-        ? "/actions-fixtures/session.mjs"
-        : "/opt/orm/app/dist/actions/main.js",
-      String(number),
+      options.controller
+        ? "/opt/orm/app/dist/actions/controller.js"
+        : options.session
+          ? "/actions-fixtures/session.mjs"
+          : "/opt/orm/app/dist/actions/main.js",
+      ...(options.controller ? ["run", String(number)] : [String(number)]),
       ...(options.session ? [options.session] : []),
     ]);
-    assert.deepEqual(inspect(name).Config.Healthcheck.Test, ["NONE"]);
+    const launched = inspect(name);
+    assert.deepEqual(launched.Config.Healthcheck.Test, ["NONE"]);
+    assert.equal(launched.HostConfig.CpusetCpus, cpuSet);
+  }
+  async function route(event, payload, issueNumber = "") {
+    const path = join(sessionFixtures, `event-${randomUUID()}.json`);
+    await writeFile(
+      path,
+      JSON.stringify({
+        repository: { id: 42, full_name: "owner/repo" },
+        ...payload,
+      }),
+    );
+    const name = `${manager}-route-${resets++}`;
+    register("container", name);
+    const value = docker([
+      "run",
+      "--rm",
+      "--name",
+      name,
+      "--label",
+      `${label}=${id}`,
+      "--network",
+      net,
+      "--no-healthcheck",
+      "--mount",
+      `type=bind,src=${path},dst=/event.json,readonly`,
+      "--mount",
+      `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
+      "--env",
+      "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+      "--env",
+      `ORM_GITHUB_TOKEN=${config.github.token}`,
+      "--env",
+      `ORM_SESSION_KEY=${config.session_key}`,
+      "--env",
+      "GITHUB_REPOSITORY=owner/repo",
+      "--env",
+      `GITHUB_EVENT_NAME=${event}`,
+      "--env",
+      "GITHUB_REF=refs/heads/main",
+      "--env",
+      "GITHUB_EVENT_PATH=/event.json",
+      "--env",
+      `ORM_ISSUE_NUMBER=${issueNumber}`,
+      "--entrypoint",
+      node,
+      image,
+      "/opt/orm/app/dist/actions/controller.js",
+      "route",
+    ]);
+    return JSON.parse(value).issues;
   }
   function output(name) {
     const logs = result(["logs", name]);
@@ -121,7 +225,26 @@ export async function runActionsTests({
   }
   async function finished(name, expected, reason) {
     await waitUntil(
-      () => !inspect(name).State.Running,
+      () => {
+        const running = inspect(name).State.Running;
+        if (running && Date.now() - lastSample >= 30000) {
+          lastSample = Date.now();
+          const sample = docker([
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{json .}}",
+            name,
+          ]);
+          if (sample)
+            resourceSamples.push({
+              scenario: name.slice(manager.length + 1),
+              observed_at: new Date().toISOString(),
+              ...JSON.parse(sample),
+            });
+        }
+        return !running;
+      },
       `Actions ${sdk}/${name} did not exit`,
       300_000,
     );
@@ -146,134 +269,230 @@ export async function runActionsTests({
     );
     assert.equal(inspect(name).State.OOMKilled, false);
     assert.equal(inspect(name).State.Pid, 0);
-    completed.push({ id: name.slice(manager.length + 1), outcome: expected });
+    completed.push({
+      id: name.slice(manager.length + 1),
+      outcome: expected,
+      duration_ms: performance.now() - started.get(name),
+    });
     return outcome;
   }
-  const first = `${manager}-publication`;
-  launch(first, 1);
-  const waiting = await finished(first, "waiting", "remote_checks");
-  assert(waiting.pull_number > 0);
-  let evidence = proof();
-  assert.equal(evidence.pulls.length, 1);
-  assert.equal(evidence.pulls[0].draft, false);
-  assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
-  for (const task of [
-    "implementation_change",
-    "implementation_audit",
-    "external_output_review",
-  ])
-    assert(evidence.requests.includes(task), `Missing ${task}`);
-  assert(evidence.runs.every((run) => run.finished_at !== null));
-  assert.equal(evidence.leases, 0);
-  assert.equal(
-    evidence.notifications.length +
-      evidence.discord.length +
-      evidence.smtp.length,
-    0,
-  );
-  upstream("/checks", "POST");
-  const readyName = `${manager}-ready`;
-  launch(readyName, 1);
-  const ready = await finished(readyName, "ready", "human_review");
-  assert.equal(ready.pull_number, waiting.pull_number);
-  assert.equal(ready.head_sha, waiting.head_sha);
-  assert.equal(proof().pulls.length, 1);
+  function mutateState(sql, number = 2, persist = true) {
+    const start = performance.now();
+    const name = `${manager}-seed-${completed.length}`;
+    register("container", name);
+    docker([
+      "run",
+      "--rm",
+      "--name",
+      name,
+      "--label",
+      `${label}=${id}`,
+      "--network",
+      net,
+      "--mount",
+      `type=volume,src=${data},dst=/data`,
+      "--mount",
+      `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
+      "--env",
+      "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+      "--env",
+      `ORM_SESSION_KEY=${config.session_key}`,
+      ...runtimeEnvironment(),
+      ...["config", "skills", "prompts"].flatMap((name) => [
+        "--mount",
+        `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
+      ]),
+      "--entrypoint",
+      node,
+      image,
+      "--input-type=module",
+      "-e",
+      "import {Store} from '/opt/orm/app/dist/repositories/store.js'; import {ActionsState} from '/opt/orm/app/dist/actions/persistence.js'; import {ActionsArtifacts} from '/opt/orm/app/dist/actions/artifacts.js'; import {GitHubArtifacts} from '/opt/orm/app/dist/adapters/github/artifacts.js'; import {loadProtectedActionsConfiguration} from '/opt/orm/app/dist/config/load.js'; const root='/data/actions/'+process.argv[1]; const store=new Store(root+'/state/manager.sqlite'); const signal=AbortSignal.timeout(30000); if(process.argv[3]==='true'){const loaded=await loadProtectedActionsConfiguration(); const artifacts=new ActionsArtifacts(loaded.actions,loaded.snapshot,loaded.secrets,root+'/runtime',new GitHubArtifacts(loaded.actions,loaded.secrets)); await ActionsState.open(store,loaded.snapshot,loaded.secrets,Number(process.argv[1]),signal,{artifacts});} store.db.exec(process.argv[2]); if(process.argv[3]==='true') await store.checkpoint(signal); store.close();",
+      String(number),
+      sql,
+      String(persist),
+    ]);
+    checkpointTimings.push({
+      issue: number,
+      persist,
+      duration_ms: performance.now() - start,
+    });
+  }
+  function durable(number) {
+    const rows = proof().comments.find(([issue]) => issue === number)[1];
+    const canonical = rows.filter((row) =>
+      row.body.includes("<!-- orm:task-state:"),
+    );
+    assert.equal(canonical.length, 1, "Duplicated canonical state");
+    const row = canonical[0];
+    const match = /<!-- orm:task-state:v1:([A-Za-z0-9_-]+):/.exec(row.body);
+    const state = JSON.parse(
+      Buffer.from(match[1], "base64url").toString("utf8"),
+    );
+    assert(Buffer.byteLength(row.body) <= 60 * 1024);
+    assert(Buffer.byteLength(JSON.stringify(state)) <= 32 * 1024);
+    for (const value of [
+      config.github.token,
+      config.proxy.key,
+      config.session_key,
+      "OPERATOR_SYSTEM_CANARY",
+      "OPERATOR_SKILL_CANARY",
+    ])
+      assert(
+        !JSON.stringify(state).includes(value),
+        "Private material entered durable state",
+      );
+    return state;
+  }
+  function discardTask(number, fresh) {
+    upstream(`/select?issue=${number}&fresh=${fresh}`, "POST");
+    upstream("/forget-local", "POST");
+    const name = `${manager}-discard-${resets++}`;
+    register("container", name);
+    docker([
+      "run",
+      "--rm",
+      "--name",
+      name,
+      "--label",
+      `${label}=${id}`,
+      "--mount",
+      `type=volume,src=${fresh ? freshData : data},dst=/data`,
+      "--entrypoint",
+      node,
+      image,
+      "--input-type=module",
+      "-e",
+      "import {rm,access} from 'node:fs/promises'; const path='/data/actions/'+process.argv[1]; await rm(path,{recursive:true,force:true}); await access(path).then(()=>{throw Error('Task storage survived')},error=>{if(error.code!=='ENOENT')throw error});",
+      String(number),
+    ]);
+  }
+  if (group === "all" || group === "lifecycle") {
+    const first = `${manager}-publication`;
+    launch(first, 1);
+    const waiting = await finished(first, "waiting", "remote_checks");
+    assert(waiting.pull_number > 0);
+    let evidence = proof();
+    assert.equal(evidence.pulls.length, 1);
+    assert.equal(evidence.pulls[0].draft, false);
+    assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
+    for (const task of [
+      "implementation_change",
+      "implementation_audit",
+      "external_output_review",
+    ])
+      assert(evidence.requests.includes(task), `Missing ${task}`);
+    assert(evidence.runs.every((run) => run.finished_at !== null));
+    assert.equal(evidence.leases, 0);
+    assert.equal(
+      evidence.notifications.length +
+        evidence.discord.length +
+        evidence.smtp.length,
+      0,
+    );
+    upstream("/checks", "POST");
+    const readyName = `${manager}-ready`;
+    launch(readyName, 1);
+    const ready = await finished(readyName, "ready", "human_review");
+    assert.equal(ready.pull_number, waiting.pull_number);
+    assert.equal(ready.head_sha, waiting.head_sha);
+    assert.equal(proof().pulls.length, 1);
 
-  const retryAt = Date.now() + 600_000;
-  mutateState(
-    `UPDATE pr_monitors SET state='queued', content=json_set(content,
+    const retryAt = Date.now() + 600_000;
+    mutateState(
+      `UPDATE pr_monitors SET state='queued', content=json_set(content,
     '$.stage','queued','$.retry_at',${retryAt})`,
-    1,
-  );
-  const beforeMonitorRetry = proof();
-  launch(`${manager}-monitor-backoff`, 1);
-  const monitorDeferred = await finished(
-    `${manager}-monitor-backoff`,
-    "waiting",
-    "retry_scheduled",
-  );
-  assert.equal(monitorDeferred.retry_at, retryAt);
-  assert.equal(monitorDeferred.pull_number, waiting.pull_number);
-  assert.equal(
-    proof().requests.length,
-    0,
-    "Deferred monitor started model work",
-  );
-  assert.equal(
-    proof().mutations.filter((kind) => kind !== "comment").length,
-    beforeMonitorRetry.mutations.filter((kind) => kind !== "comment").length,
-  );
-  assert(
-    !proof()
-      .github_requests.slice(beforeMonitorRetry.github_requests.length)
-      .some(({ path }) => /\/pulls\/\d+\//.test(path) || path === "/graphql"),
-    "Deferred monitor read remote review state",
-  );
-  mutateState(
-    "UPDATE pr_monitors SET state='ready', content=json_set(content,'$.stage','ready','$.retry_at',0)",
-    1,
-  );
-  mutateState(
-    `UPDATE publication_operations SET status='uncertain', content=json_set(content,
+      1,
+    );
+    const beforeMonitorRetry = proof();
+    launch(`${manager}-monitor-backoff`, 1);
+    const monitorDeferred = await finished(
+      `${manager}-monitor-backoff`,
+      "waiting",
+      "retry_scheduled",
+    );
+    assert.equal(monitorDeferred.retry_at, retryAt);
+    assert.equal(monitorDeferred.pull_number, waiting.pull_number);
+    assert.equal(
+      proof().requests.length,
+      0,
+      "Deferred monitor started model work",
+    );
+    assert.equal(
+      proof().mutations.filter((kind) => kind !== "comment").length,
+      beforeMonitorRetry.mutations.filter((kind) => kind !== "comment").length,
+    );
+    assert(
+      !proof()
+        .github_requests.slice(beforeMonitorRetry.github_requests.length)
+        .some(({ path }) => /\/pulls\/\d+\//.test(path) || path === "/graphql"),
+      "Deferred monitor read remote review state",
+    );
+    mutateState(
+      "UPDATE pr_monitors SET state='ready', content=json_set(content,'$.stage','ready','$.retry_at',0)",
+      1,
+    );
+    mutateState(
+      `UPDATE publication_operations SET status='uncertain', content=json_set(content,
     '$.status','uncertain','$.retry_at',${retryAt},'$.retry_pending',json('true'),
     '$.steps[' || (json_array_length(content,'$.steps') - 1) || '].state','uncertain')
     WHERE json_extract(content,'$.proposal.kind')='change'`,
-    1,
-  );
-  const mutations = proof().mutations.filter(
-    (kind) => kind !== "comment",
-  ).length;
-  launch(`${manager}-publication-backoff`, 1);
-  const deferred = await finished(
-    `${manager}-publication-backoff`,
-    "waiting",
-    "retry_scheduled",
-  );
-  assert.equal(deferred.retry_at, retryAt);
-  assert.equal(deferred.pull_number, waiting.pull_number);
-  assert.equal(deferred.head_sha, waiting.head_sha);
-  assert.equal(
-    proof().mutations.filter((kind) => kind !== "comment").length,
-    mutations,
-  );
-  assert.equal(
-    proof().requests.length,
-    0,
-    "Deferred publication started model work",
-  );
+      1,
+    );
+    const mutations = proof().mutations.filter(
+      (kind) => kind !== "comment",
+    ).length;
+    launch(`${manager}-publication-backoff`, 1);
+    const deferred = await finished(
+      `${manager}-publication-backoff`,
+      "waiting",
+      "retry_scheduled",
+    );
+    assert.equal(deferred.retry_at, retryAt);
+    assert.equal(deferred.pull_number, waiting.pull_number);
+    assert.equal(deferred.head_sha, waiting.head_sha);
+    assert.equal(
+      proof().mutations.filter((kind) => kind !== "comment").length,
+      mutations,
+    );
+    assert.equal(
+      proof().requests.length,
+      0,
+      "Deferred publication started model work",
+    );
 
-  for (const [number, expected, reason] of [
-    [2, "waiting", "needs_information"],
-    [3, "out_of_scope", "manual_feature"],
-    [4, "no_fix", "no_fix"],
-    [5, "closed", "issue_closed"],
-    [6, "blocked", "investigation_blocked"],
-  ]) {
-    const name = `${manager}-${reason}`;
-    launch(name, number);
-    const outcome = await finished(name, expected, reason);
-    assert.equal(outcome.issue_number, number);
-    evidence = proof();
-    assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
-    assert(evidence.runs.every((run) => run.finished_at !== null));
-    assert.equal(evidence.leases, 0);
-    assert.equal(evidence.pulls.length, 1);
-  }
+    for (const [number, expected, reason] of [
+      [2, "waiting", "needs_information"],
+      [3, "out_of_scope", "manual_feature"],
+      [4, "no_fix", "no_fix"],
+      [5, "closed", "issue_closed"],
+      [6, "blocked", "investigation_blocked"],
+    ]) {
+      const name = `${manager}-${reason}`;
+      launch(name, number);
+      const outcome = await finished(name, expected, reason);
+      assert.equal(outcome.issue_number, number);
+      evidence = proof();
+      assert.equal(evidence.errors.length, 0, JSON.stringify(evidence.errors));
+      assert(evidence.runs.every((run) => run.finished_at !== null));
+      assert.equal(evidence.leases, 0);
+      assert.equal(evidence.pulls.length, 1);
+    }
 
-  const cancelling = `${manager}-cancellation`;
-  launch(cancelling, 7);
-  await waitUntil(
-    () => proof().held,
-    "Actions coding worker did not reach the provider",
-    120_000,
-  );
-  docker([
-    "exec",
-    cancelling,
-    node,
-    "--input-type=module",
-    "-e",
-    `
+    const cancelling = `${manager}-cancellation`;
+    launch(cancelling, 7);
+    await waitUntil(
+      () => proof().held,
+      "Actions coding worker did not reach the provider",
+      120_000,
+    );
+    docker([
+      "exec",
+      cancelling,
+      node,
+      "--input-type=module",
+      "-e",
+      `
     import assert from 'node:assert/strict';
     import fs from 'node:fs';
     import { execFileSync } from 'node:child_process';
@@ -309,990 +528,1122 @@ export async function runActionsTests({
         assert(address.endsWith('7F') || address === '00000000000000000000000001000000', 'Non-loopback listener');
       }
   `,
-  ]);
-  upstream("/reject-checkpoint", "POST");
-  docker(["kill", "--signal", "SIGTERM", cancelling]);
-  const cancelled = await finished(cancelling, "failed", "cancelled");
-  assert.equal(
-    cancelled.checkpoint_failed,
-    true,
-    "Failed final checkpoint was not reported",
-  );
-  assert.equal(cancelled.repository, "owner/repo");
-  assert.equal(cancelled.issue_number, 7);
-  assert(cancelled.job_id > 0);
-  assert(cancelled.revision > 0);
-  upstream("/release", "POST");
-  evidence = proof();
-  assert(evidence.runs.length > 0);
-  assert(
-    evidence.runs.every((run) => run.finished_at !== null),
-    "Interrupted run has no cleanup receipt",
-  );
-  assert.equal(evidence.leases, 0);
+    ]);
+    upstream("/reject-checkpoint", "POST");
+    docker(["kill", "--signal", "SIGTERM", cancelling]);
+    const cancelled = await finished(cancelling, "failed", "cancelled");
+    assert.equal(
+      cancelled.checkpoint_failed,
+      true,
+      "Failed final checkpoint was not reported",
+    );
+    assert.equal(cancelled.repository, "owner/repo");
+    assert.equal(cancelled.issue_number, 7);
+    assert(cancelled.job_id > 0);
+    assert(cancelled.revision > 0);
+    upstream("/release", "POST");
+    evidence = proof();
+    assert(evidence.runs.length > 0);
+    assert(
+      evidence.runs.every((run) => run.finished_at !== null),
+      "Interrupted run has no cleanup receipt",
+    );
+    assert.equal(evidence.leases, 0);
 
-  assert(
-    durable(7).active,
-    "Failed cancellation checkpoint must retain the conservative active reservation",
-  );
+    assert(
+      durable(7).active,
+      "Failed cancellation checkpoint must retain the conservative active reservation",
+    );
 
-  function mutateState(sql, number = 2, persist = true) {
-    const name = `${manager}-seed-${completed.length}`;
-    register("container", name);
-    docker([
-      "run",
-      "--rm",
-      "--name",
-      name,
-      "--label",
-      `${label}=${id}`,
-      "--network",
-      net,
-      "--mount",
-      `type=volume,src=${data},dst=/data`,
-      "--mount",
-      `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
-      "--env",
-      "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
-      "--env",
-      `ORM_SESSION_KEY=${config.session_key}`,
-      ...runtimeEnvironment(),
-      ...["config", "skills", "prompts"].flatMap((name) => [
+    mutateState("UPDATE jobs SET phase='unrecognized'", 2, false);
+    launch(`${manager}-no-progress`, 2);
+    await finished(`${manager}-no-progress`, "blocked", "state_invalid");
+    mutateState("UPDATE jobs SET issue_number=8,issue_id=1008", 2, false);
+    launch(`${manager}-foreign-state`, 2);
+    await finished(`${manager}-foreign-state`, "failed", "task_state_invalid");
+    for (const [number, reason] of [
+      [0, "arguments_invalid"],
+      [999, "intake_failed"],
+    ]) {
+      const name = `${manager}-${reason}`;
+      launch(name, number);
+      await finished(name, "failed", reason);
+    }
+    const readyState = durable(1);
+    assert.equal(readyState.pending.status, "uncertain");
+    const publicationCount = proof().mutations.filter(
+      (kind) => kind !== "comment",
+    ).length;
+    launch(`${manager}-older-artifact-publication-authority`, 1, true);
+    const importedOwnership = await finished(
+      `${manager}-older-artifact-publication-authority`,
+      "waiting",
+      "retry_scheduled",
+    );
+    assert.equal(importedOwnership.pull_number, readyState.pull.number);
+    assert.equal(importedOwnership.head_sha, readyState.pull.head);
+    assert.equal(importedOwnership.retry_at, readyState.pending.retry_at);
+    assert.deepEqual(durable(1).budget, readyState.budget);
+    assert.deepEqual(durable(1).pull, readyState.pull);
+    assert.equal(durable(1).pending.status, "uncertain");
+    assert.equal(proof().requests.length, 0);
+    assert.equal(
+      proof().mutations.filter((kind) => kind !== "comment").length,
+      publicationCount,
+    );
+    const inspection = `${manager}-inspect-import`;
+    register("container", inspection);
+    const restoredRuns = Number(
+      docker([
+        "run",
+        "--rm",
+        "--name",
+        inspection,
+        "--label",
+        `${label}=${id}`,
         "--mount",
-        `type=bind,src=${join(directory, name)},dst=/${name},readonly`,
+        `type=volume,src=${freshData},dst=/data,readonly`,
+        "--entrypoint",
+        node,
+        image,
+        "--input-type=module",
+        "-e",
+        "import assert from 'node:assert/strict'; import {copyFileSync,existsSync} from 'node:fs'; import Database from 'better-sqlite3'; process.umask(0o077); const source='/data/actions/1/state/manager.sqlite'; assert(!existsSync(source+'-wal')); copyFileSync(source,'/tmp/checkpoint.sqlite'); const db=new Database('/tmp/checkpoint.sqlite',{readonly:true,fileMustExist:true}); console.log(db.prepare('SELECT count(*) AS count FROM agent_runs').get().count); db.close();",
       ]),
-      "--entrypoint",
-      node,
-      image,
-      "--input-type=module",
-      "-e",
-      "import {Store} from '/opt/orm/app/dist/repositories/store.js'; import {ActionsState} from '/opt/orm/app/dist/actions/persistence.js'; import {ActionsArtifacts} from '/opt/orm/app/dist/actions/artifacts.js'; import {GitHubArtifacts} from '/opt/orm/app/dist/adapters/github/artifacts.js'; import {loadProtectedActionsConfiguration} from '/opt/orm/app/dist/config/load.js'; const root='/data/actions/'+process.argv[1]; const store=new Store(root+'/state/manager.sqlite'); const signal=AbortSignal.timeout(30000); if(process.argv[3]==='true'){const loaded=await loadProtectedActionsConfiguration(); const artifacts=new ActionsArtifacts(loaded.actions,loaded.snapshot,loaded.secrets,root+'/runtime',new GitHubArtifacts(loaded.actions,loaded.secrets)); await ActionsState.open(store,loaded.snapshot,loaded.secrets,Number(process.argv[1]),signal,{artifacts});} store.db.exec(process.argv[2]); if(process.argv[3]==='true') await store.checkpoint(signal); store.close();",
-      String(number),
-      sql,
-      String(persist),
-    ]);
-  }
-  mutateState("UPDATE jobs SET phase='unrecognized'", 2, false);
-  launch(`${manager}-no-progress`, 2);
-  await finished(`${manager}-no-progress`, "blocked", "state_invalid");
-  mutateState("UPDATE jobs SET issue_number=8,issue_id=1008", 2, false);
-  launch(`${manager}-foreign-state`, 2);
-  await finished(`${manager}-foreign-state`, "failed", "task_state_invalid");
-  for (const [number, reason] of [
-    [0, "arguments_invalid"],
-    [999, "intake_failed"],
-  ]) {
-    const name = `${manager}-${reason}`;
-    launch(name, number);
-    await finished(name, "failed", reason);
-  }
-  function durable(number) {
-    const rows = proof().comments.find(([issue]) => issue === number)[1];
-    const canonical = rows.filter((row) =>
-      row.body.includes("<!-- orm:task-state:"),
     );
-    assert.equal(canonical.length, 1, "Duplicated canonical state");
-    const row = canonical[0];
-    const match = /<!-- orm:task-state:v1:([A-Za-z0-9_-]+):/.exec(row.body);
-    const state = JSON.parse(
-      Buffer.from(match[1], "base64url").toString("utf8"),
+    assert(restoredRuns > 0, "Older checkpoint database was not imported");
+    assert(
+      proof().artifacts.requests.some(
+        (item) =>
+          item.path ===
+          `/repos/owner/repo/actions/artifacts/${readyState.session_artifact.artifact_id}/zip`,
+      ),
     );
-    assert(Buffer.byteLength(row.body) <= 60 * 1024);
-    assert(Buffer.byteLength(JSON.stringify(state)) <= 32 * 1024);
-    for (const value of [
-      config.github.token,
-      config.proxy.key,
-      config.session_key,
-      "OPERATOR_SYSTEM_CANARY",
-      "OPERATOR_SKILL_CANARY",
-    ])
-      assert(
-        !JSON.stringify(state).includes(value),
-        "Private material entered durable state",
-      );
-    return state;
-  }
-  const readyState = durable(1);
-  assert.equal(readyState.pending.status, "uncertain");
-  const publicationCount = proof().mutations.filter(
-    (kind) => kind !== "comment",
-  ).length;
-  launch(`${manager}-older-artifact-publication-authority`, 1, true);
-  const importedOwnership = await finished(
-    `${manager}-older-artifact-publication-authority`,
-    "waiting",
-    "retry_scheduled",
-  );
-  assert.equal(importedOwnership.pull_number, readyState.pull.number);
-  assert.equal(importedOwnership.head_sha, readyState.pull.head);
-  assert.equal(importedOwnership.retry_at, readyState.pending.retry_at);
-  assert.deepEqual(durable(1).budget, readyState.budget);
-  assert.deepEqual(durable(1).pull, readyState.pull);
-  assert.equal(durable(1).pending.status, "uncertain");
-  assert.equal(proof().requests.length, 0);
-  assert.equal(
-    proof().mutations.filter((kind) => kind !== "comment").length,
-    publicationCount,
-  );
-  const inspection = `${manager}-inspect-import`;
-  register("container", inspection);
-  const restoredRuns = Number(
-    docker([
-      "run",
-      "--rm",
-      "--name",
-      inspection,
-      "--label",
-      `${label}=${id}`,
-      "--mount",
-      `type=volume,src=${freshData},dst=/data,readonly`,
-      "--entrypoint",
-      node,
-      image,
-      "--input-type=module",
-      "-e",
-      "import assert from 'node:assert/strict'; import {copyFileSync,existsSync} from 'node:fs'; import Database from 'better-sqlite3'; process.umask(0o077); const source='/data/actions/1/state/manager.sqlite'; assert(!existsSync(source+'-wal')); copyFileSync(source,'/tmp/checkpoint.sqlite'); const db=new Database('/tmp/checkpoint.sqlite',{readonly:true,fileMustExist:true}); console.log(db.prepare('SELECT count(*) AS count FROM agent_runs').get().count); db.close();",
-    ]),
-  );
-  assert(restoredRuns > 0, "Older checkpoint database was not imported");
-  assert(
-    proof().artifacts.requests.some(
-      (item) =>
-        item.path ===
-        `/repos/owner/repo/actions/artifacts/${readyState.session_artifact.artifact_id}/zip`,
-    ),
-  );
-  discardTask(1, true);
-  assert(readyState.budget.wait_ms > 0, "CI waiting was not accounted");
-  assert(
-    readyState.session_artifact,
-    "Production entrypoint did not publish a session checkpoint",
-  );
-  upstream(
-    `/artifact-fault?id=${readyState.session_artifact.artifact_id}&kind=expired`,
-    "POST",
-  );
-  launch(`${manager}-fresh-owned-pr`, 1, true);
-  const owned = await finished(
-    `${manager}-fresh-owned-pr`,
-    "blocked",
-    "recovery_evidence_missing",
-  );
-  assert.equal(owned.pull_number, waiting.pull_number);
-  assert.equal(durable(1).task_id, readyState.task_id);
-  assert.deepEqual(durable(1).budget, readyState.budget);
-  assert.equal(proof().requests.length, 0);
-  assert.equal(owned.session_recovery, "expired_or_deleted");
-
-  const noFixState = durable(4);
-  launch(`${manager}-fresh-terminal`, 4, true);
-  await finished(`${manager}-fresh-terminal`, "no_fix", "no_fix");
-  assert.equal(durable(4).task_id, noFixState.task_id);
-  assert.deepEqual(durable(4).budget, noFixState.budget);
-  assert.equal(proof().requests.length, 0);
-
-  const questionState = durable(2);
-  launch(`${manager}-fresh-question`, 2, true);
-  await finished(`${manager}-fresh-question`, "waiting", "needs_information");
-  assert.deepEqual(durable(2).question, questionState.question);
-  assert.deepEqual(durable(2).budget, questionState.budget);
-  assert.equal(proof().requests.length, 0);
-
-  const unpublished = `${manager}-unpublished-interruption`;
-  launch(unpublished, 9);
-  try {
-    await waitUntil(
-      () => {
-        if (!inspect(unpublished).State.Running)
-          assert.fail(
-            `Unpublished invocation exited: ${JSON.stringify(output(unpublished).outcome)}`,
-          );
-        return proof().held;
-      },
-      "Unpublished implementation did not reach the held provider",
-      300000,
+    discardTask(1, true);
+    assert(readyState.budget.wait_ms > 0, "CI waiting was not accounted");
+    assert(
+      readyState.session_artifact,
+      "Production entrypoint did not publish a session checkpoint",
     );
-  } catch (error) {
-    const { workflow, runs, requests } = proof();
-    throw new Error(
-      `${error.message}; workflow ${JSON.stringify({ workflow, runs, requests })}`,
-      { cause: error },
-    );
-  }
-  assert(durable(9).scope, "Frozen scope was not saved before coding");
-  docker(["kill", "--signal", "SIGTERM", unpublished]);
-  await finished(unpublished, "failed", "cancelled");
-  upstream("/release", "POST");
-  const interrupted = durable(9);
-  const unpublishedAuthority = {
-    budget: interrupted.budget,
-    pull: interrupted.pull,
-    branch: interrupted.branch,
-    reference: interrupted.session_artifact,
-  };
-  launch(`${manager}-artifact-changed-configuration`, 9, true, {
-    changedPrompts: true,
-  });
-  await finished(
-    `${manager}-artifact-changed-configuration`,
-    "blocked",
-    "session_incompatible",
-  );
-  assert.equal(proof().requests.length, 0);
-  assert.deepEqual(
-    {
-      budget: durable(9).budget,
-      pull: durable(9).pull,
-      branch: durable(9).branch,
-      reference: durable(9).session_artifact,
-    },
-    unpublishedAuthority,
-  );
-  discardTask(9, true);
-  upstream("/advance-main", "POST");
-  launch(`${manager}-artifact-changed-source`, 9, true);
-  await finished(
-    `${manager}-artifact-changed-source`,
-    "blocked",
-    "state_incompatible",
-  );
-  assert.equal(proof().requests.length, 0);
-  assert.deepEqual(
-    {
-      budget: durable(9).budget,
-      pull: durable(9).pull,
-      branch: durable(9).branch,
-      reference: durable(9).session_artifact,
-    },
-    unpublishedAuthority,
-  );
-  upstream(`/restore-main?sha=${interrupted.job.source.sha}`, "POST");
-  discardTask(9, true);
-  assert(
-    interrupted.session_artifact,
-    "Graceful interruption lost completed investigation/bootstrap checkpoints",
-  );
-  discardTask(9, false);
-  launch(`${manager}-fresh-unpublished`, 9, true);
-  await finished(`${manager}-fresh-unpublished`, "waiting", "remote_checks");
-  const resumed = durable(9);
-  assert.equal(resumed.task_id, interrupted.task_id);
-  assert.equal(resumed.scope_digest, interrupted.scope_digest);
-  assert.equal(resumed.findings.objective, interrupted.findings.objective);
-  assert.equal(resumed.scope.objective, interrupted.scope.objective);
-  assert(resumed.budget.model_requests > interrupted.budget.model_requests);
-  assert(resumed.budget.active_ms >= interrupted.budget.active_ms);
-  for (const task of ["implementation_audit", "external_output_review"])
-    assert(proof().requests.includes(task));
-  assert(
-    !proof().requests.includes("investigation_result"),
-    "Restored completed investigation was rerun",
-  );
-  assert.equal(
-    proof().reconstructed,
-    0,
-    "Rebuilt evidence must support retained continuation",
-  );
-  upstream("/advance-main", "POST");
-  upstream("/checks?issue=9", "POST");
-  launch(`${manager}-rebuilt-retained-ready`, 9, true);
-  await finished(`${manager}-rebuilt-retained-ready`, "ready", "human_review");
-
-  launch(`${manager}-lost-pull-response`, 10);
-  await finished(
-    `${manager}-lost-pull-response`,
-    "blocked",
-    "state_write_uncertain",
-  );
-  const uncertain = durable(10),
-    count = proof().pulls.length;
-  assert(
-    uncertain.pending.steps.some(
-      (step) => step.kind === "pull" && step.state === "dispatching",
-    ),
-  );
-  launch(`${manager}-fresh-lost-pull`, 10, true);
-  const recovered = await finished(
-    `${manager}-fresh-lost-pull`,
-    "waiting",
-    "remote_checks",
-  );
-  assert(recovered.pull_number > 0);
-  assert.equal(proof().pulls.length, count);
-  assert.equal(
-    durable(10).budget.repair_cycles,
-    uncertain.budget.repair_cycles,
-  );
-  assert.equal(durable(10).pending.status, "confirmed");
-  assert(proof().requests.includes("implementation_audit"));
-  assert(durable(10).budget.model_requests > uncertain.budget.model_requests);
-
-  upstream("/merge-owned?issue=9", "POST");
-  launch(`${manager}-retained-closed-after-main-advances`, 9, true);
-  await finished(
-    `${manager}-retained-closed-after-main-advances`,
-    "closed",
-    "issue_closed",
-  );
-  upstream("/merge-owned?issue=1", "POST");
-  launch(`${manager}-closed-after-main-advances`, 1, true);
-  await finished(
-    `${manager}-closed-after-main-advances`,
-    "closed",
-    "issue_closed",
-  );
-
-  upstream("/corrupt-state?issue=3", "POST");
-  launch(`${manager}-edited-comment`, 3, true);
-  await finished(`${manager}-edited-comment`, "blocked", "state_invalid");
-  upstream("/corrupt-state?issue=4&delete=true", "POST");
-  launch(`${manager}-missing-comment`, 4, true);
-  await finished(`${manager}-missing-comment`, "blocked", "state_missing");
-  evidence = proof();
-  assert(
-    !evidence.github_requests.some(
-      ({ path }) => path === "/repos/owner/repo/issues",
-    ),
-    "Actions performed backlog discovery",
-  );
-  assert(
-    !evidence.github_requests.some(({ path }) =>
-      /^\/repos\/owner\/repo\/issues\/8(?:\/|$)/.test(path),
-    ),
-    "Actions read an unrelated issue",
-  );
-  assert.equal(evidence.pulls.length, 3);
-  function discardTask(number, fresh) {
-    upstream(`/select?issue=${number}&fresh=${fresh}`, "POST");
-    upstream("/forget-local", "POST");
-    const name = `${manager}-discard-${resets++}`;
-    register("container", name);
-    docker([
-      "run",
-      "--rm",
-      "--name",
-      name,
-      "--label",
-      `${label}=${id}`,
-      "--mount",
-      `type=volume,src=${fresh ? freshData : data},dst=/data`,
-      "--entrypoint",
-      node,
-      image,
-      "--input-type=module",
-      "-e",
-      "import {rm,access} from 'node:fs/promises'; const path='/data/actions/'+process.argv[1]; await rm(path,{recursive:true,force:true}); await access(path).then(()=>{throw Error('Task storage survived')},error=>{if(error.code!=='ENOENT')throw error});",
-      String(number),
-    ]);
-  }
-  const number = 30;
-  upstream(`/session-issue?issue=${number}`, "POST");
-  upstream("/artifact-fault?kind=drop_finalize", "POST");
-  upstream("/artifact-fault?kind=drop_reference", "POST");
-  launch(`${manager}-session-seed`, number, false, { session: "seed" });
-  const seeded = await finished(
-    `${manager}-session-seed`,
-    "waiting",
-    "session_verified",
-  );
-  const checkpoint = durable(number).session_artifact;
-  assert.equal(checkpoint.run_id, 100);
-  assert.equal(seeded.messages, 1);
-  assert.equal(
-    proof().lost_reference_response,
-    true,
-    "Reference acknowledgement loss was not exercised",
-  );
-  assert(
-    proof().artifacts.requests.some((item) =>
-      item.path.endsWith("/FinalizeArtifact"),
-    ),
-  );
-  discardTask(number, false);
-  for (const [fault, reason] of [
-    ["foreign", "session_provenance_invalid"],
-    ["corrupt", "session_corrupt"],
-  ]) {
     upstream(
-      `/artifact-fault?id=${checkpoint.artifact_id}&kind=${fault}`,
+      `/artifact-fault?id=${readyState.session_artifact.artifact_id}&kind=expired`,
       "POST",
     );
-    const name = `${manager}-session-${fault}`;
-    launch(name, number, true);
-    await finished(name, "blocked", reason);
+    launch(`${manager}-fresh-owned-pr`, 1, true);
+    const owned = await finished(
+      `${manager}-fresh-owned-pr`,
+      "blocked",
+      "recovery_evidence_missing",
+    );
+    assert.equal(owned.pull_number, waiting.pull_number);
+    assert.equal(durable(1).task_id, readyState.task_id);
+    assert.deepEqual(durable(1).budget, readyState.budget);
+    assert.equal(proof().requests.length, 0);
+    assert.equal(owned.session_recovery, "expired_or_deleted");
+
+    const noFixState = durable(4);
+    launch(`${manager}-fresh-terminal`, 4, true);
+    await finished(`${manager}-fresh-terminal`, "no_fix", "no_fix");
+    assert.equal(durable(4).task_id, noFixState.task_id);
+    assert.deepEqual(durable(4).budget, noFixState.budget);
+    assert.equal(proof().requests.length, 0);
+
+    const questionState = durable(2);
+    launch(`${manager}-fresh-question`, 2, true);
+    await finished(`${manager}-fresh-question`, "waiting", "needs_information");
+    assert.deepEqual(durable(2).question, questionState.question);
+    assert.deepEqual(durable(2).budget, questionState.budget);
+    assert.equal(proof().requests.length, 0);
+
+    const unpublished = `${manager}-unpublished-interruption`;
+    launch(unpublished, 9);
+    try {
+      await waitUntil(
+        () => {
+          if (!inspect(unpublished).State.Running)
+            assert.fail(
+              `Unpublished invocation exited: ${JSON.stringify(output(unpublished).outcome)}`,
+            );
+          return proof().held;
+        },
+        "Unpublished implementation did not reach the held provider",
+        300000,
+      );
+    } catch (error) {
+      const { workflow, runs, requests } = proof();
+      throw new Error(
+        `${error.message}; workflow ${JSON.stringify({ workflow, runs, requests })}`,
+        { cause: error },
+      );
+    }
+    assert(durable(9).scope, "Frozen scope was not saved before coding");
+    docker(["kill", "--signal", "SIGTERM", unpublished]);
+    await finished(unpublished, "failed", "cancelled");
+    upstream("/release", "POST");
+    const interrupted = durable(9);
+    const unpublishedAuthority = {
+      budget: interrupted.budget,
+      pull: interrupted.pull,
+      branch: interrupted.branch,
+      reference: interrupted.session_artifact,
+    };
+    launch(`${manager}-artifact-changed-configuration`, 9, true, {
+      changedPrompts: true,
+    });
+    await finished(
+      `${manager}-artifact-changed-configuration`,
+      "blocked",
+      "session_incompatible",
+    );
+    assert.equal(proof().requests.length, 0);
+    assert.deepEqual(
+      {
+        budget: durable(9).budget,
+        pull: durable(9).pull,
+        branch: durable(9).branch,
+        reference: durable(9).session_artifact,
+      },
+      unpublishedAuthority,
+    );
+    discardTask(9, true);
+    upstream("/advance-main", "POST");
+    launch(`${manager}-artifact-changed-source`, 9, true);
+    await finished(
+      `${manager}-artifact-changed-source`,
+      "blocked",
+      "state_incompatible",
+    );
+    assert.equal(proof().requests.length, 0);
+    assert.deepEqual(
+      {
+        budget: durable(9).budget,
+        pull: durable(9).pull,
+        branch: durable(9).branch,
+        reference: durable(9).session_artifact,
+      },
+      unpublishedAuthority,
+    );
+    upstream(`/restore-main?sha=${interrupted.job.source.sha}`, "POST");
+    discardTask(9, true);
+    assert(
+      interrupted.session_artifact,
+      "Graceful interruption lost completed investigation/bootstrap checkpoints",
+    );
+    discardTask(9, false);
+    launch(`${manager}-fresh-unpublished`, 9, true);
+    await finished(`${manager}-fresh-unpublished`, "waiting", "remote_checks");
+    const resumed = durable(9);
+    assert.equal(resumed.task_id, interrupted.task_id);
+    assert.equal(resumed.scope_digest, interrupted.scope_digest);
+    assert.equal(resumed.findings.objective, interrupted.findings.objective);
+    assert.equal(resumed.scope.objective, interrupted.scope.objective);
+    assert(resumed.budget.model_requests > interrupted.budget.model_requests);
+    assert(resumed.budget.active_ms >= interrupted.budget.active_ms);
+    for (const task of ["implementation_audit", "external_output_review"])
+      assert(proof().requests.includes(task));
+    assert(
+      !proof().requests.includes("investigation_result"),
+      "Restored completed investigation was rerun",
+    );
     assert.equal(
-      proof().requests.length,
+      proof().reconstructed,
       0,
-      "Unverified artifact started model work",
+      "Rebuilt evidence must support retained continuation",
+    );
+    upstream("/advance-main", "POST");
+    upstream("/checks?issue=9", "POST");
+    launch(`${manager}-rebuilt-retained-ready`, 9, true);
+    await finished(
+      `${manager}-rebuilt-retained-ready`,
+      "ready",
+      "human_review",
+    );
+
+    launch(`${manager}-lost-pull-response`, 10);
+    await finished(
+      `${manager}-lost-pull-response`,
+      "blocked",
+      "state_write_uncertain",
+    );
+    const uncertain = durable(10),
+      count = proof().pulls.length;
+    assert(
+      uncertain.pending.steps.some(
+        (step) => step.kind === "pull" && step.state === "dispatching",
+      ),
+    );
+    launch(`${manager}-fresh-lost-pull`, 10, true);
+    const recovered = await finished(
+      `${manager}-fresh-lost-pull`,
+      "waiting",
+      "remote_checks",
+    );
+    assert(recovered.pull_number > 0);
+    assert.equal(proof().pulls.length, count);
+    assert.equal(
+      durable(10).budget.repair_cycles,
+      uncertain.budget.repair_cycles,
+    );
+    assert.equal(durable(10).pending.status, "confirmed");
+    assert(proof().requests.includes("implementation_audit"));
+    assert(durable(10).budget.model_requests > uncertain.budget.model_requests);
+
+    upstream("/merge-owned?issue=9", "POST");
+    launch(`${manager}-retained-closed-after-main-advances`, 9, true);
+    await finished(
+      `${manager}-retained-closed-after-main-advances`,
+      "closed",
+      "issue_closed",
+    );
+    upstream("/merge-owned?issue=1", "POST");
+    launch(`${manager}-closed-after-main-advances`, 1, true);
+    await finished(
+      `${manager}-closed-after-main-advances`,
+      "closed",
+      "issue_closed",
+    );
+
+    upstream("/corrupt-state?issue=3", "POST");
+    launch(`${manager}-edited-comment`, 3, true);
+    await finished(`${manager}-edited-comment`, "blocked", "state_invalid");
+    upstream("/corrupt-state?issue=4&delete=true", "POST");
+    launch(`${manager}-missing-comment`, 4, true);
+    await finished(`${manager}-missing-comment`, "blocked", "state_missing");
+    evidence = proof();
+    assert(
+      !evidence.github_requests.some(
+        ({ path }) => path === "/repos/owner/repo/issues",
+      ),
+      "Actions performed backlog discovery",
+    );
+    assert(
+      !evidence.github_requests.some(({ path }) =>
+        /^\/repos\/owner\/repo\/issues\/8(?:\/|$)/.test(path),
+      ),
+      "Actions read an unrelated issue",
+    );
+    assert.equal(evidence.pulls.length, 3);
+  }
+  if (group === "all" || group === "sessions") {
+    const initialPulls = proof().pulls.length;
+    const number = 30;
+    upstream(`/session-issue?issue=${number}`, "POST");
+    upstream("/artifact-fault?kind=drop_finalize", "POST");
+    upstream("/artifact-fault?kind=drop_reference", "POST");
+    launch(`${manager}-session-seed`, number, false, { session: "seed" });
+    const seeded = await finished(
+      `${manager}-session-seed`,
+      "waiting",
+      "session_verified",
+    );
+    const checkpoint = durable(number).session_artifact;
+    assert.equal(checkpoint.run_id, 100);
+    assert.equal(seeded.messages, 1);
+    assert.equal(
+      proof().lost_reference_response,
+      true,
+      "Reference acknowledgement loss was not exercised",
+    );
+    assert(
+      proof().artifacts.requests.some((item) =>
+        item.path.endsWith("/FinalizeArtifact"),
+      ),
+    );
+    discardTask(number, false);
+    for (const [fault, reason] of [
+      ["foreign", "session_provenance_invalid"],
+      ["corrupt", "session_corrupt"],
+    ]) {
+      upstream(
+        `/artifact-fault?id=${checkpoint.artifact_id}&kind=${fault}`,
+        "POST",
+      );
+      const name = `${manager}-session-${fault}`;
+      launch(name, number, true);
+      await finished(name, "blocked", reason);
+      assert.equal(
+        proof().requests.length,
+        0,
+        "Unverified artifact started model work",
+      );
+      assert.equal(
+        durable(number).session_artifact.artifact_id,
+        checkpoint.artifact_id,
+      );
+      discardTask(number, true);
+    }
+    upstream(`/artifact-fault?id=${checkpoint.artifact_id}&kind=none`, "POST");
+    launch(`${manager}-session-missing-runtime`, number, true, {
+      environment: { ACTIONS_RUNTIME_TOKEN: "" },
+    });
+    await finished(
+      `${manager}-session-missing-runtime`,
+      "failed",
+      "configuration_invalid",
+    );
+    launch(`${manager}-session-wrong-key`, number, true, {
+      environment: { ORM_SESSION_KEY: Buffer.alloc(32, 19).toString("base64") },
+    });
+    await finished(`${manager}-session-wrong-key`, "blocked", "state_invalid");
+    discardTask(number, true);
+    const interruptedName = `${manager}-session-unacknowledged`;
+    launch(interruptedName, number, true, { session: "interrupt" });
+    await waitUntil(
+      () => !inspect(interruptedName).State.Running,
+      "Native checkpoint interruption did not finish",
+      600000,
+    );
+    assert.equal(
+      inspect(interruptedName).State.ExitCode,
+      137,
+      result(["logs", interruptedName]).stderr,
     );
     assert.equal(
       durable(number).session_artifact.artifact_id,
       checkpoint.artifact_id,
+      "Unacknowledged local work replaced the verified checkpoint",
     );
+    const charged = durable(number).budget;
+    assert(charged.model_requests > seeded.after.model_requests);
     discardTask(number, true);
-  }
-  upstream(`/artifact-fault?id=${checkpoint.artifact_id}&kind=none`, "POST");
-  launch(`${manager}-session-missing-runtime`, number, true, {
-    environment: { ACTIONS_RUNTIME_TOKEN: "" },
-  });
-  await finished(
-    `${manager}-session-missing-runtime`,
-    "failed",
-    "configuration_invalid",
-  );
-  launch(`${manager}-session-wrong-key`, number, true, {
-    environment: { ORM_SESSION_KEY: Buffer.alloc(32, 19).toString("base64") },
-  });
-  await finished(`${manager}-session-wrong-key`, "blocked", "state_invalid");
-  discardTask(number, true);
-  const interruptedName = `${manager}-session-unacknowledged`;
-  launch(interruptedName, number, true, { session: "interrupt" });
-  await waitUntil(
-    () => !inspect(interruptedName).State.Running,
-    "Native checkpoint interruption did not finish",
-    600000,
-  );
-  assert.equal(
-    inspect(interruptedName).State.ExitCode,
-    137,
-    result(["logs", interruptedName]).stderr,
-  );
-  assert.equal(
-    durable(number).session_artifact.artifact_id,
-    checkpoint.artifact_id,
-    "Unacknowledged local work replaced the verified checkpoint",
-  );
-  const charged = durable(number).budget;
-  assert(charged.model_requests > seeded.after.model_requests);
-  discardTask(number, true);
-  launch(`${manager}-session-resumed`, number, true, { session: "resume" });
-  const resumedSession = await finished(
-    `${manager}-session-resumed`,
-    "waiting",
-    "session_verified",
-  );
-  assert.equal(
-    resumedSession.native_id,
-    seeded.native_id,
-    "Native session identity was not retained",
-  );
-  assert.equal(resumedSession.messages, 2);
-  assert.deepEqual(
-    resumedSession.before,
-    charged,
-    "Old artifact rolled back charged work",
-  );
-  assert.equal(durable(number).session_artifact.run_id, 101);
-  assert(
-    proof().artifacts.requests.some((item) =>
-      /\/artifacts\/\d+\/zip$/.test(item.path),
-    ),
-    "Real artifact download client was not exercised",
-  );
-  let previous = resumedSession;
-  for (const kind of ["expired", "deleted"]) {
-    const reference = durable(number).session_artifact;
-    upstream(
-      `/artifact-fault?id=${reference.artifact_id}&kind=${kind}`,
-      "POST",
-    );
-    discardTask(number, true);
-    launch(`${manager}-session-${kind}`, number, true, { session: "fresh" });
-    const fresh = await finished(
-      `${manager}-session-${kind}`,
+    launch(`${manager}-session-resumed`, number, true, { session: "resume" });
+    const resumedSession = await finished(
+      `${manager}-session-resumed`,
       "waiting",
       "session_verified",
     );
-    assert.equal(fresh.session_recovery, "expired_or_deleted");
-    assert.notEqual(
-      fresh.native_id,
-      previous.native_id,
-      "Expired native conversation was reused",
-    );
-    assert.deepEqual(fresh.before, previous.after, "Expiry reset task budgets");
     assert.equal(
-      proof().pulls.length,
-      3,
-      "Session recovery created another PR",
+      resumedSession.native_id,
+      seeded.native_id,
+      "Native session identity was not retained",
     );
+    assert.equal(resumedSession.messages, 2);
+    assert.deepEqual(
+      resumedSession.before,
+      charged,
+      "Old artifact rolled back charged work",
+    );
+    assert.equal(durable(number).session_artifact.run_id, 101);
     assert(
-      proof()
-        .comments.find(([issue]) => issue === number)[1]
-        .some((comment) =>
-          comment.body.includes("Saved session expired or was deleted."),
-        ),
-    );
-    previous = fresh;
-  }
-  assert.deepEqual(proof().artifacts.errors, []);
-  assert.deepEqual(proof().errors, []);
-  upstream(`/restore-main?sha=${proof().source.sha}`, "POST");
-  const recoveredIssue = 60;
-  upstream(
-    `/clarification-issue?issue=${recoveredIssue}&mode=source_only`,
-    "POST",
-  );
-  launch(`${manager}-recovery-seed`, recoveredIssue);
-  const originalPull = await finished(
-    `${manager}-recovery-seed`,
-    "waiting",
-    "remote_checks",
-  );
-  upstream(`/checks?issue=${recoveredIssue}`, "POST");
-  launch(`${manager}-recovery-ready`, recoveredIssue);
-  await finished(`${manager}-recovery-ready`, "ready", "human_review");
-  const notices = () =>
-    proof()
-      .comments.find(([issue]) => issue === recoveredIssue)[1]
-      .filter(
-        (row) =>
-          !row.body.includes("<!-- orm:task-state:") &&
-          row.body.includes("Automation clean; awaiting human review."),
-      );
-  assert.equal(notices().length, 1);
-  for (const fault of ["expired", "deleted"]) {
-    const before = durable(recoveredIssue);
-    upstream(
-      `/artifact-fault?id=${before.session_artifact.artifact_id}&kind=${fault}`,
-      "POST",
-    );
-    discardTask(recoveredIssue, true);
-    launch(`${manager}-recover-owned-${fault}`, recoveredIssue, true);
-    const recovered = await finished(
-      `${manager}-recover-owned-${fault}`,
-      "ready",
-      "human_review",
-    );
-    const after = durable(recoveredIssue);
-    assert.equal(recovered.pull_number, originalPull.pull_number);
-    assert.equal(recovered.head_sha, originalPull.head_sha);
-    assert.equal(recovered.session_recovery, "expired_or_deleted");
-    assert.equal(after.task_id, before.task_id);
-    assert.equal(after.scope_digest, before.scope_digest);
-    assert.equal(after.budget.repair_cycles, before.budget.repair_cycles);
-    assert(after.budget.model_requests > before.budget.model_requests);
-    assert(proof().requests.includes("implementation_audit"));
-    assert(!proof().requests.includes("implementation_change"));
-    assert.equal(
-      proof().pulls.filter((pull) =>
-        pull.branch.endsWith(`/issue-${recoveredIssue}`),
-      ).length,
-      1,
-    );
-    assert.equal(notices().length, 1);
-    launch(`${manager}-recover-repeat-${fault}`, recoveredIssue, true);
-    await finished(
-      `${manager}-recover-repeat-${fault}`,
-      "ready",
-      "human_review",
-    );
-    assert.equal(proof().requests.length, 0);
-    assert.equal(notices().length, 1);
-  }
-  for (const [issue, fault, mode] of [
-    [61, "notification", "source_only"],
-    [62, "thread_reply", "source_only"],
-    [63, "branch", "monitor_pipeline"],
-  ]) {
-    const prefix = `${manager}-publication-recovery-${fault}`;
-    upstream(`/clarification-issue?issue=${issue}&mode=${mode}`, "POST");
-    launch(`${prefix}-seed`, issue);
-    const seeded = await finished(`${prefix}-seed`, "waiting", "remote_checks");
-    upstream(`/publication-fault?kind=${fault}`, "POST");
-    upstream(
-      `/${fault === "notification" ? "checks" : "review"}?issue=${issue}`,
-      "POST",
-    );
-    launch(`${prefix}-interrupted`, issue);
-    await finished(`${prefix}-interrupted`, "blocked", "state_write_uncertain");
-    const before = durable(issue);
-    assert(
-      proof().publication_faults.some(
-        (item) => item.issue === issue && item.kind === fault,
+      proof().artifacts.requests.some((item) =>
+        /\/artifacts\/\d+\/zip$/.test(item.path),
       ),
+      "Real artifact download client was not exercised",
     );
-    if (fault === "thread_reply") {
-      assert.equal(before.pending.steps[0].state, "dispatching");
-      assert.equal(before.pending.steps[1].state, "prepared");
-    }
-    discardTask(issue, true);
-    if (fault === "branch") {
-      upstream("/publication-fault?kind=pull", "POST");
-      launch(`${prefix}-second-interruption`, issue, true);
-      await finished(
-        `${prefix}-second-interruption`,
-        "blocked",
-        "state_write_uncertain",
+    let previous = resumedSession;
+    for (const kind of ["expired", "deleted"]) {
+      const reference = durable(number).session_artifact;
+      upstream(
+        `/artifact-fault?id=${reference.artifact_id}&kind=${kind}`,
+        "POST",
       );
-      const second = durable(issue);
-      assert.notEqual(second.pending.id, before.pending.id);
-      assert.equal(second.pr.resume_publication.id, second.pending.id);
-      assert.equal(
-        second.pending.steps.find((step) => step.kind === "pull").state,
-        "dispatching",
+      discardTask(number, true);
+      launch(`${manager}-session-${kind}`, number, true, { session: "fresh" });
+      const fresh = await finished(
+        `${manager}-session-${kind}`,
+        "waiting",
+        "session_verified",
       );
-      assert.equal(second.budget.repair_cycles, before.budget.repair_cycles);
-      discardTask(issue, true);
-    }
-    launch(`${prefix}-recovered`, issue, true);
-    const recovered = await finished(
-      `${prefix}-recovered`,
-      fault === "branch" ? "waiting" : "ready",
-      fault === "branch" ? "remote_checks" : "human_review",
-    );
-    assert.equal(recovered.pull_number, seeded.pull_number);
-    assert.equal(
-      durable(issue).budget.repair_cycles,
-      before.budget.repair_cycles,
-    );
-    assert.equal(
-      proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
-        .length,
-      1,
-    );
-    if (fault === "notification") {
-      const comments = proof().comments.find(([number]) => number === issue)[1];
+      assert.equal(fresh.session_recovery, "expired_or_deleted");
+      assert.notEqual(
+        fresh.native_id,
+        previous.native_id,
+        "Expired native conversation was reused",
+      );
+      assert.deepEqual(
+        fresh.before,
+        previous.after,
+        "Expiry reset task budgets",
+      );
       assert.equal(
-        comments.filter(
+        proof().pulls.length,
+        initialPulls,
+        "Session recovery created another PR",
+      );
+      assert(
+        proof()
+          .comments.find(([issue]) => issue === number)[1]
+          .some((comment) =>
+            comment.body.includes("Saved session expired or was deleted."),
+          ),
+      );
+      previous = fresh;
+    }
+    assert.deepEqual(proof().artifacts.errors, []);
+    assert.deepEqual(proof().errors, []);
+  }
+  if (group === "all" || group === "pr-recovery") {
+    upstream(`/restore-main?sha=${proof().source.sha}`, "POST");
+    const recoveredIssue = 60;
+    upstream(
+      `/clarification-issue?issue=${recoveredIssue}&mode=source_only`,
+      "POST",
+    );
+    launch(`${manager}-recovery-seed`, recoveredIssue);
+    const originalPull = await finished(
+      `${manager}-recovery-seed`,
+      "waiting",
+      "remote_checks",
+    );
+    upstream(`/checks?issue=${recoveredIssue}`, "POST");
+    launch(`${manager}-recovery-ready`, recoveredIssue);
+    await finished(`${manager}-recovery-ready`, "ready", "human_review");
+    const notices = () =>
+      proof()
+        .comments.find(([issue]) => issue === recoveredIssue)[1]
+        .filter(
           (row) =>
             !row.body.includes("<!-- orm:task-state:") &&
             row.body.includes("Automation clean; awaiting human review."),
+        );
+    assert.equal(notices().length, 1);
+    for (const fault of ["expired", "deleted"]) {
+      const before = durable(recoveredIssue);
+      upstream(
+        `/artifact-fault?id=${before.session_artifact.artifact_id}&kind=${fault}`,
+        "POST",
+      );
+      discardTask(recoveredIssue, true);
+      launch(`${manager}-recover-owned-${fault}`, recoveredIssue, true);
+      const recovered = await finished(
+        `${manager}-recover-owned-${fault}`,
+        "ready",
+        "human_review",
+      );
+      const after = durable(recoveredIssue);
+      assert.equal(recovered.pull_number, originalPull.pull_number);
+      assert.equal(recovered.head_sha, originalPull.head_sha);
+      assert.equal(recovered.session_recovery, "expired_or_deleted");
+      assert.equal(after.task_id, before.task_id);
+      assert.equal(after.scope_digest, before.scope_digest);
+      assert.equal(after.budget.repair_cycles, before.budget.repair_cycles);
+      assert(after.budget.model_requests > before.budget.model_requests);
+      assert(proof().requests.includes("implementation_audit"));
+      assert(!proof().requests.includes("implementation_change"));
+      assert.equal(
+        proof().pulls.filter((pull) =>
+          pull.branch.endsWith(`/issue-${recoveredIssue}`),
         ).length,
         1,
       );
-    } else {
-      const thread = proof().threads.find(
-        ([number]) => number === seeded.pull_number,
-      )[1][0];
-      assert.equal(thread.comments.length, 2);
-      assert.equal(thread.isResolved, true);
-    }
-    assert(proof().requests.includes("implementation_audit"));
-    assert.deepEqual(proof().errors, []);
-  }
-  for (const [issue, mode] of [
-    [40, "clarification_investigation"],
-    [41, "clarification_planning"],
-    [42, "clarification_coding"],
-    [43, "clarification_intent"],
-    [44, "monitor_clarification"],
-    [45, "disguised_feature"],
-    [46, "clarification_investigation"],
-    [47, "clarification_coding"],
-    [48, "clarification_coding"],
-    [49, "clarification_investigation"],
-    [50, "clarification_rejected"],
-    [53, "clarification_invalid"],
-    [54, "clarification_marker"],
-  ]) {
-    upstream(
-      `/clarification-issue?issue=${issue}&mode=${mode}&early=${issue === 46}`,
-      "POST",
-    );
-    const prefix = `${manager}-clarify-${issue}`;
-    launch(`${prefix}-question`, issue);
-    if (mode === "clarification_rejected" || mode === "clarification_invalid") {
-      await finished(`${prefix}-question`, "blocked", "investigation_blocked");
-      assert(
-        !proof()
-          .comments.find(([number]) => number === issue)[1]
-          .some((row) => row.body.includes("Reply in a new issue comment.")),
+      assert.equal(notices().length, 1);
+      launch(`${manager}-recover-repeat-${fault}`, recoveredIssue, true);
+      await finished(
+        `${manager}-recover-repeat-${fault}`,
+        "ready",
+        "human_review",
       );
-      if (mode === "clarification_invalid") {
-        const evidence = proof();
-        assert.deepEqual(evidence.errors, []);
+      assert.equal(proof().requests.length, 0);
+      assert.equal(notices().length, 1);
+    }
+    for (const [issue, fault, mode] of [
+      [61, "notification", "source_only"],
+      [62, "thread_reply", "source_only"],
+      [63, "branch", "monitor_pipeline"],
+    ]) {
+      const prefix = `${manager}-publication-recovery-${fault}`;
+      upstream(`/clarification-issue?issue=${issue}&mode=${mode}`, "POST");
+      launch(`${prefix}-seed`, issue);
+      const seeded = await finished(
+        `${prefix}-seed`,
+        "waiting",
+        "remote_checks",
+      );
+      upstream(`/publication-fault?kind=${fault}`, "POST");
+      upstream(
+        `/${fault === "notification" ? "checks" : "review"}?issue=${issue}`,
+        "POST",
+      );
+      launch(`${prefix}-interrupted`, issue);
+      await finished(
+        `${prefix}-interrupted`,
+        "blocked",
+        "state_write_uncertain",
+      );
+      const before = durable(issue);
+      assert(
+        proof().publication_faults.some(
+          (item) => item.issue === issue && item.kind === fault,
+        ),
+      );
+      if (fault === "thread_reply") {
+        assert.equal(before.pending.steps[0].state, "dispatching");
+        assert.equal(before.pending.steps[1].state, "prepared");
+      }
+      discardTask(issue, true);
+      if (fault === "branch") {
+        upstream("/publication-fault?kind=pull", "POST");
+        launch(`${prefix}-second-interruption`, issue, true);
+        await finished(
+          `${prefix}-second-interruption`,
+          "blocked",
+          "state_write_uncertain",
+        );
+        const second = durable(issue);
+        assert.notEqual(second.pending.id, before.pending.id);
+        assert.equal(second.pr.resume_publication.id, second.pending.id);
+        assert.equal(
+          second.pending.steps.find((step) => step.kind === "pull").state,
+          "dispatching",
+        );
+        assert.equal(second.budget.repair_cycles, before.budget.repair_cycles);
+        discardTask(issue, true);
+      }
+      launch(`${prefix}-recovered`, issue, true);
+      const recovered = await finished(
+        `${prefix}-recovered`,
+        fault === "branch" ? "waiting" : "ready",
+        fault === "branch" ? "remote_checks" : "human_review",
+      );
+      assert.equal(recovered.pull_number, seeded.pull_number);
+      assert.equal(
+        durable(issue).budget.repair_cycles,
+        before.budget.repair_cycles,
+      );
+      assert.equal(
+        proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
+          .length,
+        1,
+      );
+      if (fault === "notification") {
+        const comments = proof().comments.find(
+          ([number]) => number === issue,
+        )[1];
+        assert.equal(
+          comments.filter(
+            (row) =>
+              !row.body.includes("<!-- orm:task-state:") &&
+              row.body.includes("Automation clean; awaiting human review."),
+          ).length,
+          1,
+        );
+      } else {
+        const thread = proof().threads.find(
+          ([number]) => number === seeded.pull_number,
+        )[1][0];
+        assert.equal(thread.comments.length, 2);
+        assert.equal(thread.isResolved, true);
+      }
+      assert(proof().requests.includes("implementation_audit"));
+      assert.deepEqual(proof().errors, []);
+    }
+  }
+  if (["all", "clarification", "clarification-recovery"].includes(group)) {
+    for (const [issue, mode] of [
+      [40, "clarification_investigation"],
+      [41, "clarification_planning"],
+      [42, "clarification_coding"],
+      [43, "clarification_intent"],
+      [44, "monitor_clarification"],
+      [45, "disguised_feature"],
+      [46, "clarification_investigation"],
+      [47, "clarification_coding"],
+      [48, "clarification_coding"],
+      [49, "clarification_investigation"],
+      [50, "clarification_rejected"],
+      [53, "clarification_invalid"],
+      [54, "clarification_marker"],
+    ].filter(
+      ([issue]) =>
+        group === "all" ||
+        (group === "clarification" ? issue <= 45 : issue > 45),
+    )) {
+      upstream(
+        `/clarification-issue?issue=${issue}&mode=${mode}&early=${issue === 46}`,
+        "POST",
+      );
+      const prefix = `${manager}-clarify-${issue}`;
+      launch(`${prefix}-question`, issue);
+      if (
+        mode === "clarification_rejected" ||
+        mode === "clarification_invalid"
+      ) {
+        await finished(
+          `${prefix}-question`,
+          "blocked",
+          "investigation_blocked",
+        );
         assert(
-          evidence.runs.some(
-            (run) => run.role === "investigation" && run.status === "completed",
+          !proof()
+            .comments.find(([number]) => number === issue)[1]
+            .some((row) => row.body.includes("Reply in a new issue comment.")),
+        );
+        if (mode === "clarification_invalid") {
+          const evidence = proof();
+          assert.deepEqual(evidence.errors, []);
+          assert(
+            evidence.runs.some(
+              (run) =>
+                run.role === "investigation" && run.status === "completed",
+            ),
+          );
+          assert(
+            evidence.workflow
+              .find((phase) => phase.phase === "investigations")
+              .records.some(
+                (record) => record.failure === "investigation_failed",
+              ),
+          );
+        }
+        continue;
+      }
+      if (mode === "disguised_feature") {
+        await finished(`${prefix}-question`, "out_of_scope", "manual_feature");
+        assert(
+          !proof().requests.some(
+            (task) =>
+              task.startsWith("bootstrap_") ||
+              task.startsWith("implementation_"),
+          ),
+        );
+        continue;
+      }
+      if (mode === "monitor_clarification") {
+        await finished(`${prefix}-question`, "waiting", "remote_checks");
+        upstream(`/review?issue=${issue}`, "POST");
+        launch(`${prefix}-repair-question`, issue);
+        await finished(
+          `${prefix}-repair-question`,
+          "waiting",
+          "needs_information",
+        );
+      } else
+        await finished(`${prefix}-question`, "waiting", "needs_information");
+      if (issue === 49) {
+        const legacy = durable(issue);
+        upstream(`/legacy-question?issue=${issue}`, "POST");
+        discardTask(issue, true);
+        launch(`${prefix}-legacy-reissued`, issue, true);
+        await finished(
+          `${prefix}-legacy-reissued`,
+          "waiting",
+          "needs_information",
+        );
+        assert.equal(durable(issue).task_id, legacy.task_id);
+        assert.equal(durable(issue).job.revision, legacy.job.revision);
+        assert.equal(durable(issue).question.audience, "maintainer");
+        assert(
+          durable(issue).budget.model_requests >= legacy.budget.model_requests,
+        );
+      }
+      const before = durable(issue),
+        questions = () =>
+          proof()
+            .comments.find(([number]) => number === issue)[1]
+            .filter((row) =>
+              row.body.includes("Reply in a new issue comment."),
+            );
+      assert.equal(before.active, null);
+      assert.equal(before.wait_accounted_at, null);
+      const nativeBefore = proof().conversations.find(
+        (conversation) => conversation.id === before.question.conversation_id,
+      );
+      assert.equal(questions().length, issue === 49 ? 2 : 1);
+      if (mode === "clarification_marker") {
+        assert(!questions().at(-1).body.includes("<!-- orm:task-state:"));
+        assert.equal(
+          proof()
+            .comments.find(([number]) => number === issue)[1]
+            .filter((row) => row.body.includes("<!-- orm:task-state:")).length,
+          1,
+        );
+      }
+      assert.equal(
+        before.question.phase,
+        issue === 49
+          ? "investigation_triage"
+          : ["clarification_investigation", "clarification_marker"].includes(
+                mode,
+              )
+            ? "investigation_plan"
+            : mode === "clarification_planning"
+              ? "implementation_plan"
+              : mode === "clarification_intent"
+                ? "investigation_triage"
+                : "implementation_change",
+      );
+      if (issue !== 46) {
+        upstream(
+          `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 ? "reporter" : "outsider"}${issue === 47 ? "&body=UNADMITTED_CLARIFICATION_REPLY_OUTSIDER" : ""}`,
+          "POST",
+        );
+        if (issue === 47)
+          upstream(
+            `/answer?issue=${issue}&actor=robot%5Bbot%5D&body=UNADMITTED_CLARIFICATION_REPLY_BOT`,
+            "POST",
+          );
+        discardTask(issue, true);
+        launch(`${prefix}-unauthorized`, issue, true);
+        await finished(
+          `${prefix}-unauthorized`,
+          "waiting",
+          "needs_information",
+        );
+        assert.deepEqual(durable(issue).budget, before.budget);
+        assert.equal(proof().requests.length, 0);
+      }
+      if (issue === 40) {
+        upstream(`/answer?issue=${issue}&body=insufficient`, "POST");
+        discardTask(issue, true);
+        launch(`${prefix}-insufficient`, issue, true);
+        await finished(
+          `${prefix}-insufficient`,
+          "waiting",
+          "needs_information",
+        );
+        assert.equal(questions().length, 2);
+        const afterInsufficient = durable(issue);
+        discardTask(issue, true);
+        launch(`${prefix}-duplicate`, issue, true);
+        await finished(`${prefix}-duplicate`, "waiting", "needs_information");
+        assert.deepEqual(durable(issue).budget, afterInsufficient.budget);
+        assert.equal(proof().requests.length, 0);
+      }
+      if (mode === "monitor_clarification") {
+        upstream(`/age-repair-question?issue=${issue}`, "POST");
+        const question = questions().at(-1);
+        assert(Date.now() - Date.parse(question.created_at) >= 15 * 86400000);
+        assert.equal(
+          durable(issue).budget.repair_cycles,
+          durable(issue).limits.repair_cycles,
+        );
+        assert.equal(durable(issue).wait_accounted_at, null);
+      }
+      if (issue !== 46)
+        upstream(
+          `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 || issue === 48 ? "fixture" : "reporter"}${issue === 48 ? "&body=SCOPE_EXPANSION%3A%20add%20an%20unrelated%20feature" : ""}`,
+          "POST",
+        );
+      if (issue === 47 || mode === "monitor_clarification")
+        upstream(
+          `/artifact-fault?id=${durable(issue).session_artifact.artifact_id}&kind=expired`,
+          "POST",
+        );
+      discardTask(issue, true);
+      launch(`${prefix}-resumed`, issue, true);
+      if (issue === 48) {
+        await finished(
+          `${prefix}-resumed`,
+          "blocked",
+          "implementation_blocked",
+        );
+        assert.equal(durable(issue).scope_digest, before.scope_digest);
+        assert.equal(durable(issue).scope.objective, before.scope.objective);
+        const continued = proof().conversations.find(
+          (conversation) => conversation.id === before.question.conversation_id,
+        );
+        assert.equal(continued.request_digest, nativeBefore.request_digest);
+        assert.equal(continued.native_id, nativeBefore.native_id);
+        assert.equal(
+          proof().pulls.filter((pull) =>
+            pull.branch.endsWith(`/issue-${issue}`),
+          ).length,
+          0,
+        );
+        assert(
+          proof()
+            .workflow.find((phase) => phase.phase === "implementations")
+            .records.some(
+              (record) => record.failure === "implementation_out_of_scope",
+            ),
+        );
+        continue;
+      }
+      const resumed = await finished(
+        `${prefix}-resumed`,
+        "waiting",
+        "remote_checks",
+      );
+      assert.equal(durable(issue).task_id, before.task_id);
+      assert.equal(durable(issue).job.revision, before.job.revision);
+      assert(durable(issue).budget.active_ms >= before.budget.active_ms);
+      assert(
+        durable(issue).budget.model_requests >= before.budget.model_requests,
+      );
+      assert(durable(issue).budget.wait_ms < before.budget.wait_ms + 60000);
+      if (issue === 47) {
+        assert.equal(resumed.session_recovery, "expired_or_deleted");
+        const evidence = proof(),
+          rejected = evidence.comments
+            .find(([number]) => number === issue)[1]
+            .filter((row) =>
+              row.body.includes("UNADMITTED_CLARIFICATION_REPLY"),
+            ),
+          messages = evidence.conversations.flatMap((item) => item.messages);
+        assert.equal(rejected.length, 2);
+        assert(
+          rejected.every(
+            (row) =>
+              !messages.some((item) => item.id === `github-comment:${row.id}`),
           ),
         );
         assert(
           evidence.workflow
             .find((phase) => phase.phase === "investigations")
-            .records.some(
-              (record) => record.failure === "investigation_failed",
-            ),
+            .records.some((record) => record.context_comment_count === 0),
         );
       }
-      continue;
-    }
-    if (mode === "disguised_feature") {
-      await finished(`${prefix}-question`, "out_of_scope", "manual_feature");
-      assert(
-        !proof().requests.some(
-          (task) =>
-            task.startsWith("bootstrap_") || task.startsWith("implementation_"),
-        ),
-      );
-      continue;
-    }
-    if (mode === "monitor_clarification") {
-      await finished(`${prefix}-question`, "waiting", "remote_checks");
-      upstream(`/review?issue=${issue}`, "POST");
-      launch(`${prefix}-repair-question`, issue);
-      await finished(
-        `${prefix}-repair-question`,
-        "waiting",
-        "needs_information",
-      );
-    } else await finished(`${prefix}-question`, "waiting", "needs_information");
-    if (issue === 49) {
-      const legacy = durable(issue);
-      upstream(`/legacy-question?issue=${issue}`, "POST");
-      discardTask(issue, true);
-      launch(`${prefix}-legacy-reissued`, issue, true);
-      await finished(
-        `${prefix}-legacy-reissued`,
-        "waiting",
-        "needs_information",
-      );
-      assert.equal(durable(issue).task_id, legacy.task_id);
-      assert.equal(durable(issue).job.revision, legacy.job.revision);
-      assert.equal(durable(issue).question.audience, "maintainer");
-      assert(
-        durable(issue).budget.model_requests >= legacy.budget.model_requests,
-      );
-    }
-    const before = durable(issue),
-      questions = () =>
-        proof()
-          .comments.find(([number]) => number === issue)[1]
-          .filter((row) => row.body.includes("Reply in a new issue comment."));
-    assert.equal(before.active, null);
-    assert.equal(before.wait_accounted_at, null);
-    const nativeBefore = proof().conversations.find(
-      (conversation) => conversation.id === before.question.conversation_id,
-    );
-    assert.equal(questions().length, issue === 49 ? 2 : 1);
-    if (mode === "clarification_marker") {
-      assert(!questions().at(-1).body.includes("<!-- orm:task-state:"));
-      assert.equal(
-        proof()
-          .comments.find(([number]) => number === issue)[1]
-          .filter((row) => row.body.includes("<!-- orm:task-state:")).length,
-        1,
-      );
-    }
-    assert.equal(
-      before.question.phase,
-      issue === 49
-        ? "investigation_triage"
-        : ["clarification_investigation", "clarification_marker"].includes(mode)
-          ? "investigation_plan"
-          : mode === "clarification_planning"
-            ? "implementation_plan"
-            : mode === "clarification_intent"
-              ? "investigation_triage"
-              : "implementation_change",
-    );
-    if (issue !== 46) {
-      upstream(
-        `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 ? "reporter" : "outsider"}${issue === 47 ? "&body=UNADMITTED_CLARIFICATION_REPLY_OUTSIDER" : ""}`,
-        "POST",
-      );
-      if (issue === 47)
-        upstream(
-          `/answer?issue=${issue}&actor=robot%5Bbot%5D&body=UNADMITTED_CLARIFICATION_REPLY_BOT`,
-          "POST",
+      if (mode === "monitor_clarification")
+        assert.equal(resumed.session_recovery, "expired_or_deleted");
+      if (nativeBefore && issue !== 47 && mode !== "monitor_clarification") {
+        const continued = proof().conversations.find(
+          (conversation) => conversation.id === before.question.conversation_id,
         );
-      discardTask(issue, true);
-      launch(`${prefix}-unauthorized`, issue, true);
-      await finished(`${prefix}-unauthorized`, "waiting", "needs_information");
-      assert.deepEqual(durable(issue).budget, before.budget);
-      assert.equal(proof().requests.length, 0);
-    }
-    if (issue === 40) {
-      upstream(`/answer?issue=${issue}&body=insufficient`, "POST");
-      discardTask(issue, true);
-      launch(`${prefix}-insufficient`, issue, true);
-      await finished(`${prefix}-insufficient`, "waiting", "needs_information");
-      assert.equal(questions().length, 2);
-      const afterInsufficient = durable(issue);
-      discardTask(issue, true);
-      launch(`${prefix}-duplicate`, issue, true);
-      await finished(`${prefix}-duplicate`, "waiting", "needs_information");
-      assert.deepEqual(durable(issue).budget, afterInsufficient.budget);
-      assert.equal(proof().requests.length, 0);
-    }
-    if (mode === "monitor_clarification") {
-      upstream(`/age-repair-question?issue=${issue}`, "POST");
-      const question = questions().at(-1);
-      assert(Date.now() - Date.parse(question.created_at) >= 15 * 86400000);
-      assert.equal(
-        durable(issue).budget.repair_cycles,
-        durable(issue).limits.repair_cycles,
-      );
-      assert.equal(durable(issue).wait_accounted_at, null);
-    }
-    if (issue !== 46)
-      upstream(
-        `/answer?issue=${issue}&actor=${mode === "clarification_intent" || issue === 49 || issue === 48 ? "fixture" : "reporter"}${issue === 48 ? "&body=SCOPE_EXPANSION%3A%20add%20an%20unrelated%20feature" : ""}`,
-        "POST",
-      );
-    if (issue === 47 || mode === "monitor_clarification")
-      upstream(
-        `/artifact-fault?id=${durable(issue).session_artifact.artifact_id}&kind=expired`,
-        "POST",
-      );
-    discardTask(issue, true);
-    launch(`${prefix}-resumed`, issue, true);
-    if (issue === 48) {
-      await finished(`${prefix}-resumed`, "blocked", "implementation_blocked");
-      assert.equal(durable(issue).scope_digest, before.scope_digest);
-      assert.equal(durable(issue).scope.objective, before.scope.objective);
-      const continued = proof().conversations.find(
-        (conversation) => conversation.id === before.question.conversation_id,
-      );
-      assert.equal(continued.request_digest, nativeBefore.request_digest);
-      assert.equal(continued.native_id, nativeBefore.native_id);
+        assert.equal(continued.native_id, nativeBefore.native_id);
+        assert.equal(continued.request_digest, nativeBefore.request_digest);
+      }
+      if (mode === "monitor_clarification") {
+        assert.equal(resumed.pull_number, before.pull.number);
+        assert.equal(
+          durable(issue).budget.repair_cycles,
+          durable(issue).limits.repair_cycles,
+        );
+      }
       assert.equal(
         proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
           .length,
-        0,
+        1,
       );
-      assert(
-        proof()
-          .workflow.find((phase) => phase.phase === "implementations")
-          .records.some(
-            (record) => record.failure === "implementation_out_of_scope",
-          ),
-      );
-      continue;
+      assert.equal(questions().length, issue === 40 || issue === 49 ? 2 : 1);
+      assert.deepEqual(proof().errors, []);
     }
-    const resumed = await finished(
-      `${prefix}-resumed`,
+  }
+  if (group === "all" || group === "clarification-recovery") {
+    for (const [issue, boundary] of [
+      [51, "checkpoint"],
+      [52, "dispatch"],
+    ]) {
+      upstream(
+        `/clarification-issue?issue=${issue}&mode=clarification_coding&boundary=${boundary}`,
+        "POST",
+      );
+      const prefix = `${manager}-question-boundary-${boundary}`;
+      launch(`${prefix}-interrupted`, issue);
+      await waitUntil(
+        () => proof().question_boundary?.held,
+        `Question ${boundary} boundary was not reached`,
+        300000,
+      );
+      const before = durable(issue);
+      assert.equal(
+        before.active,
+        null,
+        "Question publication retained an active worker deadline",
+      );
+      const beforeConversation = proof().conversations.find(
+        (conversation) => conversation.id === before.question.conversation_id,
+      );
+      const questions = () =>
+        proof()
+          .comments.find(([number]) => number === issue)[1]
+          .filter((row) => row.body.includes("Reply in a new issue comment."));
+      assert.equal(questions().length, boundary === "checkpoint" ? 0 : 1);
+      docker(["kill", "--signal", "KILL", `${prefix}-interrupted`]);
+      await waitUntil(
+        () => !inspect(`${prefix}-interrupted`).State.Running,
+        "Interrupted question container stayed alive",
+      );
+      upstream("/release-question-boundary", "POST");
+      discardTask(issue, true);
+      launch(`${prefix}-restored`, issue, true);
+      if (boundary === "checkpoint") {
+        await finished(`${prefix}-restored`, "waiting", "needs_information");
+        assert.equal(durable(issue).question.id, before.question.id);
+        assert.equal(questions().length, 1);
+        upstream(`/answer?issue=${issue}`, "POST");
+        discardTask(issue, true);
+        launch(`${prefix}-answered`, issue, true);
+        await finished(`${prefix}-answered`, "waiting", "remote_checks");
+      } else {
+        await finished(`${prefix}-restored`, "waiting", "remote_checks");
+        const continued = proof().conversations.find(
+          (conversation) => conversation.id === before.question.conversation_id,
+        );
+        assert.equal(continued.native_id, beforeConversation.native_id);
+        assert.equal(continued.messages.length, 1);
+      }
+      assert.equal(questions().length, 1);
+      assert.equal(durable(issue).task_id, before.task_id);
+      assert.equal(
+        proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
+          .length,
+        1,
+      );
+      const completedBudget = durable(issue).budget;
+      discardTask(issue, true);
+      launch(`${prefix}-duplicate`, issue, true);
+      await finished(`${prefix}-duplicate`, "waiting", "remote_checks");
+      assert.equal(proof().requests.length, 0);
+      assert.equal(
+        durable(issue).budget.model_requests,
+        completedBudget.model_requests,
+      );
+      assert.equal(durable(issue).budget.active_ms, completedBudget.active_ms);
+    }
+    upstream("/controller-source", "POST");
+    const controllerIssue = 70;
+    upstream(
+      `/clarification-issue?issue=${controllerIssue}&mode=clarification_investigation`,
+      "POST",
+    );
+    assert.deepEqual(
+      await route("issues", { action: "edited", issue: { number: 8 } }),
+      [],
+      "Old backlog was enrolled automatically",
+    );
+    assert.deepEqual(
+      await route(
+        "workflow_dispatch",
+        { sender: { id: 7, login: "fixture" } },
+        "8",
+      ),
+      [8],
+    );
+    assert.deepEqual(
+      await route("issues", {
+        action: "opened",
+        issue: { number: controllerIssue },
+      }),
+      [controllerIssue],
+    );
+    launch(`${manager}-controller-question`, controllerIssue, false, {
+      controller: true,
+    });
+    await finished(
+      `${manager}-controller-question`,
+      "waiting",
+      "needs_information",
+    );
+    const question = durable(controllerIssue);
+    assert.deepEqual(
+      await route("issue_comment", {
+        action: "created",
+        issue: { number: controllerIssue },
+        comment: { id: question.comment_id },
+      }),
+      [],
+    );
+    assert.deepEqual(
+      await route("issue_comment", {
+        action: "created",
+        issue: { number: controllerIssue },
+        comment: { id: question.question.comment_id },
+      }),
+      [],
+    );
+    const outsider = JSON.parse(
+      upstream(`/answer?issue=${controllerIssue}&actor=outsider`, "POST"),
+    );
+    assert.deepEqual(
+      await route("issue_comment", {
+        action: "created",
+        issue: { number: controllerIssue },
+        comment: { id: outsider.id },
+      }),
+      [controllerIssue],
+    );
+    launch(`${manager}-controller-unauthorized`, controllerIssue, true, {
+      controller: true,
+    });
+    await finished(
+      `${manager}-controller-unauthorized`,
+      "waiting",
+      "needs_information",
+    );
+    assert.deepEqual(durable(controllerIssue).budget, question.budget);
+    assert.equal(proof().requests.length, 0);
+    const answer = JSON.parse(
+      upstream(`/answer?issue=${controllerIssue}`, "POST"),
+    );
+    assert.deepEqual(
+      await route("issue_comment", {
+        action: "created",
+        issue: { number: controllerIssue },
+        comment: { id: answer.id },
+      }),
+      [controllerIssue],
+    );
+    launch(`${manager}-controller-resumed`, controllerIssue, true, {
+      controller: true,
+    });
+    const published = await finished(
+      `${manager}-controller-resumed`,
       "waiting",
       "remote_checks",
     );
-    assert.equal(durable(issue).task_id, before.task_id);
-    assert.equal(durable(issue).job.revision, before.job.revision);
-    assert(durable(issue).budget.active_ms >= before.budget.active_ms);
-    assert(
-      durable(issue).budget.model_requests >= before.budget.model_requests,
+    assert.equal(durable(controllerIssue).task_id, question.task_id);
+    assert.deepEqual(
+      await route("pull_request_target", {
+        action: "synchronize",
+        pull_request: { number: published.pull_number },
+      }),
+      [controllerIssue],
     );
-    assert(durable(issue).budget.wait_ms < before.budget.wait_ms + 60000);
-    if (issue === 47) {
-      assert.equal(resumed.session_recovery, "expired_or_deleted");
-      const evidence = proof(),
-        rejected = evidence.comments
-          .find(([number]) => number === issue)[1]
-          .filter((row) => row.body.includes("UNADMITTED_CLARIFICATION_REPLY")),
-        messages = evidence.conversations.flatMap((item) => item.messages);
-      assert.equal(rejected.length, 2);
-      assert(
-        rejected.every(
-          (row) =>
-            !messages.some((item) => item.id === `github-comment:${row.id}`),
-        ),
-      );
-      assert(
-        evidence.workflow
-          .find((phase) => phase.phase === "investigations")
-          .records.some((record) => record.context_comment_count === 0),
-      );
-    }
-    if (mode === "monitor_clarification")
-      assert.equal(resumed.session_recovery, "expired_or_deleted");
-    if (nativeBefore && issue !== 47 && mode !== "monitor_clarification") {
-      const continued = proof().conversations.find(
-        (conversation) => conversation.id === before.question.conversation_id,
-      );
-      assert.equal(continued.native_id, nativeBefore.native_id);
-      assert.equal(continued.request_digest, nativeBefore.request_digest);
-    }
-    if (mode === "monitor_clarification") {
-      assert.equal(resumed.pull_number, before.pull.number);
-      assert.equal(
-        durable(issue).budget.repair_cycles,
-        durable(issue).limits.repair_cycles,
-      );
-    }
-    assert.equal(
-      proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
-        .length,
-      1,
-    );
-    assert.equal(questions().length, issue === 40 || issue === 49 ? 2 : 1);
-    assert.deepEqual(proof().errors, []);
-  }
-  for (const [issue, boundary] of [
-    [51, "checkpoint"],
-    [52, "dispatch"],
-  ]) {
-    upstream(
-      `/clarification-issue?issue=${issue}&mode=clarification_coding&boundary=${boundary}`,
-      "POST",
-    );
-    const prefix = `${manager}-question-boundary-${boundary}`;
-    launch(`${prefix}-interrupted`, issue);
-    await waitUntil(
-      () => proof().question_boundary?.held,
-      `Question ${boundary} boundary was not reached`,
-      300000,
-    );
-    const before = durable(issue);
-    assert.equal(
-      before.active,
-      null,
-      "Question publication retained an active worker deadline",
-    );
-    const beforeConversation = proof().conversations.find(
-      (conversation) => conversation.id === before.question.conversation_id,
-    );
-    const questions = () =>
-      proof()
-        .comments.find(([number]) => number === issue)[1]
-        .filter((row) => row.body.includes("Reply in a new issue comment."));
-    assert.equal(questions().length, boundary === "checkpoint" ? 0 : 1);
-    docker(["kill", "--signal", "KILL", `${prefix}-interrupted`]);
-    await waitUntil(
-      () => !inspect(`${prefix}-interrupted`).State.Running,
-      "Interrupted question container stayed alive",
-    );
-    upstream("/release-question-boundary", "POST");
-    discardTask(issue, true);
-    launch(`${prefix}-restored`, issue, true);
-    if (boundary === "checkpoint") {
-      await finished(`${prefix}-restored`, "waiting", "needs_information");
-      assert.equal(durable(issue).question.id, before.question.id);
-      assert.equal(questions().length, 1);
-      upstream(`/answer?issue=${issue}`, "POST");
-      discardTask(issue, true);
-      launch(`${prefix}-answered`, issue, true);
-      await finished(`${prefix}-answered`, "waiting", "remote_checks");
-    } else {
-      await finished(`${prefix}-restored`, "waiting", "remote_checks");
-      const continued = proof().conversations.find(
-        (conversation) => conversation.id === before.question.conversation_id,
-      );
-      assert.equal(continued.native_id, beforeConversation.native_id);
-      assert.equal(continued.messages.length, 1);
-    }
-    assert.equal(questions().length, 1);
-    assert.equal(durable(issue).task_id, before.task_id);
-    assert.equal(
-      proof().pulls.filter((pull) => pull.branch.endsWith(`/issue-${issue}`))
-        .length,
-      1,
-    );
-    const completedBudget = durable(issue).budget;
-    discardTask(issue, true);
-    launch(`${prefix}-duplicate`, issue, true);
-    await finished(`${prefix}-duplicate`, "waiting", "remote_checks");
+    assert((await route("schedule", {})).includes(controllerIssue));
+    upstream(`/checks?issue=${controllerIssue}`, "POST");
+    launch(`${manager}-controller-ready`, controllerIssue, true, {
+      controller: true,
+    });
+    await finished(`${manager}-controller-ready`, "ready", "human_review");
+    const readyBudget = durable(controllerIssue).budget;
+    launch(`${manager}-controller-duplicate`, controllerIssue, true, {
+      controller: true,
+    });
+    await finished(`${manager}-controller-duplicate`, "ready", "human_review");
+    assert.deepEqual(durable(controllerIssue).budget, readyBudget);
     assert.equal(proof().requests.length, 0);
-    assert.equal(
-      durable(issue).budget.model_requests,
-      completedBudget.model_requests,
-    );
-    assert.equal(durable(issue).budget.active_ms, completedBudget.active_ms);
   }
   return {
     sdk,
+    group,
+    cpu_set: cpuSet,
+    toolchain_cache: toolchainCache,
+    resource_samples: resourceSamples,
+    checkpoint_helpers: checkpointTimings,
+    artifact_transport: Object.values(
+      proof().artifacts.requests.reduce((totals, item) => {
+        const operation = item.path.startsWith("/twirp/")
+          ? item.path.split("/").at(-1)
+          : item.path.startsWith("/_artifacts/")
+            ? `blob_${item.method}`
+            : item.path.endsWith("/zip")
+              ? "download_redirect"
+              : item.path.endsWith("/artifacts")
+                ? "list_metadata"
+                : "verify_run";
+        const row = (totals[operation] ??= {
+          operation,
+          requests: 0,
+          duration_ms: 0,
+          request_bytes: 0,
+          interrupted: 0,
+          failed: 0,
+        });
+        assert(
+          Number.isFinite(item.duration_ms) && item.duration_ms >= 0,
+          "Missing artifact transport timing",
+        );
+        row.requests++;
+        row.duration_ms += item.duration_ms;
+        row.request_bytes += item.request_bytes;
+        row.interrupted += Number(item.interrupted);
+        row.failed += Number(item.status >= 400);
+        return totals;
+      }, {}),
+    ),
     actions: "passed",
     completed_scenarios: completed,
-    credential_exclusion: "passed",
-    no_public_listener: "passed",
-    unrelated_issue: "untouched",
-    native_session_artifacts: "passed",
+    credential_exclusion: ["all", "lifecycle"].includes(group)
+      ? "passed"
+      : undefined,
+    no_public_listener: ["all", "lifecycle"].includes(group)
+      ? "passed"
+      : undefined,
+    unrelated_issue: ["all", "lifecycle"].includes(group)
+      ? "untouched"
+      : undefined,
+    native_session_artifacts: ["all", "sessions"].includes(group)
+      ? "passed"
+      : undefined,
   };
 }

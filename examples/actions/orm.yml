@@ -1,0 +1,45 @@
+version: 1
+proxy:
+  url: https://proxy.example.invalid/v1
+profiles:
+  coding:
+    sdk: claude
+    model: your-claude-model-id
+    effort: high
+  review:
+    sdk: codex
+    model: your-codex-model-id
+    effort: high
+roles:
+  bootstrap:
+    profile: coding
+    prompts: { system: system.md, user: user.md }
+    skills: [example, bootstrap]
+  investigation:
+    profile: coding
+    prompts: { system: system.md, user: investigation.md }
+    skills: [example, investigate]
+  implementation:
+    profile: coding
+    prompts: { system: system.md, user: user.md }
+    skills: [example, implement, review-feedback]
+  audit:
+    profile: review
+    prompts: { system: system.md, user: user.md }
+    skills: [example, bootstrap, audit]
+  output_review:
+    profile: review
+    prompts: { system: system.md, user: user.md }
+    skills: [example, output-review]
+pr_monitor:
+  enabled: true
+  requirements_source: github
+  automated_reviewers:
+    - { login: "chatgpt-codex-connector[bot]", signal: codex }
+    - { login: "coderabbitai[bot]", signal: coderabbit }
+limits:
+  active_minutes: 60
+  model_requests: 200
+  repair_cycles: 3
+  infrastructure_retries: 2
+  wait_hours: 24

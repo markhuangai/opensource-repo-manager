@@ -1,21 +1,23 @@
 import { runActionsTests } from "../tests/integration/actions/harness.mjs";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   appendFile,
   cp,
   mkdir,
+  lstat,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { cpus, freemem, totalmem, tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
@@ -25,9 +27,18 @@ import {
   implementationScenarios,
   implementationSdks,
   verifyImplementationReceipts,
+  actionsGroups,
+  verifyActionsReceipts,
+  selectActionsCpuSet,
 } from "./container-suites.mjs";
 
-const { platform, suites } = selectContainerSuites(process.argv.slice(2));
+const {
+  platform,
+  suites,
+  actionsConcurrency = 3,
+  actionsSdk,
+  actionsGroup,
+} = selectContainerSuites(process.argv.slice(2));
 const root = fileURLToPath(new URL("../", import.meta.url));
 if (suites.length > 1) {
   for (const suite of suites) {
@@ -51,6 +62,40 @@ if (suites.length > 1) {
   process.exit(0);
 }
 const [suite] = suites;
+async function sourceInputDigest() {
+  const hash = createHash("sha256");
+  async function visit(path) {
+    const info = await lstat(path);
+    assert(!info.isSymbolicLink(), "Test source must not contain symlinks");
+    if (info.isDirectory()) {
+      for (const name of (await readdir(path)).sort())
+        await visit(join(path, name));
+    } else {
+      assert(info.isFile(), "Unsupported test input");
+      hash
+        .update(relative(root, path))
+        .update("\0")
+        .update(await readFile(path))
+        .update("\0");
+    }
+  }
+  for (const path of [
+    "Dockerfile",
+    ".dockerignore",
+    "package.json",
+    "package-lock.json",
+    "config.example.yml",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "src",
+    "examples/workflow",
+    "tests",
+    "scripts",
+  ])
+    await visit(join(root, path));
+  return hash.digest("hex");
+}
+const inputDigest = await sourceInputDigest();
 const sourceSha = execFileSync(
   "git",
   ["--no-optional-locks", "rev-parse", "HEAD"],
@@ -84,14 +129,28 @@ function phase(name) {
   if (name) console.log(`[${suite}] ${name}`);
 }
 phase("setup");
-const temporary = await mkdtemp(join(tmpdir(), "orm-container-"));
+const temporary = await mkdtemp(
+  join(process.env.ORM_TEST_TEMP_PARENT ?? tmpdir(), "orm-container-"),
+);
 const context = join(temporary, "context");
 const config = join(temporary, "docker-client");
 const fixtures = join(temporary, "fixtures");
 const testInputs = join(temporary, "test-inputs");
-const id = `orm-test-${randomUUID()}`;
+const reusedImage = process.env.ORM_TEST_IMAGE;
+const imageOwner = reusedImage ? process.env.ORM_TEST_IMAGE_OWNER : undefined;
+assert(
+  !reusedImage ||
+    (actionsSdk &&
+      actionsGroup &&
+      /^orm-test-[a-f0-9-]{36}$/.test(imageOwner ?? "") &&
+      /^sha256:[a-f0-9]{64}$/.test(process.env.ORM_TEST_IMAGE_ID ?? "")),
+  "Invalid parent image receipt",
+);
+const id = reusedImage
+  ? `${imageOwner}-lane-${actionsSdk}-${actionsGroup}`
+  : `orm-test-${randomUUID()}`;
 const label = "org.opensource-repo-manager.test-run";
-const image = `${id}:app`;
+const image = reusedImage ?? `${id}:app`;
 const probeImage = `${id}:context`;
 const runtime = `${id}-runtime`;
 const probe = `${id}-probe`;
@@ -115,7 +174,10 @@ let runtimeProof,
   bootstrapProof;
 const investigationStartupProof = [];
 const actionsProof = [];
+const actionsLaneReceipts = [];
+const laneOwners = [];
 let protectedFixtures = false;
+let actionsCpuSet;
 
 let daemon;
 
@@ -144,8 +206,8 @@ function docker(command, options) {
   return output.stdout?.trim() ?? "";
 }
 
-function register(type, name) {
-  resources.push({ type, name });
+function register(type, name, owner = id) {
+  resources.push({ type, name, owner });
 }
 
 function logs(container) {
@@ -278,6 +340,7 @@ try {
   assert(buildx?.Path, "Docker Buildx is required");
   await symlink(buildx.Path, join(config, "cli-plugins", "docker-buildx"));
   await mkdir(context);
+  await mkdir(join(context, "examples"));
   await cp(join(root, "tests"), join(testInputs, "tests"), { recursive: true });
   await cp(
     join(root, "scripts", "container-suites.mjs"),
@@ -291,10 +354,17 @@ try {
     "tsconfig.json",
     "tsconfig.build.json",
     "src",
+    "examples/workflow",
   ]) {
     await cp(join(root, file), join(context, file), { recursive: true });
   }
-  for (const directory of [".codex", "config", "data", "workspaces"]) {
+  for (const directory of [
+    ".codex",
+    "config",
+    "data",
+    "workspaces",
+    "examples/actions",
+  ]) {
     await mkdir(join(context, directory));
     await writeFile(join(context, directory, "secret-canary"), canary);
   }
@@ -341,26 +411,39 @@ try {
     "A secret canary entered the Docker build context",
   );
 
-  phase("image-build");
-  console.log(`Building the production image for ${platform}`);
-  register("image", image);
-  docker(
-    [
-      "build",
-      "--builder",
-      "default",
-      "--platform",
-      platform,
-      "--label",
-      `${label}=${id}`,
-      "--tag",
-      image,
-      "--file",
-      join(context, "Dockerfile"),
-      context,
-    ],
-    { inherit: true, timeout: 1_200_000 },
-  );
+  if (reusedImage) {
+    phase("image-reuse");
+    const [parentImage] = JSON.parse(docker(["image", "inspect", image]));
+    assert.equal(parentImage.Id, process.env.ORM_TEST_IMAGE_ID);
+    assert.equal(parentImage.Config.Labels?.[label], imageOwner);
+    assert.equal(parentImage.Config.Labels?.[`${label}.inputs`], inputDigest);
+    assert.equal(parentImage.Config.Labels?.[`${label}.source`], sourceSha);
+  } else {
+    phase("image-build");
+    console.log(`Building the production image for ${platform}`);
+    register("image", image);
+    docker(
+      [
+        "build",
+        "--builder",
+        "default",
+        "--platform",
+        platform,
+        "--label",
+        `${label}=${id}`,
+        "--label",
+        `${label}.inputs=${inputDigest}`,
+        "--label",
+        `${label}.source=${sourceSha}`,
+        "--tag",
+        image,
+        "--file",
+        join(context, "Dockerfile"),
+        context,
+      ],
+      { inherit: true, timeout: 1_200_000 },
+    );
+  }
 
   phase("production-startup");
   await mkdir(join(fixtures, "investigations"), { recursive: true });
@@ -1221,8 +1304,117 @@ try {
       cleanup: "passed",
     };
   }
-  if (suite === "investigation" || suite === "actions") {
-    for (const sdk of ["codex", "claude"]) {
+  if (suite === "actions") {
+    const status = docker(["exec", runtime, "cat", "/proc/self/status"]);
+    actionsCpuSet = selectActionsCpuSet(
+      /^Cpus_allowed_list:\s*(.+)$/m.exec(status)?.[1],
+    );
+  }
+  if (suite === "actions" && !actionsGroup) {
+    phase("actions-pool");
+    const imageId = docker(["image", "inspect", "--format", "{{.Id}}", image]);
+    const tasks = actionsGroups.flatMap((group) =>
+      implementationSdks.map((sdk) => ({ sdk, group })),
+    );
+    const errors = [];
+    let cursor = 0;
+    async function worker() {
+      while (cursor < tasks.length && !errors.length) {
+        const { sdk, group } = tasks[cursor++];
+        laneOwners.push(`${id}-lane-${sdk}-${group}`);
+        const logPath = join(temporary, `actions-${sdk}-${group}.log`);
+        const started = performance.now();
+        const startedAt = new Date().toISOString();
+        console.log(`[actions] starting ${sdk}/${group}`);
+        try {
+          const childReceipt = await new Promise((resolve, reject) => {
+            const child = spawn(
+              process.execPath,
+              [
+                fileURLToPath(import.meta.url),
+                "--platform",
+                platform,
+                "--suite",
+                "actions",
+                "--actions-sdk",
+                sdk,
+                "--actions-group",
+                group,
+                "--actions-concurrency",
+                "1",
+              ],
+              {
+                cwd: root,
+                env: {
+                  ...process.env,
+                  ORM_TEST_IMAGE: image,
+                  ORM_TEST_IMAGE_OWNER: id,
+                  ORM_TEST_IMAGE_ID: imageId,
+                  ORM_TEST_TEMP_PARENT: temporary,
+                },
+                stdio: ["ignore", "pipe", "pipe"],
+              },
+            );
+            let stdout = "",
+              stderr = "";
+            child.stdout.on("data", (bytes) => {
+              stdout += bytes;
+            });
+            child.stderr.on("data", (bytes) => {
+              stderr += bytes;
+            });
+            child.once("error", reject);
+            child.once("close", (code, signal) => {
+              void writeFile(logPath, stdout + stderr).then(() => {
+                if (code !== 0)
+                  return reject(
+                    new Error(
+                      `${sdk}/${group} exited ${code ?? signal}: ${stdout.slice(-4000)}${stderr.slice(-8000)}`,
+                    ),
+                  );
+                try {
+                  resolve(JSON.parse(stdout.trim().split("\n").at(-1)));
+                } catch (error) {
+                  reject(error);
+                }
+              }, reject);
+            });
+          });
+          actionsLaneReceipts.push(childReceipt);
+          timings.push({
+            phase: `actions-${sdk}-${group}`,
+            started_at: startedAt,
+            duration_ms: performance.now() - started,
+          });
+          console.log(`[actions] completed ${sdk}/${group}`);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    }
+    await Promise.all(
+      Array.from(
+        { length: Math.min(actionsConcurrency, tasks.length) },
+        worker,
+      ),
+    );
+    if (errors.length)
+      throw new AggregateError(errors, "Actions scenario lane failed");
+    verifyActionsReceipts(actionsLaneReceipts, {
+      source_sha: sourceSha,
+      pr_head_sha: prHeadSha,
+      platform,
+      image_id: imageId,
+      input_digest: inputDigest,
+      dirty_worktree: dirtyWorktree,
+      actions_cpu_set: actionsCpuSet,
+    });
+    actionsProof.push(
+      ...actionsLaneReceipts.flatMap((row) => row.bounded_actions),
+    );
+  }
+  if (suite === "investigation" || (suite === "actions" && actionsGroup)) {
+    for (const sdk of actionsSdk ? [actionsSdk] : ["codex", "claude"]) {
       phase(`production-startup-${sdk}`);
       console.log(`Verifying production startup through ${sdk}`);
       const prefix = `${id}-investigation-${sdk}`,
@@ -1366,6 +1558,30 @@ try {
         "-c",
         `chown -R 0:0 /fixture && chmod 700 /fixture/config && chmod 600 /fixture/config/${configName}`,
       ]);
+      if (suite === "actions") {
+        phase(`actions-toolchain-cache-${sdk}`);
+        docker(
+          [
+            "run",
+            "--rm",
+            "--name",
+            setup,
+            "--label",
+            `${label}=${id}`,
+            "--no-healthcheck",
+            "--mount",
+            `type=bind,src=${directory},dst=/fixture`,
+            ...mounts,
+            "--entrypoint",
+            "/opt/orm-runtime/bin/node",
+            image,
+            "/actions-fixtures/toolchain-cache.mjs",
+            "prepare",
+          ],
+          { timeout: 300000 },
+        );
+        phase(`actions-fixture-startup-${sdk}`);
+      }
       register("network", net);
       docker(["network", "create", "--label", `${label}=${id}`, net]);
       register("volume", data);
@@ -1422,9 +1638,12 @@ try {
         "Investigation upstream fixture did not start",
       );
       if (suite === "actions") {
+        phase(`actions-scenarios-${sdk}-${actionsGroup}`);
         actionsProof.push(
           await runActionsTests({
             sdk,
+            group: actionsGroup,
+            cpuSet: actionsCpuSet,
             manager,
             upstreamName,
             data,
@@ -1752,6 +1971,11 @@ try {
   );
   stopCleanly();
   const imageId = docker(["image", "inspect", "--format", "{{.Id}}", image]);
+  assert.equal(
+    await sourceInputDigest(),
+    inputDigest,
+    "Source changed during container verification",
+  );
   receipt = {
     suite,
     platform,
@@ -1759,6 +1983,13 @@ try {
     dirty_worktree: dirtyWorktree,
     source_sha: sourceSha,
     image_id: imageId,
+    input_digest: inputDigest,
+    actions_cpu_set: actionsCpuSet,
+    runner_resources: {
+      cpus: cpus().length,
+      memory_total_bytes: totalmem(),
+      memory_available_bytes: freemem(),
+    },
     http: "passed",
     users_and_mounts: "passed",
     context_exclusion: "passed",
@@ -1774,6 +2005,17 @@ try {
     investigation_startup:
       suite === "investigation" ? investigationStartupProof : undefined,
     bounded_actions: suite === "actions" ? actionsProof : undefined,
+    actions_lane_receipts: actionsLaneReceipts.map((row) => ({
+      source_sha: row.source_sha,
+      pr_head_sha: row.pr_head_sha,
+      image_id: row.image_id,
+      input_digest: row.input_digest,
+      sdk: row.bounded_actions[0].sdk,
+      group: row.bounded_actions[0].group,
+      timings: row.timings,
+      cleanup: row.cleanup,
+      resources_removed: row.resources_removed,
+    })),
     durable_notifications: notificationProof,
     repository_bootstrap: bootstrapProof,
   };
@@ -1782,10 +2024,32 @@ try {
 } finally {
   phase("cleanup");
   console.log("Cleaning owned test resources");
+  for (const owner of laneOwners)
+    for (const type of ["image", "network", "volume", "container"]) {
+      try {
+        const names = docker([
+          type,
+          "ls",
+          ...(type === "container" ? ["--all"] : []),
+          "--filter",
+          `label=${label}=${owner}`,
+          "--format",
+          type === "container"
+            ? "{{.Names}}"
+            : type === "image"
+              ? "{{.ID}}"
+              : "{{.Name}}",
+        ]);
+        for (const name of names.split("\n").filter(Boolean))
+          register(type, name, owner);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
   if (protectedFixtures) {
     try {
       const [inspection] = JSON.parse(docker(["image", "inspect", image]));
-      assert.equal(inspection.Config.Labels?.[label], id);
+      assert.equal(inspection.Config.Labels?.[label], imageOwner ?? id);
       docker([
         "run",
         "--rm",
@@ -1794,18 +2058,18 @@ try {
         "--label",
         `${label}=${id}`,
         "--mount",
-        `type=bind,src=${fixtures},dst=/fixture`,
+        `type=bind,src=${temporary},dst=/fixture`,
         "--entrypoint",
         "/bin/sh",
         image,
         "-c",
-        `find /fixture/config /fixture/cases /fixture/investigations -exec chown -h ${process.getuid()}:${process.getgid()} {} + && chmod 700 /fixture/config /fixture/cases /fixture/cases/*`,
+        `find /fixture -exec chown -h ${process.getuid()}:${process.getgid()} {} + && find /fixture -type d -exec chmod u+rwx {} +`,
       ]);
     } catch (error) {
       cleanupErrors.push(error);
     }
   }
-  for (const { type, name } of resources.reverse()) {
+  for (const { type, name, owner } of resources.reverse()) {
     try {
       const inspection = result([type, "inspect", name]);
       if (inspection.status !== 0) {
@@ -1817,7 +2081,7 @@ try {
         (["volume", "network"].includes(type)
           ? object.Labels
           : object.Config.Labels)?.[label],
-        id,
+        owner,
         `Refusing cleanup of unowned ${type} ${name}`,
       );
       docker([type, "rm", ...(type === "container" ? ["--force"] : []), name]);

@@ -144,6 +144,7 @@ export async function createPublicationFixture(root: string) {
     state: string;
     author: number | null;
     author_login?: string;
+    head_repository_id?: number;
     draft: boolean;
   };
   const state = {
@@ -235,7 +236,7 @@ export async function createPublicationFixture(root: string) {
     head: {
       sha: head(row.branch),
       ref: row.branch,
-      repo: { id: state.repository_id },
+      repo: { id: row.head_repository_id ?? state.repository_id },
     },
     base: {
       ref: row.base,
@@ -495,12 +496,61 @@ export async function createPublicationFixture(root: string) {
     }
     if (path === `${base}/issues` && req.method === "GET") {
       const page = Number(url.searchParams.get("page") ?? 1);
+      const labels = url.searchParams.get("labels")?.split(",") ?? [];
       send(
         [...state.issues.values()]
-          .filter((item) => !state.closed.has(item.number))
+          .filter(
+            (item) =>
+              (url.searchParams.get("state") === "all" ||
+                !state.closed.has(item.number)) &&
+              labels.every((label) =>
+                state.issueLabels.get(item.number)?.includes(label),
+              ),
+          )
           .slice((page - 1) * 100, page * 100)
-          .map((item) => ({ ...item, state: "open" })),
+          .map((item) => ({
+            ...item,
+            state: state.closed.has(item.number) ? "closed" : "open",
+          })),
       );
+      return;
+    }
+    const tree = path.match(
+      /^\/repos\/owner\/repo\/git\/trees\/([a-f0-9]{40})$/,
+    );
+    if (tree && req.method === "GET") {
+      const entries = git(["ls-tree", "-rlz", tree[1]])
+        .split("\0")
+        .filter(Boolean)
+        .map((line) => {
+          const match =
+            /^(\d+) (\S+) ([a-f0-9]{40})\s+(\d+|-)\t([\s\S]+)$/.exec(line)!;
+          return {
+            mode: match[1],
+            type: match[2],
+            sha: match[3],
+            size: Number(match[4]),
+            path: match[5],
+          };
+        });
+      send({ sha: tree[1], truncated: false, tree: entries });
+      return;
+    }
+    const blob = path.match(
+      /^\/repos\/owner\/repo\/git\/blobs\/([a-f0-9]{40})$/,
+    );
+    if (blob && req.method === "GET") {
+      const content = execFileSync(
+        "/usr/bin/git",
+        ["--git-dir", repository, "cat-file", "blob", blob[1]],
+        { env },
+      );
+      send({
+        sha: blob[1],
+        encoding: "base64",
+        size: content.length,
+        content: content.toString("base64"),
+      });
       return;
     }
     if (path === `${base}/labels` && req.method === "POST") {
