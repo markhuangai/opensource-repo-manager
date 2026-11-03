@@ -18,6 +18,7 @@ async function workflow(name) {
 
 const review = await workflow("ai-pr-review");
 const release = await workflow("release");
+const promotion = await workflow("promote-release");
 const ci = await workflow("ci");
 const codeql = await workflow("codeql");
 const maintenance = await workflow("maintenance");
@@ -86,6 +87,8 @@ async function run(
     setOutput: (key, value) => (outputs[key] = value),
     setFailed: (message) => failures.push(message),
     info: (message) => notices.push(message),
+    error: (message) => notices.push(message),
+    warning: (message) => notices.push(message),
   };
   await new AsyncFunction(
     "github",
@@ -126,11 +129,6 @@ const resolve = step(review.jobs.resolve, "Resolve and fence pull request head")
   .with.script;
 const finalize = step(review.jobs.review, "Publish final review status").with
   .script;
-const validate = step(
-  release.jobs.resolve,
-  "Validate release source and version",
-).with.script;
-
 describe("AI review routing and exact-head policy", () => {
   it("registers edited PR events for CI, CodeQL and the trusted review route", () => {
     for (const trigger of [
@@ -411,23 +409,28 @@ describe("AI review routing and exact-head policy", () => {
 });
 
 describe("release and CI boundaries", () => {
-  it("publishes only release events after both native jobs succeed", () => {
-    expect(release.on).toEqual({ release: { types: ["published"] } });
+  it("publishes candidates only after native builds and shares its mutation lock with promotion", () => {
+    expect(release.on).toEqual({
+      workflow_run: {
+        workflows: ["Repository CI", "CodeQL"],
+        types: ["completed"],
+        branches: ["main"],
+      },
+    });
+    expect(promotion.on.workflow_dispatch.inputs.source_rc.required).toBe(true);
     expect(ci.permissions).toEqual({ contents: "read" });
-    expect(JSON.stringify(ci)).not.toContain("secrets.");
     expect(JSON.stringify(ci)).not.toContain("packages");
     expect(release.jobs.resolve.permissions).toEqual({
-      contents: "read",
+      contents: "write",
       actions: "read",
     });
     expect(release.jobs.build.needs).toBe("resolve");
+    expect(release.jobs.build.if).toContain("build_required == 'true'");
     expect(release.jobs.publish.needs).toEqual(["resolve", "build"]);
-    expect(release.jobs.publish.if).toBeUndefined();
+    expect(release.jobs.publish.if).toContain(
+      "needs.build.result == 'success'",
+    );
     expect(release.jobs.build.permissions).toEqual({
-      contents: "read",
-      packages: "write",
-    });
-    expect(release.jobs.publish.permissions).toEqual({
       contents: "read",
       packages: "write",
     });
@@ -435,9 +438,9 @@ describe("release and CI boundaries", () => {
       ci.jobs.containers.strategy.matrix.include,
     );
     expect(JSON.stringify(release)).not.toContain("setup-qemu");
-    const build = step(release.jobs.build, "Build and push by digest");
-    expect(build.with.outputs).toContain("push-by-digest=true");
-    expect(build.with.tags).toBeUndefined();
+    expect(
+      step(release.jobs.build, "Build and push by digest").with.outputs,
+    ).toContain("push-by-digest=true");
     const upload = release.jobs.build.steps.find((entry) =>
       entry.uses?.startsWith("actions/upload-artifact@"),
     );
@@ -448,15 +451,19 @@ describe("release and CI boundaries", () => {
       ),
     );
     expect(release.concurrency["cancel-in-progress"]).toBe(false);
-    expect(release.concurrency.group).toContain("github.event.release.id");
-    expect(release.jobs.promote_latest.needs).toEqual(["resolve", "publish"]);
-    expect(release.jobs.promote_latest.if).toBe(
-      "needs.resolve.outputs.prerelease == 'false'",
-    );
-    expect(release.jobs.promote_latest.concurrency).toEqual({
-      group: "release-${{ github.repository }}",
-      "cancel-in-progress": false,
-    });
+    expect(promotion.concurrency["cancel-in-progress"]).toBe(false);
+    expect(release.concurrency.group).not.toBe(promotion.concurrency.group);
+    for (const job of [
+      release.jobs.resolve,
+      release.jobs.publish,
+      promotion.jobs.promote,
+    ])
+      expect(job.concurrency).toEqual({
+        group: "release-state-${{ github.repository }}",
+        "cancel-in-progress": false,
+      });
+    expect(JSON.stringify(promotion)).not.toContain("build-push-action");
+    expect(promotion.jobs.promote.if).toBe("github.ref == 'refs/heads/main'");
   });
 
   it("requires native smoke tests for both architectures", () => {
@@ -508,7 +515,14 @@ describe("release and CI boundaries", () => {
     expect(step(review.jobs.review, "Review pull request").uses).toBe(
       "markhuangai/ai-pr-reviewer@v1-prerelease",
     );
-    for (const document of [ci, codeql, review, release, maintenance]) {
+    for (const document of [
+      ci,
+      codeql,
+      review,
+      release,
+      promotion,
+      maintenance,
+    ]) {
       for (const job of Object.values(document.jobs)) {
         for (const entry of job.steps) {
           if (
@@ -822,173 +836,6 @@ describe("pinned reusable maintenance workflow", () => {
 });
 
 const image = "ghcr.io/markhuangai/opensource-repo-manager";
-const publishedRelease = {
-  id: 42,
-  tag_name: "v0.1.0",
-  draft: false,
-  prerelease: false,
-  published_at: "2026-10-26T00:00:00Z",
-};
-function releaseContext(releaseData = publishedRelease, overrides = {}) {
-  return {
-    eventName: "release",
-    ref: `refs/tags/${releaseData.tag_name}`,
-    sha,
-    payload: { action: "published", release: releaseData },
-    ...overrides,
-  };
-}
-function releaseTransport({
-  commit = sha,
-  comparison = "ahead",
-  runs = {},
-  current = publishedRelease,
-  latest = publishedRelease,
-} = {}) {
-  return {
-    repos: {
-      getCommit: async () => ({ data: { sha: commit } }),
-      getBranch: async () => ({ data: { commit: { sha: "b".repeat(40) } } }),
-      compareCommits: async () => ({ data: { status: comparison } }),
-      getRelease: async () => ({ data: current }),
-      getLatestRelease: async () => ({ data: latest }),
-    },
-    actions: {
-      listWorkflowRuns: async (args) => {
-        expect(args).toMatchObject({
-          head_sha: sha,
-          branch: "main",
-          event: "push",
-          per_page: 1,
-        });
-        return {
-          data: {
-            workflow_runs: runs[args.workflow_id] ?? [
-              {
-                head_sha: sha,
-                head_branch: "main",
-                event: "push",
-                status: "completed",
-                conclusion: "success",
-                html_url: "https://example.invalid/run",
-              },
-            ],
-          },
-        };
-      },
-    },
-  };
-}
-
-describe("release source policy", () => {
-  for (const [tag, prerelease, expected] of [
-    ["v0.1.0", false, "false"],
-    ["v0.1.0-rc.1", true, "true"],
-    ["v0.1.0-rc.1", false, "true"],
-    ["v0.1.0", true, "true"],
-  ]) {
-    it(`resolves ${tag} with prerelease=${prerelease}`, async () => {
-      const result = await run(validate, {
-        context: releaseContext({
-          ...publishedRelease,
-          tag_name: tag,
-          prerelease,
-        }),
-        transport: releaseTransport(),
-      });
-      expect(result.outputs).toEqual({
-        version: tag.slice(1),
-        source_sha: sha,
-        prerelease: expected,
-      });
-    });
-  }
-  for (const tag_name of [
-    "0.1.0",
-    "latest",
-    "v01.1.0",
-    "v0.1.0-rc.01",
-    "v0.1.0+build",
-    "v0.1.0; echo unsafe",
-    "v0.1.0\n",
-    `v0.1.0-${"x".repeat(128)}`,
-  ]) {
-    it(`rejects malformed tag ${JSON.stringify(tag_name)}`, async () => {
-      await expect(
-        run(validate, {
-          context: releaseContext({ ...publishedRelease, tag_name }),
-          transport: releaseTransport(),
-        }),
-      ).rejects.toThrow();
-    });
-  }
-  for (const context of [
-    releaseContext(publishedRelease, { eventName: "pull_request" }),
-    releaseContext(publishedRelease, { eventName: "workflow_dispatch" }),
-    releaseContext(publishedRelease, { ref: "refs/heads/main" }),
-    releaseContext(publishedRelease, { sha: "moving-branch" }),
-    releaseContext(publishedRelease, {
-      payload: { action: "edited", release: publishedRelease },
-    }),
-    releaseContext({ ...publishedRelease, draft: true }),
-    releaseContext({ ...publishedRelease, published_at: null }),
-  ]) {
-    it("rejects nonpublication events and invalid release sources", async () => {
-      await expect(
-        run(validate, { context, transport: releaseTransport() }),
-      ).rejects.toThrow();
-    });
-  }
-  for (const overrides of [
-    { commit: "c".repeat(40) },
-    { comparison: "behind" },
-    { comparison: "diverged" },
-  ]) {
-    it("rejects moved tags and commits outside main", async () => {
-      await expect(
-        run(validate, {
-          context: releaseContext(),
-          transport: releaseTransport(overrides),
-        }),
-      ).rejects.toThrow();
-    });
-  }
-  for (const workflow of ["ci.yml", "codeql.yml"]) {
-    for (const change of [
-      null,
-      { conclusion: "failure" },
-      { conclusion: "cancelled" },
-      { conclusion: "skipped" },
-      { status: "in_progress", conclusion: null },
-      { head_sha: "c".repeat(40) },
-      { head_branch: "feature" },
-      { event: "pull_request" },
-    ]) {
-      it(`requires successful exact-source ${workflow}: ${JSON.stringify(change)}`, async () => {
-        const runs =
-          change === null
-            ? []
-            : [
-                {
-                  head_sha: sha,
-                  head_branch: "main",
-                  event: "push",
-                  status: "completed",
-                  conclusion: "success",
-                  ...change,
-                },
-              ];
-        await expect(
-          run(validate, {
-            context: releaseContext(),
-            transport: releaseTransport({ runs: { [workflow]: runs } }),
-          }),
-        ).rejects.toThrow("successful main-push run");
-      });
-    }
-  }
-});
-
 const digest = (letter) => `sha256:${letter.repeat(64)}`;
 const nativeReceipts = ["amd64", "arm64"].map((architecture, index) => ({
   source_sha: sha,
@@ -1002,31 +849,6 @@ const descriptor = (receipt) => ({
   digest: receipt.platform_digest,
   platform: { os: "linux", architecture: receipt.platform.split("/")[1] },
 });
-const combinedManifest = {
-  digest: digest("e"),
-  manifests: nativeReceipts.map(descriptor),
-};
-const publicationAnnotation = (
-  release = publishedRelease,
-  receipts = nativeReceipts,
-) => ({
-  version: 1,
-  release_id: release.id,
-  source_sha: receipts[0].source_sha,
-  release_version: release.tag_name.slice(1),
-  platforms: receipts.map(({ platform, platform_digest }) => ({
-    platform,
-    platform_digest,
-  })),
-});
-const promotionScript = step(
-  release.jobs.promote_latest,
-  "Promote the current verified stable release",
-).with.script;
-const publishScript = step(
-  release.jobs.publish,
-  "Verify manifests and publish release tags",
-).with.script;
 const smokeScript = step(
   release.jobs.build,
   "Smoke-test the published native image",
@@ -1046,493 +868,6 @@ async function withReceipts(callback, receipts = nativeReceipts) {
     await rm(directory, { recursive: true });
   }
 }
-
-function registryTransport(overrides = {}) {
-  const publications = [];
-  const manifests = Object.fromEntries(
-    nativeReceipts.map((receipt) => [
-      `${image}@${receipt.digest}`,
-      { digest: receipt.digest, manifests: [descriptor(receipt)] },
-    ]),
-  );
-  return {
-    publications,
-    executor: {
-      exec: async (command, args) => {
-        expect(command).toBe("docker");
-        expect(args.slice(0, 3)).toEqual(["buildx", "imagetools", "create"]);
-        publications.push(args);
-        const annotationIndex = args.indexOf("--annotation");
-        const annotations =
-          annotationIndex < 0
-            ? {}
-            : {
-                "org.opensource-repo-manager.publication": args[
-                  annotationIndex + 1
-                ]
-                  .split("=")
-                  .slice(1)
-                  .join("="),
-              };
-        for (let index = 0; index < args.length; index++) {
-          if (args[index] === "--tag")
-            manifests[args[index + 1]] = {
-              ...combinedManifest,
-              annotations,
-            };
-        }
-      },
-      getExecOutput: async (command, args) => {
-        expect(command).toBe("docker");
-        expect(args.slice(0, 3)).toEqual(["buildx", "imagetools", "inspect"]);
-        expect(args.slice(4)).toEqual(["--format", "{{json .Manifest}}"]);
-        return {
-          stdout: JSON.stringify(
-            overrides[args[3]] ?? manifests[args[3]] ?? combinedManifest,
-          ),
-        };
-      },
-    },
-  };
-}
-const publicationEnv = (directory) => ({
-  IMAGE: image,
-  SOURCE_SHA: sha,
-  VERSION: "0.1.0",
-  IS_PRERELEASE: "false",
-  RECEIPTS: directory,
-});
-
-describe("release manifest promotion", () => {
-  it("publishes version and source tags with verified promotion evidence", async () => {
-    await withReceipts(async (directory) => {
-      const registry = registryTransport();
-      const result = await run(publishScript, {
-        context: releaseContext(),
-        env: publicationEnv(directory),
-        transport: releaseTransport(),
-        executor: registry.executor,
-      });
-      expect(registry.publications).toEqual([
-        [
-          "buildx",
-          "imagetools",
-          "create",
-          "--tag",
-          `${image}:0.1.0`,
-          "--tag",
-          `${image}:sha-${sha}`,
-          "--annotation",
-          `index:org.opensource-repo-manager.publication=${JSON.stringify(publicationAnnotation())}`,
-          ...nativeReceipts.map((receipt) => `${image}@${receipt.digest}`),
-        ],
-      ]);
-      expect(result.summaries).toEqual([
-        {
-          repository: image,
-          version: "0.1.0",
-          source_sha: sha,
-          digest: digest("e"),
-          tags: [`${image}:0.1.0`, `${image}:sha-${sha}`],
-          platforms: nativeReceipts.map(
-            ({ platform, digest, platform_digest }) => ({
-              platform,
-              digest,
-              platform_digest,
-            }),
-          ),
-          run_url:
-            "https://github.com/markhuangai/opensource-repo-manager/actions/runs/123",
-        },
-      ]);
-    });
-  });
-  for (const scenario of [
-    "older release",
-    "initial prerelease",
-    "became prerelease",
-    "suffix without prerelease flag",
-  ]) {
-    it(`does not promote latest for ${scenario}`, async () => {
-      const version = scenario.startsWith("suffix") ? "0.1.0-rc.1" : "0.1.0";
-      const current = {
-        ...publishedRelease,
-        tag_name: `v${version}`,
-        prerelease: scenario === "became prerelease",
-      };
-      await withReceipts(
-        async (directory) => {
-          const registry = registryTransport();
-          await run(publishScript, {
-            context: releaseContext(current),
-            env: {
-              ...publicationEnv(directory),
-              VERSION: version,
-              IS_PRERELEASE:
-                scenario === "initial prerelease" ? "true" : "false",
-            },
-            transport: releaseTransport({
-              current,
-              latest:
-                scenario === "older release"
-                  ? { ...publishedRelease, id: 43 }
-                  : current,
-            }),
-            executor: registry.executor,
-          });
-          expect(registry.publications).toHaveLength(1);
-        },
-        nativeReceipts.map((receipt) => ({ ...receipt, version })),
-      );
-    });
-  }
-  for (const changes of [
-    { source_sha: "f".repeat(40) },
-    { version: "0.2.0" },
-    { smoke: "failed" },
-    { digest: "invalid" },
-    { platform_digest: "invalid" },
-  ]) {
-    it(`rejects mismatched architecture receipt ${JSON.stringify(changes)}`, async () => {
-      await withReceipts(
-        async (directory) => {
-          const registry = registryTransport();
-          await expect(
-            run(publishScript, {
-              context: releaseContext(),
-              env: publicationEnv(directory),
-              transport: releaseTransport(),
-              executor: registry.executor,
-            }),
-          ).rejects.toThrow();
-          expect(registry.publications).toEqual([]);
-        },
-        [{ ...nativeReceipts[0], ...changes }, nativeReceipts[1]],
-      );
-    });
-  }
-  it("does not publish with a missing or duplicate architecture", async () => {
-    for (const receipts of [
-      nativeReceipts.slice(0, 1),
-      [nativeReceipts[0], nativeReceipts[0]],
-    ]) {
-      await withReceipts(async (directory) => {
-        const registry = registryTransport();
-        await expect(
-          run(publishScript, {
-            context: releaseContext(),
-            env: publicationEnv(directory),
-            transport: releaseTransport(),
-            executor: registry.executor,
-          }),
-        ).rejects.toThrow("Both architecture receipts");
-        expect(registry.publications).toEqual([]);
-      }, receipts);
-    }
-  });
-  for (const overrides of [
-    { commit: "f".repeat(40) },
-    { current: { ...publishedRelease, draft: true } },
-    { current: { ...publishedRelease, tag_name: "v0.2.0" } },
-  ]) {
-    it("rechecks live release identity before publishing", async () => {
-      await withReceipts(async (directory) => {
-        const registry = registryTransport();
-        await expect(
-          run(publishScript, {
-            context: releaseContext(),
-            env: publicationEnv(directory),
-            transport: releaseTransport(overrides),
-            executor: registry.executor,
-          }),
-        ).rejects.toThrow();
-        expect(registry.publications).toEqual([]);
-      });
-    });
-  }
-  it("rechecks the tag again before latest promotion", async () => {
-    await withReceipts(async (directory) => {
-      const registry = registryTransport();
-      const transport = releaseTransport();
-      let reads = 0;
-      transport.repos.getCommit = async () => ({
-        data: { sha: ++reads === 1 ? sha : "f".repeat(40) },
-      });
-      await expect(
-        run(publishScript, {
-          context: releaseContext(),
-          env: publicationEnv(directory),
-          transport,
-          executor: registry.executor,
-        }),
-      ).rejects.toThrow("tag moved");
-      expect(registry.publications).toHaveLength(1);
-    });
-  });
-  it("rejects a native registry manifest that differs from its smoke receipt", async () => {
-    await withReceipts(async (directory) => {
-      const registry = registryTransport({
-        [`${image}@${nativeReceipts[0].digest}`]: {
-          digest: nativeReceipts[0].digest,
-          manifests: [descriptor(nativeReceipts[1])],
-        },
-      });
-      await expect(
-        run(publishScript, {
-          context: releaseContext(),
-          env: publicationEnv(directory),
-          transport: releaseTransport(),
-          executor: registry.executor,
-        }),
-      ).rejects.toThrow("smoke-tested platforms");
-      expect(registry.publications).toEqual([]);
-    });
-  });
-  for (const manifests of [
-    [],
-    [descriptor(nativeReceipts[0])],
-    [descriptor(nativeReceipts[0]), descriptor(nativeReceipts[0])],
-  ]) {
-    it("never promotes a combined manifest missing either tested platform", async () => {
-      await withReceipts(async (directory) => {
-        const registry = registryTransport({
-          [`${image}:0.1.0`]: { digest: digest("e"), manifests },
-        });
-        await expect(
-          run(publishScript, {
-            context: releaseContext(),
-            env: publicationEnv(directory),
-            transport: releaseTransport(),
-            executor: registry.executor,
-          }),
-        ).rejects.toThrow("smoke-tested platforms");
-        expect(registry.publications).toHaveLength(1);
-      });
-    });
-  }
-  it("accepts provenance attestations alongside both runnable platforms", async () => {
-    await withReceipts(async (directory) => {
-      const registry = registryTransport({
-        [`${image}:0.1.0`]: {
-          ...combinedManifest,
-          manifests: [
-            ...combinedManifest.manifests,
-            {
-              digest: digest("f"),
-              platform: { os: "unknown", architecture: "unknown" },
-              annotations: {
-                "vnd.docker.reference.type": "attestation-manifest",
-              },
-            },
-          ],
-        },
-      });
-      await run(publishScript, {
-        context: releaseContext(),
-        env: publicationEnv(directory),
-        transport: releaseTransport(),
-        executor: registry.executor,
-      });
-      expect(registry.publications).toHaveLength(1);
-    });
-  });
-});
-
-describe("serialized latest reconciliation", () => {
-  const verified = (release = publishedRelease, changes = {}) => ({
-    ...combinedManifest,
-    annotations: {
-      "org.opensource-repo-manager.publication": JSON.stringify(
-        publicationAnnotation(release),
-      ),
-    },
-    ...changes,
-  });
-  const reconcile = (
-    registry,
-    transport = releaseTransport(),
-    context = releaseContext(),
-  ) =>
-    run(promotionScript, {
-      context,
-      env: { IMAGE: image },
-      transport,
-      executor: registry.executor,
-    });
-
-  it("reconciles the current latest release even when an older run wins the pending slot", async () => {
-    const current = { ...publishedRelease, id: 44, tag_name: "v0.3.0" };
-    const registry = registryTransport({
-      [`${image}:0.3.0`]: verified(current),
-    });
-    const result = await reconcile(
-      registry,
-      releaseTransport({ latest: current }),
-    );
-    expect(registry.publications).toEqual([
-      [
-        "buildx",
-        "imagetools",
-        "create",
-        "--tag",
-        `${image}:latest`,
-        `${image}@${digest("e")}`,
-      ],
-    ]);
-    expect(result.summaries[0]).toMatchObject({
-      release_id: 44,
-      version: "0.3.0",
-      source_sha: sha,
-    });
-  });
-
-  it("publishes all three versions before a coalesced promotion and tolerates reruns", async () => {
-    const registry = registryTransport();
-    const versions = ["0.1.0", "0.2.0", "0.3.0"];
-    for (const index of [0, 2, 1, 0]) {
-      const version = versions[index];
-      const release = {
-        ...publishedRelease,
-        id: 42 + index,
-        tag_name: `v${version}`,
-      };
-      await withReceipts(
-        async (directory) => {
-          await run(publishScript, {
-            context: releaseContext(release),
-            env: { ...publicationEnv(directory), VERSION: version },
-            transport: releaseTransport({ current: release }),
-            executor: registry.executor,
-          });
-        },
-        nativeReceipts.map((receipt) => ({ ...receipt, version })),
-      );
-    }
-    expect(registry.publications).toHaveLength(4);
-    for (const version of versions)
-      expect(
-        registry.publications.some((args) =>
-          args.includes(`${image}:${version}`),
-        ),
-      ).toBe(true);
-    expect(
-      registry.publications.every((args) => !args.includes(`${image}:latest`)),
-    ).toBe(true);
-    const latest = { ...publishedRelease, id: 44, tag_name: "v0.3.0" };
-    await reconcile(registry, releaseTransport({ latest }));
-    expect(registry.publications).toHaveLength(5);
-  });
-
-  it("accepts a source tag concurrently published by another verified version of the same source", async () => {
-    const other = { ...publishedRelease, id: 43, tag_name: "v0.2.0" };
-    const registry = registryTransport({
-      [`${image}:sha-${sha}`]: verified(other, { digest: digest("f") }),
-    });
-    await withReceipts((directory) =>
-      run(publishScript, {
-        context: releaseContext(),
-        env: publicationEnv(directory),
-        transport: releaseTransport(),
-        executor: registry.executor,
-      }),
-    );
-    expect(registry.publications).toHaveLength(1);
-  });
-
-  it("rejects a competing source tag that identifies another source", async () => {
-    const proof = { ...publicationAnnotation(), source_sha: "f".repeat(40) };
-    const registry = registryTransport({
-      [`${image}:sha-${sha}`]: {
-        ...combinedManifest,
-        digest: digest("f"),
-        annotations: {
-          "org.opensource-repo-manager.publication": JSON.stringify(proof),
-        },
-      },
-    });
-    await expect(
-      withReceipts((directory) =>
-        run(publishScript, {
-          context: releaseContext(),
-          env: publicationEnv(directory),
-          transport: releaseTransport(),
-          executor: registry.executor,
-        }),
-      ),
-    ).rejects.toThrow("Source tag");
-  });
-
-  for (const changes of [
-    { release_id: 43 },
-    { source_sha: "f".repeat(40) },
-    { release_version: "0.2.0" },
-    { platforms: [] },
-    {
-      platforms: [
-        publicationAnnotation().platforms[0],
-        publicationAnnotation().platforms[0],
-      ],
-    },
-  ])
-    it(`rejects invalid promotion provenance ${JSON.stringify(changes)}`, async () => {
-      const manifest = verified();
-      manifest.annotations["org.opensource-repo-manager.publication"] =
-        JSON.stringify({ ...publicationAnnotation(), ...changes });
-      const registry = registryTransport({ [`${image}:0.1.0`]: manifest });
-      await expect(reconcile(registry)).rejects.toThrow();
-      expect(registry.publications).toEqual([]);
-    });
-
-  for (const change of [
-    { prerelease: true },
-    { draft: true },
-    { tag_name: "v0.1.0-rc.1" },
-  ])
-    it("never promotes a prerelease or draft", async () => {
-      const registry = registryTransport();
-      await expect(
-        reconcile(
-          registry,
-          releaseTransport({ latest: { ...publishedRelease, ...change } }),
-        ),
-      ).rejects.toThrow("stable release");
-      expect(registry.publications).toEqual([]);
-    });
-
-  it("does not regress latest when the release changes during registry inspection", async () => {
-    const registry = registryTransport({ [`${image}:0.1.0`]: verified() });
-    const transport = releaseTransport();
-    let reads = 0;
-    transport.repos.getLatestRelease = async () => ({
-      data: ++reads === 1 ? publishedRelease : { ...publishedRelease, id: 43 },
-    });
-    const result = await reconcile(registry, transport);
-    expect(registry.publications).toEqual([]);
-    expect(result.notices.join(" ")).toContain("changed during inspection");
-  });
-
-  it("defers a latest release whose version image has not passed publication yet", async () => {
-    const registry = registryTransport();
-    registry.executor.getExecOutput = async () => ({
-      exitCode: 1,
-      stderr: "manifest unknown",
-      stdout: "",
-    });
-    const result = await reconcile(registry);
-    expect(result.notices.join(" ")).toContain("not published yet");
-    expect(registry.publications).toEqual([]);
-  });
-
-  it("does not hide registry authentication or transport failures as missing images", async () => {
-    const registry = registryTransport();
-    registry.executor.getExecOutput = async () => ({
-      exitCode: 1,
-      stderr: "unauthorized",
-      stdout: "",
-    });
-    await expect(reconcile(registry)).rejects.toThrow("inspection failed");
-  });
-});
 
 describe("native image smoke receipts", () => {
   for (const receipt of nativeReceipts) {

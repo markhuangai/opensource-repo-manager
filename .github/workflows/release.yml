@@ -1,14 +1,17 @@
-name: Release
+name: Release prerelease
+run-name: Prerelease ${{ github.event.workflow_run.head_sha }}
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [Repository CI, CodeQL]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.repository }}-${{ github.event.release.id }}
+  group: prerelease-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -16,59 +19,42 @@ env:
 
 jobs:
   resolve:
-    if: github.event_name == 'release' && github.event.action == 'published'
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.id == github.repository_id
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    concurrency:
+      group: release-state-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
-      contents: read
+      contents: write
       actions: read
     outputs:
       version: ${{ steps.release.outputs.version }}
       source_sha: ${{ steps.release.outputs.source_sha }}
-      prerelease: ${{ steps.release.outputs.prerelease }}
+      release_id: ${{ steps.release.outputs.release_id }}
+      build_required: ${{ steps.release.outputs.build_required }}
+      publish_required: ${{ steps.release.outputs.publish_required }}
     steps:
-      - name: Validate release source and version
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Resolve and reserve candidate
         id: release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
-            const assert = require("node:assert/strict");
-            const release = context.payload.release;
-            assert(context.eventName === "release" && context.payload.action === "published" &&
-              release && !release.draft && release.published_at, "A published GitHub Release is required.");
-            const tag = release.tag_name;
-            const match = typeof tag === "string" && tag.match(/^v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+\.)*[0-9A-Za-z-]+)?)$/);
-            assert(match && tag === tag.trim() && match[1].length <= 128,
-              "Release tag must be vMAJOR.MINOR.PATCH with an optional prerelease suffix.");
-            const version = match[1];
-            const suffix = version.indexOf("-");
-            assert(suffix < 0 || version.slice(suffix + 1).split(".").every(part =>
-              !/^[0-9]+$/.test(part) || part === "0" || !part.startsWith("0")), "Invalid numeric prerelease identifier.");
-            assert(context.ref === `refs/tags/${tag}` && /^[0-9a-f]{40}$/.test(context.sha), "Invalid release source.");
-            const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${tag}` });
-            assert.equal(commit.sha, context.sha, "Release tag moved.");
-            const { data: main } = await github.rest.repos.getBranch({ ...context.repo, branch: "main" });
-            const { data: comparison } = await github.rest.repos.compareCommits({
-              ...context.repo, base: context.sha, head: main.commit.sha,
-            });
-            assert(["ahead", "identical"].includes(comparison.status), "Release commit must belong to main.");
-            for (const workflow_id of ["ci.yml", "codeql.yml"]) {
-              const { data } = await github.rest.actions.listWorkflowRuns({
-                ...context.repo, workflow_id, head_sha: context.sha, branch: "main", event: "push", per_page: 1,
-              });
-              const run = data.workflow_runs[0];
-              assert(run && run.head_sha === context.sha && run.head_branch === "main" && run.event === "push" &&
-                run.status === "completed" && run.conclusion === "success",
-                `${workflow_id} must have a successful main-push run for the release SHA; rerun this release after CI passes.`);
-              core.info(JSON.stringify({ workflow: workflow_id, source_sha: context.sha, run_url: run.html_url }));
-            }
-            core.setOutput("version", version);
-            core.setOutput("source_sha", context.sha);
-            core.setOutput("prerelease", String(release.prerelease || suffix >= 0));
+            const { resolveCandidate } = require(`${process.env.GITHUB_WORKSPACE}/scripts/release-policy.mjs`);
+            await resolveCandidate({ github, context, core, env: process.env });
 
   build:
     name: Release image (${{ matrix.architecture }})
     needs: resolve
+    if: needs.resolve.outputs.build_required == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
@@ -125,6 +111,11 @@ jobs:
             const { writeFile } = require("node:fs/promises");
             const { join } = require("node:path");
             const { IMAGE, IMAGE_DIGEST, PLATFORM, SOURCE_SHA, VERSION, RUNNER_TEMP } = process.env;
+            const started = Date.now();
+            core.info(JSON.stringify({event: "release.smoke.started", repository: `${context.repo.owner}/${context.repo.repo}`, run_id: context.runId,
+              attempt: process.env.GITHUB_RUN_ATTEMPT, stage: "smoke", source_sha: SOURCE_SHA,
+              version: VERSION, platform: PLATFORM, digest: IMAGE_DIGEST}));
+            try {
             assert(/^sha256:[0-9a-f]{64}$/.test(IMAGE_DIGEST), "Invalid build digest.");
             const architecture = PLATFORM.split("/")[1];
             const reference = `${IMAGE}@${IMAGE_DIGEST}`;
@@ -168,6 +159,17 @@ jobs:
               source_sha: SOURCE_SHA, version: VERSION, platform: PLATFORM,
               digest: IMAGE_DIGEST, platform_digest: platformDigest, smoke: "passed",
             }));
+            core.info(JSON.stringify({event: "release.smoke.finished", repository: `${context.repo.owner}/${context.repo.repo}`, run_id: context.runId,
+              stage: "smoke", source_sha: SOURCE_SHA, version: VERSION, platform: PLATFORM,
+              digest: IMAGE_DIGEST, platform_digest: platformDigest, elapsed_ms: Date.now() - started, outcome: "passed"}));
+            } catch (error) {
+              core.error(JSON.stringify({event: "release.smoke.failed", repository: `${context.repo.owner}/${context.repo.repo}`, run_id: context.runId,
+                attempt: process.env.GITHUB_RUN_ATTEMPT, stage: "smoke", source_sha: SOURCE_SHA,
+                version: VERSION, platform: PLATFORM, digest: IMAGE_DIGEST,
+                elapsed_ms: Date.now() - started, cause: error.message,
+                recovery: "Inspect the native build and failed assertion; correct the cause before rerunning this candidate."}));
+              throw error;
+            }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digest-${{ matrix.architecture }}
@@ -177,12 +179,24 @@ jobs:
 
   publish:
     needs: [resolve, build]
+    if: >-
+      always() && needs.resolve.result == 'success' &&
+      needs.resolve.outputs.publish_required == 'true' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    concurrency:
+      group: release-state-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
-      contents: read
+      contents: write
+      actions: read
       packages: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -190,175 +204,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.resolve.outputs.build_required == 'true'
         with:
           pattern: digest-*
           path: ${{ runner.temp }}/digests
           merge-multiple: true
-      - name: Verify manifests and publish release tags
+      - name: Publish verified candidate
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          RELEASE_ID: ${{ needs.resolve.outputs.release_id }}
           RECEIPTS: ${{ runner.temp }}/digests
         with:
           script: |
-            const assert = require("node:assert/strict");
-            const { readdir, readFile } = require("node:fs/promises");
-            const { join } = require("node:path");
-            const { IMAGE, SOURCE_SHA, VERSION, RECEIPTS } = process.env;
-            const architectures = ["amd64", "arm64"];
-            assert.deepEqual((await readdir(RECEIPTS)).sort(), architectures.map(arch => `image-${arch}.json`),
-              "Both architecture receipts are required.");
-            const receipts = await Promise.all(architectures.map(async architecture => {
-              const receipt = JSON.parse(await readFile(join(RECEIPTS, `image-${architecture}.json`), "utf8"));
-              assert.equal(receipt.source_sha, SOURCE_SHA);
-              assert.equal(receipt.version, VERSION);
-              assert.equal(receipt.platform, `linux/${architecture}`);
-              assert.equal(receipt.smoke, "passed");
-              for (const digest of [receipt.digest, receipt.platform_digest]) {
-                assert(/^sha256:[0-9a-f]{64}$/.test(digest), "Invalid architecture digest.");
-              }
-              return receipt;
-            }));
-            async function inspect(reference) {
-              return JSON.parse((await exec.getExecOutput("docker", ["buildx", "imagetools", "inspect",
-                reference, "--format", "{{json .Manifest}}"], { silent: true })).stdout);
-            }
-            function verifyPlatforms(manifest, expected) {
-              const runnable = manifest.manifests.filter(item => item.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest");
-              assert.deepEqual(runnable.map(item => ({
-                platform: `${item.platform?.os}/${item.platform?.architecture}`, digest: item.digest,
-              })).sort((a, b) => a.platform.localeCompare(b.platform)), expected.map(receipt => ({
-                platform: receipt.platform, digest: receipt.platform_digest,
-              })), "Published manifest does not match the smoke-tested platforms.");
-            }
-            for (const receipt of receipts) {
-              const manifest = await inspect(`${IMAGE}@${receipt.digest}`);
-              assert.equal(manifest.digest, receipt.digest);
-              if (manifest.manifests) verifyPlatforms(manifest, [receipt]);
-              else assert.equal(manifest.digest, receipt.platform_digest);
-            }
-            async function recheckSource() {
-              const { data: release } = await github.rest.repos.getRelease({ ...context.repo, release_id: context.payload.release.id });
-              assert(!release.draft && release.published_at && release.tag_name === `v${VERSION}`, "Release changed before publication.");
-              const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${release.tag_name}` });
-              assert.equal(commit.sha, SOURCE_SHA, "Release tag moved before publication.");
-              return release;
-            }
-            await recheckSource();
-            const tags = [`${IMAGE}:${VERSION}`, `${IMAGE}:sha-${SOURCE_SHA}`];
-            const publication = {
-              version: 1, release_id: context.payload.release.id, source_sha: SOURCE_SHA, release_version: VERSION,
-              platforms: receipts.map(({ platform, platform_digest }) => ({ platform, platform_digest })),
-            };
-            await exec.exec("docker", ["buildx", "imagetools", "create", ...tags.flatMap(tag => ["--tag", tag]),
-              "--annotation", `index:org.opensource-repo-manager.publication=${JSON.stringify(publication)}`,
-              ...receipts.map(receipt => `${IMAGE}@${receipt.digest}`)]);
-            const combined = await inspect(tags[0]);
-            assert(/^sha256:[0-9a-f]{64}$/.test(combined.digest), "Invalid combined digest.");
-            verifyPlatforms(combined, receipts);
-            const sourceTag = await inspect(tags[1]);
-            if (sourceTag.digest !== combined.digest) {
-              const other = JSON.parse(sourceTag.annotations?.["org.opensource-repo-manager.publication"] ?? "null");
-              assert(other?.version === 1 && other.source_sha === SOURCE_SHA, "Source tag does not identify this source.");
-              assert.deepEqual(other.platforms?.map(item => item.platform).sort(), ["linux/amd64", "linux/arm64"]);
-              assert(other.platforms.every(item => /^sha256:[0-9a-f]{64}$/.test(item.platform_digest)));
-              verifyPlatforms(sourceTag, other.platforms);
-            }
-            await recheckSource();
-            const receipt = {
-              repository: IMAGE, version: VERSION, source_sha: SOURCE_SHA, digest: combined.digest, tags,
-              platforms: receipts.map(({ platform, digest, platform_digest }) => ({ platform, digest, platform_digest })),
-              run_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            };
-            core.info(JSON.stringify(receipt));
-            await core.summary.addHeading("Image publication receipt").addCodeBlock(JSON.stringify(receipt, null, 2), "json").write();
-
-  promote_latest:
-    name: Reconcile latest image
-    needs: [resolve, publish]
-    if: needs.resolve.outputs.prerelease == 'false'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    concurrency:
-      group: release-${{ github.repository }}
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      actions: read
-      packages: write
-    steps:
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Promote the current verified stable release
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        with:
-          script: |
-            const assert = require("node:assert/strict");
-            const { IMAGE } = process.env;
-            let release;
-            try {
-              release = (await github.rest.repos.getLatestRelease(context.repo)).data;
-            } catch (error) {
-              if (error.status !== 404) throw error;
-              core.notice("No stable release is available for latest promotion.");
-              return;
-            }
-            assert(!release.draft && !release.prerelease && release.published_at &&
-              /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(release.tag_name), "Invalid latest stable release.");
-            const version = release.tag_name.slice(1);
-            const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${release.tag_name}` });
-            assert(/^[0-9a-f]{40}$/.test(commit.sha), "Invalid latest source.");
-            const { data: main } = await github.rest.repos.getBranch({ ...context.repo, branch: "main" });
-            const { data: comparison } = await github.rest.repos.compareCommits({
-              ...context.repo, base: commit.sha, head: main.commit.sha,
-            });
-            assert(["ahead", "identical"].includes(comparison.status), "Latest source must belong to main.");
-            for (const workflow_id of ["ci.yml", "codeql.yml"]) {
-              const { data } = await github.rest.actions.listWorkflowRuns({
-                ...context.repo, workflow_id, head_sha: commit.sha, branch: "main", event: "push", per_page: 1,
-              });
-              const run = data.workflow_runs[0];
-              assert(run && run.head_sha === commit.sha && run.head_branch === "main" && run.event === "push" &&
-                run.status === "completed" && run.conclusion === "success", "Latest source requires successful main-push CI.");
-            }
-            async function inspect(reference, optional = false) {
-              const output = await exec.getExecOutput("docker", ["buildx", "imagetools", "inspect",
-                reference, "--format", "{{json .Manifest}}"], { silent: true, ignoreReturnCode: optional });
-              if (output.exitCode && optional && /manifest unknown|not found|404/i.test(output.stderr)) return null;
-              assert(!output.exitCode, "Registry manifest inspection failed.");
-              return JSON.parse(output.stdout);
-            }
-            const combined = await inspect(`${IMAGE}:${version}`, true);
-            if (!combined) {
-              core.notice("The latest release image is not published yet; its publication will reconcile latest.");
-              return;
-            }
-            assert(/^sha256:[0-9a-f]{64}$/.test(combined.digest), "Invalid latest digest.");
-            const proof = JSON.parse(combined.annotations?.["org.opensource-repo-manager.publication"] ?? "null");
-            assert(proof?.version === 1 && proof.release_id === release.id && proof.source_sha === commit.sha &&
-              proof.release_version === version, "Latest image has no matching verified publication.");
-            assert.deepEqual(proof.platforms?.map(item => item.platform).sort(), ["linux/amd64", "linux/arm64"]);
-            assert(proof.platforms.every(item => /^sha256:[0-9a-f]{64}$/.test(item.platform_digest)));
-            const runnable = combined.manifests.filter(item => item.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest");
-            assert.deepEqual(runnable.map(item => ({
-              platform: `${item.platform?.os}/${item.platform?.architecture}`, platform_digest: item.digest,
-            })).sort((a, b) => a.platform.localeCompare(b.platform)), proof.platforms,
-              "Latest manifest differs from the smoke-tested publication.");
-            const current = (await github.rest.repos.getLatestRelease(context.repo)).data;
-            const source = (await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${release.tag_name}` })).data;
-            if (current.id !== release.id || current.tag_name !== release.tag_name || current.draft || current.prerelease ||
-              !current.published_at || source.sha !== commit.sha) {
-              core.notice("Latest release changed during inspection; a subsequent publication will reconcile it.");
-              return;
-            }
-            await exec.exec("docker", ["buildx", "imagetools", "create", "--tag", `${IMAGE}:latest`, `${IMAGE}@${combined.digest}`]);
-            assert.equal((await inspect(`${IMAGE}:latest`)).digest, combined.digest);
-            await core.summary.addHeading("Latest promotion receipt").addCodeBlock(JSON.stringify({
-              release_id: release.id, version, source_sha: commit.sha, digest: combined.digest,
-              run_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            }, null, 2), "json").write();
+            const { publishCandidate } = require(`${process.env.GITHUB_WORKSPACE}/scripts/release-policy.mjs`);
+            await publishCandidate({ github, context, core, exec, env: process.env });
