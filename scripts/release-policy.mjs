@@ -394,11 +394,24 @@ function operation({ github, context, core, exec, env = process.env }, stage) {
       assert.equal(commit, source, `Release tag ${tag} moved.`);
     },
     async release(tag) {
-      return (
-        await read("github.getReleaseByTag", { ...repo, tag }, (args) =>
-          github.rest.repos.getReleaseByTag(args),
+      const matches = (
+        await read("github.listReleases", { ...repo, per_page: 100 }, (args) =>
+          github.paginate(github.rest.repos.listReleases, args),
         )
-      ).data;
+      ).filter((release) => release.tag_name === tag);
+      assert(matches.length <= 1, `Conflicting releases for ${tag}.`);
+      if (!matches.length)
+        throw Object.assign(new Error(`Release ${tag} not found.`), {
+          status: 404,
+        });
+      const release = matches[0];
+      log("release_lookup", {
+        tag,
+        release_id: release.id,
+        draft: release.draft,
+        prerelease: release.prerelease,
+      });
+      return release;
     },
     async inspect(reference, optional = false) {
       return read("registry.inspect", { reference }, async () => {
@@ -1038,7 +1051,6 @@ export async function publishCandidate(options) {
       !latest || compareVersions(latest, version) <= 0,
       "A newer candidate already exists.",
     );
-    await api.copy([`${version.major}-prerelease`], receipt.digest);
     if (release.draft)
       await api.mutate(
         "github.updateRelease",
@@ -1066,6 +1078,7 @@ export async function publishCandidate(options) {
       "Candidate publication readback failed.",
     );
     await candidateProof(api, current, source);
+    await api.copy([`${version.major}-prerelease`], receipt.digest);
     await api.alias(version.tag, source);
     await api.summary(receipt);
   });
@@ -1263,10 +1276,7 @@ export async function promoteStable(options) {
       "Latest candidate changed before promotion.",
     );
     const currentStable = versions(currentState.releases, false)[0]?.version;
-    const tags = [version.base.slice(1), String(version.major)];
-    if (!currentStable || compareVersions(target, currentStable) >= 0)
-      tags.push("latest");
-    await api.copy(tags, receipt.digest);
+    if (!existing) await api.copy([version.base.slice(1)], receipt.digest);
     verifyReceipt(
       promoted,
       release,
@@ -1302,6 +1312,10 @@ export async function promoteStable(options) {
       "Stable publication readback failed.",
     );
     await api.tagSource(version.base, source);
+    const tags = [String(version.major)];
+    if (!currentStable || compareVersions(target, currentStable) >= 0)
+      tags.push("latest");
+    await api.copy(tags, receipt.digest);
     await api.alias(version.base, source);
     await api.summary(promoted);
   });

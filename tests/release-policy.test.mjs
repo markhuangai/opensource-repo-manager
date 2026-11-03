@@ -150,7 +150,7 @@ function fixture() {
         },
         getReleaseByTag: async ({ tag }) => {
           const release = state.releases.find(
-            (release) => release.tag_name === tag,
+            (release) => release.tag_name === tag && !release.draft,
           );
           if (!release) throw notFound();
           return { data: globalThis.structuredClone(release) };
@@ -262,8 +262,10 @@ function fixture() {
     },
     paginate: async (route, args) => {
       expect(args.per_page).toBe(100);
-      if (route === "releases")
+      if (route === "releases") {
+        readProvider("listReleases", args);
         return globalThis.structuredClone(state.releases);
+      }
       if (route === "refs")
         return globalThis.structuredClone([...state.refs.values()]);
       if (route === "assets")
@@ -380,6 +382,14 @@ function fixture() {
             {
               digest: item.platform_digest,
               platform: { os: "linux", architecture: arch },
+            },
+            {
+              digest: digest(index ? "f" : "e"),
+              platform: { os: "unknown", architecture: "unknown" },
+              annotations: {
+                "vnd.docker.reference.type": "attestation-manifest",
+                "vnd.docker.reference.digest": item.platform_digest,
+              },
             },
           ],
         });
@@ -549,7 +559,7 @@ describe("actual candidate workflow scripts", () => {
       },
     });
   });
-  it("reserves a draft and publishes both native proofs, durable receipt and matching aliases", async () => {
+  it("publishes both native platforms with provenance attestations, durable receipt and matching aliases", async () => {
     const state = fixture();
     await state.candidate();
     const release = state.releases[0];
@@ -564,6 +574,17 @@ describe("actual candidate workflow scripts", () => {
       "linux/amd64",
       "linux/arm64",
     ]);
+    const manifest = state.manifests.get(`${image}@${receipt.digest}`);
+    expect(manifest.manifests).toHaveLength(4);
+    expect(
+      manifest.manifests
+        .filter(
+          (item) =>
+            item.annotations?.["vnd.docker.reference.type"] ===
+            "attestation-manifest",
+        )
+        .map((item) => item.annotations["vnd.docker.reference.digest"]),
+    ).toEqual(receipt.platforms.map((item) => item.platform_digest));
     for (const tag of ["1.0.0-rc.1", "1-prerelease", `sha-${source}`])
       expect(state.manifests.get(`${image}:${tag}`).digest).toBe(
         receipt.digest,
@@ -587,6 +608,88 @@ describe("actual candidate workflow scripts", () => {
     await state.invoke("resolve");
     expect(state.outputs.version).toBe("1.0.0-rc.10");
   });
+  it("recovers a draft reservation beyond the first release page without creating a duplicate", async () => {
+    const state = fixture();
+    state.releases.push(
+      ...Array.from({ length: 105 }, (_, id) => ({
+        id,
+        tag_name: `unrelated-${id}`,
+        draft: false,
+      })),
+    );
+    await state.invoke("resolve");
+    const reservation = state.releases.at(-1);
+    expect(reservation.draft).toBe(true);
+    const before = state.writes.length;
+    await state.invoke("resolve");
+    expect(state.writes).toHaveLength(before);
+    expect(state.outputs.release_id).toBe(String(reservation.id));
+    await state.publish();
+    expect(reservation.draft).toBe(false);
+    expect(
+      state.writes.filter((write) => write.operation === "createRelease"),
+    ).toHaveLength(1);
+  });
+  it("rejects conflicting release reservations before publishing images", async () => {
+    const state = fixture();
+    await state.invoke("resolve");
+    state.releases.push({ ...state.releases[0], id: 999 });
+    const before = state.writes.length;
+    await expect(state.invoke("publish")).rejects.toThrow(
+      "Conflicting releases for v1.0.0-rc.1",
+    );
+    expect(state.writes).toHaveLength(before);
+  });
+  for (const interruption of ["publication", "readback"])
+    it(`keeps prerelease aliases on the prior publication after failed ${interruption} and repairs them on retry`, async () => {
+      const state = fixture();
+      await state.candidate();
+      const priorDigest = state.manifests.get(`${image}:1-prerelease`).digest;
+      const priorRef = state.refs.get("tags/v1-prerelease").object.sha;
+      state.main = "b".repeat(40);
+      state.context.payload.workflow_run.head_sha = state.main;
+      state.writes = [];
+      if (interruption === "publication") state.failure = "updateRelease";
+      else
+        state.readFailure = {
+          operation: "listReleases",
+          after: "updateRelease",
+        };
+      await expect(state.candidate()).rejects.toThrow(
+        interruption === "publication"
+          ? "Provider interrupted updateRelease"
+          : "Provider read failed: listReleases",
+      );
+      const reservedDigest = state.manifests.get(`${image}:1.0.0-rc.2`).digest;
+      expect(state.releases.at(-1).draft).toBe(interruption === "publication");
+      expect(state.manifests.get(`${image}:1-prerelease`).digest).toBe(
+        priorDigest,
+      );
+      expect(state.refs.get("tags/v1-prerelease").object.sha).toBe(priorRef);
+      const before = state.writes.length;
+      await state.invoke("resolve");
+      expect(state.outputs.build_required).toBe("false");
+      await state.invoke("publish");
+      expect(state.releases.at(-1).draft).toBe(false);
+      expect(state.manifests.get(`${image}:1-prerelease`).digest).toBe(
+        reservedDigest,
+      );
+      expect(state.manifests.get(`${image}:1.0.0-rc.2`).digest).toBe(
+        reservedDigest,
+      );
+      expect(state.refs.get("tags/v1-prerelease").object.sha).not.toBe(
+        priorRef,
+      );
+      expect(
+        state.writes
+          .slice(before)
+          .some(
+            (write) =>
+              write.operation === "registry" &&
+              write.args.includes("--annotation"),
+          ),
+      ).toBe(false);
+    });
   it("reuses completed publication on duplicate events without rebuilding or replacing the version", async () => {
     const state = fixture();
     await state.candidate();
@@ -741,6 +844,22 @@ describe("actual candidate workflow scripts", () => {
     const before = state.writes.length;
     await expect(state.invoke("publish")).rejects.toThrow("digest changed");
     expect(state.writes).toHaveLength(before);
+  });
+  it("rejects a conflicting immutable source-SHA image on publication retry before further writes", async () => {
+    const state = fixture();
+    await state.candidate();
+    state.manifests.set(`${image}:sha-${source}`, {
+      ...state.manifests.get(`${image}:sha-${source}`),
+      digest: digest("f"),
+    });
+    const before = state.writes.length;
+    await expect(state.invoke("publish")).rejects.toThrow(
+      "Source image tag conflicts with this publication.",
+    );
+    expect(state.writes).toHaveLength(before);
+    expect(state.manifests.get(`${image}:sha-${source}`).digest).toBe(
+      digest("f"),
+    );
   });
 });
 
@@ -910,6 +1029,58 @@ describe("actual stable promotion workflow script", () => {
     expect(state.assets.size).toBe(2);
     expect(state.manifests.get(`${image}:latest`).digest).toBe(original);
   });
+  for (const interruption of ["publication", "readback"])
+    it(`keeps stable aliases on the prior publication after failed ${interruption} and repairs them without rebuilding`, async () => {
+      const state = fixture();
+      await state.candidate();
+      state.context.payload.inputs = { source_rc: "v1.0.0-rc.1" };
+      await state.invoke("promote");
+      const priorDigest = state.manifests.get(`${image}:latest`).digest;
+      const priorRef = state.refs.get("tags/v1").object.sha;
+      state.main = "b".repeat(40);
+      state.context.payload.workflow_run.head_sha = state.main;
+      await state.candidate();
+      const candidateDigest = state.manifests.get(`${image}:1.0.1-rc.1`).digest;
+      state.context.payload.inputs = { source_rc: "v1.0.1-rc.1" };
+      state.writes = [];
+      if (interruption === "publication") state.failure = "updateRelease";
+      else
+        state.readFailure = {
+          operation: "listReleases",
+          after: "updateRelease",
+        };
+      await expect(state.invoke("promote")).rejects.toThrow(
+        interruption === "publication"
+          ? "Provider interrupted updateRelease"
+          : "Provider read failed: listReleases",
+      );
+      expect(state.releases.at(-1).draft).toBe(interruption === "publication");
+      expect(state.manifests.get(`${image}:1.0.1`).digest).toBe(
+        candidateDigest,
+      );
+      for (const tag of ["1", "latest"])
+        expect(state.manifests.get(`${image}:${tag}`).digest).toBe(priorDigest);
+      expect(state.refs.get("tags/v1").object.sha).toBe(priorRef);
+      const before = state.writes.length;
+      await state.invoke("promote");
+      expect(state.releases.at(-1).draft).toBe(false);
+      for (const tag of ["1.0.1", "1", "latest"])
+        expect(state.manifests.get(`${image}:${tag}`).digest).toBe(
+          candidateDigest,
+        );
+      expect(state.refs.get("tags/v1").object.sha).not.toBe(priorRef);
+      expect(
+        state.writes
+          .slice(before)
+          .filter((write) => write.operation === "registry")
+          .every(
+            (write) =>
+              !write.args.includes("--annotation") &&
+              !write.args.includes(`${image}:1.0.1`) &&
+              write.args.at(-1) === `${image}@${candidateDigest}`,
+          ),
+      ).toBe(true);
+    });
   it("rejects non-main dispatch and malformed candidate input before writes", async () => {
     for (const configure of [
       (state) => {
