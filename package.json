@@ -1,6 +1,6 @@
 {
   "name": "opensource-repo-manager",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Bounded GitHub Actions maintenance with audited fixes and human-reviewed pull requests.",
   "license": "Apache-2.0",

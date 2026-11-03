@@ -1,0 +1,50 @@
+name: Promote stable release
+run-name: Promote ${{ inputs.source_rc }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_rc:
+        description: Latest verified candidate tag, for example v1.0.0-rc.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/markhuangai/opensource-repo-manager
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: release-state-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote exact verified candidate
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { promoteStable } = require(`${process.env.GITHUB_WORKSPACE}/scripts/release-policy.mjs`);
+            await promoteStable({ github, context, core, exec, env: process.env });
