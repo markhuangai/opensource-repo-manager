@@ -205,8 +205,13 @@ function register(type, name, owner = id) {
   resources.push({ type, name, owner });
 }
 
-function logs(container) {
-  const output = result(["container", "logs", container]);
+function logs(container, since) {
+  const output = result([
+    "container",
+    "logs",
+    ...(since ? ["--since", since] : []),
+    container,
+  ]);
   assert.equal(output.status, 0, "Container logs unavailable");
   return output.stdout + output.stderr;
 }
@@ -224,8 +229,11 @@ function stopCleanly(container = runtime) {
 }
 
 async function waitForFixture(container = runtime) {
+  const startedAt = JSON.parse(docker(["container", "inspect", container]))[0]
+    .State.StartedAt;
+  // Docker retains ready messages from earlier starts of the same container.
   await waitUntil(
-    () => logs(container).includes("Component fixture ready."),
+    () => logs(container, startedAt).includes("Component fixture ready."),
     "Component fixture did not start",
   );
 }
