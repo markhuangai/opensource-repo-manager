@@ -54,7 +54,7 @@ jobs:
             const environment = ["ORM_GITHUB_TOKEN", "ORM_SESSION_KEY", "ORM_ISSUE_NUMBER", "GITHUB_REPOSITORY", "GITHUB_EVENT_NAME", "GITHUB_REF"];
             await exec.exec("docker", ["create", "--name", name,
               "--label", `org.opensource-repo-manager.actions-run=${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`,
-              "--no-healthcheck", "--mount", `type=bind,src=${process.env.GITHUB_EVENT_PATH},dst=/event.json,readonly`,
+              "--mount", `type=bind,src=${process.env.GITHUB_EVENT_PATH},dst=/event.json,readonly`,
               "--env", "GITHUB_EVENT_PATH=/event.json", ...environment.flatMap(key => ["--env", key]),
               "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "route"]);
             const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true});
@@ -115,7 +115,7 @@ jobs:
             assert(environment.every(key => process.env[key]), "Missing trusted Actions context or credentials.");
             await exec.exec("docker", ["create", "--name", name,
               "--label", `org.opensource-repo-manager.actions-run=${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`,
-              "--no-healthcheck", ...environment.flatMap(key => ["--env", key]),
+              ...environment.flatMap(key => ["--env", key]),
               "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "run", issue]);
             const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true, ignoreReturnCode: true});
             const result = JSON.parse(output.stdout.trim());

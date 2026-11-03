@@ -25,7 +25,7 @@ import {
   createRunSnapshot,
 } from "/opt/orm/app/dist/config/load.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
-import { parseConfiguration } from "/opt/orm/app/dist/config/schema.js";
+import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { digest } from "/opt/orm/app/dist/domain/agents.js";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
 import { respond as claude } from "/agent-fixtures/claude.mjs";
@@ -209,9 +209,9 @@ export async function runBootstrapTests() {
   let number = 5000;
   const seed = (snapshot, source) => {
     store.saveSnapshot(snapshot);
-    store.discover([++number], 1, true);
+    ++number;
     store.applyIssue(
-      store.nextDirty(),
+      store.refreshIssue(number),
       {
         id: number + 10000,
         number,
@@ -258,7 +258,7 @@ export async function runBootstrapTests() {
         argv: [
           "/bin/sh",
           "-c",
-          'test ! -r /config/config.yml && test "$(id -u)" != 0 && test ! -e "$HOME/bootstrap-canary" && printf \'%s\' "$(id -u)" > "$HOME/bootstrap-canary"',
+          'test ! -r /config/actions.yml && test "$(id -u)" != 0 && test ! -e "$HOME/bootstrap-canary" && printf \'%s\' "$(id -u)" > "$HOME/bootstrap-canary"',
         ],
       },
     ],
@@ -285,16 +285,14 @@ export async function runBootstrapTests() {
     for (const sdk of ["claude", "codex"]) {
       currentSdk = sdk;
       markPhase("sdk:start");
-      const config = parseConfiguration(
-        await readFile("/config/config.yml", "utf8"),
+      const config = parseActionsConfiguration(
+        await readFile("/config/actions.yml", "utf8"),
       );
       config.github.repository = "owner/repo";
       config.proxy.url = proxy;
-      config.mcp = { ...config.mcp, servers: {}, credentials: {} };
       for (const role of Object.keys(config.roles)) {
         config.profiles[role] = profiles[sdk];
         config.roles[role].profile = role;
-        config.roles[role].mcp = {};
       }
       const bundles = globalThis.structuredClone(
         Object.fromEntries(
@@ -332,7 +330,6 @@ export async function runBootstrapTests() {
         errors,
         requests,
         histories,
-        mcpCredential: "bootstrap-mcp-unused",
         bootstrap(scenario, text) {
           if (scenario === "bootstrap_plan") return currentPlan;
           return {
@@ -569,7 +566,7 @@ export async function runBootstrapTests() {
           (name === "npm"
             ? "\nprintf SDK-generated > .yarn/cache/late.zip\n"
             : "") +
-          '\ntest ! -r /config/config.yml\ntest "$(id -u)" = 10001\nprintf "\\nBOOTSTRAP_TESTS_PASSED\\n"\n';
+          '\ntest ! -r /config/actions.yml\ntest "$(id -u)" = 10001\nprintf "\\nBOOTSTRAP_TESTS_PASSED\\n"\n';
         const result = await events(
           supervisor.run(
             {
@@ -1054,14 +1051,8 @@ export async function runBootstrapTests() {
           const interruptedAt = Date.now();
           if (mode === "cancelled") controller.abort();
           else {
-            store.accept(
-              `bootstrap-stale-${randomUUID()}`,
-              "digest",
-              "issues",
-              [{ kind: "issue", number: cancelled.issue_number }],
-            );
             store.applyIssue(
-              store.nextDirty(),
+              store.refreshIssue(cancelled.issue_number),
               {
                 id: cancelled.issue_number + 10000,
                 number: cancelled.issue_number,

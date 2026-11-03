@@ -15,7 +15,7 @@ import {
   loadProtectedConfiguration,
   createRunSnapshot,
 } from "/opt/orm/app/dist/config/load.js";
-import { parseConfiguration } from "/opt/orm/app/dist/config/schema.js";
+import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
 import { respond as claude } from "/agent-fixtures/claude.mjs";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
@@ -82,7 +82,7 @@ export async function runPublicationTests() {
   let config, snapshot, secrets, options;
   const seed = () => {
     store.saveSnapshot(snapshot);
-    store.discover([++number], 1, true);
+    ++number;
     const context = {
       id: number + 10000,
       number,
@@ -94,7 +94,7 @@ export async function runPublicationTests() {
       source: remote.source,
     };
     remote.state.issues.set(number, context);
-    store.applyIssue(store.nextDirty(), context, snapshot);
+    store.applyIssue(store.refreshIssue(number), context, snapshot);
     return store.job(number);
   };
   const candidate = async (job, label, binary = false, structured) => {
@@ -171,31 +171,21 @@ export async function runPublicationTests() {
     supervisor.publication.publish(proposal, signal());
   try {
     for (sdk of ["codex", "claude"]) {
-      config = parseConfiguration(await readFile("/config/config.yml", "utf8"));
+      config = parseActionsConfiguration(
+        await readFile("/config/actions.yml", "utf8"),
+      );
       config.github.repository = "owner/repo";
       config.github.token = remote.state.token;
       config.proxy.url = proxy;
-      config.proxy.key = `publication-model-${randomUUID()}`;
-      config.github.webhook_secret = `line-one\nline-two ${randomUUID()}`;
-      config.notifications.smtp = {
-        enabled: true,
-        host: "smtp.example.invalid",
-        port: 587,
-        secure: false,
-        username: "publication-fixture-user",
-        password: `folded password ${randomUUID()}`,
-        from: "fixture@example.invalid",
-        to: ["fixture@example.invalid"],
-      };
+      config.proxy.key = `folded password ${randomUUID()}`;
+      const scannerRuntimeToken = `line-one\nline-two ${randomUUID()}`;
       config.limits.infrastructure_retries = 20;
-      config.mcp = { ...config.mcp, servers: {}, credentials: {} };
       config.profiles = Object.fromEntries(
         Object.keys(config.roles).map((role) => [role, profiles[sdk]]),
       );
       const bundles = {};
       for (const role of Object.keys(config.roles)) {
         config.roles[role].profile = role;
-        config.roles[role].mcp = {};
         const bundle = globalThis.structuredClone(
           loaded.snapshot.roles[role].bundle,
         );
@@ -212,7 +202,7 @@ export async function runPublicationTests() {
           }
         bundles[role] = bundle;
       }
-      const separated = separateSecrets(config);
+      const separated = separateSecrets(config, undefined, scannerRuntimeToken);
       secrets = separated.secrets;
       snapshot = createRunSnapshot(separated.settings, bundles, secrets);
       const silent = () => {};
@@ -247,7 +237,6 @@ export async function runPublicationTests() {
         requests,
         errors,
         histories: new Map(),
-        mcpCredential: "publication-mcp-unused",
         async outputReview(text) {
           if (holdReview) {
             reviewEntered = true;
@@ -353,10 +342,7 @@ export async function runPublicationTests() {
             );
         }
       }
-      const foldedSecret = config.notifications.smtp.password.replace(
-        " ",
-        "\n  ",
-      );
+      const foldedSecret = config.proxy.key.replace(" ", "\n  ");
       for (const quote of ["'", '"'])
         for (const text of [
           `password: ${quote}${foldedSecret}${quote}\n`,
@@ -366,17 +352,14 @@ export async function runPublicationTests() {
             scanner.scan(text, signal()),
             /publication_secret/,
           );
-      const blockPassword = config.notifications.smtp.password.replace(
-        " ",
-        "\n",
-      );
+      const blockPassword = config.proxy.key.replace(" ", "\n");
       const blockSecrets = [
         `password: ${foldedSecret}\n`,
         `? ${foldedSecret}\n: value\n`,
         `password: >-\n  ${blockPassword.replaceAll("\n", "\n  ")}\n`,
         `? >-\n  ${blockPassword.replaceAll("\n", "\n  ")}\n: value\n`,
-        `password: |-\n  ${config.github.webhook_secret.replaceAll("\n", "\n  ")}\n`,
-        `? |-\n  ${config.github.webhook_secret.replaceAll("\n", "\n  ")}\n: value\n`,
+        `password: |-\n  ${scannerRuntimeToken.replaceAll("\n", "\n  ")}\n`,
+        `? |-\n  ${scannerRuntimeToken.replaceAll("\n", "\n  ")}\n: value\n`,
       ];
       for (const text of blockSecrets)
         await assert.rejects(
@@ -478,68 +461,6 @@ export async function runPublicationTests() {
         supervisor.publication.outputReview.verify(reviewed.id, request).id,
         reviewed.id,
       );
-      const notification = supervisor.notifications.prepare({
-        id: `reviewed-notification-${sdk}`,
-        job_id: reviewJob.id,
-        revision: reviewJob.revision,
-        repository_id: 42,
-        issue_number: reviewJob.issue_number,
-        occurred_at: 1792451961000,
-        outcome: "needs_attention",
-        reason: "workflow_blocked",
-        narrative: "A bounded operator summary for this workflow.",
-      });
-      await assert.rejects(
-        supervisor.notifications.enqueue(notification, {}, signal()),
-        /review_missing/,
-      );
-      await assert.rejects(
-        supervisor.notifications.enqueue(
-          notification,
-          { review_id: reviewed.id },
-          signal(),
-        ),
-        /output_review_mismatch/,
-      );
-      const notificationReview =
-        await supervisor.publication.outputReview.review(
-          notification.review,
-          signal(),
-        );
-      await supervisor.notifications.enqueue(
-        notification,
-        { review_id: notificationReview.id },
-        signal(),
-      );
-      assert(
-        supervisor.notifications
-          .receipt(notification.event.id)
-          .every((receipt) => receipt.state === "pending"),
-      );
-      const changedNotification = globalThis.structuredClone(notification);
-      changedNotification.event.narrative = "A different generated summary.";
-      await assert.rejects(
-        supervisor.notifications.enqueue(
-          changedNotification,
-          { review_id: notificationReview.id },
-          signal(),
-        ),
-        /prepared_mismatch/,
-      );
-      const changedDestination = globalThis.structuredClone(notification);
-      changedDestination.review.destination = {
-        type: "notification",
-        channels: {},
-      };
-      await assert.rejects(
-        supervisor.notifications.enqueue(
-          changedDestination,
-          { review_id: notificationReview.id },
-          signal(),
-        ),
-        /prepared_mismatch/,
-      );
-      proof.push({ sdk, reviewed_notifications: "passed" });
       assert.throws(
         () =>
           supervisor.publication.outputReview.verify(reviewed.id, {

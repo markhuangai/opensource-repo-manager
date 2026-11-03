@@ -13,7 +13,7 @@ import { loadWorkflowBundles } from "../src/config/bundles.ts";
 import { createRunSnapshot } from "../src/config/load.ts";
 import { readRegularFile } from "../src/config/files.ts";
 import { separateSecrets } from "../src/config/secrets.ts";
-import { fixtureMcp } from "./fixtures.ts";
+import { fixtureConfiguration } from "./fixtures.ts";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -45,7 +45,7 @@ async function fixture() {
     "Contained reference\n",
     { mode: 0o644 },
   );
-  const config = fixtureMcp();
+  const config = fixtureConfiguration();
   for (const role of Object.values(config.roles)) {
     role.skills = ["example"];
     role.prompts = { system: "system.md", user: "user.md" };
@@ -58,13 +58,6 @@ describe("immutable credential-free workflow snapshots", () => {
     const { roots, settings, secrets } = await fixture();
     const bundles = await loadWorkflowBundles(settings, secrets, roots);
     const snapshot = createRunSnapshot(settings, bundles, secrets);
-    expect(
-      snapshot.roles.investigation.mcp.context.tools.store_record.effect,
-    ).toBe("write");
-    expect(snapshot.roles.output_review.mcp).toEqual({});
-    expect(snapshot.settings.mcp.servers.context.credential_ref).toBe(
-      "service",
-    );
     expect(snapshot.roles.audit.bundle.skills.map((file) => file.path)).toEqual(
       ["example/references/note.md", "example/SKILL.md"].sort((a, b) =>
         a.localeCompare(b),
@@ -77,11 +70,9 @@ describe("immutable credential-free workflow snapshots", () => {
       ).toString(),
     ).toBe("Contained reference\n");
     const serialized = JSON.stringify(snapshot);
-    expect(serialized).not.toMatch(
-      /REPLACE_GITHUB|REPLACE_CPA|REPLACE_NOTIFICATION|mcp-credential-canary/,
-    );
+    expect(serialized).not.toMatch(/github-fixture-token|proxy-fixture-key/);
     expect(JSON.stringify(snapshot.roles)).not.toMatch(
-      /tools\.example|cpa:8317|credential_ref|Authorization/,
+      /proxy\.example|github-fixture-token|proxy-fixture-key/,
     );
     expect(snapshot.digest).toMatch(/^[0-9a-f]{64}$/);
   });
@@ -96,8 +87,8 @@ describe("immutable credential-free workflow snapshots", () => {
       Object.assign(before.roles.audit.profile, { model: "changed" }),
     ).toThrow();
     expect(() =>
-      Object.assign(before.settings.roles.investigation.mcp.context, {
-        tools: ["missing"],
+      Object.assign(before.settings.roles.investigation, {
+        skills: ["missing"],
       }),
     ).toThrow();
     expect(() =>
@@ -108,7 +99,6 @@ describe("immutable credential-free workflow snapshots", () => {
       "Reconfigured system prompt\n",
     );
     settings.limits.active_minutes = 30;
-    settings.roles.investigation.mcp.context.tools = ["read_record"];
     const after = createRunSnapshot(
       settings,
       await loadWorkflowBundles(settings, secrets, roots),
@@ -116,20 +106,14 @@ describe("immutable credential-free workflow snapshots", () => {
     );
     expect(before.roles.audit.bundle.system).toBe("Trusted system prompt\n");
     expect(before.settings.limits.active_minutes).toBe(60);
-    expect(
-      before.roles.investigation.mcp.context.tools.store_record.effect,
-    ).toBe("write");
     expect(after.roles.audit.bundle.system).toBe(
       "Reconfigured system prompt\n",
     );
-    expect(
-      after.roles.investigation.mcp.context.tools.store_record,
-    ).toBeUndefined();
     expect(after.digest).not.toBe(before.digest);
   });
   for (const reference of [
-    "../config/config.yml",
-    "/config/config.yml",
+    "../config/actions.yml",
+    "/config/actions.yml",
     "example/../secret",
     "example\\secret",
     "example//SKILL.md",
@@ -168,7 +152,7 @@ describe("immutable credential-free workflow snapshots", () => {
       "bundle_invalid",
     );
     await chmod(path, 0o644);
-    await writeFile(path, "mcp-credential-canary");
+    await writeFile(path, secrets.get("proxy.key"));
     await expect(loadWorkflowBundles(settings, secrets, roots)).rejects.toThrow(
       "secret_in_snapshot",
     );

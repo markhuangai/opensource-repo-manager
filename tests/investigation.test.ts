@@ -2,13 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import Database from "better-sqlite3";
 import { Store } from "../src/repositories/store.ts";
 import { InvestigationRepository } from "../src/repositories/investigation.ts";
-import { PublicationRepository } from "../src/repositories/publication.ts";
 import { fixtureSnapshot } from "./fixtures.ts";
 import { createPublicationFixture } from "./fixtures/publication.ts";
-import { resolveWriteEvidence } from "../src/services/mcp-writes/evidence.ts";
+import { resolveSourceEvidence } from "../src/services/investigation/evidence.ts";
 import {
   investigationPlanSchema,
   renderFindings,
@@ -71,73 +69,6 @@ async function fixture() {
 }
 
 describe("durable investigations", () => {
-  it("deduplicates pre-upgrade reopening deliveries without hiding body or event conflicts", async () => {
-    const f = await fixture(),
-      target = [{ kind: "issue" as const, number: 1 }];
-    expect(f.store.accept("legacy-reopen", "same-body", "issues", target)).toBe(
-      true,
-    );
-    expect(
-      f.store.accept("legacy-reopen", "same-body", "issues.reopened", target),
-    ).toBe(false);
-    expect(() =>
-      f.store.accept(
-        "legacy-reopen",
-        "changed-body",
-        "issues.reopened",
-        target,
-      ),
-    ).toThrow("delivery_conflict");
-    expect(() =>
-      f.store.accept("legacy-reopen", "same-body", "issue_comment", target),
-    ).toThrow("delivery_conflict");
-  });
-  it("migrates schema 7 without changing jobs, snapshots, budgets, ownership or receipts", async () => {
-    const f = await fixture();
-    f.store.db
-      .prepare(
-        "UPDATE jobs SET budget_json=json_set(budget_json,'$.model_requests',17)",
-      )
-      .run();
-    const jobs = f.store.jobs(),
-      instance = new PublicationRepository(f.store).instance();
-    f.store.db.exec(
-      "DROP TABLE agent_conversations; DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; PRAGMA user_version=7",
-    );
-    const reopened = f.reopen();
-    expect(reopened.db.pragma("user_version", { simple: true })).toBe(11);
-    expect(reopened.jobs()).toEqual(jobs);
-    expect(reopened.snapshot(f.loaded.snapshot.digest)).toEqual(
-      f.loaded.snapshot,
-    );
-    expect(new PublicationRepository(reopened).instance()).toBe(instance);
-  });
-
-  it("rolls back an incomplete schema 8 migration", async () => {
-    const f = await fixture();
-    const jobs = f.store.jobs();
-    f.store.db.exec(
-      "DROP TABLE agent_conversations; DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; DROP TABLE investigations; DROP TABLE investigation_evidence; DROP TABLE mcp_read_results; CREATE TABLE investigation_evidence(marker TEXT); INSERT INTO investigation_evidence VALUES('preserve'); PRAGMA user_version=7",
-    );
-    f.store.close();
-    expect(() => new Store(f.path)).toThrow();
-    const raw = new Database(f.path);
-    try {
-      expect(raw.pragma("user_version", { simple: true })).toBe(7);
-      expect(raw.prepare("SELECT * FROM jobs").all()).toEqual(jobs);
-      expect(raw.prepare("SELECT * FROM investigation_evidence").all()).toEqual(
-        [{ marker: "preserve" }],
-      );
-      expect(
-        raw
-          .prepare("SELECT name FROM sqlite_master WHERE name='investigations'")
-          .get(),
-      ).toBeUndefined();
-    } finally {
-      raw.close();
-    }
-  });
-
   it("allows the last retry and retains a denied reservation across revisions and restart", async () => {
     const f = await fixture(),
       job = f.store.job(1)!,
@@ -300,10 +231,9 @@ describe("durable investigations", () => {
       source: remote.source,
       snapshot_digest: job.snapshot_digest,
       repository: "owner/repo",
-      artifact_digest: null,
     };
     const resolve = (path: string, end_line = 1) =>
-      resolveWriteEvidence(
+      resolveSourceEvidence(
         f.store,
         f.loaded.secrets,
         join(f.root, "evidence"),
@@ -317,10 +247,10 @@ describe("durable investigations", () => {
       { text: "original", source: remote.source },
     ]);
     await expect(resolve("missing.txt")).rejects.toThrow(
-      "mcp_write_evidence_path_invalid",
+      "investigation_evidence_path_invalid",
     );
     await expect(resolve("app.txt", 99)).rejects.toThrow(
-      "mcp_write_evidence_range_invalid",
+      "investigation_evidence_range_invalid",
     );
     await expect(resolve("image.bin")).rejects.toThrow(
       "publication_binary_unsupported",

@@ -59,7 +59,7 @@ export type InvestigationEvidence = {
   job_id: number;
   revision: number;
   source: SourceMetadata;
-  kind: "context" | "source" | "command" | "mcp";
+  kind: "context" | "source" | "command";
   details: unknown;
 };
 export type Investigation = {
@@ -73,7 +73,7 @@ export type Investigation = {
   stage: InvestigationStage | "completed" | "cancelled";
   plan: InvestigationPlan | null;
   agent_pending: boolean;
-  recovery_attempts: string[];
+
   result: InvestigationResult | null;
   evidence_ids: string[];
   bootstrap_receipt: string | null;

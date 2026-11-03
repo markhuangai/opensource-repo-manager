@@ -151,7 +151,6 @@ export function modelFixture(config, store, root, controls = {}) {
     errors,
     requests,
     histories: new Map(),
-    mcpCredential: "investigation-unused-credential",
     bootstrap(task, text) {
       if (task === "bootstrap_plan")
         return {
@@ -283,13 +282,6 @@ export function modelFixture(config, store, root, controls = {}) {
           },
         };
       }
-      if (task === "implementation_review_readiness")
-        return {
-          result: {
-            summary:
-              "Controller evidence establishes automation readiness for this head; human review and merge remain required.",
-          },
-        };
       if (task === "implementation_plan")
         return {
           result: {
@@ -309,13 +301,6 @@ export function modelFixture(config, store, root, controls = {}) {
             findings: [],
             scope_digest: record.scope_digest,
             artifact_digest: record.artifact_digest,
-          },
-        };
-      if (task === "implementation_milestone")
-        return {
-          result: {
-            summary:
-              "A tested candidate exists; publication and remote checks remain pending.",
           },
         };
       assert.equal(task, "implementation_change");
@@ -355,8 +340,7 @@ export function modelFixture(config, store, root, controls = {}) {
       const rejected =
         (mode === "clarification_rejected" &&
           text.includes('"kind":"question"')) ||
-        controls.rejectReview ||
-        (controls.rejectWrite && text.includes('"type":"mcp_write"'));
+        controls.rejectReview;
       return {
         approved: !rejected,
         binding,
@@ -399,40 +383,6 @@ export function modelFixture(config, store, root, controls = {}) {
           },
         };
       if (task === "investigation_plan") {
-        if (mode.startsWith("mcp")) {
-          const read = store.db
-            .prepare("SELECT * FROM mcp_calls WHERE run_id=?")
-            .get(run.id);
-          if (!read)
-            return {
-              tool: "mcp__context__lookup_record",
-              arguments: { query: "increment defect" },
-            };
-          const write = store.db
-            .prepare(
-              "SELECT content FROM mcp_write_operations WHERE json_extract(content,'$.binding.run_id')=?",
-            )
-            .get(run.id);
-          if (mode !== "mcp_read" && !write)
-            return {
-              tool: "mcp__context__store_record",
-              arguments: {
-                arguments: {
-                  text: "Hypothesis: inspect increment at the pinned source.",
-                },
-                purpose:
-                  "Retain an explicitly labeled hypothesis with source provenance.",
-                evidence: [
-                  {
-                    kind: "source",
-                    path: "bug.mjs",
-                    start_line: 1,
-                    end_line: 1,
-                  },
-                ],
-              },
-            };
-        }
         return {
           result: {
             hypothesis:
@@ -475,9 +425,8 @@ export function modelFixture(config, store, root, controls = {}) {
             : mode === "reproduced"
               ? "reproduced"
               : "source",
-        summary: mode.startsWith("mcp")
-          ? "Retrieved context is untrusted and its stale SHA does not establish current behavior. The pinned source adds two although its documentation specifies one. No successful external business effect is claimed."
-          : outcome === "maintenance_candidate"
+        summary:
+          outcome === "maintenance_candidate"
             ? "The implementation adds two while README specifies adding one."
             : `${outcome}: the issue requires this investigation outcome.`,
         evidence_ids: mode === "forged_receipt" ? ["f".repeat(64)] : ids,

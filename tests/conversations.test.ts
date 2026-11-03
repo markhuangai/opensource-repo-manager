@@ -184,7 +184,7 @@ describe("controller-admitted conversations", () => {
     ).toThrow("conversation_message_conflict");
   });
 
-  it("retains messages and task accounting through SQLite reopen and upgrades schema 10 additively", async () => {
+  it("retains messages and task accounting through SQLite reopen", async () => {
     const f = await setup(),
       resume = f.complete(f.request);
     const path = join(f.root, "state.sqlite"),
@@ -200,21 +200,10 @@ describe("controller-admitted conversations", () => {
         new ConversationRepository(reopened).prepare({ ...f.request, resume })
           ?.duplicate?.outcome,
       ).toBe("completed");
-      reopened.db.exec(
-        "DROP TABLE agent_conversations; PRAGMA user_version=10",
-      );
+      expect(reopened.db.pragma("user_version", { simple: true })).toBe(12);
+      expect(reopened.jobs()).toEqual(jobs);
     } finally {
       reopened.close();
-    }
-    const upgraded = new Store(path);
-    try {
-      expect(upgraded.db.pragma("user_version", { simple: true })).toBe(11);
-      expect(upgraded.jobs()).toEqual(jobs);
-      expect(
-        upgraded.db.prepare("SELECT * FROM agent_conversations").all(),
-      ).toEqual([]);
-    } finally {
-      upgraded.close();
     }
   });
 

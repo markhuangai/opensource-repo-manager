@@ -65,8 +65,7 @@ function send(res, output) {
 }
 
 export async function respond(req, res, fixture) {
-  const { config, store, root, requests, histories, errors, mcpCredential } =
-    fixture;
+  const { config, store, root, requests, histories, errors } = fixture;
   try {
     assert.equal(req.url, "/v1/responses");
     assert.equal(req.headers.authorization, `Bearer ${config.proxy.key}`);
@@ -83,7 +82,7 @@ export async function respond(req, res, fixture) {
       body.reasoning.effort,
       selected.roles[active.role].profile.effort,
     );
-    for (const secret of [config.proxy.key, config.github.token, mcpCredential])
+    for (const secret of [config.proxy.key, config.github.token])
       assert(!data.includes(secret));
     const text = strings(body.input).join("\n");
     const scenario =
@@ -209,13 +208,6 @@ export async function respond(req, res, fixture) {
         else
           assert(/(?:^|\n)BOOTSTRAP_TESTS_PASSED(?:\n|$)/.test(latest), latest);
       }
-    } else if (scenario === "mcp_write") {
-      if (!previous)
-        output = use(
-          `mcp__${fixture.writeAlias}__${fixture.writeTool}`,
-          fixture.writeInput,
-        );
-      else fixture.writeResults.push(results.at(-1));
     } else if (scenario === "crash") {
       output = command('pkill -ABRT -u "$(id -u)" -x codex');
     } else if (scenario === "output_review") {
@@ -236,32 +228,6 @@ export async function respond(req, res, fixture) {
         );
     } else if (scenario === "review" && !previous) {
       output = command('test "$(id -u)" = 10002 && cat app.txt');
-    } else if (
-      ["mcp", "expiry", "cancel_mcp"].includes(scenario) &&
-      !previous
-    ) {
-      output = use("mcp__context__read", {});
-    } else if (scenario === "mcp" && previous === 1) {
-      assert(strings(results).join("\n").includes("granted-read-effect"));
-      const script = `import fs from 'node:fs';
-        let pid=process.ppid,setting;
-        for(let i=0;i<12&&!setting;i++){
-          const args=fs.readFileSync('/proc/'+pid+'/cmdline','utf8').split('\\0');
-          const raw=args.find(a=>a.startsWith('mcp_servers='));
-          if(raw) setting=raw;
-          else pid=Number(/^PPid:\\s+(\\d+)/m.exec(fs.readFileSync('/proc/'+pid+'/status','utf8'))[1]);
-        }
-        if(!setting) throw Error('no SDK descriptor');
-        const url=JSON.parse(/"url"=("[^"]+")/.exec(setting)[1]);
-        const env=fs.readFileSync('/proc/'+pid+'/environ','utf8').split('\\0');
-        const auth=env.find(v=>v.startsWith('ORM_MCP_AUTH_0=')).slice('ORM_MCP_AUTH_0='.length);
-        const r=await fetch(url,{method:'POST',headers:{authorization:'Bearer '+auth,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':${JSON.stringify(fixture.downstreamId)}},body:JSON.stringify({jsonrpc:'2.0',id:99123,method:'tools/call',params:{name:'hidden',arguments:{}}})});
-        const text=await r.text();
-        if(r.ok&&!text.includes('"error"')&&!text.includes('"isError":true')) throw Error('raw grant bypass');
-        fs.writeFileSync('raw-denied','yes');console.log('raw-denied');`;
-      output = command(
-        `/opt/orm-runtime/bin/node --input-type=module -e '${script.replaceAll("'", "'\\''")}'`,
-      );
     } else if (["tools", "hostile", "cancel"].includes(scenario) && !previous) {
       const reference = join(
         root,
@@ -277,7 +243,7 @@ export async function respond(req, res, fixture) {
         [
           "set -eu",
           'test "$(id -u)" = 10001',
-          "test ! -r /config/config.yml",
+          "test ! -r /config/actions.yml",
           `test ! -r /proc/${process.pid}/environ`,
           "test ! -r /data/state/manager.sqlite",
           'test -z "${ORM_RELAY_AUTH:-}${ORM_MCP_AUTH_0:-}${GH_TOKEN:-}${OPENAI_API_KEY:-}${INJECTED_ENV:-}"',

@@ -82,15 +82,6 @@ describe("Claude worker policy", () => {
       selected: [],
     },
     relay: { url: "http://127.0.0.1:1234/v1", authorization: "short-lived" },
-    mcp: [
-      {
-        alias: "context",
-        url: "http://127.0.0.1:5678/mcp",
-        authorization: "scoped",
-        tools: ["read"],
-        deadline: Date.now() + 900000,
-      },
-    ],
   } as WorkerRequest;
   it("does not inherit ambient credentials and refuses invented tool permissions", async () => {
     const options = claudeOptions(request, new AbortController());
@@ -109,13 +100,12 @@ describe("Claude worker policy", () => {
       },
     );
     expect(decision?.behavior).toBe("deny");
-    const server = options.mcpServers!.context;
-    expect(server.type === "http" && server.timeout).toBeGreaterThan(300000);
+    expect(options.mcpServers).toEqual({});
   });
   it("gives independent roles fresh persistence and narrower native tools", () => {
     for (const role of ["audit", "output_review"] as const) {
       const options = claudeOptions(
-        { ...request, role, mcp: [] },
+        { ...request, role },
         new AbortController(),
       );
       expect(options.persistSession).toBe(false);

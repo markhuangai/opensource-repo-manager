@@ -182,10 +182,7 @@ describe("authenticated Actions task authority", () => {
     expect(fresh.owns("issue_comment", identity.state_comment_id)).toBe(true);
     expect(f.remote.state.issueLabels.get(1)).toEqual(["orm:managed"]);
     expect(f.remote.state.comments.get(1)).toHaveLength(2);
-    const intake = new IntakeService(fresh, f.reader, f.snapshot, f.secrets, {
-      info() {},
-      error() {},
-    });
+    const intake = new IntakeService(fresh, f.reader, f.snapshot, f.secrets);
     await intake.enrollIssue(1, signal());
     expect(fresh.job(1)!.revision).toBe(before.job!.revision);
     await intake.stop();

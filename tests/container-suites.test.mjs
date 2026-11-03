@@ -87,8 +87,8 @@ describe("container suite selection", () => {
         selectContainerSuites(["--platform", platform, "--suite", "all"], arch),
       ).toEqual({ platform, suites: containerSuites });
     }
-    expect(containerSuites).toHaveLength(9);
-    expect(new Set(containerSuites).size).toBe(9);
+    expect(containerSuites).toHaveLength(8);
+    expect(new Set(containerSuites).size).toBe(8);
     expect(implementationSdks).toEqual(["codex", "claude"]);
   });
 
@@ -99,7 +99,7 @@ describe("container suite selection", () => {
       ).toEqual({ platform: "linux/arm64", suites: [suite] });
       const selected = selectContainerSuites([]);
       selected.suites.pop();
-      expect(containerSuites).toHaveLength(9);
+      expect(containerSuites).toHaveLength(8);
     });
   }
 
@@ -161,7 +161,7 @@ describe("Actions lane coverage and identity", () => {
         ...identity,
         suite: "actions",
         cleanup: "passed",
-        protected_configuration_and_service_startup: "parent-image-verified",
+        protected_configuration_and_bounded_startup: "parent-image-verified",
         bounded_actions: [
           {
             sdk,
@@ -175,7 +175,14 @@ describe("Actions lane coverage and identity", () => {
               node_signature: "f".repeat(64),
               installation_integrity: "a".repeat(64),
             },
-            resource_samples: [],
+            resource_samples: [
+              {
+                scenario: actionsScenarios[group][0],
+                observed_at: "2026-11-02T00:00:00.000Z",
+                CPUPerc: "1.0%",
+                MemUsage: "32MiB / 4GiB",
+              },
+            ],
             completed_scenarios: actionsScenarios[group].map((id) => ({
               id,
               duration_ms: 1,
@@ -248,7 +255,7 @@ describe("Actions lane coverage and identity", () => {
     [
       "missing shared startup proof",
       (rows) => {
-        delete rows[0].protected_configuration_and_service_startup;
+        delete rows[0].protected_configuration_and_bounded_startup;
       },
     ],
     [
@@ -321,6 +328,12 @@ describe("Actions lane coverage and identity", () => {
       },
     ],
     [
+      "empty resource observations",
+      (rows) => {
+        rows[0].bounded_actions[0].resource_samples = [];
+      },
+    ],
+    [
       "missing resource observations",
       (rows) => {
         delete rows[0].bounded_actions[0].resource_samples;
@@ -371,10 +384,9 @@ describe("implementation coverage receipts", () => {
       ),
     ).toEqual({
       "implementation-candidates": 17,
-      "implementation-recovery": 6,
+      "implementation-recovery": 5,
       "implementation-monitor-repair": 6,
       "implementation-monitor-state": 7,
-      "implementation-monitor-mcp": 2,
     });
     for (const ids of Object.values(implementationScenarios))
       expect(new Set(ids).size).toBe(ids.length);

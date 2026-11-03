@@ -45,8 +45,7 @@ export type PullContext = {
   checks: unknown[];
   statuses: unknown[];
 };
-export type Target = { kind: "issue" | "pull"; number: number };
-export type DirtyTarget = Target & { generation: number };
+export type IssueRefresh = { number: number; generation: number };
 export type BudgetUsage = {
   active_ms: number;
   model_requests: number;

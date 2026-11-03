@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { parseConfiguration } from "../src/config/schema.ts";
+import { parseRepositoryActionsConfiguration } from "../src/config/schema.ts";
 import { loadWorkflowBundles } from "../src/config/bundles.ts";
 import { createRunSnapshot } from "../src/config/load.ts";
 import { separateSecrets } from "../src/config/secrets.ts";
@@ -10,42 +10,23 @@ import { OctokitReader } from "../src/adapters/github/reader.ts";
 import { githubFixtureRequest, githubFixtureState } from "./fixtures/github.ts";
 
 export function fixtureConfiguration() {
-  return parseConfiguration(
-    readFileSync(new URL("../config.example.yml", import.meta.url), "utf8"),
-  );
-}
-
-export function fixtureMcp() {
-  const config = fixtureConfiguration();
-  config.mcp.credentials.service = {
-    headers: { Authorization: "Bearer mcp-credential-canary" },
-  };
-  config.mcp.servers.context = {
-    transport: "streamable_http",
-    review_required_tools: [],
-    url: "https://tools.example.invalid/mcp",
-    allow_plain_http: false,
-    credential_ref: "service",
-    tools: {
-      read_record: { effect: "read" },
-      store_record: {
-        effect: "write",
-        idempotency_argument: "operation_key",
-      },
+  return parseRepositoryActionsConfiguration(
+    readFileSync(
+      new URL("../examples/actions/orm.yml", import.meta.url),
+      "utf8",
+    ),
+    {
+      repository: "owner/repo",
+      token: "github-fixture-token",
+      proxyKey: "proxy-fixture-key",
     },
-  };
-  config.roles.investigation.mcp.context = {
-    tools: ["read_record", "store_record"],
-  };
-  return config;
+  );
 }
 
 export async function fixtureSnapshot(
   model = "fixture-model",
   config = fixtureConfiguration(),
 ) {
-  config.github.repository = "owner/repo";
-  config.github.token = "github-fixture-token";
   config.profiles.coding.model = model;
   const { settings, secrets } = separateSecrets(config);
   const bundles = await loadWorkflowBundles(settings, secrets, {

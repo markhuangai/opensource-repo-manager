@@ -1,7 +1,7 @@
 import { createServer, request } from "node:http";
 import assert from "node:assert/strict";
 import { createServer as httpsServer } from "node:https";
-import { readFileSync, mkdirSync, readdirSync, lstatSync } from "node:fs";
+import { readFileSync, readdirSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { stringify as stringifyYaml } from "/opt/orm/app/node_modules/yaml/dist/index.js";
 import Database from "/opt/orm/app/node_modules/better-sqlite3/lib/index.js";
@@ -10,20 +10,18 @@ import {
   makeCheck,
   makeThread,
 } from "/publication-fixture.ts";
-import { notificationFixture } from "/notification-fixtures/fixture.mts";
 import { respond as claude } from "/agent-fixtures/claude.mjs";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
 import { sourceFiles, modelFixture } from "./protocol.mjs";
 import { artifactFixture } from "/actions-fixtures/artifact-fixture.mjs";
 import { StateCodec } from "/opt/orm/app/dist/actions/state.js";
 
-const actions = process.argv.includes("--actions");
 let selectedIssue = 1;
 let dataRoot = "/data";
 let held = false;
 let releaseHold;
 const config = JSON.parse(readFileSync("/fixture/configuration.json", "utf8"));
-const artifacts = actions ? artifactFixture(config) : undefined;
+const artifacts = artifactFixture(config);
 let sessionPhase = "seed";
 let loseReferenceResponse = false,
   lostReferenceResponse = false;
@@ -33,15 +31,6 @@ let publicationFault;
 const publicationFaults = [];
 let releaseQuestionBoundary;
 const remote = await createPublicationFixture("/fixture/git");
-mkdirSync("/fixture/notifications", { recursive: true });
-const notificationServer = await notificationFixture("/fixture/notifications", {
-  key: "/fixture-key.pem",
-  cert: "/fixture-ca.pem",
-  listenHost: "0.0.0.0",
-  smtpPort: 8465,
-});
-const notifications = [],
-  discord = [];
 remote.state.token = config.github.token;
 const source = remote.commit(sourceFiles);
 remote.git(["update-ref", "refs/heads/main", source.sha]);
@@ -52,7 +41,7 @@ remote.state.issues.set(1, {
   body: "increment returns the wrong value",
   updated_at: "2026-10-21T00:00:00Z",
 });
-if (actions) {
+{
   remote.git(["config", "uploadpack.allowReachableSHA1InWant", "true"]);
   for (const [index, mode] of [
     "source_only",
@@ -185,9 +174,7 @@ const databases = new Map();
 const store = {
   get db() {
     return (database ??= new Database(
-      actions
-        ? `${dataRoot}/actions/${selectedIssue}/state/manager.sqlite`
-        : "/data/state/manager.sqlite",
+      `${dataRoot}/actions/${selectedIssue}/state/manager.sqlite`,
       {
         readonly: true,
         fileMustExist: true,
@@ -212,15 +199,14 @@ function makeFixture() {
   const selected = modelFixture(
     config,
     store,
-    actions ? `${dataRoot}/actions/${selectedIssue}/runtime` : "/data/runtime",
+    `${dataRoot}/actions/${selectedIssue}/runtime`,
     {
       investigationObjective:
-        actions && selectedIssue === 9 && dataRoot === "/fresh-data"
+        selectedIssue === 9 && dataRoot === "/fresh-data"
           ? "Restore the documented add-one result for increment."
           : undefined,
       async implementation(task) {
         if (
-          actions &&
           selectedIssue === 9 &&
           dataRoot === "/data" &&
           task === "implementation_change"
@@ -232,7 +218,7 @@ function makeFixture() {
         }
       },
       async investigate() {
-        if (actions && selectedIssue === 7) {
+        if (selectedIssue === 7) {
           held = true;
           await new Promise((resolve) => {
             releaseHold = resolve;
@@ -314,7 +300,7 @@ const tls = httpsServer(
       });
       if (res.destroyed) return;
     }
-    if (artifacts && (await artifacts.handle(req, res))) return;
+    if (await artifacts.handle(req, res)) return;
     const upstream = request(
       remote.url + req.url,
       { method: req.method, headers: req.headers },
@@ -329,11 +315,7 @@ const tls = httpsServer(
 );
 const http = createServer(async (req, res) => {
   const url = new URL(req.url, "http://fixture");
-  if (
-    actions &&
-    url.pathname === "/controller-source" &&
-    req.method === "POST"
-  ) {
+  if (url.pathname === "/controller-source" && req.method === "POST") {
     const operator = {
       version: config.version,
       proxy: { url: config.proxy.url },
@@ -370,7 +352,7 @@ const http = createServer(async (req, res) => {
     const pinned = remote.commit(files, remote.head("main"));
     remote.git(["update-ref", "refs/heads/main", pinned.sha]);
     res.end(JSON.stringify(pinned));
-  } else if (actions && url.pathname === "/select" && req.method === "POST") {
+  } else if (url.pathname === "/select" && req.method === "POST") {
     if (database) databases.set(`${dataRoot}:${selectedIssue}`, database);
     selectedIssue = Number(url.searchParams.get("issue"));
     sessionPhase = url.searchParams.get("session") ?? "seed";
@@ -385,11 +367,7 @@ const http = createServer(async (req, res) => {
     held = false;
     fixture = makeFixture();
     res.end("selected");
-  } else if (
-    actions &&
-    url.pathname === "/publication-fault" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/publication-fault" && req.method === "POST") {
     publicationFault = url.searchParams.get("kind");
     assert(
       ["notification", "thread_reply", "branch", "pull"].includes(
@@ -397,11 +375,7 @@ const http = createServer(async (req, res) => {
       ),
     );
     res.end("armed");
-  } else if (
-    actions &&
-    url.pathname === "/age-repair-question" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/age-repair-question" && req.method === "POST") {
     const number = Number(url.searchParams.get("issue"));
     const row = remote.state.comments
       .get(number)
@@ -426,11 +400,7 @@ const http = createServer(async (req, res) => {
     artifacts.fault(saved.state.session_artifact.artifact_id, "expired");
     row.body = codec.encode(saved.state, saved.narrative);
     res.end("aged fifteen days at the final reserved repair cycle");
-  } else if (
-    actions &&
-    url.pathname === "/clarification-issue" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/clarification-issue" && req.method === "POST") {
     const number = Number(url.searchParams.get("issue"));
     remote.state.issues.set(number, {
       id: 1000 + number,
@@ -450,7 +420,6 @@ const http = createServer(async (req, res) => {
       : undefined;
     res.end("created");
   } else if (
-    actions &&
     url.pathname === "/release-question-boundary" &&
     req.method === "POST"
   ) {
@@ -458,11 +427,7 @@ const http = createServer(async (req, res) => {
     questionBoundary = undefined;
     releaseQuestionBoundary?.();
     res.end("released");
-  } else if (
-    actions &&
-    url.pathname === "/legacy-question" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/legacy-question" && req.method === "POST") {
     const number = Number(url.searchParams.get("issue"));
     const row = remote.state.comments
       .get(number)
@@ -492,7 +457,7 @@ const http = createServer(async (req, res) => {
     state.generation++;
     row.body = codec.encode(state, decoded.narrative);
     res.end("legacy signed state prepared");
-  } else if (actions && url.pathname === "/answer" && req.method === "POST") {
+  } else if (url.pathname === "/answer" && req.method === "POST") {
     const number = Number(url.searchParams.get("issue"));
     const login = url.searchParams.get("actor") ?? "reporter";
     const id =
@@ -516,11 +481,7 @@ const http = createServer(async (req, res) => {
     );
     if (login.endsWith("[bot]")) row.author_type = "Bot";
     res.end(JSON.stringify(row));
-  } else if (
-    actions &&
-    url.pathname === "/artifact-fault" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/artifact-fault" && req.method === "POST") {
     if (url.searchParams.get("kind") === "drop_reference")
       loseReferenceResponse = true;
     else
@@ -529,11 +490,7 @@ const http = createServer(async (req, res) => {
         url.searchParams.get("kind"),
       );
     res.end("armed");
-  } else if (
-    actions &&
-    url.pathname === "/session-issue" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/session-issue" && req.method === "POST") {
     const number = Number(url.searchParams.get("issue"));
     remote.state.issues.set(number, {
       id: 1000 + number,
@@ -543,21 +500,13 @@ const http = createServer(async (req, res) => {
       updated_at: "2026-10-28T00:00:00Z",
     });
     res.end("created");
-  } else if (
-    actions &&
-    url.pathname === "/forget-local" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/forget-local" && req.method === "POST") {
     const key = `${dataRoot}:${selectedIssue}`;
     database?.close();
     database = undefined;
     databases.delete(key);
     res.end("closed local fixture connection");
-  } else if (
-    actions &&
-    url.pathname === "/corrupt-state" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/corrupt-state" && req.method === "POST") {
     const number = Number(url.searchParams.get("issue"));
     const comment = remote.state.comments
       .get(number)
@@ -571,41 +520,25 @@ const http = createServer(async (req, res) => {
       );
     else comment.body = "Edited outside the controller\n" + comment.body;
     res.end("changed");
-  } else if (actions && url.pathname === "/release" && req.method === "POST") {
+  } else if (url.pathname === "/release" && req.method === "POST") {
     releaseHold?.();
     res.end("released");
-  } else if (
-    actions &&
-    url.pathname === "/advance-main" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/advance-main" && req.method === "POST") {
     const next = remote.commit(
       { ...sourceFiles, "unrelated.md": "Unrelated default-branch change.\n" },
       remote.head("main"),
     );
     remote.git(["update-ref", "refs/heads/main", next.sha]);
     res.end("advanced");
-  } else if (
-    actions &&
-    url.pathname === "/restore-main" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/restore-main" && req.method === "POST") {
     const sha = url.searchParams.get("sha");
     assert(/^[a-f0-9]{40}$/.test(sha));
     remote.git(["update-ref", "refs/heads/main", sha]);
     res.end("restored fixture main");
-  } else if (
-    actions &&
-    url.pathname === "/reject-checkpoint" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/reject-checkpoint" && req.method === "POST") {
     remote.state.rejectBefore = "comment";
     res.end("armed");
-  } else if (
-    actions &&
-    url.pathname === "/merge-owned" &&
-    req.method === "POST"
-  ) {
+  } else if (url.pathname === "/merge-owned" && req.method === "POST") {
     const number = Number(url.searchParams.get("issue"));
     const pull = remote.state.pulls.find((pull) =>
       pull.branch.endsWith(`/issue-${number}`),
@@ -619,7 +552,7 @@ const http = createServer(async (req, res) => {
     res.end(
       JSON.stringify({
         source,
-        artifacts: artifacts?.proof(),
+        artifacts: artifacts.proof(),
         lost_reference_response: lostReferenceResponse,
         held,
         question_boundary: questionBoundary,
@@ -672,18 +605,6 @@ const http = createServer(async (req, res) => {
               }),
             )
           : [],
-        deliveries: database
-          ? store.db
-              .prepare(
-                `SELECT channel,state,retry_at,
-                json_extract(content,'$.reason') AS reason
-                FROM notification_deliveries ORDER BY rowid DESC LIMIT 9`,
-              )
-              .all()
-          : [],
-        notifications,
-        discord,
-        smtp: notificationServer.messages,
         heads: remote.state.pulls.map((pull) => ({
           number: pull.number,
           id: pull.id,
@@ -696,14 +617,13 @@ const http = createServer(async (req, res) => {
               .all()
               .map((row) => JSON.parse(row.content))
           : [],
-        reconstructed:
-          actions && database
-            ? store.db
-                .prepare(
-                  "SELECT reconstructed FROM actions_checkpoint WHERE singleton=1",
-                )
-                .get()?.reconstructed
-            : null,
+        reconstructed: database
+          ? store.db
+              .prepare(
+                "SELECT reconstructed FROM actions_checkpoint WHERE singleton=1",
+              )
+              .get()?.reconstructed
+          : null,
       }),
     );
   } else if (
@@ -750,12 +670,6 @@ const http = createServer(async (req, res) => {
       updated_at: "2026-10-21T00:01:00Z",
     });
     res.end("created");
-  } else if (req.url === "/notify" || req.url === "/discord") {
-    let body = "";
-    for await (const chunk of req) body += chunk;
-    (req.url === "/notify" ? notifications : discord).push(JSON.parse(body));
-    res.statusCode = 204;
-    res.end();
   } else
     await (config.profiles.worker.sdk === "claude" ? claude : codex)(
       req,
@@ -772,6 +686,5 @@ process.on("SIGTERM", async () => {
   }
   if (database) databases.set(selectedIssue, database);
   for (const connection of databases.values()) connection.close();
-  await notificationServer.close();
   await remote.close();
 });

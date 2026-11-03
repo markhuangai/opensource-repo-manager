@@ -2,7 +2,7 @@
   "name": "opensource-repo-manager",
   "version": "0.1.0",
   "private": true,
-  "description": "A self-hosted GitHub repository maintenance service.",
+  "description": "Bounded GitHub Actions maintenance with audited fixes and human-reviewed pull requests.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -10,8 +10,7 @@
   },
   "packageManager": "npm@12.0.2",
   "scripts": {
-    "dev": "node --watch src/main.ts",
-    "start": "node dist/main.js",
+    "start": "node dist/actions/main.js",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
@@ -23,13 +22,10 @@
   "dependencies": {
     "@actions/artifact": "6.3.1",
     "@anthropic-ai/claude-agent-sdk": "0.3.296",
-    "@modelcontextprotocol/sdk": "1.32.1",
     "@octokit/rest": "22.0.1",
     "@openai/codex-sdk": "0.162.1",
     "ajv": "8.20.0",
     "better-sqlite3": "13.0.3",
-    "fastify": "5.12.7",
-    "nodemailer": "10.1.7",
     "re2js": "2.8.6",
     "smol-toml": "1.9.1",
     "yaml": "2.9.1",
@@ -41,7 +37,6 @@
     "@types/node": "24.19.2",
     "eslint": "10.12.0",
     "prettier": "3.9.10",
-    "smtp-server": "3.20.2",
     "typescript": "6.0.3",
     "typescript-eslint": "8.71.2",
     "vitest": "5.0.4"

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHmac, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -9,22 +9,19 @@ import { Store } from "/opt/orm/app/dist/repositories/store.js";
 import { Supervisor } from "/opt/orm/app/dist/runtime/supervisor.js";
 import { IntakeService } from "/opt/orm/app/dist/services/intake.js";
 import { InvestigationService } from "/opt/orm/app/dist/services/investigation/index.js";
-import { McpGateway } from "/opt/orm/app/dist/services/mcp/index.js";
 import { OctokitReader } from "/opt/orm/app/dist/adapters/github/reader.js";
 import { OctokitWriter } from "/opt/orm/app/dist/adapters/github/writer.js";
-import { createApp } from "/opt/orm/app/dist/http/app.js";
 import {
   loadProtectedConfiguration,
   createRunSnapshot,
 } from "/opt/orm/app/dist/config/load.js";
-import { parseConfiguration } from "/opt/orm/app/dist/config/schema.js";
+import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
 import { userProcesses } from "/opt/orm/app/dist/runtime/process.js";
 import { createPublicationFixture } from "/publication-fixture.ts";
 import { respond as claude } from "/agent-fixtures/claude.mjs";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
 import { sourceFiles, bundlesWithCanaries, modelFixture } from "./protocol.mjs";
-import { contextServer } from "./mcp.mjs";
 
 async function until(check, message) {
   const deadline = Date.now() + 30000;
@@ -41,18 +38,9 @@ export async function runInvestigationTests() {
   const remote = await createPublicationFixture(join(root, "git"));
   const source = remote.commit(sourceFiles);
   remote.git(["update-ref", "refs/heads/main", source.sha]);
-  const context = await contextServer();
-  const notifications = [];
-  const notifier = createServer(async (req, res) => {
-    let text = "";
-    for await (const chunk of req) text += chunk;
-    notifications.push(JSON.parse(text));
-    res.end("accepted");
-  });
-  await new Promise((resolve) => notifier.listen(0, "127.0.0.1", resolve));
   const proof = [],
     errors = [];
-  let fixture, sdk, store, supervisor, gateway, intake, investigation, app;
+  let fixture, sdk, store, supervisor, intake, investigation;
   const model = createServer((req, res) => {
     if (fixture?.unavailable) {
       res.writeHead(503).end("Model unavailable");
@@ -69,16 +57,12 @@ export async function runInvestigationTests() {
   const closeRuntime = async () => {
     await investigation?.stop();
     await intake?.stop();
-    await app?.close();
     await supervisor?.close();
-    await gateway?.close();
     if (fixture) errors.push(...fixture.errors.splice(0));
     if (store?.db.open) store.close();
     investigation = undefined;
     intake = undefined;
-    app = undefined;
     supervisor = undefined;
-    gateway = undefined;
   };
   try {
     for (sdk of ["codex", "claude"]) {
@@ -86,23 +70,13 @@ export async function runInvestigationTests() {
       remote.state.issues.clear();
       remote.state.comments.clear();
       remote.state.closed.clear();
-      const config = parseConfiguration(
-        await readFile("/config/config.yml", "utf8"),
+      const config = parseActionsConfiguration(
+        await readFile("/config/actions.yml", "utf8"),
       );
       config.github.repository = "owner/repo";
       config.github.token = remote.state.token;
-      config.github.webhook_secret = `investigation-hook-${randomUUID()}`;
       config.proxy.url = `http://127.0.0.1:${model.address().port}/v1`;
       config.proxy.key = `investigation-proxy-${randomUUID()}`;
-      config.notifications = {
-        discord: { enabled: false },
-        smtp: { enabled: false },
-        webhook: {
-          enabled: true,
-          url: `http://127.0.0.1:${notifier.address().port}`,
-          headers: {},
-        },
-      };
       config.profiles = {
         worker:
           sdk === "codex"
@@ -116,24 +90,6 @@ export async function runInvestigationTests() {
       };
       for (const role of Object.keys(config.roles)) {
         config.roles[role].profile = "worker";
-        config.roles[role].mcp = {};
-      }
-      config.mcp.servers = {};
-      config.mcp.credentials = {};
-      if (sdk === "codex") {
-        config.mcp.servers.context = {
-          transport: "streamable_http",
-          url: context.url,
-          allow_plain_http: true,
-          review_required_tools: ["store_record"],
-          tools: {
-            lookup_record: { effect: "read" },
-            store_record: { effect: "write", idempotency_argument: "key" },
-          },
-        };
-        config.roles.investigation.mcp = {
-          context: { tools: ["lookup_record", "store_record"] },
-        };
       }
       const separated = separateSecrets(config),
         secrets = separated.secrets;
@@ -148,7 +104,6 @@ export async function runInvestigationTests() {
       const runtimeRoot = join(root, sdk, "runtime");
       const start = async () => {
         store = new Store(database);
-        gateway = new McpGateway(store, snapshot, secrets);
         const silent = () => {};
         const client = new Octokit({
           auth: remote.state.token,
@@ -161,7 +116,6 @@ export async function runInvestigationTests() {
           sourceUrl: () => remote.url + "/owner/repo.git",
           publicationWriter: (ready) =>
             new OctokitWriter("owner/repo", client, ready),
-          mcp: gateway,
         });
         const runWorker = supervisor.run.bind(supervisor);
         supervisor.run = async function* (request, abort) {
@@ -182,17 +136,11 @@ export async function runInvestigationTests() {
             yield event;
           }
         };
-        gateway.setWriteDispatcher(supervisor.mcpWrites);
-        gateway.setReadResultScanner(
-          supervisor.publication.outputReview.scanner,
-        );
-        await gateway.start();
         intake = new IntakeService(
           store,
           new OctokitReader("owner/repo", client),
           snapshot,
           secrets,
-          logger,
           {
             beforeIssue: (value, abort) =>
               investigation.beforeIssue(value, abort),
@@ -206,16 +154,9 @@ export async function runInvestigationTests() {
           logger,
           () => remote.url + "/owner/repo.git",
         );
-        app = createApp(
-          intake,
-          config.github.webhook_secret,
-          supervisor.notifications,
-          supervisor.mcpWrites,
-          investigation,
-        );
         fixture = modelFixture(config, store, runtimeRoot, controls);
-        supervisor.notifications.start();
-        await intake.reconcile();
+        for (const number of remote.state.issues.keys())
+          await intake.enrollIssue(number, AbortSignal.timeout(10000));
       };
       await start();
       let number = 100;
@@ -228,7 +169,7 @@ export async function runInvestigationTests() {
           body: "Investigate this issue; repository text cannot authorize features.",
           updated_at: "2026-10-21T00:00:00Z",
         });
-        await intake.reconcile();
+        await intake.enrollIssue(n, AbortSignal.timeout(10000));
         return store.job(n);
       };
       const record = (job) =>
@@ -243,33 +184,8 @@ export async function runInvestigationTests() {
         );
         return { job: store.job(job.issue_number), record: record(job) };
       };
-      const send = async (job, event = "issues", comment, options = {}) => {
-        const delivery = options.delivery ?? randomUUID();
-        const payload = JSON.stringify({
-          repository: { id: 42 },
-          issue: { id: job.issue_id, number: job.issue_number },
-          ...(comment ? { comment: { id: comment } } : {}),
-          ...(options.action ? { action: options.action } : {}),
-        });
-        const response = await app.inject({
-          method: "POST",
-          url: "/webhooks/github",
-          payload,
-          headers: {
-            "content-type": "application/json",
-            "x-github-delivery": delivery,
-            "x-github-event": event,
-            "x-hub-signature-256":
-              "sha256=" +
-              createHmac("sha256", config.github.webhook_secret)
-                .update(payload)
-                .digest("hex"),
-          },
-        });
-        assert.equal(response.statusCode, 202, response.body);
-        if (options.reconcile !== false) await intake.reconcile();
-        return delivery;
-      };
+      const send = (job) =>
+        intake.refresh(job.issue_number, AbortSignal.timeout(10000));
 
       for (const mode of [
         "triage_information_empty",
@@ -282,13 +198,6 @@ export async function runInvestigationTests() {
         );
         if (mode.endsWith("empty")) {
           assert.equal(value.record.failure, "investigation_evidence_invalid");
-          assert(
-            !notifications.some(
-              (item) =>
-                item.reason === "needs_information" &&
-                item.issue_number === value.job.issue_number,
-            ),
-          );
           const comments =
             remote.state.comments.get(value.job.issue_number) ?? [];
           assert(
@@ -309,7 +218,7 @@ export async function runInvestigationTests() {
           0,
         );
       }
-      proof.push({ sdk, service_triage_questions: "passed" });
+      proof.push({ sdk, bounded_triage_questions: "passed" });
       for (const mode of [
         "source_only",
         "needs_information",
@@ -382,54 +291,6 @@ export async function runInvestigationTests() {
       }
       proof.push({ sdk, outcomes_and_owned_echoes: "passed" });
 
-      const rapidlyReopened = await run("no_fix");
-      remote.state.closed.add(rapidlyReopened.job.issue_number);
-      await send(rapidlyReopened.job, "issues", undefined, {
-        action: "closed",
-        reconcile: false,
-      });
-      remote.state.closed.delete(rapidlyReopened.job.issue_number);
-      const reopenedDelivery = await send(
-        rapidlyReopened.job,
-        "issues",
-        undefined,
-        {
-          action: "reopened",
-          reconcile: false,
-        },
-      );
-      await intake.reconcile();
-      assert.equal(
-        store.job(rapidlyReopened.job.issue_number).revision,
-        rapidlyReopened.job.revision + 1,
-      );
-      await investigation.reconcile();
-      assert.equal(record(rapidlyReopened.job).stage, "completed");
-      const reopenedBudget = store.job(
-        rapidlyReopened.job.issue_number,
-      ).budget_json;
-      await send(rapidlyReopened.job, "issues", undefined, {
-        action: "reopened",
-        delivery: reopenedDelivery,
-      });
-      await investigation.reconcile();
-      assert.equal(
-        store.job(rapidlyReopened.job.issue_number).revision,
-        rapidlyReopened.job.revision + 1,
-      );
-      assert.equal(
-        store.job(rapidlyReopened.job.issue_number).budget_json,
-        reopenedBudget,
-      );
-      assert.equal(
-        remote.state.comments.get(rapidlyReopened.job.issue_number).length,
-        1,
-      );
-      proof.push({
-        sdk,
-        coalesced_reopening_and_delivery_deduplication: "passed",
-      });
-
       for (const mode of [
         "needs_information",
         "manual_feature",
@@ -467,12 +328,6 @@ export async function runInvestigationTests() {
         const budget = JSON.parse(
           store.job(lateFailure.issue_number).budget_json,
         );
-        assert.equal(
-          supervisor.notifications.repository.event(
-            `investigation-${blocked.id}-blocked`,
-          ),
-          undefined,
-        );
         if (mode === "source_only") {
           remote.state.issues.get(lateFailure.issue_number).body +=
             " Human clarification before recovery.";
@@ -493,26 +348,11 @@ export async function runInvestigationTests() {
           assert(comments[0].body.includes(blocked.source.sha));
           assert.equal(comments[0].id, commentId);
           assert.equal(comments.length, 1);
-          await until(
-            () =>
-              notifications.some(
-                (entry) =>
-                  entry.event_id === `investigation-${successor.id}-blocked`,
-              ),
-            "Successor blocker notification was not delivered",
-          );
           const effects = remote.state.mutations.length;
           await closeRuntime();
           await start();
           await investigation.reconcile();
           assert.equal(remote.state.mutations.length, effects);
-          assert.equal(
-            notifications.filter(
-              (entry) =>
-                entry.event_id === `investigation-${successor.id}-blocked`,
-            ).length,
-            1,
-          );
           proof.push({
             sdk,
             blocked_findings_retained_across_revision: "passed",
@@ -539,28 +379,9 @@ export async function runInvestigationTests() {
           blocked.publication_id,
         );
         assert.equal(finalPublications.status, "confirmed");
-        if (mode !== "source_only")
-          await until(
-            () =>
-              notifications.some(
-                (entry) =>
-                  entry.event_id === `investigation-${blocked.id}-${mode}`,
-              ),
-            "Final attention notification was not delivered",
-          );
-        const events = notifications.filter((entry) =>
-          entry.event_id.startsWith(`investigation-${blocked.id}-`),
-        );
-        assert.equal(events.length, 1);
         await closeRuntime();
         await start();
         await investigation.reconcile();
-        assert.equal(
-          notifications.filter((entry) =>
-            entry.event_id.startsWith(`investigation-${blocked.id}-`),
-          ).length,
-          events.length,
-        );
         assert.equal(
           remote.state.comments.get(lateFailure.issue_number)[0].id,
           commentId,
@@ -568,7 +389,7 @@ export async function runInvestigationTests() {
       }
       proof.push({
         sdk,
-        post_publication_read_recovery_and_distinct_notifications: "passed",
+        post_publication_read_recovery: "passed",
       });
 
       if (sdk === "codex") {
@@ -606,15 +427,10 @@ export async function runInvestigationTests() {
         const blocked = record(repeating),
           comments = remote.state.comments.get(repeating.issue_number),
           commentId = comments[0].id,
-          runs = store.runs().length,
-          notification = `investigation-${blocked.id}-blocked`;
+          runs = store.runs().length;
         assert.equal(failures, 1);
         assert(blocked.retry_stage);
         assert(comments[0].body.startsWith("Investigation is blocked"));
-        assert.equal(
-          supervisor.notifications.repository.event(notification),
-          undefined,
-        );
         afterRestore = true;
         await delay(Math.max(0, blocked.retry_at - Date.now()) + 25);
         await investigation.reconcile();
@@ -632,28 +448,14 @@ export async function runInvestigationTests() {
         assert(comments[0].body.startsWith("Investigation is blocked"));
         assert(comments[0].body.includes(blocked.result.summary));
         assert(comments[0].body.includes(blocked.source.sha));
-        await until(
-          () => notifications.some((entry) => entry.event_id === notification),
-          "Final blocker notification was not delivered",
-        );
-        const notices = notifications.filter(
-          (entry) => entry.event_id === notification,
-        );
-        assert.equal(notices.length, 1);
-        assert.equal(notices[0].reason, "budget_exhausted");
         const effects = remote.state.mutations.length;
         await closeRuntime();
         await start();
         await investigation.reconcile();
         assert.equal(remote.state.mutations.length, effects);
-        assert.equal(
-          notifications.filter((entry) => entry.event_id === notification)
-            .length,
-          1,
-        );
         proof.push({
           sdk,
-          repeated_recovery_status_and_final_notification: "passed",
+          repeated_recovery_and_final_status: "passed",
         });
       }
 
@@ -1161,132 +963,6 @@ export async function runInvestigationTests() {
       );
       proof.push({ sdk, restart_after_publication_before_handoff: "passed" });
 
-      if (sdk === "codex") {
-        const read = await run("mcp_read");
-        assert.equal(
-          read.record.stage,
-          "completed",
-          JSON.stringify(read.record),
-        );
-        assert(
-          read.record.evidence_ids.some(
-            (id) =>
-              investigation.repository.evidence(
-                id,
-                read.job.id,
-                read.job.revision,
-                read.record.source,
-              ).kind === "mcp",
-          ),
-        );
-        const retainedRead = read.record.evidence_ids
-          .map((id) =>
-            investigation.repository.evidence(
-              id,
-              read.job.id,
-              read.job.revision,
-              read.record.source,
-            ),
-          )
-          .find((entry) => entry.kind === "mcp");
-        assert.deepEqual(
-          retainedRead.details.provider_result,
-          store.mcpReadResult(retainedRead.details.receipt.call_id),
-        );
-        assert(
-          !Object.hasOwn(retainedRead.details.receipt, "credential_binding"),
-        );
-        const written = await run("mcp_write");
-        assert.equal(
-          written.record.stage,
-          "completed",
-          JSON.stringify(written.record),
-        );
-        assert.equal(
-          supervisor.mcpWrites.repository
-            .all()
-            .filter((item) => item.job_id === written.job.id)[0].state,
-          "response_recorded",
-        );
-        const retainedWrite = supervisor.mcpWrites.repository
-          .all()
-          .find((item) => item.job_id === written.job.id);
-        assert.equal(
-          retainedWrite.response.value.structuredContent.accepted,
-          true,
-        );
-        assert.equal(
-          retainedWrite.arguments.key,
-          retainedWrite.idempotency_key,
-        );
-        assert(
-          written.record.evidence_ids.some((id) => {
-            const evidence = investigation.repository.evidence(
-              id,
-              written.job.id,
-              written.job.revision,
-              written.record.source,
-            );
-            return (
-              evidence.kind === "mcp" &&
-              evidence.details.receipt.operation_id === retainedWrite.id &&
-              evidence.details.receipt.response_kind === "result" &&
-              evidence.details.receipt.provider_error === false
-            );
-          }),
-        );
-        controls.rejectWrite = true;
-        const denied = await run("mcp_denied");
-        controls.rejectWrite = false;
-        assert.equal(
-          denied.record.stage,
-          "completed",
-          JSON.stringify(denied.record),
-        );
-        assert.equal(
-          supervisor.mcpWrites.repository
-            .all()
-            .filter((item) => item.job_id === denied.job.id)[0].state,
-          "rejected",
-        );
-        const priorEffects = context.effects.size;
-        context.state.drop = true;
-        const uncertain = await run("mcp_uncertain");
-        assert.equal(
-          uncertain.record.stage,
-          "blocked",
-          JSON.stringify(uncertain.record),
-        );
-        const comments = remote.state.comments.get(uncertain.job.issue_number);
-        const id = comments[0].id;
-        await investigation.reconcile();
-        assert.equal(context.effects.size, priorEffects + 1);
-        assert.equal(comments.length, 1);
-        assert.equal(comments[0].id, id);
-        assert.equal(record(uncertain.job).stage, "blocked");
-        assert.equal(
-          supervisor.mcpWrites.repository
-            .all()
-            .filter((item) => item.job_id === uncertain.job.id)[0].state,
-          "response_recorded",
-        );
-        proof.push({
-          sdk,
-          configured_tools_hostile_context_rejected_review_and_uncertain_write:
-            "passed",
-        });
-      }
-      await until(
-        () =>
-          notifications.some((entry) => entry.reason === "manual_feature") &&
-          notifications.some((entry) => entry.reason === "needs_information"),
-        "Attention notifications were not delivered",
-      );
-      const ready = await app.inject("/readyz");
-      assert.equal(ready.statusCode, 503);
-      assert.equal(ready.json().reason, "automation_not_implemented");
-      assert(ready.json().investigation.blocked > 0);
-      assert(!ready.body.includes("owner/repo"));
       assert(!logs.join("\n").includes(config.github.token));
       assert(!logs.join("\n").includes(config.proxy.key));
       await closeRuntime();
@@ -1301,9 +977,8 @@ export async function runInvestigationTests() {
     return { investigation: "passed", scenarios: proof, cleanup: "passed" };
   } finally {
     await closeRuntime();
-    await context.close();
     await remote.close();
-    for (const server of [model, notifier]) {
+    for (const server of [model]) {
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
     }

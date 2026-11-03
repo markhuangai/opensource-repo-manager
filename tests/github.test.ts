@@ -24,17 +24,6 @@ describe("Octokit read integration against GitHub HTTP", () => {
     github.state.repository.private = false;
     expect((await github.reader.repository(signal())).private).toBe(false);
     expect(github.requests.at(-1)?.status).toBe(200);
-    for (let number = 2; number <= 101; number++)
-      github.state.issues[number] = makeIssue(number);
-    await github.reader.issuePage(1, signal());
-    await github.reader.issuePage(2, signal());
-    expect((await github.reader.issuePage(1, signal())).numbers).toHaveLength(
-      100,
-    );
-    expect((await github.reader.issuePage(2, signal())).numbers).toEqual([101]);
-    expect(github.requests.slice(-2).map((request) => request.status)).toEqual([
-      304, 304,
-    ]);
     github.state.failures["/repos/owner/repo"] = { status: 401 };
     await expect(github.reader.repository(signal())).rejects.toThrow(
       "github_authentication",
@@ -64,20 +53,13 @@ describe("Octokit read integration against GitHub HTTP", () => {
       ).toBe(true);
     },
   );
-  it("paginates issue discovery, excludes PRs and reads all comment pages", async () => {
+  it("rejects PRs as selected issues and reads all comment pages", async () => {
     const github = await fixture();
     for (let number = 2; number <= 101; number++)
       github.state.issues[number] = makeIssue(number);
     github.state.issues[2].pull_request = {
       url: "https://untrusted.invalid/ignored",
     };
-    expect((await github.reader.issuePage(1, signal())).numbers).not.toContain(
-      2,
-    );
-    expect(await github.reader.issuePage(2, signal())).toEqual({
-      numbers: [101],
-      finished: true,
-    });
     github.state.comments[1] = Array.from({ length: 101 }, (_, index) => ({
       id: index + 1,
       body: "Comment",

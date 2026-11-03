@@ -103,13 +103,13 @@ export type Implementation = {
   result: ImplementationResult | null;
   bootstrap_receipt: string | null;
   candidate_bootstrap: string | null;
-  milestone_done: boolean;
+
   audit_id: string | null;
   test_id: string | null;
   audits: AuditReceipt[];
   tests: VerificationReceipt[];
-  agent_pending: { task: string; prior_runs: string[] } | null;
-  recovery_attempts: string[];
+  agent_pending: { task: string } | null;
+
   publication_id: string | null;
   status_operation: string | null;
   status_generation: number;

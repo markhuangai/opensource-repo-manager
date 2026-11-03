@@ -30,7 +30,6 @@ jobs:
       - run: npm install --global npm@12.0.2
       - run: npm ci
       - run: npm run check
-      - run: docker compose config --quiet
       - name: Validate workflows
         env:
           ACTIONLINT_VERSION: 1.7.12
@@ -67,7 +66,6 @@ jobs:
           - implementation-recovery
           - implementation-monitor-repair
           - implementation-monitor-state
-          - implementation-monitor-mcp
         include:
           - architecture: amd64
             platform: linux/amd64

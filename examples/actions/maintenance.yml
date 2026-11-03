@@ -1,5 +1,7 @@
 name: Repository maintenance
 
+# The pinned image defaults to one bounded Actions task; each invocation exits.
+
 on:
   issues:
     types: [opened, edited, reopened, closed]

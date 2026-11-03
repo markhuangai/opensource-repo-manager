@@ -4,11 +4,6 @@ import type { RunSnapshot } from "../config/load.ts";
 import type { ModelProfile, Role } from "../config/schema.ts";
 import { isContainedReference } from "../config/files.ts";
 import type { SourceMetadata } from "./jobs.ts";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type {
-  McpWriteChannel,
-  WriteBinding,
-} from "../services/mcp-writes/contracts.ts";
 
 export class RuntimeError extends Error {
   readonly code: string;
@@ -27,74 +22,11 @@ export const sdkVersions = { claude: "0.3.296", codex: "0.162.1" } as const;
 
 export function workerLimits(snapshot: RunSnapshot) {
   return {
-    processes: snapshot.settings.limits.worker_processes ?? 128,
-    output: snapshot.settings.limits.worker_output_bytes ?? 16 * 1024 * 1024,
-    storage: snapshot.settings.limits.worker_storage_bytes ?? 4 * 1024 ** 3,
+    processes: snapshot.settings.limits.worker_processes,
+    output: snapshot.settings.limits.worker_output_bytes,
+    storage: snapshot.settings.limits.worker_storage_bytes,
   };
 }
-
-export type McpConnection = Readonly<{
-  alias: string;
-  url: string;
-  authorization: string;
-  tools: readonly string[];
-  deadline: number;
-}>;
-export interface McpSessionProvider {
-  open(request: {
-    run_id: string;
-    job_id: number;
-    revision: number;
-    role: Role;
-    grants: RunSnapshot["roles"][Role]["mcp"];
-    deadline: number;
-    signal: AbortSignal;
-    available?: () => boolean;
-    artifact_digest?: string;
-  }): Promise<{
-    connections: readonly McpConnection[];
-    policy_identity: string;
-    catalog_identity: string;
-    close(): Promise<void>;
-  }>;
-}
-
-export interface McpWriteDispatcher {
-  assertAvailable(reviewRequired: boolean): void;
-  dispatch(
-    request: Readonly<{
-      binding: WriteBinding;
-      arguments: Readonly<Record<string, unknown>>;
-      deadline: number;
-      signal: AbortSignal;
-    }>,
-    channel: McpWriteChannel,
-  ): Promise<CallToolResult>;
-}
-
-export type McpCallReceipt = {
-  id: string;
-  run_id: string;
-  job_id: number;
-  revision: number;
-  role: Role;
-  alias: string;
-  tool: string;
-  credential_binding: string;
-  policy_identity: string;
-  catalog_identity: string;
-  request_digest: string;
-  result_digest: string | null;
-  started_at: number;
-  finished_at: number | null;
-  outcome:
-    | "running"
-    | "completed"
-    | "tool_error"
-    | "failed"
-    | "cancelled"
-    | "interrupted";
-};
 
 export type SessionIdentity = Readonly<{ id: string; binding: string }>;
 export const conversationSchema = z.strictObject({
@@ -148,7 +80,6 @@ export type WorkerRequest = Omit<AgentRunRequest, "workspace"> & {
     selected: readonly string[];
   };
   relay: { url: string; authorization: string };
-  mcp: readonly McpConnection[];
   binding: string;
   environment?: Readonly<Record<string, string>>;
 };

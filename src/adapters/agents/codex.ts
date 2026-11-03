@@ -23,7 +23,7 @@ import {
   type WorkerRequest,
 } from "../../domain/agents.ts";
 import { cleanEnvironment } from "../../runtime/process.ts";
-import { compile } from "../../services/mcp/catalog.ts";
+import { compile } from "./schema.ts";
 
 const version = sdkVersions.codex;
 type Counts = { input_tokens: number; output_tokens: number };
@@ -66,8 +66,6 @@ export function codexOptions(request: WorkerRequest): {
     throw new RuntimeError("codex_effort_unsupported");
   if (!request.relay.authorization)
     throw new RuntimeError("codex_authorization_missing");
-  if (request.role === "output_review" && request.mcp.length)
-    throw new RuntimeError("codex_review_tools_forbidden");
   const environment = {
     ...cleanEnvironment(
       request.home,
@@ -76,40 +74,12 @@ export function codexOptions(request: WorkerRequest): {
     ),
     ...request.environment,
   } as Record<string, string>;
-  const connections = Object.fromEntries(
-    request.mcp.map((server, index) => [
-      server.alias,
-      {
-        url: server.url,
-        bearer_token_env_var: `ORM_MCP_AUTH_${index}`,
-        enabled_tools: [...server.tools],
-        // The pinned CLI ignores the removed tool_search flag; keep granted tools directly visible.
-        omit_tools_from: ["deferred", "code_mode"],
-        required: true,
-        startup_readiness: "connection",
-        startup_timeout_sec: Math.max(
-          1,
-          (server.deadline - Date.now()) / 1000 + 1,
-        ),
-        tool_timeout_sec: Math.max(
-          1,
-          (server.deadline - Date.now()) / 1000 + 1,
-        ),
-      },
-    ]),
-  );
   return {
     options: {
       env: {
         ...environment,
         CODEX_HOME: join(request.home, ".codex"),
         ORM_RELAY_AUTH: request.relay.authorization,
-        ...Object.fromEntries(
-          request.mcp.map((server, index) => [
-            `ORM_MCP_AUTH_${index}`,
-            server.authorization,
-          ]),
-        ),
       },
       config: {
         model_provider: "orm_relay",
@@ -165,7 +135,7 @@ export function codexOptions(request: WorkerRequest): {
       },
       configOverrides: [
         `projects.${JSON.stringify(request.workspace)}.trust_level="untrusted"`,
-        `mcp_servers=${toml(connections)}`,
+        "mcp_servers={}",
       ],
     },
     thread: {
@@ -178,19 +148,6 @@ export function codexOptions(request: WorkerRequest): {
       webSearchMode: "disabled",
     },
   };
-}
-
-function toml(value: unknown): string {
-  if (
-    typeof value === "string" ||
-    typeof value === "boolean" ||
-    typeof value === "number"
-  )
-    return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(toml).join(",")}]`;
-  return `{${Object.entries(value as Record<string, unknown>)
-    .map(([key, child]) => `${JSON.stringify(key)}=${toml(child)}`)
-    .join(",")}}`;
 }
 
 async function copyTranscript(from: string, to: string) {
@@ -296,7 +253,7 @@ export async function* run(
     // Executor-local configuration ignores session flags, so trust must also be set in the fresh home.
     await writeFile(
       join(home, "config.toml"),
-      `projects=${toml({ [request.workspace]: { trust_level: "untrusted" } })}\n`,
+      `projects={${JSON.stringify(request.workspace)}={trust_level="untrusted"}}\n`,
       { mode: 0o600, flag: "wx" },
     );
     const client = new Codex(options);

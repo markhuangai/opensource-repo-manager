@@ -3,7 +3,6 @@ import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, writeFile, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { Store } from "../src/repositories/store.ts";
 import { InvestigationRepository } from "../src/repositories/investigation.ts";
@@ -207,7 +206,7 @@ describe("durable maintenance implementation", () => {
     record.audit_id = "audit";
     record.test_id = "tests";
     record.candidate_bootstrap = "bootstrap";
-    record.milestone_done = true;
+
     for (
       let cycle = 0;
       cycle < f.snapshot.settings.limits.repair_cycles;
@@ -219,7 +218,6 @@ describe("durable maintenance implementation", () => {
       audit_id: null,
       test_id: null,
       candidate_bootstrap: null,
-      milestone_done: false,
     });
     expect(() => f.repository.repair(record, ["Another gap"])).toThrow(
       "repair_budget_exhausted",
@@ -251,43 +249,6 @@ describe("durable maintenance implementation", () => {
     expect(f.store.job(1)).toEqual(before);
     expect(() => f.store.assertPublishedScope(1)).toThrow("pr_scope_changed");
     expect(f.store.ownedPull(77)?.object_id).toBe("77");
-  });
-
-  it("migrates schema 8 additively without changing jobs or existing ownership", async () => {
-    const f = await fixture();
-    f.handoff();
-    const jobs = f.store.jobs(),
-      instance = f.publications.instance();
-    f.store.db.exec(
-      "DROP TABLE agent_conversations; DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; PRAGMA user_version=8",
-    );
-    f.store.close();
-    const upgraded = new Store(f.path);
-    cleanup.push(() => upgraded.close());
-    expect(upgraded.db.pragma("user_version", { simple: true })).toBe(11);
-    expect(upgraded.jobs()).toEqual(jobs);
-    expect(new PublicationRepository(upgraded).instance()).toBe(instance);
-    expect(new ImplementationRepository(upgraded).all()).toEqual([]);
-  });
-
-  it("rolls back a conflicting schema 9 migration", async () => {
-    const f = await fixture();
-    const jobs = f.store.jobs();
-    f.store.db.exec(
-      "DROP TABLE agent_conversations; DROP TABLE pr_observations; DROP TABLE pr_monitor_evidence; DROP TABLE pr_monitors; DROP TABLE implementations; CREATE TABLE implementations(marker TEXT); INSERT INTO implementations VALUES('preserve'); PRAGMA user_version=8",
-    );
-    f.store.close();
-    expect(() => new Store(f.path)).toThrow();
-    const raw = new Database(f.path);
-    try {
-      expect(raw.pragma("user_version", { simple: true })).toBe(8);
-      expect(raw.prepare("SELECT * FROM jobs").all()).toEqual(jobs);
-      expect(raw.prepare("SELECT * FROM implementations").all()).toEqual([
-        { marker: "preserve" },
-      ]);
-    } finally {
-      raw.close();
-    }
   });
 });
 

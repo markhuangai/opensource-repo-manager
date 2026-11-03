@@ -18,7 +18,6 @@ import {
   type AgentEvent,
   type AgentRunner,
   type AgentRunRequest,
-  type McpSessionProvider,
   type WorkerRequest,
 } from "../domain/agents.ts";
 import type { SourceMetadata } from "../domain/jobs.ts";
@@ -35,9 +34,6 @@ import type {
   CommandReceipt,
 } from "../services/bootstrap/contracts.ts";
 import { PublicationService } from "../services/publication/index.ts";
-import { NotificationService } from "../services/notifications/index.ts";
-import { McpWriteService } from "../services/mcp-writes/index.ts";
-import type { McpWriteTransport } from "../services/mcp-writes/contracts.ts";
 import type { GitHubWriter } from "../adapters/github/writer.ts";
 import { runCommand } from "../adapters/toolchains/process.ts";
 import {
@@ -110,12 +106,10 @@ export type BootstrapLease = Readonly<{
   signal: AbortSignal;
   request: AgentRunRequest;
   abort: (reason: RuntimeError) => void;
-  recovery_operation?: string;
 }>;
 export type SupervisorOptions = {
   root?: string;
   workers?: Partial<Record<"claude" | "codex", string>>;
-  mcp?: McpSessionProvider & Partial<McpWriteTransport>;
   sourceUrl?: (repository: string) => string;
   publicationWriter?: (ready: () => void) => GitHubWriter;
 };
@@ -128,8 +122,6 @@ export class Supervisor implements AgentRunner {
   readonly workspaces: WorkspaceService;
   readonly bootstrap: BootstrapService;
   readonly publication: PublicationService;
-  readonly notifications: NotificationService;
-  readonly mcpWrites: McpWriteService;
   private readonly bootstrapLeases = new Set<BootstrapLease>();
   private readonly bootstrapOutput = new Map<string, number>();
   private readonly relay: ModelRelay;
@@ -158,22 +150,6 @@ export class Supervisor implements AgentRunner {
       writer: options.publicationWriter,
       sourceUrl: options.sourceUrl,
     });
-    this.notifications = new NotificationService(
-      store,
-      snapshot,
-      secrets,
-      this.publication.outputReview,
-    );
-    this.mcpWrites = new McpWriteService(
-      this,
-      store,
-      secrets,
-      this.publication.outputReview,
-      options.mcp?.openRecovery
-        ? (options.mcp as McpSessionProvider & McpWriteTransport)
-        : undefined,
-      options.sourceUrl,
-    );
   }
 
   static async create(
@@ -200,7 +176,6 @@ export class Supervisor implements AgentRunner {
         store.finishRun(run.id, "interrupted", null, null);
       }
       for (const lease of store.leases()) store.releaseLease(lease.token);
-      await supervisor.mcpWrites.initialize();
       await supervisor.relay.start();
       return supervisor;
     } catch (error) {
@@ -311,41 +286,13 @@ export class Supervisor implements AgentRunner {
     return this.withLease(request, signal, operation);
   }
 
-  async withMcpWriteRecovery<T>(
-    operationId: string,
-    signal: AbortSignal,
-    operation: (session: BootstrapLease) => Promise<T>,
-  ) {
-    const receipt = this.mcpWrites.receipt(operationId);
-    if (receipt.state !== "uncertain")
-      throw new RuntimeError("mcp_write_recovery_denied");
-    return this.withLease(
-      this.request(receipt.job_id, "output_review"),
-      signal,
-      operation,
-      operationId,
-    );
-  }
-
-  blockMcpWriteJob(jobId: number) {
-    for (const run of this.active.values())
-      if (run.request.job_id === jobId)
-        run.controller.abort(new RuntimeError("mcp_write_job_blocked"));
-    for (const lease of this.bootstrapLeases)
-      if (lease.request.job_id === jobId)
-        lease.abort(new RuntimeError("mcp_write_job_blocked"));
-  }
-
   private async withLease<T>(
     request: AgentRunRequest,
     signal: AbortSignal,
     operation: (session: BootstrapLease) => Promise<T>,
-    recovery?: string,
   ): Promise<T> {
-    const snapshot = this.validate(request, recovery),
-      lease = recovery
-        ? this.store.acquireMcpWriteRecovery(recovery)
-        : this.store.acquireLease(request.job_id, request.revision);
+    const snapshot = this.validate(request),
+      lease = this.store.acquireLease(request.job_id, request.revision);
     if (!lease) throw new RuntimeError("lease_busy");
     const controller = new AbortController();
     let session: BootstrapLease | undefined;
@@ -380,9 +327,9 @@ export class Supervisor implements AgentRunner {
             this.controller.signal,
           ]),
           abort: (reason) => controller.abort(reason),
-          ...(recovery ? { recovery_operation: recovery } : {}),
         };
         this.bootstrapLeases.add(session);
+        this.validate(request);
         session.signal.throwIfAborted();
         result = await operation(session);
       } catch (error) {
@@ -444,16 +391,6 @@ export class Supervisor implements AgentRunner {
       request.revision !== session.request.revision
     )
       throw new RuntimeError("revision_stale");
-    if (
-      session.recovery_operation &&
-      (request.role !== "output_review" ||
-        !this.store.mcpWriteRecoveryCurrent(
-          session.lease,
-          session.recovery_operation,
-        ))
-    )
-      throw new RuntimeError("mcp_write_recovery_denied");
-    this.validate(request, session.recovery_operation);
     session.signal.throwIfAborted();
   }
 
@@ -772,7 +709,7 @@ export class Supervisor implements AgentRunner {
     }
   }
 
-  private validate(request: AgentRunRequest, recovery?: string) {
+  private validate(request: AgentRunRequest) {
     const job = this.store.jobById(request.job_id);
     if (
       !job ||
@@ -782,17 +719,6 @@ export class Supervisor implements AgentRunner {
       !roleNames.includes(request.role)
     )
       throw new RuntimeError("revision_stale");
-    if (recovery) {
-      const operation = this.mcpWrites.receipt(recovery);
-      if (
-        operation.state !== "uncertain" ||
-        operation.job_id !== job.id ||
-        operation.revision !== job.revision ||
-        request.role !== "output_review"
-      )
-        throw new RuntimeError("mcp_write_recovery_denied");
-    } else if (this.store.hasUncertainMcpWrite(job.id))
-      throw new RuntimeError("mcp_write_job_blocked");
     const snapshot = this.store.snapshot(job.snapshot_digest),
       saved = JSON.parse(job.input_json) as { source: SourceMetadata };
     if (
@@ -815,18 +741,12 @@ export class Supervisor implements AgentRunner {
     parent?: ActiveRun,
     held?: BootstrapLease,
   ): AsyncIterable<AgentEvent> {
-    const snapshot = this.validate(request, held?.recovery_operation),
+    const snapshot = this.validate(request),
       worker = this.options.workers?.[request.profile.sdk];
     if (!worker) throw new RuntimeError("backend_unavailable");
     await trustedExecutable(worker);
     const bootstrap = fileURLToPath(new URL("./worker.js", import.meta.url));
     await trustedExecutable(bootstrap);
-    const grant = snapshot.roles[request.role].mcp;
-    const hasGrants = Object.values(grant).some(
-      (value) => Object.keys(value.tools).length > 0,
-    );
-    if (hasGrants && !this.options.mcp)
-      throw new RuntimeError("mcp_unavailable");
     const controller = new AbortController(),
       combined = AbortSignal.any([
         signal,
@@ -906,8 +826,7 @@ export class Supervisor implements AgentRunner {
     const { request, snapshot, signal, lease, id } = context,
       identity = roleUsers[request.role],
       limits = workerLimits(snapshot);
-    let prepared: PreparedWorkspace | undefined,
-      mcp: Awaited<ReturnType<McpSessionProvider["open"]>> | undefined;
+    let prepared: PreparedWorkspace | undefined;
     let environment: Readonly<Record<string, string>> | undefined;
     let excluded: ((reference: string) => boolean) | undefined;
     let relay: ReturnType<ModelRelay["authorize"]> | undefined,
@@ -915,18 +834,12 @@ export class Supervisor implements AgentRunner {
       cleaned = false;
     let session: string | null = null,
       terminal: Extract<AgentEvent, { type: "terminal" }> | undefined;
-    let closeProvider: Promise<void> | undefined,
-      termination: Promise<void> | undefined,
+    let termination: Promise<void> | undefined,
       watching: Promise<void> | undefined;
     let cleanupFailure: unknown,
       cleanupStep = "connections";
     const revoke = () => {
       relay?.revoke();
-      if (mcp && !closeProvider) closeProvider = mcp.close();
-      if (closeProvider)
-        void closeProvider.catch((error) => {
-          cleanupFailure = error;
-        });
     };
     const abort = () => {
       revoke();
@@ -1027,20 +940,6 @@ export class Supervisor implements AgentRunner {
           signal,
         );
       }
-      if (hasTools(grantFor(snapshot, request.role))) {
-        mcp = await this.options.mcp!.open({
-          run_id: id,
-          job_id: request.job_id,
-          revision: request.revision,
-          role: request.role,
-          grants: grantFor(snapshot, request.role),
-          deadline: context.deadline,
-          signal,
-          available: () => !context.suspended,
-          artifact_digest: request.workspace.artifact,
-        });
-        this.validateMcp(mcp, context);
-      }
       signal.throwIfAborted();
       const binding = digest({
         ...(request.conversation
@@ -1055,8 +954,6 @@ export class Supervisor implements AgentRunner {
         artifact: request.workspace.artifact,
         snapshot: request.snapshot_digest,
         profile: request.profile,
-        policy: mcp?.policy_identity ?? digest({}),
-        catalog: mcp?.catalog_identity ?? digest({}),
         ...(request.bootstrap_receipt
           ? {
               environment: digest({
@@ -1178,20 +1075,11 @@ export class Supervisor implements AgentRunner {
           ),
         },
         relay: { url: relay.url, authorization: relay.authorization },
-        mcp:
-          mcp?.connections.map((connection) => ({
-            alias: connection.alias,
-            url: connection.url,
-            authorization: connection.authorization,
-            tools: [...connection.tools],
-            deadline: connection.deadline,
-          })) ?? [],
         binding,
         ...(environment ? { environment } : {}),
       };
       const outputCredentials = createKnownSecretChecker([
           workerRequest.relay.authorization,
-          ...workerRequest.mcp.map((connection) => connection.authorization),
         ]),
         credentialStream = outputCredentials.createStream(),
         input = JSON.stringify(workerRequest);
@@ -1284,7 +1172,7 @@ export class Supervisor implements AgentRunner {
       if (terminal.outcome !== "completed" && terminal.outcome !== "limited")
         throw new RuntimeError(terminal.outcome);
       revoke();
-      await closeProvider;
+
       termination ??= cleanUser(identity.uid);
       await termination;
       if (cleanupFailure) throw new RuntimeError("cleanup_failed");
@@ -1365,7 +1253,6 @@ export class Supervisor implements AgentRunner {
       await watching;
       revoke();
       try {
-        await closeProvider;
         if (registered) {
           cleanupStep = "processes";
           termination ??= cleanUser(identity.uid);
@@ -1449,71 +1336,14 @@ export class Supervisor implements AgentRunner {
     queue.end();
   }
 
-  private validateMcp(
-    session: Awaited<ReturnType<McpSessionProvider["open"]>>,
-    context: ActiveRun,
-  ) {
-    const grants = grantFor(context.snapshot, context.request.role),
-      seen = new Set<string>();
-    if (!session.policy_identity || !session.catalog_identity)
-      throw new RuntimeError("mcp_descriptor_invalid");
-    for (const connection of session.connections) {
-      const url = new URL(connection.url),
-        tools = grants[connection.alias]?.tools;
-      if (
-        !["http:", "https:"].includes(url.protocol) ||
-        !["127.0.0.1", "[::1]"].includes(url.hostname) ||
-        url.username ||
-        url.password ||
-        url.hash ||
-        url.search ||
-        !tools ||
-        seen.has(connection.alias) ||
-        !connection.authorization ||
-        connection.authorization.length > 16384 ||
-        /[\r\n\0]/.test(connection.authorization) ||
-        Object.keys(connection).some(
-          (key) =>
-            !["alias", "url", "authorization", "tools", "deadline"].includes(
-              key,
-            ),
-        ) ||
-        !Number.isSafeInteger(connection.deadline) ||
-        connection.deadline > context.deadline ||
-        connection.deadline <= Date.now() ||
-        new Set(connection.tools).size !== connection.tools.length ||
-        connection.tools.some((name) => !Object.hasOwn(tools, name)) ||
-        this.secrets.containsCredentials(connection)
-      )
-        throw new RuntimeError("mcp_descriptor_invalid");
-      seen.add(connection.alias);
-    }
-    if (
-      Object.entries(grants).some(
-        ([alias, grant]) => Object.keys(grant.tools).length && !seen.has(alias),
-      )
-    )
-      throw new RuntimeError("mcp_unavailable");
-  }
-
   async close() {
     this.controller.abort(new RuntimeError("cancelled"));
     try {
-      await this.notifications.stop();
-    } finally {
       await Promise.all(this.tasks);
+    } finally {
       await this.relay.close();
     }
     if (this.store.runs().some((run) => run.finished_at === null))
       throw new RuntimeError("cleanup_failed");
   }
-}
-
-function grantFor(snapshot: RunSnapshot, role: Role) {
-  return snapshot.roles[role].mcp;
-}
-function hasTools(grants: RunSnapshot["roles"][Role]["mcp"]) {
-  return Object.values(grants).some(
-    (value) => Object.keys(value.tools).length > 0,
-  );
 }

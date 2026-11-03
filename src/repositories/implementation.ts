@@ -65,13 +65,13 @@ export class ImplementationRepository {
       result: null,
       bootstrap_receipt: null,
       candidate_bootstrap: null,
-      milestone_done: false,
+
       audit_id: null,
       test_id: null,
       audits: [],
       tests: [],
       agent_pending: null,
-      recovery_attempts: [],
+
       publication_id: null,
       status_operation: null,
       status_generation: 0,
@@ -120,8 +120,6 @@ export class ImplementationRepository {
     )
       throw new RuntimeError("implementation_handoff_invalid");
     this.store.assertPublishedScope(job.id);
-    if (this.store.hasUncertainMcpWrite(job.id))
-      throw new RuntimeError("mcp_write_uncertain");
     return job;
   }
 
@@ -144,7 +142,7 @@ export class ImplementationRepository {
         record.audit_id = null;
         record.test_id = null;
         record.candidate_bootstrap = null;
-        record.milestone_done = false;
+
         this.save(record);
       })
       .immediate();

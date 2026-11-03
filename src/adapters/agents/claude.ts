@@ -26,7 +26,7 @@ import {
   type WorkerRequest,
 } from "../../domain/agents.ts";
 import { cleanEnvironment } from "../../runtime/process.ts";
-import { compile } from "../../services/mcp/catalog.ts";
+import { compile } from "./schema.ts";
 
 const version = sdkVersions.claude;
 const reading = ["Read", "Glob", "Grep"];
@@ -110,12 +110,8 @@ export function claudeOptions(
   if (request.profile.sdk !== "claude")
     throw new RuntimeError("backend_unavailable");
   const tools = nativeTools[request.role];
-  const granted = request.mcp.flatMap((server) =>
-    server.tools.map((tool) => `mcp__${server.alias}__${tool}`),
-  );
   const allowed = [
     ...tools,
-    ...granted,
     ...(request.output_schema ? ["StructuredOutput"] : []),
   ];
   return {
@@ -173,22 +169,7 @@ export function claudeOptions(
       dirname(request.prompts.system),
       request.prompts.skills,
     ],
-    mcpServers: Object.fromEntries(
-      request.mcp.map((server) => [
-        server.alias,
-        {
-          type: "http" as const,
-          url: server.url,
-          headers: { Authorization: `Bearer ${server.authorization}` },
-          timeout: Math.max(1000, server.deadline - Date.now() + 1000),
-          alwaysLoad: true,
-          tools: server.tools.map((name) => ({
-            name,
-            permission_policy: "always_allow" as const,
-          })),
-        },
-      ]),
-    ),
+    mcpServers: {},
     strictMcpConfig: true,
     verbatimPrompts: true,
     persistSession: roleUsers[request.role].uid === 10001,
@@ -267,21 +248,9 @@ async function preflight(running: Query, request: WorkerRequest) {
     !model.supportedEffortLevels?.includes(request.profile.effort)
   )
     throw new RuntimeError("claude_profile_unsupported");
-  const servers = await running.mcpServerStatus();
-  if (
-    servers.length !== request.mcp.length ||
-    servers.some((server) => {
-      const issued = request.mcp.find((issued) => issued.alias === server.name);
-      return (
-        !issued ||
-        server.status !== "connected" ||
-        !server.tools ||
-        server.tools.length !== issued.tools.length ||
-        server.tools.some((tool) => !issued.tools.includes(tool.name))
-      );
-    })
-  )
-    throw new RuntimeError("claude_mcp_unavailable");
+
+  if ((await running.mcpServerStatus()).length)
+    throw new RuntimeError("claude_tools_forbidden");
 }
 
 export async function* run(

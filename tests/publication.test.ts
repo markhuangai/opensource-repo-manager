@@ -75,7 +75,7 @@ async function setup() {
 describe("publication policy and immutable Git export", () => {
   it("rejects decoded YAML credentials before scanner execution, including folded and block keys", async () => {
     const config = fixtureConfiguration();
-    config.github.webhook_secret = "folded fixture password";
+    config.github.token = "folded fixture password";
     const { secrets } = await fixtureSnapshot("fixture-model", config);
     const scanner = new PublicationScanner("/not-used", secrets);
     for (const text of [

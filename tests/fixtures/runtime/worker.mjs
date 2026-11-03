@@ -62,77 +62,12 @@ export async function* run(request, signal) {
     };
     return;
   }
-  if (input.mode === "mcp-real") {
-    const { Client } =
-      await import("/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js");
-    const { StreamableHTTPClientTransport } =
-      await import("/opt/orm/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js");
-    const serialized = JSON.stringify({ environment: process.env, request });
-    assert(!serialized.includes("mcp-upstream-container-"));
-    assert(await denied(readFile("/config/config.yml")));
-    const name = request.role === "audit" ? "hidden" : "read",
-      values = [];
-    for (const connection of request.mcp) {
-      assert.deepEqual(connection.tools, [name]);
-      assert.equal(new URL(connection.url).hostname, "127.0.0.1");
-      const client = new Client(
-        { name: "unprivileged-fixture", version: "1" },
-        { capabilities: {} },
-      );
-      try {
-        await client.connect(
-          new StreamableHTTPClientTransport(new URL(connection.url), {
-            requestInit: {
-              headers: { Authorization: `Bearer ${connection.authorization}` },
-            },
-          }),
-        );
-        assert.deepEqual(
-          (await client.listTools()).tools.map((tool) => tool.name),
-          [name],
-        );
-        await assert.rejects(
-          client.callTool({ name: name === "read" ? "hidden" : "read" }),
-          /mcp_tool_denied/,
-        );
-        assert.equal(
-          (
-            await fetch(connection.url, {
-              method: "POST",
-              headers: { Authorization: "Bearer forged" },
-              body: "{}",
-              signal,
-            })
-          ).status,
-          401,
-        );
-        const result = await client.callTool(
-          { name, arguments: { text: "safe" } },
-          undefined,
-          { signal },
-        );
-        values.push(result.content[0].text);
-      } finally {
-        await client.close();
-      }
-    }
-    yield { type: "session", id: "real-mcp-session" };
-    yield {
-      type: "terminal",
-      outcome: "completed",
-      result: { binding: request.binding, uid: process.getuid(), values },
-    };
-    return;
-  }
   if (input.mode === "terminal-outcome") {
     yield { type: "terminal", outcome: input.outcome };
     return;
   }
   if (input.mode === "emit-credential") {
-    const credential =
-      input.credential === "mcp"
-        ? request.mcp[0].authorization
-        : request.relay.authorization;
+    const credential = request.relay.authorization;
     if (input.event === "progress") {
       const messages = input.split
         ? [
@@ -267,7 +202,7 @@ export async function* run(request, signal) {
       "GIT_CONFIG_VALUE_2",
     ])
       assert.equal(process.env[key], undefined);
-    assert(await denied(readFile("/config/config.yml")));
+    assert(await denied(readFile("/config/actions.yml")));
     assert(await denied(readFile(input.database)));
     assert(await denied(readFile(`/proc/${input.supervisor}/environ`)));
     assert(await denied(access(`/proc/${input.supervisor}/fd/0`)));
@@ -348,30 +283,8 @@ export async function* run(request, signal) {
     yield { type: "terminal", outcome: "completed" };
     return;
   }
-  if (input.mode === "mcp" || input.mode === "mcp-hang") {
-    assert.equal(request.mcp.length, 1);
-    const connection = request.mcp[0];
-    assert.deepEqual(connection.tools, ["read"]);
-    const response = await fetch(connection.url, {
-      method: "POST",
-      headers: { authorization: `Bearer ${connection.authorization}` },
-      body: "read",
-      signal,
-    });
-    assert.equal(response.status, 200);
-    assert.equal((await response.json()).role, request.role);
-    yield { type: "session", id: "mcp-session" };
-    if (input.mode === "mcp") {
-      yield {
-        type: "terminal",
-        outcome: "completed",
-        result: { binding: request.binding },
-      };
-      return;
-    }
-  }
   if (input.mode === "review") {
-    assert.equal(request.mcp.length, 0);
+    assert.equal(request.mcp, undefined);
     if (input.peer) assert(await denied(readFile(input.peer)));
     if (input.peer) yield { type: "progress", message: "peer-denied" };
     yield { type: "progress", message: "review-start" };
@@ -427,7 +340,7 @@ export async function* run(request, signal) {
     return;
   }
   if (input.mode === "escape") {
-    await symlink("/config/config.yml", join(request.workspace, "escape"));
+    await symlink("/config/actions.yml", join(request.workspace, "escape"));
     yield { type: "terminal", outcome: "completed" };
     return;
   }
