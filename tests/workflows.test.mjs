@@ -822,13 +822,66 @@ describe("pinned reusable maintenance workflow", () => {
     expect(calls[1][1]).toContain("ORM_CONFIGURATION_SECRETS");
     expect(calls[1][1]).toContain("ORM_CONFIGURATION_VARIABLES");
     expect(calls[1][1]).not.toContain("ORM_PROXY_KEY");
-    expect(result.maskedValues.sort()).toEqual([
-      "model-canary",
-      "protected-key",
-      "protected-pat",
-      "protected-proxy",
-    ]);
+    expect(result.maskedValues).toEqual([]);
   });
+  for (const field of [
+    "ORM_CONFIGURATION_VARIABLES",
+    "ORM_CONFIGURATION_SECRETS",
+  ])
+    it(`preserves routing and diagnostics for scalar values in ${field}`, async () => {
+      const env = {
+        ...environment,
+        [field]: JSON.stringify({
+          ...JSON.parse(environment[field]),
+          ENABLED: "true",
+          COUNT: "0",
+          ISSUE_DIGIT: "1",
+        }),
+      };
+      const diagnostic = JSON.stringify({
+        event: "configuration_resolved",
+        run_id: "100",
+        source_sha: "a0".repeat(20),
+        schema_version: 1,
+        elapsed_ms: 0,
+      });
+      const routed = await run(route, {
+        env,
+        executor: {
+          exec: async () => {},
+          getExecOutput: async () => ({
+            stdout: JSON.stringify({
+              version: 1,
+              repository_id: 42,
+              issues: [1, 10],
+            }),
+            stderr: diagnostic,
+            exitCode: 0,
+          }),
+        },
+      });
+      expect(routed.outputs).toEqual({ issues: "[1,10]", has_work: "true" });
+      expect(routed.maskedValues).toEqual([]);
+      expect(routed.notices).toContain(diagnostic);
+      const executed = await run(execute, {
+        env,
+        executor: {
+          exec: async () => {},
+          getExecOutput: async () => ({
+            stdout: JSON.stringify({
+              version: 1,
+              outcome: "waiting",
+              reason: "remote_checks",
+            }),
+            stderr: diagnostic,
+            exitCode: 0,
+          }),
+        },
+      });
+      expect(executed.maskedValues).toEqual([]);
+      expect(executed.notices).toContain(diagnostic);
+      expect(maintenance.on.workflow_call.secrets[field].required).toBe(true);
+    });
   it("forwards safe controller diagnostics into the Actions log", async () => {
     const diagnostic = JSON.stringify({
       event: "configuration_load_failed",
@@ -855,17 +908,22 @@ describe("pinned reusable maintenance workflow", () => {
     expect(result.failures).toEqual(["Maintenance stopped: source_missing"]);
     expect(JSON.stringify(result.notices)).not.toContain("protected-");
   });
-  for (const value of ["{invalid-canary", "[]", '{"TOKEN":7}'])
-    it("rejects invalid secret transport without echoing its contents", async () => {
-      const calls = [];
-      await expect(
-        run(execute, {
-          env: { ...environment, ORM_CONFIGURATION_SECRETS: value },
-          executor: { exec: async (...args) => calls.push(args) },
-        }),
-      ).rejects.toThrow("Invalid configuration secret map");
-      expect(calls).toEqual([]);
-    });
+  for (const [field, label] of [
+    ["ORM_CONFIGURATION_SECRETS", "secret"],
+    ["ORM_CONFIGURATION_VARIABLES", "variable"],
+  ])
+    for (const value of ["{invalid-canary", "[]", '{"TOKEN":7}'])
+      it(`rejects invalid ${label} transport without echoing its contents`, async () => {
+        const calls = [];
+        for (const script of [route, execute])
+          await expect(
+            run(script, {
+              env: { ...environment, [field]: value },
+              executor: { exec: async (...args) => calls.push(args) },
+            }),
+          ).rejects.toThrow(`Invalid configuration ${label} map`);
+        expect(calls).toEqual([]);
+      });
   it("treats waiting as a successful bounded exit and preserves failed results", async () => {
     for (const exitCode of [0, 1]) {
       const result = await run(execute, {

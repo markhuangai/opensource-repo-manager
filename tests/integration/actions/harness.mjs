@@ -1597,6 +1597,12 @@ export async function runActionsTests({
         "github_access_denied",
         {},
       ],
+      [
+        "repository-mismatch",
+        { GITHUB_REPOSITORY_ID: "43" },
+        "state_invalid",
+        {},
+      ],
     ]) {
       if (scenario === "variable-credential")
         upstream("/controller-source?credential=variable", "POST");
@@ -1622,17 +1628,23 @@ export async function runActionsTests({
       assert.equal(error.issue_number, String(controllerIssue));
       for (const [key, value] of Object.entries(expected))
         assert.equal(error[key], value);
-      if (scenario !== "bootstrap-denied") {
+      if (!["bootstrap-denied", "repository-mismatch"].includes(scenario)) {
         assert.match(error.source_sha, /^[a-f0-9]{40}$/);
         assert(error.line > 0 && error.column > 0);
       }
       assert(error.elapsed_ms >= 0);
       assert.equal(proof().mutations.length, mutationsBeforeConfiguration);
-      assert(
-        proof()
-          .configuration_requests.slice(before)
-          .every((item) => item.method === "GET"),
-      );
+      const configurationRequests =
+        proof().configuration_requests.slice(before);
+      assert(configurationRequests.every((item) => item.method === "GET"));
+      if (scenario === "repository-mismatch") {
+        assert(configurationRequests.length > 0);
+        assert(
+          configurationRequests.every(
+            (item) => item.credential === "bootstrap",
+          ),
+        );
+      }
       if (
         [
           "variable-credential",

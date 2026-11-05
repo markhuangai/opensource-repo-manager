@@ -58,7 +58,6 @@ jobs:
             catch { throw new Error("Invalid configuration variable map."); }
             assert(variables && typeof variables === "object" && !Array.isArray(variables) &&
               Object.values(variables).every(value => typeof value === "string"), "Invalid configuration variable map.");
-            for (const value of [...Object.values(secrets), ...Object.values(variables)]) if (value) core.setSecret(value);
             const image = process.env.ORM_RUNTIME_IMAGE;
             assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
             const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-route`;
@@ -131,7 +130,6 @@ jobs:
             catch { throw new Error("Invalid configuration variable map."); }
             assert(variables && typeof variables === "object" && !Array.isArray(variables) &&
               Object.values(variables).every(value => typeof value === "string"), "Invalid configuration variable map.");
-            for (const value of [...Object.values(secrets), ...Object.values(variables)]) if (value) core.setSecret(value);
             assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
             assert(/^[1-9][0-9]*$/.test(issue) && Number.isSafeInteger(Number(issue)), "Invalid selected issue.");
             const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-issue-${issue}`;

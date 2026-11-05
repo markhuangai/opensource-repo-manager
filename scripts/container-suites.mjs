@@ -112,6 +112,7 @@ export const actionsScenarios = {
     "controller-invalid-policy",
     "controller-duplicate-checks",
     "controller-bootstrap-denied",
+    "controller-repository-mismatch",
     "controller-unauthorized",
     "controller-resumed",
     "controller-ready",
