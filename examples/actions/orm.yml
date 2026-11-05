@@ -1,15 +1,19 @@
 version: 1
+github:
+  token: { from_secret: ORM_GITHUB_TOKEN }
+session_key: { from_secret: ORM_SESSION_KEY }
 proxy:
-  url: https://proxy.example.invalid/v1
+  url: { from_secret: PROXY_URL }
+  key: { from_secret: ORM_PROXY_KEY }
 profiles:
   coding:
     sdk: claude
-    model: your-claude-model-id
-    effort: high
+    model: { from_variable: CODING_MODEL }
+    effort: { from_variable: CODING_MODEL_EFFORT }
   review:
     sdk: codex
-    model: your-codex-model-id
-    effort: high
+    model: { from_variable: REVIEW_MODEL }
+    effort: { from_variable: REVIEW_MODEL_EFFORT }
 roles:
   bootstrap:
     profile: coding

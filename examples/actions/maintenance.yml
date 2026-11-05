@@ -30,6 +30,11 @@ jobs:
       runner: ubuntu-24.04
       issue-number: ${{ inputs.issue-number || '' }}
     secrets:
-      ORM_GITHUB_TOKEN: ${{ secrets.ORM_GITHUB_TOKEN }}
-      ORM_PROXY_KEY: ${{ secrets.ORM_PROXY_KEY }}
-      ORM_SESSION_KEY: ${{ secrets.ORM_SESSION_KEY }}
+      ORM_CONFIGURATION_VARIABLES: ${{ toJSON(vars) }}
+      ORM_CONFIGURATION_SECRETS: |
+        {
+          "ORM_GITHUB_TOKEN": ${{ toJSON(secrets.ORM_GITHUB_TOKEN) }},
+          "ORM_PROXY_KEY": ${{ toJSON(secrets.ORM_PROXY_KEY) }},
+          "ORM_SESSION_KEY": ${{ toJSON(secrets.ORM_SESSION_KEY) }},
+          "PROXY_URL": ${{ toJSON(secrets.PROXY_URL) }}
+        }

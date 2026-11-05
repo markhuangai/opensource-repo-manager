@@ -32,6 +32,7 @@ const publicationFaults = [];
 let releaseQuestionBoundary;
 const remote = await createPublicationFixture("/fixture/git");
 remote.state.token = config.github.token;
+remote.state.bootstrapToken = config.bootstrap_token ?? "";
 const source = remote.commit(sourceFiles);
 remote.git(["update-ref", "refs/heads/main", source.sha]);
 remote.state.issues.set(1, {
@@ -260,7 +261,7 @@ function makeFixture() {
           command: [
             "set -eu",
             'test "$(id -u)" = 10001',
-            'test -z "${ORM_SESSION_KEY:-}${ACTIONS_RUNTIME_TOKEN:-}${ORM_ARTIFACT_TOKEN:-}"',
+            'test -z "${ORM_SESSION_KEY:-}${ACTIONS_RUNTIME_TOKEN:-}${ORM_ARTIFACT_TOKEN:-}${ORM_BOOTSTRAP_GITHUB_TOKEN:-}${ORM_CONFIGURATION_VARIABLES:-}${ORM_CONFIGURATION_SECRETS:-}"',
             'test "$(node --version)" = v24.18.0',
             ...(resumed
               ? [
@@ -318,12 +319,43 @@ const http = createServer(async (req, res) => {
   if (url.pathname === "/controller-source" && req.method === "POST") {
     const operator = {
       version: config.version,
-      proxy: { url: config.proxy.url },
-      profiles: config.profiles,
-      roles: config.roles,
-      pr_monitor: config.pr_monitor,
-      limits: config.limits,
+      github: { token: { from_secret: "TASK_GITHUB_TOKEN" } },
+      session_key: { from_secret: "TASK_SESSION_KEY" },
+      proxy: {
+        url: { from_secret: "PROXY_URL" },
+        key: { from_secret: "TASK_PROXY_KEY" },
+      },
+      profiles: Object.fromEntries(
+        Object.entries(config.profiles).map(([name, profile]) => [
+          name,
+          {
+            ...profile,
+            model: { from_variable: name.toUpperCase() + "_MODEL" },
+            effort: { from_variable: name.toUpperCase() + "_EFFORT" },
+          },
+        ]),
+      ),
+      roles: globalThis.structuredClone(config.roles),
+      pr_monitor: globalThis.structuredClone(config.pr_monitor),
+      limits: {
+        ...config.limits,
+        repair_cycles: { from_variable: "REPAIRS", format: "json" },
+      },
     };
+    if (url.searchParams.get("credential") === "variable")
+      operator.github.token = { from_variable: "TASK_GITHUB_TOKEN" };
+    if (url.searchParams.has("profile"))
+      operator.roles.audit.profile = { from_variable: "AUDIT_PROFILE" };
+    if (url.searchParams.has("checks"))
+      operator.pr_monitor.required_checks = [
+        { from_variable: "CHECK_A" },
+        { from_variable: "CHECK_B" },
+      ];
+    if (url.searchParams.has("policy"))
+      operator.pr_monitor.local_checks_only = {
+        from_variable: "LOCAL_ONLY",
+        format: "json",
+      };
     const files = {
       ...sourceFiles,
       ".github/orm.yml": stringifyYaml(operator),
@@ -572,6 +604,7 @@ const http = createServer(async (req, res) => {
               }))
           : [],
         github_requests: remote.state.requests,
+        configuration_requests: remote.state.configurationRequests,
         runs: database
           ? store.runs().map(({ role, uid, status, finished_at }) => ({
               role,

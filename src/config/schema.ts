@@ -1,7 +1,20 @@
-import { LineCounter, parseDocument, stringify } from "yaml";
+import { LineCounter, parseDocument } from "yaml";
 import { z } from "zod";
 import { ConfigurationError, configurationSections } from "./errors.ts";
 import { isContainedReference } from "./files.ts";
+import {
+  configurationBytes,
+  configurationValueType,
+  resolveConfigurationSources,
+  sourceContextBytes,
+  sourceForPath,
+  type ConfigurationPath,
+  type ConfigurationSources,
+} from "./sources.ts";
+import type {
+  ConfigurationDiagnostic,
+  ConfigurationErrorCode,
+} from "./errors.ts";
 
 export const roleNames = [
   "bootstrap",
@@ -92,6 +105,10 @@ const actionsConfigurationSchema = z.strictObject({
   }),
   pr_monitor: prMonitorPolicy,
   proxy: z.strictObject({ url: endpointUrl, key: secret }),
+  redaction_values: z
+    .array(z.string().min(1).max(sourceContextBytes))
+    .max(65536)
+    .default([]),
   profiles: z.record(name, profile),
   roles: z.strictObject({
     bootstrap: role,
@@ -118,11 +135,10 @@ const actionsConfigurationSchema = z.strictObject({
 export type ActionsConfiguration = z.infer<typeof actionsConfigurationSchema>;
 export type ModelProfile = ActionsConfiguration["profiles"][string];
 
-function parseSchema<T>(source: string, schema: z.ZodType<T>): T {
-  if (Buffer.byteLength(source) > 1024 * 1024)
+function parseYaml(source: string) {
+  if (Buffer.byteLength(source) > configurationBytes)
     throw new ConfigurationError("yaml_invalid");
   const lineCounter = new LineCounter();
-  let input: unknown;
   try {
     const document = parseDocument(source, {
       logLevel: "error",
@@ -136,70 +152,250 @@ function parseSchema<T>(source: string, schema: z.ZodType<T>): T {
       const { line, col } = lineCounter.linePos(position);
       throw new ConfigurationError("yaml_invalid", { line, column: col });
     }
-    input = document.toJS({ maxAliasCount: 100 });
+    return {
+      input: document.toJS({ maxAliasCount: 100 }) as unknown,
+      document,
+      lineCounter,
+    };
   } catch (error) {
     if (error instanceof ConfigurationError) throw error;
     throw new ConfigurationError("yaml_invalid");
   }
+}
+
+type DiagnosticLookup = (path: ConfigurationPath) => {
+  location?: { line: number; column: number };
+  diagnostic?: ConfigurationDiagnostic;
+};
+
+function rejectConfiguration(
+  code: ConfigurationErrorCode,
+  path: ConfigurationPath,
+  expected: string,
+  observed: string,
+  diagnostic?: DiagnosticLookup,
+): never {
+  const detail = diagnostic?.(path);
+  throw new ConfigurationError(
+    code,
+    detail?.location,
+    configurationSections.find((section) => section === path[0]),
+    { ...detail?.diagnostic, expected, observed },
+  );
+}
+
+function parseData<T>(
+  input: unknown,
+  schema: z.ZodType<T>,
+  diagnostic?: DiagnosticLookup,
+): T {
   const parsed = schema.safeParse(input);
   if (!parsed.success) {
-    const first = parsed.error.issues[0]?.path[0];
-    const section = configurationSections.find((section) => section === first);
-    throw new ConfigurationError("schema_invalid", undefined, section);
+    const issue = parsed.error.issues[0];
+    const path = issue.path.filter(
+      (part): part is string | number => typeof part !== "symbol",
+    );
+    let observed = input;
+    for (const part of path)
+      observed =
+        observed !== null &&
+        typeof observed === "object" &&
+        Object.hasOwn(observed, part)
+          ? (observed as Record<string | number, unknown>)[part]
+          : undefined;
+    rejectConfiguration(
+      "schema_invalid",
+      path,
+      issue.code === "invalid_type" ? issue.expected : issue.code,
+      configurationValueType(observed),
+      diagnostic,
+    );
   }
   return parsed.data;
 }
 
-function validateReferences(config: ActionsConfiguration) {
-  if (
-    new Set(config.pr_monitor.required_checks).size !==
-      config.pr_monitor.required_checks.length ||
-    new Set(
-      config.pr_monitor.automated_reviewers.map((item) =>
-        item.login.toLowerCase(),
-      ),
-    ).size !== config.pr_monitor.automated_reviewers.length ||
-    (config.pr_monitor.local_checks_only &&
-      (config.pr_monitor.requirements_source !== "operator" ||
-        config.pr_monitor.required_checks.length > 0)) ||
-    config.pr_monitor.automated_reviewers.some((item) =>
-      item.signal === "codex"
-        ? !/^chatgpt-codex-connector(?:\[bot\])?$/.test(item.login)
-        : item.signal === "coderabbit" &&
-          !/^coderabbitai(?:\[bot\])?$/.test(item.login),
-    )
-  )
-    throw new ConfigurationError("schema_invalid", undefined, "pr_monitor");
-  for (const phase of roleNames) {
-    const settings = config.roles[phase];
-    if (!Object.hasOwn(config.profiles, settings.profile))
-      throw new ConfigurationError("reference_invalid");
+function validateReferences(
+  config: ActionsConfiguration,
+  diagnostic?: DiagnosticLookup,
+) {
+  function invalid(
+    code: ConfigurationErrorCode,
+    paths: ConfigurationPath[],
+    expected: string,
+    observed: string,
+  ): never {
+    const path =
+      paths.find((path) => diagnostic?.(path).diagnostic?.source) ?? paths[0];
+    return rejectConfiguration(code, path, expected, observed, diagnostic);
   }
+  const policy = config.pr_monitor;
+  function duplicateIndices(values: readonly string[]) {
+    const seen = new Map<string, number>();
+    for (const [index, value] of values.entries()) {
+      const previous = seen.get(value);
+      if (previous !== undefined) return [index, previous];
+      seen.set(value, index);
+    }
+    return undefined;
+  }
+  const checks = duplicateIndices(policy.required_checks);
+  if (checks)
+    invalid(
+      "schema_invalid",
+      checks.map((index) => ["pr_monitor", "required_checks", index]),
+      "unique_check_names",
+      "duplicate_check_names",
+    );
+  const reviewers = duplicateIndices(
+    policy.automated_reviewers.map((item) => item.login.toLowerCase()),
+  );
+  if (reviewers)
+    invalid(
+      "schema_invalid",
+      reviewers.map((index) => [
+        "pr_monitor",
+        "automated_reviewers",
+        index,
+        "login",
+      ]),
+      "unique_reviewers",
+      "duplicate_reviewers",
+    );
+  if (
+    policy.local_checks_only &&
+    (policy.requirements_source !== "operator" ||
+      policy.required_checks.length > 0)
+  )
+    invalid(
+      "schema_invalid",
+      [
+        ["pr_monitor", "local_checks_only"],
+        ["pr_monitor", "requirements_source"],
+        ...policy.required_checks.map((_, index) => [
+          "pr_monitor",
+          "required_checks",
+          index,
+        ]),
+      ],
+      "operator_policy_without_remote_checks",
+      "incompatible_policy",
+    );
+  for (const [index, reviewer] of policy.automated_reviewers.entries()) {
+    if (
+      reviewer.signal === "codex"
+        ? !/^chatgpt-codex-connector(?:\[bot\])?$/.test(reviewer.login)
+        : reviewer.signal === "coderabbit" &&
+          !/^coderabbitai(?:\[bot\])?$/.test(reviewer.login)
+    )
+      invalid(
+        "schema_invalid",
+        [
+          ["pr_monitor", "automated_reviewers", index, "login"],
+          ["pr_monitor", "automated_reviewers", index, "signal"],
+        ],
+        "supported_reviewer_login",
+        "mismatched_reviewer_signal",
+      );
+  }
+  for (const phase of roleNames)
+    if (!Object.hasOwn(config.profiles, config.roles[phase].profile))
+      invalid(
+        "reference_invalid",
+        [["roles", phase, "profile"]],
+        "existing_profile",
+        "unknown_profile",
+      );
 }
 
 export function parseActionsConfiguration(
   source: string,
 ): ActionsConfiguration {
-  const config = parseSchema(source, actionsConfigurationSchema);
+  const config = parseData(parseYaml(source).input, actionsConfigurationSchema);
   validateReferences(config);
   return config;
 }
 
 export function parseRepositoryActionsConfiguration(
   source: string,
-  credentials: { repository: string; token: string; proxyKey: string },
-): ActionsConfiguration {
-  const input = parseSchema(
-    source,
-    actionsConfigurationSchema.omit({ github: true }).extend({
-      proxy: actionsConfigurationSchema.shape.proxy.omit({ key: true }),
-    }),
+  repository: string,
+  sources: ConfigurationSources,
+) {
+  const yaml = parseYaml(source);
+  function location(path: ConfigurationPath) {
+    for (let length = path.length; length >= 0; length--) {
+      const node = yaml.document.getIn(path.slice(0, length), true) as
+        { range?: number[] } | undefined;
+      if (node?.range) {
+        const position = yaml.lineCounter.linePos(node.range[0]);
+        return { line: position.line, column: position.col };
+      }
+    }
+    return undefined;
+  }
+  const resolved = resolveConfigurationSources(
+    yaml.input,
+    sources,
+    (code, path, diagnostic) => {
+      throw new ConfigurationError(
+        code,
+        location(path),
+        configurationSections.find((section) => section === path[0]),
+        diagnostic,
+      );
+    },
   );
-  return parseActionsConfiguration(
-    stringify({
-      ...input,
-      github: { repository: credentials.repository, token: credentials.token },
-      proxy: { ...input.proxy, key: credentials.proxyKey },
-    }),
+  const diagnostic: DiagnosticLookup = (path) => {
+    const record = sourceForPath(resolved.records, path);
+    return {
+      location: location(path),
+      diagnostic: record && { source: record.source, name: record.name },
+    };
+  };
+  for (const path of [["github", "token"], ["proxy", "key"], ["session_key"]])
+    if (sourceForPath(resolved.records, path)?.source !== "secret")
+      rejectConfiguration(
+        "source_reference_invalid",
+        path,
+        "secret_reference",
+        "non_secret_source",
+        diagnostic,
+      );
+  const input = parseData(
+    resolved.value,
+    actionsConfigurationSchema
+      .omit({ github: true, redaction_values: true })
+      .extend({
+        github: z.strictObject({ token: secret }),
+        session_key: secret.refine(
+          (value) =>
+            /^[A-Za-z0-9+/]{43}=$/.test(value) &&
+            Buffer.from(value, "base64").toString("base64") === value,
+        ),
+      }),
+    diagnostic,
   );
+  const { session_key, github, ...settings } = input;
+  const configuration = parseData(
+    {
+      ...settings,
+      github: { repository, token: github.token },
+      redaction_values: resolved.redactions,
+    },
+    actionsConfigurationSchema,
+    diagnostic,
+  );
+  validateReferences(configuration, diagnostic);
+  return {
+    configuration,
+    sessionKey: session_key,
+    sources: resolved.records.map((record) => ({
+      ...location(record.path),
+      section: configurationSections.find(
+        (section) => section === record.path[0],
+      ),
+      source: record.source,
+      name: record.name,
+      observed: record.observed,
+    })),
+  };
 }

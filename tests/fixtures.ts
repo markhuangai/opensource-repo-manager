@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { parseRepositoryActionsConfiguration } from "../src/config/schema.ts";
+import { parseConfigurationSources } from "../src/config/sources.ts";
 import { loadWorkflowBundles } from "../src/config/bundles.ts";
 import { createRunSnapshot } from "../src/config/load.ts";
 import { separateSecrets } from "../src/config/secrets.ts";
@@ -9,18 +10,32 @@ import { Octokit } from "@octokit/rest";
 import { OctokitReader } from "../src/adapters/github/reader.ts";
 import { githubFixtureRequest, githubFixtureState } from "./fixtures/github.ts";
 
+export function fixtureConfigurationSources() {
+  return parseConfigurationSources(
+    JSON.stringify({
+      CODING_MODEL: "your-claude-model-id",
+      CODING_MODEL_EFFORT: "high",
+      REVIEW_MODEL: "your-codex-model-id",
+      REVIEW_MODEL_EFFORT: "high",
+    }),
+    JSON.stringify({
+      ORM_GITHUB_TOKEN: "github-fixture-token",
+      ORM_PROXY_KEY: "proxy-fixture-key",
+      ORM_SESSION_KEY: Buffer.alloc(32, 13).toString("base64"),
+      PROXY_URL: "https://proxy.example.invalid/v1",
+    }),
+  );
+}
+
 export function fixtureConfiguration() {
   return parseRepositoryActionsConfiguration(
     readFileSync(
       new URL("../examples/actions/orm.yml", import.meta.url),
       "utf8",
     ),
-    {
-      repository: "owner/repo",
-      token: "github-fixture-token",
-      proxyKey: "proxy-fixture-key",
-    },
-  );
+    "owner/repo",
+    fixtureConfigurationSources(),
+  ).configuration;
 }
 
 export async function fixtureSnapshot(

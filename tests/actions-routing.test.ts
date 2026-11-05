@@ -8,7 +8,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import { GitHubActionsSource } from "../src/adapters/github/actions-source.ts";
 import { routeActions } from "../src/actions/routing.ts";
-import { prepareActionsConfiguration } from "../src/actions/setup.ts";
+import {
+  prepareActionsConfiguration,
+  readActionsConfiguration,
+} from "../src/actions/setup.ts";
 import { ActionsState } from "../src/actions/persistence.ts";
 import { StateCodec, type TaskState } from "../src/actions/state.ts";
 import { Store } from "../src/repositories/store.ts";
@@ -19,7 +22,11 @@ import {
   parseRepositoryActionsConfiguration,
 } from "../src/config/schema.ts";
 import { loadWorkflowBundles } from "../src/config/bundles.ts";
-import { fixtureConfiguration, fixtureSnapshot } from "./fixtures.ts";
+import {
+  fixtureConfiguration,
+  fixtureConfigurationSources,
+  fixtureSnapshot,
+} from "./fixtures.ts";
 import { createPublicationFixture } from "./fixtures/publication.ts";
 
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -349,7 +356,9 @@ function operatorConfiguration() {
   const config = fixtureConfiguration();
   return {
     version: config.version,
-    proxy: { url: config.proxy.url },
+    github: { token: { from_secret: "ORM_GITHUB_TOKEN" } },
+    session_key: { from_secret: "ORM_SESSION_KEY" },
+    proxy: { url: config.proxy.url, key: { from_secret: "ORM_PROXY_KEY" } },
     profiles: config.profiles,
     pr_monitor: config.pr_monitor,
     limits: config.limits,
@@ -394,13 +403,14 @@ describe("trusted repository Actions configuration", () => {
       skills: join(f.root, "skills"),
       defaults: fileURLToPath(new URL("../examples/workflow", import.meta.url)),
     };
-    const credentials = {
-      repository: "owner/repo",
-      token: "protected-token",
-      proxyKey: "protected-proxy-key",
-    };
+    const loaded = await readActionsConfiguration(
+      f.source,
+      "owner/repo",
+      fixtureConfigurationSources(),
+      signal(),
+    );
     expect(
-      await prepareActionsConfiguration(f.source, credentials, signal(), roots),
+      await prepareActionsConfiguration(f.source, loaded, signal(), roots),
     ).toEqual({ source_sha: pinned.sha });
     const path = join(roots.config, "actions.yml"),
       config = parseActionsConfiguration(await readFile(path, "utf8"));
@@ -421,7 +431,7 @@ describe("trusted repository Actions configuration", () => {
     expect(config.github.repository).toBe("owner/repo");
     expect(config.roles.audit.profile).toBe("review");
     await expect(
-      prepareActionsConfiguration(f.source, credentials, signal(), roots),
+      prepareActionsConfiguration(f.source, loaded, signal(), roots),
     ).rejects.toThrow();
   });
   it("rejects a truncated recursive Git-tree response at the transport boundary", async () => {
@@ -445,17 +455,18 @@ describe("trusted repository Actions configuration", () => {
       expect(() =>
         parseRepositoryActionsConfiguration(
           stringify({ ...operatorConfiguration(), ...extra }),
-          { repository: "owner/repo", token: "token", proxyKey: "key" },
+          "owner/repo",
+          fixtureConfigurationSources(),
         ),
       ).toThrow();
     const input = operatorConfiguration();
     Object.assign(input.proxy, { key: "leaked" });
     expect(() =>
-      parseRepositoryActionsConfiguration(stringify(input), {
-        repository: "owner/repo",
-        token: "token",
-        proxyKey: "key",
-      }),
+      parseRepositoryActionsConfiguration(
+        stringify(input),
+        "owner/repo",
+        fixtureConfigurationSources(),
+      ),
     ).toThrow();
   });
   it("rejects non-directory override roots instead of silently using defaults", async () => {
@@ -474,18 +485,11 @@ describe("trusted repository Actions configuration", () => {
       );
       f.remote.git(["update-ref", "refs/heads/main", pinned.sha]);
       await expect(
-        prepareActionsConfiguration(
+        readActionsConfiguration(
           f.source,
-          { repository: "owner/repo", token: "token", proxyKey: "key" },
+          "owner/repo",
+          fixtureConfigurationSources(),
           signal(),
-          {
-            config: join(f.root, "rejected-config"),
-            prompts: join(f.root, "rejected-prompts"),
-            skills: join(f.root, "rejected-skills"),
-            defaults: fileURLToPath(
-              new URL("../examples/workflow", import.meta.url),
-            ),
-          },
         ),
       ).rejects.toThrow("bundle_invalid");
     }

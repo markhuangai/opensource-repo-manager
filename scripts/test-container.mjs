@@ -20,7 +20,9 @@ import { performance } from "node:perf_hooks";
 import { join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { stringify as stringifyYaml } from "yaml";
+import { parseRepositoryActionsConfiguration } from "../src/config/schema.ts";
+import { parseConfigurationSources } from "../src/config/sources.ts";
 import {
   selectContainerSuites,
   implementationScenarios,
@@ -417,9 +419,24 @@ try {
     join(fixtures, "prompts"),
     { recursive: true },
   );
-  const validConfig = parseYaml(
+  const validConfig = parseRepositoryActionsConfiguration(
     await readFile(join(root, "examples/actions/orm.yml"), "utf8"),
-  );
+    "owner/repo",
+    parseConfigurationSources(
+      JSON.stringify({
+        CODING_MODEL: "your-claude-model-id",
+        CODING_MODEL_EFFORT: "high",
+        REVIEW_MODEL: "your-codex-model-id",
+        REVIEW_MODEL_EFFORT: "high",
+      }),
+      JSON.stringify({
+        ORM_GITHUB_TOKEN: canary + "-github",
+        ORM_PROXY_KEY: canary + "-proxy",
+        ORM_SESSION_KEY: Buffer.alloc(32, 13).toString("base64"),
+        PROXY_URL: "https://proxy.example.invalid/v1",
+      }),
+    ),
+  ).configuration;
   validConfig.github = { repository: "owner/repo", token: `${canary}-github` };
   validConfig.proxy.key = `${canary}-proxy`;
   const validYaml = stringifyYaml(validConfig);
@@ -1175,6 +1192,7 @@ try {
           ...(suite === "actions"
             ? {
                 session_key: randomBytes(32).toString("base64"),
+                bootstrap_token: canary + "-bootstrap",
                 artifact_tokens: Object.fromEntries(
                   [100, 101].map((run) => [
                     run,

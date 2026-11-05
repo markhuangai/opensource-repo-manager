@@ -5,39 +5,128 @@ import { fileURLToPath } from "node:url";
 import { GitHubActionsSource } from "../adapters/github/actions-source.ts";
 import { StateError } from "./state.ts";
 import { routeActions } from "./routing.ts";
-import { prepareActionsConfiguration } from "./setup.ts";
+import {
+  prepareActionsConfiguration,
+  readActionsConfiguration,
+} from "./setup.ts";
 import { parseTaskRequest } from "./task.ts";
 import { ConfigurationError } from "../config/errors.ts";
+import { parseConfigurationSources } from "../config/sources.ts";
+import {
+  createKnownSecretChecker,
+  createSafeLogger,
+} from "../logging/redact.ts";
+import { IntakeError } from "../domain/jobs.ts";
 
 const controller = new AbortController();
+const started = performance.now();
+let operation = "configuration_load";
+let logger = createSafeLogger(createKnownSecretChecker([]), true);
+const correlation = {
+  repository: /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(
+    process.env.GITHUB_REPOSITORY ?? "",
+  )
+    ? process.env.GITHUB_REPOSITORY
+    : undefined,
+  run_id: /^[1-9][0-9]*$/.test(process.env.GITHUB_RUN_ID ?? "")
+    ? process.env.GITHUB_RUN_ID
+    : undefined,
+  run_attempt: /^[1-9][0-9]*$/.test(process.env.GITHUB_RUN_ATTEMPT ?? "")
+    ? process.env.GITHUB_RUN_ATTEMPT
+    : undefined,
+  issue_number: /^[1-9][0-9]*$/.test(process.argv[3] ?? "")
+    ? process.argv[3]
+    : undefined,
+};
 const cancel = () => controller.abort();
 process.once("SIGTERM", cancel);
 process.once("SIGINT", cancel);
 try {
   const [mode, number, ...extra] = process.argv.slice(2);
   const repository = process.env.GITHUB_REPOSITORY;
-  const token = process.env.ORM_GITHUB_TOKEN;
-  const key = process.env.ORM_SESSION_KEY;
+  const bootstrapToken = process.env.ORM_BOOTSTRAP_GITHUB_TOKEN;
   if (
     !repository ||
     !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
-    !token ||
-    !key ||
-    !/^[A-Za-z0-9+/]{43}=$/.test(key) ||
-    Buffer.from(key, "base64").toString("base64") !== key ||
-    extra.length
+    !bootstrapToken ||
+    extra.length ||
+    !["route", "run"].includes(mode) ||
+    (mode === "route" && number)
   )
     throw new StateError("state_invalid");
   const silent = () => {};
-  const source = new GitHubActionsSource(
+  const sources = parseConfigurationSources(
+    process.env.ORM_CONFIGURATION_VARIABLES,
+    process.env.ORM_CONFIGURATION_SECRETS,
+  );
+  logger = createSafeLogger(
+    createKnownSecretChecker([
+      bootstrapToken,
+      ...Object.values(sources.secrets),
+    ]),
+    true,
+  );
+  const client = (token: string) =>
+    new GitHubActionsSource(
+      repository,
+      new Octokit({
+        auth: token,
+        log: { debug: silent, info: silent, warn: silent, error: silent },
+      }),
+    );
+  const signal = controller.signal;
+  const request =
+    mode === "run" ? parseTaskRequest(number ? [number] : []) : undefined;
+  const bootstrap = client(bootstrapToken);
+  const loaded = await readActionsConfiguration(
+    bootstrap,
     repository,
-    new Octokit({
-      auth: token,
-      log: { debug: silent, info: silent, warn: silent, error: silent },
+    sources,
+    signal,
+  );
+  if (String(loaded.repository.id) !== process.env.GITHUB_REPOSITORY_ID)
+    throw new StateError("state_invalid");
+  logger = createSafeLogger(
+    createKnownSecretChecker([
+      bootstrapToken,
+      ...Object.values(sources.secrets),
+      ...loaded.configuration.redaction_values,
+    ]),
+    true,
+  );
+  for (const source of loaded.sources)
+    logger.info(
+      JSON.stringify({
+        event: "configuration_source_resolved",
+        level: "info",
+        ...correlation,
+        repository,
+        operation,
+        source_sha: loaded.pinned.source.sha,
+        schema_version: loaded.configuration.version,
+        ...source,
+        elapsed_ms: Math.round(performance.now() - started),
+      }),
+    );
+  logger.info(
+    JSON.stringify({
+      event: "configuration_resolved",
+      level: "info",
+      ...correlation,
+      repository,
+      operation,
+      source_sha: loaded.pinned.source.sha,
+      schema_version: loaded.configuration.version,
+      elapsed_ms: Math.round(performance.now() - started),
     }),
   );
-  const signal = controller.signal;
+  delete process.env.ORM_BOOTSTRAP_GITHUB_TOKEN;
+  delete process.env.ORM_CONFIGURATION_VARIABLES;
+  delete process.env.ORM_CONFIGURATION_SECRETS;
+  const source = client(loaded.configuration.github.token);
+  const key = loaded.sessionKey;
   if (mode === "route" && !number) {
+    operation = "route";
     const payload = JSON.parse(
       await readFile(process.env.GITHUB_EVENT_PATH ?? "/event.json", "utf8"),
     );
@@ -58,21 +147,15 @@ try {
       ),
     );
   } else if (mode === "run") {
-    const request = parseTaskRequest(number ? [number] : []);
-    const proxyKey = process.env.ORM_PROXY_KEY;
-    if (!proxyKey) throw new StateError("state_invalid");
-    await prepareActionsConfiguration(
-      source,
-      { repository, token, proxyKey },
-      signal,
-    );
-    delete process.env.ORM_GITHUB_TOKEN;
-    delete process.env.ORM_PROXY_KEY;
+    operation = "configuration_prepare";
+    await prepareActionsConfiguration(bootstrap, loaded, signal);
+    operation = "task_execution";
+    process.env.ORM_SESSION_KEY = key;
     const child = spawn(
       process.execPath,
       [
         fileURLToPath(new URL("./main.js", import.meta.url)),
-        String(request.issue_number),
+        String(request!.issue_number),
       ],
       { stdio: "inherit", env: process.env },
     );
@@ -86,14 +169,37 @@ try {
     signal.removeEventListener("abort", stop);
   } else throw new StateError("state_invalid");
 } catch (error) {
+  const status =
+    error && typeof error === "object" && "status" in error
+      ? error.status
+      : undefined;
+  const reason =
+    error instanceof StateError ||
+    error instanceof ConfigurationError ||
+    error instanceof IntakeError
+      ? error.code
+      : operation === "configuration_load" && (status === 401 || status === 403)
+        ? "github_access_denied"
+        : "controller_failed";
+  logger.error(
+    JSON.stringify({
+      event:
+        operation === "configuration_load"
+          ? "configuration_load_failed"
+          : "controller_failed",
+      level: "error",
+      operation,
+      ...correlation,
+      cause: reason,
+      ...(error instanceof ConfigurationError ? error.diagnostic : {}),
+      elapsed_ms: Math.round(performance.now() - started),
+    }),
+  );
   console.log(
     JSON.stringify({
       version: 1,
       outcome: "failed",
-      reason:
-        error instanceof StateError || error instanceof ConfigurationError
-          ? error.code
-          : "controller_failed",
+      reason,
     }),
   );
   process.exitCode = 1;

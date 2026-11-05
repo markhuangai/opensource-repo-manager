@@ -54,6 +54,26 @@ async function fixture() {
 }
 
 describe("immutable credential-free workflow snapshots", () => {
+  it("projects secret-sourced model settings without copying redaction metadata or credentials", async () => {
+    const { roots, config } = await fixture();
+    config.profiles.coding.model = "private-model-canary";
+    config.redaction_values.push("private-model-canary");
+    const { settings, secrets } = separateSecrets(config);
+    const snapshot = createRunSnapshot(
+      settings,
+      await loadWorkflowBundles(settings, secrets, roots),
+      secrets,
+    );
+    expect(snapshot.roles.implementation.profile.model).toBe(
+      "private-model-canary",
+    );
+    expect(snapshot.settings).not.toHaveProperty("redaction_values");
+    expect(JSON.stringify(snapshot.roles)).not.toContain(config.proxy.url);
+    expect(secrets.containsCredentials(snapshot)).toBe(false);
+    expect(secrets.redact(snapshot.roles.implementation.profile.model)).toBe(
+      "[redacted]",
+    );
+  });
   it("copies contained resources and per-role policy without worker credentials or endpoints", async () => {
     const { roots, settings, secrets } = await fixture();
     const bundles = await loadWorkflowBundles(settings, secrets, roots);

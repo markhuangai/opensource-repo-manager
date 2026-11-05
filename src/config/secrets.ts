@@ -25,8 +25,14 @@ export function separateSecrets(
     );
   }
   const checker = createKnownSecretChecker(sensitive);
+  const redactor = createKnownSecretChecker([
+    ...sensitive,
+    config.proxy.url,
+    ...config.redaction_values,
+  ]);
   const secrets = Object.freeze({
     ...checker,
+    redact: redactor.redact,
     containsCredentials: checker.contains,
     createCredentialStream: checker.createStream,
     get(name: string) {
