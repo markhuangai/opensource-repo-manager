@@ -262,6 +262,8 @@ jobs:
     timeout-minutes: 60
     env:
       REVIEW_STATUS_CONTEXT: ${{ needs.resolve.outputs.review_status_context }}
+      AI_ENDPOINT: ${{ vars.AI_ENDPOINT || secrets.AI_ENDPOINT }}
+      AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'auto' }}
 
     concurrency:
       group: ai-pr-review-${{ github.repository }}-${{ needs.resolve.outputs.pr_number }}
@@ -272,13 +274,12 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           PR_REVIEW_PAT: ${{ secrets.PR_REVIEW_PAT }}
-          AI_ENDPOINT: ${{ secrets.AI_ENDPOINT }}
           LOCAL_AI_SECRET: ${{ secrets.LOCAL_AI_SECRET }}
           PROJECT_MEMORY_MCP_ENDPOINT: ${{ secrets.PROJECT_MEMORY_MCP_ENDPOINT }}
           PROJECT_MEMORY_MCP_TOKEN: ${{ secrets.PROJECT_MEMORY_MCP_TOKEN }}
         with:
           script: |
-            const required = ["PR_REVIEW_PAT", "AI_ENDPOINT", "LOCAL_AI_SECRET",
+            const required = ["PR_REVIEW_PAT", "AI_ENDPOINT", "AI_REVIEW_MODEL", "LOCAL_AI_SECRET",
               "PROJECT_MEMORY_MCP_ENDPOINT", "PROJECT_MEMORY_MCP_TOKEN"];
             const missing = required.filter(name => !process.env[name]?.trim());
             if (missing.length) {
@@ -312,9 +313,9 @@ jobs:
           executor: claude
           pull-request-url: ${{ format('{0}/{1}/pull/{2}', github.server_url, github.repository, needs.resolve.outputs.pr_number) }}
           github-pat: ${{ secrets.PR_REVIEW_PAT }}
-          ai-base-url: ${{ secrets.AI_ENDPOINT }}
+          ai-base-url: ${{ env.AI_ENDPOINT }}
           ai-secret: ${{ secrets.LOCAL_AI_SECRET }}
-          model: auto
+          model: ${{ env.AI_REVIEW_MODEL }}
           effort: xhigh
           parallel-count: "6"
           max-turns: "200"

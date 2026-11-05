@@ -159,6 +159,7 @@ export async function createPublicationFixture(root: string) {
       }
     >(),
     token: "github-fixture-token",
+    bootstrapToken: "",
     actor: { id: 7, login: "fixture" },
     reporter: { id: 8, login: "reporter", type: "User" },
     permissions: new Map<string, { id: number; permission: string }>([
@@ -201,6 +202,11 @@ export async function createPublicationFixture(root: string) {
     beforeRequest: undefined as
       undefined | ((method: string, path: string) => Promise<void>),
     requests: [] as Array<{ method: string; path: string }>,
+    configurationRequests: [] as Array<{
+      method: string;
+      path: string;
+      credential: string;
+    }>,
     readFailure: null as null | {
       path: string;
       status: number;
@@ -263,6 +269,26 @@ export async function createPublicationFixture(root: string) {
       res.end(JSON.stringify(value));
     };
     state.requests.push({ method: req.method!, path });
+    const bootstrap =
+      !!state.bootstrapToken &&
+      ["token ", "Bearer "].some(
+        (prefix) => req.headers.authorization === prefix + state.bootstrapToken,
+      );
+    const bootstrapRead =
+      bootstrap &&
+      req.method === "GET" &&
+      (path === "/repos/owner/repo" ||
+        /^\/repos\/owner\/repo\/(?:git\/|commits\/[^/]+$)/.test(path));
+    state.configurationRequests.push({
+      method: req.method!,
+      path,
+      credential: bootstrap
+        ? "bootstrap"
+        : req.headers.authorization?.endsWith(" " + state.token)
+          ? "operator"
+          : "other",
+    });
+    if (bootstrap && !bootstrapRead) return send({}, 403);
     await state.beforeRequest?.(req.method!, path);
     if (req.method === "GET" && state.readFailure?.path === path) {
       const failure = state.readFailure;
@@ -369,6 +395,7 @@ export async function createPublicationFixture(root: string) {
       return;
     }
     if (
+      !bootstrapRead &&
       req.headers.authorization !== `token ${state.token}` &&
       req.headers.authorization !== `Bearer ${state.token}`
     ) {

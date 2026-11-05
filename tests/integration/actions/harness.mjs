@@ -34,6 +34,31 @@ export async function runActionsTests({
   const config = JSON.parse(
     await readFile(join(directory, "configuration.json"), "utf8"),
   );
+  const sourceVariables = Object.fromEntries([
+    ...Object.entries(config.profiles).flatMap(([name, profile]) => [
+      [name.toUpperCase() + "_MODEL", profile.model],
+      [name.toUpperCase() + "_EFFORT", profile.effort],
+    ]),
+    ["REPAIRS", JSON.stringify(config.limits.repair_cycles)],
+    ["TASK_GITHUB_TOKEN", "variable-is-not-a-credential-source"],
+    ["AUDIT_PROFILE", "private-missing-profile-canary"],
+    ["LOCAL_ONLY", "true"],
+    ["CHECK_A", "Same CI"],
+    ["CHECK_B", "Same CI"],
+  ]);
+  const sourceSecrets = {
+    TASK_GITHUB_TOKEN: config.github.token,
+    TASK_PROXY_KEY: config.proxy.key,
+    TASK_SESSION_KEY: config.session_key,
+    PROXY_URL: config.proxy.url,
+    WORKER_MODEL: "unused-secret-namespace-model",
+  };
+  const configurationEnvironment = () =>
+    Object.entries({
+      ORM_BOOTSTRAP_GITHUB_TOKEN: config.bootstrap_token,
+      ORM_CONFIGURATION_VARIABLES: JSON.stringify(sourceVariables),
+      ORM_CONFIGURATION_SECRETS: JSON.stringify(sourceSecrets),
+    }).flatMap(([key, value]) => ["--env", key + "=" + value]);
   const toolchainCache = JSON.parse(
     await readFile(join(directory, "toolchain-cache.json"), "utf8"),
   );
@@ -119,14 +144,7 @@ export async function runActionsTests({
       "--env",
       `ORM_SESSION_KEY=${config.session_key}`,
       ...runtimeEnvironment(fresh),
-      ...(options.controller
-        ? [
-            "--env",
-            `ORM_GITHUB_TOKEN=${config.github.token}`,
-            "--env",
-            `ORM_PROXY_KEY=${config.proxy.key}`,
-          ]
-        : []),
+      ...(options.controller ? configurationEnvironment() : []),
       ...Object.entries(options.environment ?? {}).flatMap(([key, value]) => [
         "--env",
         `${key}=${value}`,
@@ -191,10 +209,13 @@ export async function runActionsTests({
       `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
       "--env",
       "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
+      ...configurationEnvironment(),
       "--env",
-      `ORM_GITHUB_TOKEN=${config.github.token}`,
+      "GITHUB_REPOSITORY_ID=42",
       "--env",
-      `ORM_SESSION_KEY=${config.session_key}`,
+      "GITHUB_RUN_ID=100",
+      "--env",
+      "GITHUB_RUN_ATTEMPT=1",
       "--env",
       "GITHUB_REPOSITORY=owner/repo",
       "--env",
@@ -220,6 +241,8 @@ export async function runActionsTests({
       config.github.token,
       config.proxy.key,
       config.session_key,
+      config.bootstrap_token,
+      config.proxy.url,
       ...Object.values(config.artifact_tokens),
     ])
       assert(
@@ -1488,6 +1511,150 @@ export async function runActionsTests({
       `/clarification-issue?issue=${controllerIssue}&mode=clarification_investigation`,
       "POST",
     );
+    const mutationsBeforeConfiguration = proof().mutations.length;
+    for (const [scenario, environment, reason, expected] of [
+      [
+        "missing-source",
+        {
+          ORM_CONFIGURATION_VARIABLES: JSON.stringify({
+            ...sourceVariables,
+            WORKER_MODEL: undefined,
+          }),
+        },
+        "source_missing",
+        {
+          source: "variable",
+          name: "WORKER_MODEL",
+          expected: "present_source",
+          observed: "missing",
+        },
+      ],
+      [
+        "invalid-json",
+        {
+          ORM_CONFIGURATION_VARIABLES: JSON.stringify({
+            ...sourceVariables,
+            REPAIRS: "private-invalid-json-canary",
+          }),
+        },
+        "source_value_invalid",
+        {
+          source: "variable",
+          name: "REPAIRS",
+          expected: "json",
+          observed: "text",
+        },
+      ],
+      [
+        "variable-credential",
+        {},
+        "source_reference_invalid",
+        {
+          source: "variable",
+          name: "TASK_GITHUB_TOKEN",
+          expected: "secret_reference",
+          observed: "non_secret_source",
+        },
+      ],
+      [
+        "invalid-profile",
+        {},
+        "reference_invalid",
+        {
+          source: "variable",
+          name: "AUDIT_PROFILE",
+          expected: "existing_profile",
+          observed: "unknown_profile",
+        },
+      ],
+      [
+        "invalid-policy",
+        {},
+        "schema_invalid",
+        {
+          source: "variable",
+          name: "LOCAL_ONLY",
+          expected: "operator_policy_without_remote_checks",
+          observed: "incompatible_policy",
+        },
+      ],
+      [
+        "duplicate-checks",
+        {},
+        "schema_invalid",
+        {
+          source: "variable",
+          name: "CHECK_B",
+          expected: "unique_check_names",
+          observed: "duplicate_check_names",
+        },
+      ],
+      [
+        "bootstrap-denied",
+        {
+          ORM_BOOTSTRAP_GITHUB_TOKEN: config.bootstrap_token + "-denied",
+        },
+        "github_access_denied",
+        {},
+      ],
+      [
+        "repository-mismatch",
+        { GITHUB_REPOSITORY_ID: "43" },
+        "state_invalid",
+        {},
+      ],
+    ]) {
+      if (scenario === "variable-credential")
+        upstream("/controller-source?credential=variable", "POST");
+      if (scenario === "invalid-profile")
+        upstream("/controller-source?profile=invalid", "POST");
+      if (scenario === "invalid-policy")
+        upstream("/controller-source?policy=invalid", "POST");
+      if (scenario === "duplicate-checks")
+        upstream("/controller-source?checks=duplicate", "POST");
+      const name = manager + "-controller-" + scenario;
+      const before = proof().configuration_requests.length;
+      launch(name, controllerIssue, false, { controller: true, environment });
+      await finished(name, "failed", reason);
+      const evidence = output(name)
+        .logs.stderr.split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+      const error = evidence.find((item) => item.level === "error");
+      assert.equal(error.event, "configuration_load_failed");
+      assert.equal(error.cause, reason);
+      assert.equal(error.run_id, "100");
+      assert.equal(error.repository, "owner/repo");
+      assert.equal(error.issue_number, String(controllerIssue));
+      for (const [key, value] of Object.entries(expected))
+        assert.equal(error[key], value);
+      if (!["bootstrap-denied", "repository-mismatch"].includes(scenario)) {
+        assert.match(error.source_sha, /^[a-f0-9]{40}$/);
+        assert(error.line > 0 && error.column > 0);
+      }
+      assert(error.elapsed_ms >= 0);
+      assert.equal(proof().mutations.length, mutationsBeforeConfiguration);
+      const configurationRequests =
+        proof().configuration_requests.slice(before);
+      assert(configurationRequests.every((item) => item.method === "GET"));
+      if (scenario === "repository-mismatch") {
+        assert(configurationRequests.length > 0);
+        assert(
+          configurationRequests.every(
+            (item) => item.credential === "bootstrap",
+          ),
+        );
+      }
+      if (
+        [
+          "variable-credential",
+          "invalid-profile",
+          "invalid-policy",
+          "duplicate-checks",
+        ].includes(scenario)
+      )
+        upstream("/controller-source", "POST");
+    }
     assert.deepEqual(
       await route("issues", { action: "edited", issue: { number: 8 } }),
       [],
@@ -1510,6 +1677,10 @@ export async function runActionsTests({
     );
     launch(`${manager}-controller-question`, controllerIssue, false, {
       controller: true,
+      environment: {
+        NODE_OPTIONS:
+          "--import /actions-fixtures/configuration-environment.mjs",
+      },
     });
     await finished(
       `${manager}-controller-question`,
@@ -1517,6 +1688,44 @@ export async function runActionsTests({
       "needs_information",
     );
     const question = durable(controllerIssue);
+    const configurationLogs = output(`${manager}-controller-question`)
+      .logs.stderr.split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert(
+      configurationLogs.some(
+        (item) =>
+          item.event === "configuration_environment_isolated" &&
+          item.sensitive_keys_absent,
+      ),
+    );
+    const selectedModel = configurationLogs.find(
+      (item) =>
+        item.event === "configuration_source_resolved" &&
+        item.name === "WORKER_MODEL",
+    );
+    assert.equal(selectedModel.source, "variable");
+    assert.equal(selectedModel.observed, "string");
+    assert.equal(selectedModel.schema_version, 1);
+    assert.match(selectedModel.source_sha, /^[a-f0-9]{40}$/);
+    const configurationRequests = proof().configuration_requests;
+    assert(
+      configurationRequests.some(
+        (item) => item.credential === "operator" && item.path === "/user",
+      ),
+    );
+    assert(
+      configurationRequests
+        .filter((item) => item.credential === "bootstrap")
+        .every(
+          (item) =>
+            item.method === "GET" &&
+            (item.path === "/repos/owner/repo" ||
+              /^\/repos\/owner\/repo\/(?:git\/|commits\/[^/]+$)/.test(
+                item.path,
+              )),
+        ),
+    );
     assert.deepEqual(
       await route("issue_comment", {
         action: "created",

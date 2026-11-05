@@ -16,11 +16,11 @@ on:
         default: ""
         type: string
     secrets:
-      ORM_GITHUB_TOKEN:
+      ORM_CONFIGURATION_VARIABLES:
+        description: JSON of the caller vars context, transported as a secret to suppress runner metadata
         required: true
-      ORM_PROXY_KEY:
-        required: true
-      ORM_SESSION_KEY:
+      ORM_CONFIGURATION_SECRETS:
+        description: JSON map of explicitly forwarded repository secrets
         required: true
 
 permissions:
@@ -42,22 +42,36 @@ jobs:
         env:
           ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
           ORM_ISSUE_NUMBER: ${{ inputs.issue-number }}
-          ORM_GITHUB_TOKEN: ${{ secrets.ORM_GITHUB_TOKEN }}
-          ORM_SESSION_KEY: ${{ secrets.ORM_SESSION_KEY }}
+          ORM_BOOTSTRAP_GITHUB_TOKEN: ${{ github.token }}
+          ORM_CONFIGURATION_SECRETS: ${{ secrets.ORM_CONFIGURATION_SECRETS }}
+          ORM_CONFIGURATION_VARIABLES: ${{ secrets.ORM_CONFIGURATION_VARIABLES }}
         with:
           script: |
             const assert = require("node:assert/strict");
+            let secrets;
+            try { secrets = JSON.parse(process.env.ORM_CONFIGURATION_SECRETS); }
+            catch { throw new Error("Invalid configuration secret map."); }
+            assert(secrets && typeof secrets === "object" && !Array.isArray(secrets) &&
+              Object.values(secrets).every(value => typeof value === "string"), "Invalid configuration secret map.");
+            let variables;
+            try { variables = JSON.parse(process.env.ORM_CONFIGURATION_VARIABLES); }
+            catch { throw new Error("Invalid configuration variable map."); }
+            assert(variables && typeof variables === "object" && !Array.isArray(variables) &&
+              Object.values(variables).every(value => typeof value === "string"), "Invalid configuration variable map.");
             const image = process.env.ORM_RUNTIME_IMAGE;
             assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
             const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-route`;
             await exec.exec("docker", ["pull", image]);
-            const environment = ["ORM_GITHUB_TOKEN", "ORM_SESSION_KEY", "ORM_ISSUE_NUMBER", "GITHUB_REPOSITORY", "GITHUB_EVENT_NAME", "GITHUB_REF"];
+            const environment = ["ORM_BOOTSTRAP_GITHUB_TOKEN", "ORM_CONFIGURATION_SECRETS", "ORM_CONFIGURATION_VARIABLES",
+              "ORM_ISSUE_NUMBER", "GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_EVENT_NAME", "GITHUB_REF"];
             await exec.exec("docker", ["create", "--name", name,
               "--label", `org.opensource-repo-manager.actions-run=${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`,
               "--mount", `type=bind,src=${process.env.GITHUB_EVENT_PATH},dst=/event.json,readonly`,
               "--env", "GITHUB_EVENT_PATH=/event.json", ...environment.flatMap(key => ["--env", key]),
               "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "route"]);
-            const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true});
+            const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true, ignoreReturnCode: true});
+            if (output.stderr) core.info(output.stderr);
+            assert(output.exitCode === 0, "Configuration or routing stopped; inspect configuration diagnostics.");
             const result = JSON.parse(output.stdout.trim());
             assert(result.version === 1 && result.repository_id === Number(process.env.GITHUB_REPOSITORY_ID) &&
               Array.isArray(result.issues) && result.issues.length <= 256 &&
@@ -99,18 +113,28 @@ jobs:
         env:
           ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
           ORM_SELECTED_ISSUE: ${{ matrix.issue }}
-          ORM_GITHUB_TOKEN: ${{ secrets.ORM_GITHUB_TOKEN }}
-          ORM_PROXY_KEY: ${{ secrets.ORM_PROXY_KEY }}
-          ORM_SESSION_KEY: ${{ secrets.ORM_SESSION_KEY }}
+          ORM_BOOTSTRAP_GITHUB_TOKEN: ${{ github.token }}
+          ORM_CONFIGURATION_SECRETS: ${{ secrets.ORM_CONFIGURATION_SECRETS }}
+          ORM_CONFIGURATION_VARIABLES: ${{ secrets.ORM_CONFIGURATION_VARIABLES }}
         with:
           script: |
             const assert = require("node:assert/strict");
             const image = process.env.ORM_RUNTIME_IMAGE, issue = process.env.ORM_SELECTED_ISSUE;
+            let secrets;
+            try { secrets = JSON.parse(process.env.ORM_CONFIGURATION_SECRETS); }
+            catch { throw new Error("Invalid configuration secret map."); }
+            assert(secrets && typeof secrets === "object" && !Array.isArray(secrets) &&
+              Object.values(secrets).every(value => typeof value === "string"), "Invalid configuration secret map.");
+            let variables;
+            try { variables = JSON.parse(process.env.ORM_CONFIGURATION_VARIABLES); }
+            catch { throw new Error("Invalid configuration variable map."); }
+            assert(variables && typeof variables === "object" && !Array.isArray(variables) &&
+              Object.values(variables).every(value => typeof value === "string"), "Invalid configuration variable map.");
             assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
             assert(/^[1-9][0-9]*$/.test(issue) && Number.isSafeInteger(Number(issue)), "Invalid selected issue.");
             const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-issue-${issue}`;
             await exec.exec("docker", ["pull", image]);
-            const environment = ["ORM_GITHUB_TOKEN", "ORM_PROXY_KEY", "ORM_SESSION_KEY", "GITHUB_ACTIONS", "GITHUB_REPOSITORY",
+            const environment = ["ORM_BOOTSTRAP_GITHUB_TOKEN", "ORM_CONFIGURATION_SECRETS", "ORM_CONFIGURATION_VARIABLES", "GITHUB_ACTIONS", "GITHUB_REPOSITORY",
               "GITHUB_REPOSITORY_ID", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_RESULTS_URL"];
             assert(environment.every(key => process.env[key]), "Missing trusted Actions context or credentials.");
             await exec.exec("docker", ["create", "--name", name,
@@ -118,6 +142,7 @@ jobs:
               ...environment.flatMap(key => ["--env", key]),
               "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "run", issue]);
             const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true, ignoreReturnCode: true});
+            if (output.stderr) core.info(output.stderr);
             const result = JSON.parse(output.stdout.trim());
             assert(result.version === 1 && typeof result.outcome === "string", "Missing bounded-task result.");
             await core.summary.addHeading(`Maintenance issue ${issue}`).addCodeBlock(JSON.stringify(result, null, 2), "json").write();
