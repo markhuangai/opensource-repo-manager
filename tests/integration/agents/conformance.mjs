@@ -466,42 +466,32 @@ INJECTED_ENV="injected"
     assert.equal(injected, 0);
     groups++;
     if (driver.sdk === "claude") {
-      const unsupportedSettings = globalThis.structuredClone(settings);
-      unsupportedSettings.profiles.coding = {
-        sdk: "claude",
-        model: "auto",
-        behaves_as: "claude-haiku-4-5",
-        effort: "max",
-      };
-      const unsupported = createRunSnapshot(
-          unsupportedSettings,
-          trusted,
-          secrets,
-        ),
-        beforeUnsupported = requests.length;
-      assert.equal(
-        last(await run(seed(unsupported), "tools")).outcome,
-        "failed",
-      );
-      assert.equal(requests.length, beforeUnsupported);
-      for (const profile of [
-        { model: "auto", behaves_as: "unknown-capability", effort: "high" },
-        {
-          model: "claude-opus-4-8",
-          behaves_as: "claude-haiku-4-5",
+      for (const model of ["auto", "proxy/custom-model"]) {
+        const selectedSettings = globalThis.structuredClone(settings);
+        selectedSettings.profiles.coding = {
+          sdk: "claude",
+          model,
           effort: "xhigh",
-        },
-        {
-          model: "claude-opus-4-8",
-          behaves_as: "claude-sonnet-4-6",
-          effort: "high",
-        },
-      ]) {
-        const invalidSettings = globalThis.structuredClone(settings);
-        invalidSettings.profiles.coding = { sdk: "claude", ...profile };
-        const invalid = createRunSnapshot(invalidSettings, trusted, secrets);
-        assert.equal(last(await run(seed(invalid), "tools")).outcome, "failed");
-        assert.equal(requests.length, beforeUnsupported);
+        };
+        const selected = createRunSnapshot(selectedSettings, trusted, secrets);
+        const before = requests.length;
+        assert.equal(
+          last(
+            await run(seed(selected), "structured", {
+              extra: { output_schema: schema },
+            }),
+          ).outcome,
+          "completed",
+        );
+        assert(requests.length > before);
+        assert(
+          requests
+            .slice(before)
+            .every(
+              ({ body }) =>
+                body.model === model && body.output_config.effort === "xhigh",
+            ),
+        );
       }
       groups++;
     } else {

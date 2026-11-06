@@ -35,7 +35,6 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
       source_sha: ${{ steps.release.outputs.source_sha }}
-      release_id: ${{ steps.release.outputs.release_id }}
       build_required: ${{ steps.release.outputs.build_required }}
       publish_required: ${{ steps.release.outputs.publish_required }}
     steps:
@@ -214,7 +213,6 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           VERSION: ${{ needs.resolve.outputs.version }}
-          RELEASE_ID: ${{ needs.resolve.outputs.release_id }}
           RECEIPTS: ${{ runner.temp }}/digests
         with:
           script: |

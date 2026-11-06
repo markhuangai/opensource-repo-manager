@@ -95,7 +95,7 @@ export async function runActionsTests({
       `/select?issue=${number}&fresh=${fresh}&session=${options.session ?? "seed"}`,
       "POST",
     );
-    if (Number.isSafeInteger(number) && number > 0) {
+    if (Number.isSafeInteger(number) && number > 0 && !options.aiTest) {
       const cache = `${name}-cache`;
       register("container", cache);
       docker([
@@ -169,7 +169,11 @@ export async function runActionsTests({
               : "/actions-fixtures/session.mjs",
           ]
         : [image]),
-      ...(options.controller ? ["run", String(number)] : [String(number)]),
+      ...(options.controller
+        ? options.aiTest
+          ? ["test-ai", options.aiTest]
+          : ["run", String(number)]
+        : [String(number)]),
       ...(options.session ? [options.session] : []),
     ]);
     const launched = inspect(name);
@@ -1506,6 +1510,63 @@ export async function runActionsTests({
       assert.equal(durable(issue).budget.active_ms, completedBudget.active_ms);
     }
     upstream("/controller-source", "POST");
+    const beforeAiTest = proof().mutations.length;
+    for (const [scenario, role, environment, expected, reason] of [
+      [
+        "ai-test",
+        "implementation",
+        {},
+        "completed",
+        "ai_interaction_completed",
+      ],
+      ["ai-test-invalid-role", "unknown", {}, "failed", "state_invalid"],
+      [
+        "ai-test-nonmanual",
+        "implementation",
+        { GITHUB_EVENT_NAME: "schedule" },
+        "failed",
+        "state_invalid",
+      ],
+      [
+        "ai-test-missing-source",
+        "implementation",
+        {
+          ORM_CONFIGURATION_VARIABLES: JSON.stringify({
+            ...sourceVariables,
+            WORKER_MODEL: undefined,
+          }),
+        },
+        "failed",
+        "source_missing",
+      ],
+    ]) {
+      const name = `${manager}-controller-${scenario}`;
+      launch(name, 70, false, {
+        controller: true,
+        aiTest: role,
+        environment: {
+          GITHUB_EVENT_NAME: "workflow_dispatch",
+          GITHUB_REF: "refs/heads/main",
+          ORM_CONFIGURATION_SECRETS: JSON.stringify({
+            ...sourceSecrets,
+            PROXY_URL: config.proxy.url.replace(/\/v1\/?$/, "") + "/ai-test/v1",
+          }),
+          ...environment,
+        },
+      });
+      const result = await finished(name, expected, reason);
+      if (scenario === "ai-test") {
+        assert.equal(result.sdk, sdk);
+        assert.equal(result.role, "implementation");
+        assert.equal(result.cleanup, "passed");
+        assert(result.model_requests >= 1 && result.model_requests <= 2);
+      }
+    }
+    assert.equal(
+      proof().mutations.length,
+      beforeAiTest,
+      "AI configuration test published a GitHub mutation",
+    );
     const controllerIssue = 70;
     upstream(
       `/clarification-issue?issue=${controllerIssue}&mode=clarification_investigation`,
@@ -1623,6 +1684,11 @@ export async function runActionsTests({
       const error = evidence.find((item) => item.level === "error");
       assert.equal(error.event, "configuration_load_failed");
       assert.equal(error.cause, reason);
+      assert.equal(error.outcome, "failed");
+      assert.match(
+        error.recovery,
+        /configuration source.*GitHub read access.*rerun/,
+      );
       assert.equal(error.run_id, "100");
       assert.equal(error.repository, "owner/repo");
       assert.equal(error.issue_number, String(controllerIssue));

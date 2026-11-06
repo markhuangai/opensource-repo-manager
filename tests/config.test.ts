@@ -410,18 +410,17 @@ describe("repository configuration sources", () => {
 });
 
 describe("strict protected configuration contract", () => {
-  it("preserves a declared Claude alias capability model without changing the wire model", () => {
+  it("accepts proxy model IDs without capability declarations and rejects the retired field", () => {
     const config = fixtureConfiguration();
     config.profiles.coding = {
       sdk: "claude",
-      model: "auto",
-      behaves_as: "claude-opus-4-8",
+      model: "proxy/custom-model",
       effort: "xhigh",
     };
     expect(
       parseActionsConfiguration(stringify(config)).profiles.coding,
     ).toEqual(config.profiles.coding);
-    config.profiles.review = { ...config.profiles.coding, sdk: "codex" };
+    Object.assign(config.profiles.coding, { behaves_as: "claude-opus-4-8" });
     expect(() => parseActionsConfiguration(stringify(config))).toThrow(
       "schema_invalid",
     );

@@ -1,0 +1,32 @@
+name: Test AI configuration
+
+on:
+  workflow_dispatch:
+    inputs:
+      role:
+        description: Use the profile assigned to this role in .github/orm.yml
+        required: true
+        default: implementation
+        type: choice
+        options:
+          [implementation, audit, bootstrap, investigation, output_review]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: markhuangai/opensource-repo-manager/.github/workflows/test-ai.yml@REPLACE_WITH_FULL_COMMIT_SHA
+    with:
+      runtime-image: ghcr.io/markhuangai/opensource-repo-manager@sha256:REPLACE_WITH_64_HEX_DIGEST
+      runner: ubuntu-24.04
+      role: ${{ inputs.role }}
+    secrets:
+      ORM_CONFIGURATION_VARIABLES: ${{ toJSON(vars) }}
+      ORM_CONFIGURATION_SECRETS: |
+        {
+          "ORM_GITHUB_TOKEN": ${{ toJSON(secrets.ORM_GITHUB_TOKEN) }},
+          "ORM_PROXY_KEY": ${{ toJSON(secrets.ORM_PROXY_KEY) }},
+          "ORM_SESSION_KEY": ${{ toJSON(secrets.ORM_SESSION_KEY) }},
+          "PROXY_URL": ${{ toJSON(secrets.PROXY_URL) }}
+        }

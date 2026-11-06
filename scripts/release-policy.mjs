@@ -145,19 +145,42 @@ export function verifyReceipt(receipt, release, source, image, manifest) {
   );
   assert.equal(manifest.digest, receipt.digest, "Publication digest changed.");
   verifyPlatforms(manifest, receipt.platforms);
-  const proof = JSON.parse(manifest.annotations?.[annotation] ?? "null");
-  assert(
-    proof?.version === 1 &&
-      proof.source_sha === source &&
-      proof.release_id === (receipt.candidate_release_id ?? release.id) &&
-      proof.release_version === (receipt.candidate_tag ?? receipt.tag).slice(1),
-    "Image has no matching verified publication.",
+  const proof = verifyCandidateImage(
+    manifest,
+    source,
+    receipt.candidate_tag ?? receipt.tag,
+    receipt.candidate_release_id ?? release.id,
   );
   assert.deepEqual(
     proof.platforms,
     receipt.platforms,
     "Image proof differs from the durable receipt.",
   );
+}
+
+function verifyCandidateImage(manifest, source, tag, releaseId) {
+  const proof = JSON.parse(manifest.annotations?.[annotation] ?? "null");
+  assert(
+    digestPattern.test(manifest.digest) &&
+      (proof?.version === 2 ||
+        (proof?.version === 1 &&
+          releaseId !== undefined &&
+          proof.release_id === releaseId)) &&
+      proof.source_sha === source &&
+      proof.release_version === tag.slice(1),
+    "Image has no matching verified publication.",
+  );
+  assert.deepEqual(
+    proof.platforms?.map((item) => item.platform),
+    platforms,
+    "Both native platform receipts are required.",
+  );
+  assert(
+    proof.platforms.every((item) => digestPattern.test(item.platform_digest)),
+    "Invalid native platform digest.",
+  );
+  verifyPlatforms(manifest, proof.platforms);
+  return proof;
 }
 
 async function missing(read) {
@@ -762,7 +785,7 @@ function operation({ github, context, core, exec, env = process.env }, stage) {
 
 export async function resolveCandidate(options) {
   return operation(options, "resolve").run(async (api) => {
-    const { github, context, core, log } = api;
+    const { context, core, log } = api;
     const run = context.payload.workflow_run;
     assert(
       context.eventName === "workflow_run" &&
@@ -810,50 +833,23 @@ export async function resolveCandidate(options) {
       return { outcome: "skipped" };
     }
     await api.numberedTag(version.tag, source);
-    let release = await missing(() => api.release(version.tag));
-    if (!release)
-      release = (
-        await api.mutate(
-          "github.createRelease",
-          {
-            prior: null,
-            desired: {
-              tag: version.tag,
-              source_sha: source,
-              draft: true,
-              prerelease: true,
-            },
-          },
-          () =>
-            github.rest.repos.createRelease({
-              ...context.repo,
-              tag_name: version.tag,
-              target_commitish: source,
-              name: version.tag,
-              body: `Candidate for ${source}. Publication is incomplete until the verified image receipt is attached.`,
-              draft: true,
-              prerelease: true,
-            }),
-        )
-      ).data;
-    assert(
-      release.tag_name === version.tag && release.prerelease,
-      "Candidate release identity conflicts with its reservation.",
-    );
-    const receipt = await api.receipt(release);
-    assert(
-      release.draft || receipt,
-      "Published candidate has no durable receipt.",
-    );
+    const release = await missing(() => api.release(version.tag));
+    if (release)
+      assert(
+        release.tag_name === version.tag && release.prerelease,
+        "Candidate release identity conflicts with its reservation.",
+      );
+    const receipt = release && (await api.receipt(release));
     for (const [name, value] of Object.entries({
       version: version.tag.slice(1),
       source_sha: source,
-      release_id: release.id,
-      build_required: !receipt,
+      build_required: !receipt && (!release || release.draft),
       publish_required: true,
     }))
       core.setOutput(name, String(value));
-    return { outcome: release.draft ? "reserved" : "resume_publication" };
+    return {
+      outcome: !release || release.draft ? "reserved" : "resume_publication",
+    };
   });
 }
 
@@ -885,54 +881,41 @@ export async function publishCandidate(options) {
       version?.rc !== undefined,
       "An exact candidate version is required.",
     );
-    const release = await api.release(version.tag);
+    let release = await missing(() => api.release(version.tag));
+    const completed = release && published(release);
     assert(
-      await api.source(source, release.draft),
+      await api.source(source, !completed),
       "Candidate source was superseded; wait for current main CI.",
     );
     assert(
       await api.ci(source),
       "Candidate requires successful exact-source main-push CI.",
     );
-    assert.equal(
-      String(release.id),
-      env.RELEASE_ID,
-      "Candidate reservation changed.",
-    );
-    assert(release.prerelease, "Candidate release changed channel.");
+    if (release)
+      assert(release.prerelease, "Candidate release changed channel.");
     await api.tagSource(version.tag, source);
     const state = await api.history();
     const stable = versions(state.releases, false)[0]?.version;
     assert(
-      !release.draft ||
+      completed ||
         !stable ||
         compareVersions(parseVersion(version.base), stable) > 0,
       "Candidate reservation was superseded by stable promotion.",
     );
-    let receipt = await api.receipt(release);
-    const existing = await api.inspect(`${image}:${env.VERSION}`, true);
+    let receipt = release && (await api.receipt(release));
+    let manifest = await api.inspect(`${image}:${env.VERSION}`, true);
     if (receipt) {
-      assert(existing, "Published version image is missing.");
-      verifyReceipt(receipt, release, source, image, existing);
-    } else if (existing) {
-      const proof = JSON.parse(existing.annotations?.[annotation] ?? "null");
-      receipt = {
-        version: 1,
-        release_id: release.id,
-        tag: version.tag,
-        source_sha: source,
-        image,
-        digest: existing.digest,
-        platforms: proof?.platforms,
-      };
-      verifyReceipt(receipt, release, source, image, existing);
+      assert(manifest, "Published version image is missing.");
+      verifyReceipt(receipt, release, source, image, manifest);
+    } else if (manifest) {
+      verifyCandidateImage(manifest, source, version.tag, release?.id);
       log(
         "resumed",
-        { version: version.tag, source_sha: source, digest: existing.digest },
+        { version: version.tag, source_sha: source, digest: manifest.digest },
         "warning",
       );
     } else {
-      assert(release.draft, "Completed candidate image cannot be rebuilt.");
+      assert(!completed, "Completed candidate image cannot be rebuilt.");
       assert.deepEqual(
         (await readdir(env.RECEIPTS)).sort(),
         ["image-amd64.json", "image-arm64.json"],
@@ -961,14 +944,14 @@ export async function publishCandidate(options) {
               digestPattern.test(item.platform_digest),
             "Native smoke receipt mismatch.",
           );
-          const manifest = await api.inspect(`${image}@${item.digest}`);
+          const actual = await api.inspect(`${image}@${item.digest}`);
           assert.equal(
-            manifest.digest,
+            actual.digest,
             item.digest,
             "Native build digest changed.",
           );
-          if (manifest.manifests)
-            verifyPlatforms(manifest, [
+          if (actual.manifests)
+            verifyPlatforms(actual, [
               {
                 platform: item.platform,
                 platform_digest: item.platform_digest,
@@ -976,7 +959,7 @@ export async function publishCandidate(options) {
             ]);
           else
             assert.equal(
-              manifest.digest,
+              actual.digest,
               item.platform_digest,
               "Native platform digest changed.",
             );
@@ -984,8 +967,7 @@ export async function publishCandidate(options) {
         }),
       );
       const proof = {
-        version: 1,
-        release_id: release.id,
+        version: 2,
         source_sha: source,
         release_version: env.VERSION,
         platforms: native.map(({ platform, platform_digest }) => ({
@@ -995,7 +977,10 @@ export async function publishCandidate(options) {
       };
       await api.mutate(
         "registry.create_candidate_index",
-        { prior: null, desired: { tag: `${image}:${env.VERSION}`, proof } },
+        {
+          prior: null,
+          desired: { tag: `${image}:${env.VERSION}`, proof },
+        },
         () =>
           options.exec.exec("docker", [
             "buildx",
@@ -1008,7 +993,23 @@ export async function publishCandidate(options) {
             ...native.map((item) => `${image}@${item.digest}`),
           ]),
       );
-      const manifest = await api.inspect(`${image}:${env.VERSION}`);
+      manifest = await api.inspect(`${image}:${env.VERSION}`);
+      verifyCandidateImage(manifest, source, version.tag);
+    }
+    const sourceTag = await api.inspect(`${image}:sha-${source}`, true);
+    if (sourceTag)
+      assert.equal(
+        sourceTag.digest,
+        manifest.digest,
+        "Source image tag conflicts with this publication.",
+      );
+    else await api.copy([`sha-${source}`], manifest.digest);
+    await api.tagSource(version.tag, source);
+    assert(
+      await api.source(source, !completed),
+      "Candidate source advanced during publication; rerun only for current main.",
+    );
+    if (completed && !receipt) {
       receipt = {
         version: 1,
         release_id: release.id,
@@ -1016,28 +1017,23 @@ export async function publishCandidate(options) {
         source_sha: source,
         image,
         digest: manifest.digest,
-        platforms: proof.platforms,
+        platforms: verifyCandidateImage(
+          manifest,
+          source,
+          version.tag,
+          release.id,
+        ).platforms,
       };
-      verifyReceipt(receipt, release, source, image, manifest);
+      await api.saveReceipt(release, receipt);
     }
-    await api.saveReceipt(release, receipt);
-    const sourceTag = await api.inspect(`${image}:sha-${source}`, true);
-    if (sourceTag)
-      assert.equal(
-        sourceTag.digest,
-        receipt.digest,
-        "Source image tag conflicts with this publication.",
-      );
-    else await api.copy([`sha-${source}`], receipt.digest);
-    await api.tagSource(version.tag, source);
-    assert(
-      await api.source(source, release.draft),
-      "Candidate source advanced during publication; rerun only for current main.",
-    );
     const latest = versions((await api.history()).releases, true).find(
       ({ version: other }) => other.major === version.major,
     )?.version;
-    if (!release.draft && latest && compareVersions(latest, version) > 0) {
+    if (completed && latest && compareVersions(latest, version) > 0) {
+      assert(
+        receipt,
+        "Completed candidate has no durable publication receipt.",
+      );
       log("skipped", {
         source_sha: source,
         version: version.tag,
@@ -1051,27 +1047,70 @@ export async function publishCandidate(options) {
       !latest || compareVersions(latest, version) <= 0,
       "A newer candidate already exists.",
     );
-    if (release.draft)
-      await api.mutate(
-        "github.updateRelease",
-        {
-          prior: { release_id: release.id, draft: true },
-          desired: {
-            tag: version.tag,
-            source_sha: source,
-            draft: false,
-            prerelease: true,
+    const body = `Verified native AMD64 and ARM64 images.\n\nSource: ${source}\n\nRuntime image: \`${image}@${manifest.digest}\`\n\nWorkflow: \`${context.repo.owner}/${context.repo.repo}/.github/workflows/maintenance.yml@${version.tag}\`\n\nSee publication.json for the immutable image receipt.`;
+    if (!release)
+      release = (
+        await api.mutate(
+          "github.createRelease",
+          {
+            prior: null,
+            desired: {
+              tag: version.tag,
+              source_sha: source,
+              draft: false,
+              prerelease: true,
+              digest: manifest.digest,
+            },
           },
-        },
-        () =>
-          github.rest.repos.updateRelease({
-            ...context.repo,
-            release_id: release.id,
-            draft: false,
-            prerelease: true,
-            body: `Verified native AMD64 and ARM64 images.\n\nSource: ${source}\n\nRuntime image: \`${image}@${receipt.digest}\`\n\nWorkflow: \`${context.repo.owner}/${context.repo.repo}/.github/workflows/maintenance.yml@${version.tag}\`\n\nSee publication.json for the immutable image receipt.`,
-          }),
-      );
+          () =>
+            github.rest.repos.createRelease({
+              ...context.repo,
+              tag_name: version.tag,
+              target_commitish: source,
+              name: version.tag,
+              body,
+              draft: false,
+              prerelease: true,
+              make_latest: "false",
+            }),
+        )
+      ).data;
+    else if (release.draft)
+      release = (
+        await api.mutate(
+          "github.updateRelease",
+          {
+            prior: { release_id: release.id, draft: true },
+            desired: {
+              tag: version.tag,
+              source_sha: source,
+              draft: false,
+              prerelease: true,
+            },
+          },
+          () =>
+            github.rest.repos.updateRelease({
+              ...context.repo,
+              release_id: release.id,
+              draft: false,
+              prerelease: true,
+              make_latest: "false",
+              body,
+            }),
+        )
+      ).data;
+    receipt ??= {
+      version: 1,
+      release_id: release.id,
+      tag: version.tag,
+      source_sha: source,
+      image,
+      digest: manifest.digest,
+      platforms: verifyCandidateImage(manifest, source, version.tag, release.id)
+        .platforms,
+    };
+    verifyReceipt(receipt, release, source, image, manifest);
+    await api.saveReceipt(release, receipt);
     const current = await api.release(version.tag);
     assert(
       published(current) && current.prerelease && current.id === release.id,

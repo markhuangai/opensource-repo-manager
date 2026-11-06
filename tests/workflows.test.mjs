@@ -1169,3 +1169,98 @@ describe("native image smoke receipts", () => {
     }
   }
 });
+
+const aiTest = await workflow("test-ai");
+const aiTestScript = step(aiTest.jobs.test, "Test one AI response").with.script;
+const aiTestCleanup = step(aiTest.jobs.test, "Remove the AI test container")
+  .with.script;
+describe("manual consumer AI test", () => {
+  const env = {
+    ORM_RUNTIME_IMAGE: `${image}@${digest("a")}`,
+    ORM_TEST_ROLE: "audit",
+  };
+  const context = {
+    eventName: "workflow_dispatch",
+    ref: "refs/heads/main",
+    payload: { repository: { default_branch: "main" } },
+  };
+  it("exposes configured-role selection and forwards the existing configuration sources", async () => {
+    expect(Object.keys(aiTest.on)).toEqual(["workflow_call"]);
+    expect(aiTest.on.workflow_call.inputs.role.default).toBe("implementation");
+    expect(aiTest.permissions).toEqual({ contents: "read" });
+    const caller = parse(
+      await readFile(
+        new URL("../examples/actions/test-ai.yml", import.meta.url),
+        "utf8",
+      ),
+    );
+    expect(Object.keys(caller.on)).toEqual(["workflow_dispatch"]);
+    expect(caller.jobs.test.secrets.ORM_CONFIGURATION_VARIABLES).toBe(
+      "${{ toJSON(vars) }}",
+    );
+    const calls = [];
+    const result = await run(aiTestScript, {
+      context,
+      env,
+      executor: {
+        exec: async (...args) => calls.push(args),
+        getExecOutput: async () => ({
+          exitCode: 0,
+          stdout: JSON.stringify({
+            version: 1,
+            outcome: "completed",
+            reason: "ai_interaction_completed",
+            cleanup: "passed",
+          }),
+          stderr: "",
+        }),
+      },
+    });
+    expect(calls[1][1].slice(-2)).toEqual(["test-ai", "audit"]);
+    expect(calls[1][1]).toContain("ORM_CONFIGURATION_SECRETS");
+    expect(result.failures).toEqual([]);
+    expect(result.summaries[0].runtime_image).toBe(env.ORM_RUNTIME_IMAGE);
+  });
+  for (const override of [
+    { eventName: "pull_request" },
+    { ref: "refs/heads/feature" },
+  ])
+    it("rejects non-manual or non-default-branch callers before starting a container", async () => {
+      await expect(
+        run(aiTestScript, { context: { ...context, ...override }, env }),
+      ).rejects.toThrow();
+    });
+  it("reports failed interaction and refuses cleanup of another run's container", async () => {
+    const result = await run(aiTestScript, {
+      context,
+      env,
+      executor: {
+        exec: async () => {},
+        getExecOutput: async () => ({
+          exitCode: 1,
+          stdout: JSON.stringify({
+            version: 1,
+            outcome: "failed",
+            reason: "ai_test_timeout",
+            cleanup: "passed",
+          }),
+          stderr: "",
+        }),
+      },
+    });
+    expect(result.failures).toEqual(["AI test stopped: ai_test_timeout"]);
+    await expect(
+      run(aiTestCleanup, {
+        context,
+        env,
+        executor: {
+          getExecOutput: async () => ({
+            exitCode: 0,
+            stdout: "another-run",
+            stderr: "",
+          }),
+        },
+      }),
+    ).rejects.toThrow("ownership is unverified");
+  });
+});

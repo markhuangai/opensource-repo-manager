@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -8,7 +8,8 @@ import { once } from "node:events";
 import { setInterval, clearInterval } from "node:timers";
 import type { ModelProfile } from "../config/schema.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
-import { RuntimeError } from "../domain/agents.ts";
+import { RuntimeError, sdkVersions } from "../domain/agents.ts";
+import { createSafeLogger } from "../logging/redact.ts";
 import type { Store } from "../repositories/store.ts";
 
 type Grant = {
@@ -21,6 +22,7 @@ type Grant = {
   current: () => boolean;
   controller: AbortController;
   available?: () => boolean;
+  context?: { run_id: string; job_id: number; revision: number; role: string };
 };
 
 export class ModelRelay {
@@ -30,13 +32,19 @@ export class ModelRelay {
   });
   private url = "";
   private readonly watcher: ReturnType<typeof setInterval>;
-  private readonly store: Store;
+  private readonly store: Pick<Store, "reserveModelRequest" | "checkpoint">;
   private readonly endpoint: string;
   private readonly secrets: SecretAccessor;
-  constructor(store: Store, endpoint: string, secrets: SecretAccessor) {
+  private readonly logger: ReturnType<typeof createSafeLogger>;
+  constructor(
+    store: Pick<Store, "reserveModelRequest" | "checkpoint">,
+    endpoint: string,
+    secrets: SecretAccessor,
+  ) {
     this.store = store;
     this.endpoint = endpoint;
     this.secrets = secrets;
+    this.logger = createSafeLogger(secrets, true);
     this.server.on("upgrade", (_request, socket) => {
       socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
     });
@@ -96,6 +104,12 @@ export class ModelRelay {
 
   private async handle(req: IncomingMessage, res: ServerResponse) {
     const controller = new AbortController();
+    const started = Date.now();
+    const requestId = randomUUID();
+    let context: Record<string, unknown> | undefined;
+    let cause = "request_invalid";
+    let providerStatus: number | undefined;
+    let succeeded = false;
     req.on("aborted", () => controller.abort());
     res.on("close", () => {
       if (!res.writableEnded) controller.abort();
@@ -124,6 +138,13 @@ export class ModelRelay {
         this.fail(res, 409);
         return;
       }
+      context = {
+        ...grant.context,
+        request_id: requestId,
+        sdk: grant.profile.sdk,
+        sdk_version: sdkVersions[grant.profile.sdk],
+        deadline: grant.deadline,
+      };
       if (
         req.method !== "POST" ||
         !req.url?.startsWith("/") ||
@@ -168,6 +189,7 @@ export class ModelRelay {
           Object.hasOwn(data, key),
         )
       ) {
+        cause = "model_or_request_mismatch";
         this.fail(res, 403);
         return;
       }
@@ -179,6 +201,7 @@ export class ModelRelay {
           (!effort || typeof effort !== "object" || Array.isArray(effort))) ||
         (effort?.effort !== undefined && effort.effort !== grant.profile.effort)
       ) {
+        cause = "effort_mismatch";
         this.fail(res, 403);
         return;
       }
@@ -192,10 +215,12 @@ export class ModelRelay {
         Date.now() >= grant.deadline ||
         !this.store.reserveModelRequest(grant.lease, grant.requests)
       ) {
+        cause = "request_budget_exhausted";
         this.fail(res, 429);
         return;
       }
       const destination = new URL(this.endpoint);
+      context.route = route.pathname;
       await this.store.checkpoint(
         AbortSignal.any([
           controller.signal,
@@ -229,6 +254,14 @@ export class ModelRelay {
           Math.max(1, Math.min(2_147_483_647, grant.deadline - Date.now())),
         ),
       ]);
+      cause = "upstream_transport_failed";
+      this.logger.info(
+        JSON.stringify({
+          event: "model.request.started",
+          level: "info",
+          ...context,
+        }),
+      );
       const upstream = await fetch(destination, {
         method: "POST",
         headers,
@@ -236,7 +269,9 @@ export class ModelRelay {
         redirect: "manual",
         signal,
       });
+      providerStatus = upstream.status;
       if (!upstream.ok || !upstream.body) {
+        cause = "upstream_rejected";
         await upstream.body?.cancel();
         this.fail(res, 502);
         return;
@@ -368,9 +403,39 @@ export class ModelRelay {
         res.write(pending);
       }
       res.end();
-    } catch {
+      succeeded = true;
+    } catch (error) {
+      if (error instanceof RuntimeError) cause = error.code;
+      else if (controller.signal.aborted) cause = "request_cancelled";
       this.fail(res, 502);
     } finally {
+      if (context) {
+        const details = {
+          ...context,
+          provider_status: providerStatus,
+          elapsed_ms: Date.now() - started,
+          outcome: succeeded ? "completed" : "failed",
+        };
+        if (succeeded)
+          this.logger.info(
+            JSON.stringify({
+              event: "model.request.finished",
+              level: "info",
+              ...details,
+            }),
+          );
+        else
+          this.logger.error(
+            JSON.stringify({
+              event: "model.request.failed",
+              level: "error",
+              ...details,
+              cause,
+              recovery:
+                "Verify the selected profile and proxy settings, or restore provider connectivity, before retrying.",
+            }),
+          );
+      }
       controller.abort();
     }
   }

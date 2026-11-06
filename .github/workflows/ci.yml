@@ -47,7 +47,7 @@ jobs:
           sha256sum --check selected-checksum.txt
           tar -xzf "$archive" actionlint
           cd "$GITHUB_WORKSPACE"
-          "$tool_dir/actionlint" .github/workflows/*.yml examples/actions/maintenance.yml
+          "$tool_dir/actionlint" .github/workflows/*.yml examples/actions/maintenance.yml examples/actions/test-ai.yml
 
   containers:
     name: Container tests (${{ matrix.architecture }}, ${{ matrix.suite }})

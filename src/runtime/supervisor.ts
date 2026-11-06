@@ -1051,6 +1051,12 @@ export class Supervisor implements AgentRunner {
       }
       relay = this.relay.authorize({
         lease,
+        context: {
+          run_id: id,
+          job_id: request.job_id,
+          revision: request.revision,
+          role: request.role,
+        },
         profile: request.profile,
         deadline: context.deadline,
         requests: snapshot.settings.limits.model_requests,
