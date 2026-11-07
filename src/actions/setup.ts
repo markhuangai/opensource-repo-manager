@@ -37,8 +37,8 @@ export async function readActionsConfiguration(
       throw new ConfigurationError("bundle_invalid");
   }
   const file = pinned.files.find((file) => file.path === ".github/orm.yml");
-  if (!file) throw new ConfigurationError("config_unreadable");
   try {
+    if (!file) throw new ConfigurationError("config_unreadable");
     const bytes = await source.blob(file, signal);
     let content: string;
     try {

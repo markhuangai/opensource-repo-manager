@@ -85,6 +85,57 @@ export function createKnownSecretChecker(values: readonly string[]) {
 
 export type KnownSecretChecker = ReturnType<typeof createKnownSecretChecker>;
 
+const publicLogFields = [
+  "event",
+  "level",
+  "operation",
+  "repository",
+  "run_id",
+  "run_attempt",
+  "issue_number",
+  "source_sha",
+  "cause",
+  "outcome",
+  "elapsed_ms",
+  "schema_version",
+  "source",
+  "name",
+  "line",
+  "column",
+  "section",
+  "expected",
+  "observed",
+  "recovery",
+] as const;
+type PublicLogRecord = Partial<
+  Record<(typeof publicLogFields)[number], string | number | undefined>
+>;
+
+// Public provenance bypasses value redaction; private content must use the string methods.
+function publicRecord(record: PublicLogRecord) {
+  const fields: PublicLogRecord = {};
+  const omitted: string[] = [];
+  for (const key of publicLogFields) {
+    const value = record[key];
+    if (value === undefined) continue;
+    if (
+      (typeof value !== "string" &&
+        (typeof value !== "number" || !Number.isFinite(value))) ||
+      JSON.stringify({
+        ...fields,
+        [key]: value,
+        omitted_fields: publicLogFields,
+      }).length > 2048
+    )
+      omitted.push(key);
+    else fields[key] = value;
+  }
+  return JSON.stringify({
+    ...fields,
+    ...(omitted.length && { omitted_fields: omitted }),
+  });
+}
+
 export function createSafeLogger(checker: KnownSecretChecker, stderr = false) {
   return Object.freeze({
     info: (message: string) =>
@@ -93,7 +144,14 @@ export function createSafeLogger(checker: KnownSecretChecker, stderr = false) {
       ),
     error: (message: string) =>
       console.error(checker.redact(message).slice(0, 2048)),
+    infoPublic: (record: PublicLogRecord) =>
+      (stderr ? console.error : console.log)(publicRecord(record)),
+    errorPublic: (record: PublicLogRecord) =>
+      console.error(publicRecord(record)),
   });
 }
 
-export type SafeLogger = ReturnType<typeof createSafeLogger>;
+export type SafeLogger = Pick<
+  ReturnType<typeof createSafeLogger>,
+  "info" | "error"
+>;

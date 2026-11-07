@@ -802,9 +802,10 @@ export async function resolveCandidate(options) {
     const ready = await api.ci(source);
     const packageVersion = await api.packageVersion(source);
     const { releases, refs } = await api.history();
+    const base = intendedBase(packageVersion, releases).base;
     log("base", {
       source_sha: source,
-      base: intendedBase(packageVersion, releases).base,
+      base,
     });
     const completedSource = versions(releases, true).find(({ release }) =>
       refs.some(
@@ -814,6 +815,15 @@ export async function resolveCandidate(options) {
           ref.object.sha === source,
       ),
     );
+    if (!current && !completedSource) {
+      log("skipped", {
+        source_sha: source,
+        package_version: packageVersion,
+        base,
+        reason: "source_superseded_or_ci_incomplete",
+      });
+      return { outcome: "skipped" };
+    }
     const version =
       completedSource?.version ??
       nextCandidate(packageVersion, releases, refs, source);
@@ -823,7 +833,7 @@ export async function resolveCandidate(options) {
       version: version.tag,
       base: version.base,
     });
-    if ((!current && !completedSource) || !ready) {
+    if (!ready) {
       log("skipped", {
         source_sha: source,
         reason: "source_superseded_or_ci_incomplete",
