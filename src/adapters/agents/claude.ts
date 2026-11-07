@@ -147,13 +147,6 @@ export function claudeOptions(
       syncClaudeAiSkills: false,
       syncClaudeAiPlugins: false,
       fallbackModel: [],
-      modelPicker: {
-        replaceBuiltInOptions: true,
-        // Known models ignore behavesAs; unknown names must lose effort support during recognition.
-        options: [request.profile.model, request.profile.behaves_as]
-          .filter((model): model is string => model !== undefined)
-          .map((model) => ({ model, behavesAs: "claude-haiku-4-5" })),
-      },
     },
     skills: [],
     extraArgs: { "disable-slash-commands": null },
@@ -203,52 +196,7 @@ async function copyTranscript(from: string, to: string) {
   });
 }
 
-async function preflight(running: Query, request: WorkerRequest) {
-  if (request.profile.sdk !== "claude")
-    throw new RuntimeError("backend_unavailable");
-  let models = await running.supportedModels();
-  if (request.profile.behaves_as) {
-    const capability = request.profile.behaves_as;
-    const declared = models.find(
-      (model) =>
-        model.value === capability || model.resolvedModel === capability,
-    );
-    const known = models.find(
-      (model) =>
-        model.value !== "default" &&
-        (model.value === request.profile.model ||
-          model.resolvedModel === request.profile.model),
-    );
-    if (
-      !declared?.supportsEffort ||
-      !declared.supportedEffortLevels?.includes(request.profile.effort) ||
-      (known?.supportsEffort && known.resolvedModel !== declared.resolvedModel)
-    )
-      throw new RuntimeError("claude_profile_unsupported");
-    await running.applyFlagSettings({
-      modelPicker: {
-        replaceBuiltInOptions: true,
-        options: [
-          {
-            model: request.profile.model,
-            behavesAs: request.profile.behaves_as,
-          },
-        ],
-      },
-    });
-    models = (await running.reinitialize()).models;
-  }
-  const model = models.find(
-    (model) =>
-      model.value === request.profile.model ||
-      model.resolvedModel === request.profile.model,
-  );
-  if (
-    !model?.supportsEffort ||
-    !model.supportedEffortLevels?.includes(request.profile.effort)
-  )
-    throw new RuntimeError("claude_profile_unsupported");
-
+async function preflight(running: Query) {
   if ((await running.mcpServerStatus()).length)
     throw new RuntimeError("claude_tools_forbidden");
 }
@@ -340,7 +288,7 @@ export async function* run(
         },
       },
     });
-    await preflight(running, request);
+    await preflight(running);
     signal.throwIfAborted();
     release!();
     let result: SDKResultMessage | undefined,
@@ -352,8 +300,6 @@ export async function* run(
           if (
             event.session_id !== id ||
             event.model !== request.profile.model ||
-            (event.effort !== undefined &&
-              event.effort !== request.profile.effort) ||
             event.tools.some((name) => !options.allowedTools!.includes(name)) ||
             event.plugins.length ||
             event.skills.length

@@ -10,7 +10,11 @@ export async function respond(req, res, fixture) {
     for await (const chunk of req) data += chunk;
     const body = JSON.parse(data);
     assert.equal(req.headers.authorization, `Bearer ${config.proxy.key}`);
-    assert.equal(body.model, "auto");
+    const active = store.runs().findLast((run) => run.finished_at === null);
+    const selected = store.snapshot(
+      store.jobById(active.job_id).snapshot_digest,
+    );
+    assert.equal(body.model, selected.roles[active.role].profile.model);
     if (req.url.startsWith("/v1/messages/count_tokens")) {
       res.setHeader("content-type", "application/json");
       res.end('{"input_tokens":20}');
@@ -50,7 +54,6 @@ export async function respond(req, res, fixture) {
       ),
     );
     requests.push({ scenario, body });
-    const active = store.runs().findLast((run) => run.finished_at === null);
     let history = histories.get(active.job_id);
     const initial = !history && ["tools", "limited"].includes(scenario);
     if (initial) {
@@ -288,7 +291,6 @@ export function verifyClaude(options) {
       profile: {
         sdk: "claude",
         model: "auto",
-        behaves_as: "claude-opus-4-8",
         effort: "xhigh",
       },
       respond,

@@ -12,6 +12,7 @@ import {
 } from "/publication-fixture.ts";
 import { respond as claude } from "/agent-fixtures/claude.mjs";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
+import { respondAiTest } from "/agent-fixtures/ai-test.mjs";
 import { sourceFiles, modelFixture } from "./protocol.mjs";
 import { artifactFixture } from "/actions-fixtures/artifact-fixture.mjs";
 import { StateCodec } from "/opt/orm/app/dist/actions/state.js";
@@ -703,6 +704,8 @@ const http = createServer(async (req, res) => {
       updated_at: "2026-10-21T00:01:00Z",
     });
     res.end("created");
+  } else if (url.pathname.startsWith("/ai-test/v1/")) {
+    await respondAiTest(req, res, config.profiles.worker, config.proxy.key);
   } else
     await (config.profiles.worker.sdk === "claude" ? claude : codex)(
       req,

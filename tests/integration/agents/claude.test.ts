@@ -72,7 +72,6 @@ describe("Claude worker policy", () => {
     profile: {
       sdk: "claude",
       model: "auto",
-      behaves_as: "claude-opus-4-8",
       effort: "xhigh",
     },
     prompts: {
@@ -88,6 +87,9 @@ describe("Claude worker policy", () => {
     expect(options.env).not.toHaveProperty("GH_TOKEN");
     expect(options.env?.ANTHROPIC_API_KEY).toBe("short-lived");
     expect(options.model).toBe("auto");
+    expect(options.effort).toBe("xhigh");
+    expect(options.env).not.toHaveProperty("CLAUDE_CODE_EFFORT_LEVEL");
+    expect(options.settings).not.toHaveProperty("modelPicker");
     expect(options.settingSources).toEqual([]);
     expect(options.strictMcpConfig).toBe(true);
     const decision = await options.canUseTool!(

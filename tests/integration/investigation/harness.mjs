@@ -84,7 +84,6 @@ export async function runInvestigationTests() {
             : {
                 sdk,
                 model: "auto",
-                behaves_as: "claude-opus-4-8",
                 effort: "xhigh",
               },
       };

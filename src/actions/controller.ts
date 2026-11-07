@@ -12,6 +12,8 @@ import {
 import { parseTaskRequest } from "./task.ts";
 import { ConfigurationError } from "../config/errors.ts";
 import { parseConfigurationSources } from "../config/sources.ts";
+import { roleNames, type Role } from "../config/schema.ts";
+import { testAiConfiguration } from "./test-ai.ts";
 import {
   createKnownSecretChecker,
   createSafeLogger,
@@ -50,8 +52,11 @@ try {
     !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
     !bootstrapToken ||
     extra.length ||
-    !["route", "run"].includes(mode) ||
-    (mode === "route" && number)
+    !["route", "run", "test-ai"].includes(mode) ||
+    (mode === "route" && number) ||
+    (mode === "test-ai" &&
+      (process.env.GITHUB_EVENT_NAME !== "workflow_dispatch" ||
+        !roleNames.includes(number as Role)))
   )
     throw new StateError("state_invalid");
   const silent = () => {};
@@ -125,7 +130,22 @@ try {
   delete process.env.ORM_CONFIGURATION_SECRETS;
   const source = client(loaded.configuration.github.token);
   const key = loaded.sessionKey;
-  if (mode === "route" && !number) {
+  if (mode === "test-ai") {
+    if (
+      process.env.GITHUB_REF !==
+      `refs/heads/${loaded.repository.default_branch}`
+    )
+      throw new StateError("state_invalid");
+    operation = "ai_test";
+    const result = await testAiConfiguration(
+      loaded.configuration,
+      number as Role,
+      loaded.pinned.source,
+      signal,
+    );
+    console.log(JSON.stringify(result));
+    process.exitCode = result.outcome === "completed" ? 0 : 1;
+  } else if (mode === "route" && !number) {
     operation = "route";
     const payload = JSON.parse(
       await readFile(process.env.GITHUB_EVENT_PATH ?? "/event.json", "utf8"),
@@ -191,6 +211,11 @@ try {
       operation,
       ...correlation,
       cause: reason,
+      outcome: "failed",
+      recovery:
+        operation === "configuration_load"
+          ? "Check the named configuration source and GitHub read access on the default branch, then rerun."
+          : "Inspect the operation and cause, correct the configuration or runtime failure, then rerun.",
       ...(error instanceof ConfigurationError ? error.diagnostic : {}),
       elapsed_ms: Math.round(performance.now() - started),
     }),

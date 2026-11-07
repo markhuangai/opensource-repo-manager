@@ -1,0 +1,78 @@
+name: Test AI configuration
+
+on:
+  workflow_call:
+    inputs:
+      runtime-image:
+        description: Immutable runtime image reference including its sha256 digest
+        required: true
+        type: string
+      runner:
+        description: Compatible Linux AMD64 or ARM64 Docker runner label
+        default: ubuntu-24.04
+        type: string
+      role:
+        description: Configured role whose profile should receive one test prompt
+        default: implementation
+        type: string
+    secrets:
+      ORM_CONFIGURATION_VARIABLES:
+        description: JSON of the caller vars context
+        required: true
+      ORM_CONFIGURATION_SECRETS:
+        description: JSON map of explicitly forwarded repository secrets
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test configured AI profile
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Test one AI response
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
+          ORM_TEST_ROLE: ${{ inputs.role }}
+          ORM_BOOTSTRAP_GITHUB_TOKEN: ${{ github.token }}
+          ORM_CONFIGURATION_SECRETS: ${{ secrets.ORM_CONFIGURATION_SECRETS }}
+          ORM_CONFIGURATION_VARIABLES: ${{ secrets.ORM_CONFIGURATION_VARIABLES }}
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            assert(context.eventName === "workflow_dispatch", "AI tests require a manual caller.");
+            assert(context.ref === `refs/heads/${context.payload.repository.default_branch}`, "Run the caller from its default branch.");
+            const image = process.env.ORM_RUNTIME_IMAGE, role = process.env.ORM_TEST_ROLE;
+            assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
+            assert(["bootstrap", "investigation", "implementation", "audit", "output_review"].includes(role), "Unknown configured role.");
+            const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-ai-test`;
+            await exec.exec("docker", ["pull", image]);
+            const environment = ["ORM_BOOTSTRAP_GITHUB_TOKEN", "ORM_CONFIGURATION_SECRETS", "ORM_CONFIGURATION_VARIABLES",
+              "GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_EVENT_NAME", "GITHUB_REF"];
+            await exec.exec("docker", ["create", "--name", name,
+              "--label", `org.opensource-repo-manager.ai-test=${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`,
+              ...environment.flatMap(key => ["--env", key]),
+              "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "test-ai", role]);
+            const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true, ignoreReturnCode: true});
+            if (output.stderr) core.info(output.stderr);
+            const result = JSON.parse(output.stdout.trim());
+            assert(result.version === 1 && ["completed", "failed"].includes(result.outcome), "Missing bounded AI test result.");
+            await core.summary.addHeading("AI configuration test").addCodeBlock(JSON.stringify({ ...result, runtime_image: image }, null, 2), "json").write();
+            if (output.exitCode || result.outcome !== "completed" || result.cleanup !== "passed") core.setFailed(`AI test stopped: ${result.reason}`);
+      - name: Remove the AI test container
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-ai-test`;
+            const inspected = await exec.getExecOutput("docker", ["inspect", "--format",
+              '{{index .Config.Labels "org.opensource-repo-manager.ai-test"}}', name], {silent: true, ignoreReturnCode: true});
+            if (inspected.exitCode && /No such (object|container)/i.test(inspected.stderr)) return;
+            assert(!inspected.exitCode && inspected.stdout.trim() === `${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`, "AI test container ownership is unverified.");
+            await exec.exec("docker", ["stop", "--time", "15", name]);
+            await exec.exec("docker", ["rm", "--volumes", name]);
+            core.info(JSON.stringify({container: name, cleanup: "passed"}));

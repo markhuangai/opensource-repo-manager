@@ -148,7 +148,6 @@ export async function runImplementationTests(sdks, suite) {
             : {
                 sdk,
                 model: "auto",
-                behaves_as: "claude-opus-4-8",
                 effort: "xhigh",
               },
       };

@@ -157,10 +157,17 @@ function fixture() {
         },
         createRelease: async (args) => {
           write("createRelease", args);
+          if (args.prerelease) {
+            expect(args.draft).toBe(false);
+            expect(args.make_latest).toBe("false");
+            expect(
+              state.manifests.has(`${image}:${args.tag_name.slice(1)}`),
+            ).toBe(true);
+          }
           const release = {
             ...args,
             id: state.releases.length + 42,
-            published_at: null,
+            published_at: args.draft ? null : "2026-11-03T00:00:00Z",
           };
           state.releases.push(release);
           return { data: globalThis.structuredClone(release) };
@@ -353,7 +360,6 @@ function fixture() {
           GITHUB_WORKSPACE: fileURLToPath(new URL("../", import.meta.url)),
           VERSION: state.outputs.version,
           SOURCE_SHA: state.outputs.source_sha,
-          RELEASE_ID: state.outputs.release_id,
           ...env,
         },
       },
@@ -608,8 +614,11 @@ describe("actual candidate workflow scripts", () => {
     await state.invoke("resolve");
     expect(state.outputs.version).toBe("1.0.0-rc.10");
   });
-  it("recovers a draft reservation beyond the first release page without creating a duplicate", async () => {
+  it("reserves only the tag and recovers a legacy draft beyond the first release page", async () => {
     const state = fixture();
+    await state.invoke("resolve");
+    expect(state.releases).toEqual([]);
+    expect(state.outputs).not.toHaveProperty("release_id");
     state.releases.push(
       ...Array.from({ length: 105 }, (_, id) => ({
         id,
@@ -617,22 +626,20 @@ describe("actual candidate workflow scripts", () => {
         draft: false,
       })),
     );
-    await state.invoke("resolve");
-    const reservation = state.releases.at(-1);
-    expect(reservation.draft).toBe(true);
+    const reservation = state.seed("v1.0.0-rc.1", source, true, true);
     const before = state.writes.length;
     await state.invoke("resolve");
     expect(state.writes).toHaveLength(before);
-    expect(state.outputs.release_id).toBe(String(reservation.id));
     await state.publish();
     expect(reservation.draft).toBe(false);
     expect(
       state.writes.filter((write) => write.operation === "createRelease"),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
   });
   it("rejects conflicting release reservations before publishing images", async () => {
     const state = fixture();
     await state.invoke("resolve");
+    state.seed("v1.0.0-rc.1", source, true, true);
     state.releases.push({ ...state.releases[0], id: 999 });
     const before = state.writes.length;
     await expect(state.invoke("publish")).rejects.toThrow(
@@ -649,26 +656,28 @@ describe("actual candidate workflow scripts", () => {
       state.main = "b".repeat(40);
       state.context.payload.workflow_run.head_sha = state.main;
       state.writes = [];
-      if (interruption === "publication") state.failure = "updateRelease";
+      if (interruption === "publication") state.failure = "createRelease";
       else
         state.readFailure = {
           operation: "listReleases",
-          after: "updateRelease",
+          after: "createRelease",
         };
       await expect(state.candidate()).rejects.toThrow(
         interruption === "publication"
-          ? "Provider interrupted updateRelease"
+          ? "Provider interrupted createRelease"
           : "Provider read failed: listReleases",
       );
       const reservedDigest = state.manifests.get(`${image}:1.0.0-rc.2`).digest;
-      expect(state.releases.at(-1).draft).toBe(interruption === "publication");
+      expect(state.releases.every((release) => !release.draft)).toBe(true);
       expect(state.manifests.get(`${image}:1-prerelease`).digest).toBe(
         priorDigest,
       );
       expect(state.refs.get("tags/v1-prerelease").object.sha).toBe(priorRef);
       const before = state.writes.length;
       await state.invoke("resolve");
-      expect(state.outputs.build_required).toBe("false");
+      expect(state.outputs.build_required).toBe(
+        interruption === "publication" ? "true" : "false",
+      );
       await state.invoke("publish");
       expect(state.releases.at(-1).draft).toBe(false);
       expect(state.manifests.get(`${image}:1-prerelease`).digest).toBe(
@@ -708,12 +717,7 @@ describe("actual candidate workflow scripts", () => {
         ),
     ).toBe(true);
   });
-  for (const operation of [
-    "createRelease",
-    "uploadReleaseAsset",
-    "updateRelease",
-    "createTag",
-  ])
+  for (const operation of ["createRelease", "uploadReleaseAsset", "createTag"])
     it(`resumes after interrupted ${operation} without replacing a numbered tag or image`, async () => {
       const state = fixture();
       state.failure = operation;
@@ -818,6 +822,34 @@ describe("actual candidate workflow scripts", () => {
     expect(
       state.writes.filter((write) => write.operation === "registry"),
     ).toEqual([]);
+  });
+  it("recovers a published release with missing receipt without rebuilding its image", async () => {
+    const state = fixture();
+    state.failure = "uploadReleaseAsset";
+    await expect(state.candidate()).rejects.toThrow("uploadReleaseAsset");
+    expect(state.releases[0].draft).toBe(false);
+    const original = state.manifests.get(`${image}:1.0.0-rc.1`).digest;
+    await state.invoke("resolve");
+    expect(state.outputs.build_required).toBe("false");
+    await state.invoke("publish");
+    expect(state.manifests.get(`${image}:1.0.0-rc.1`).digest).toBe(original);
+    expect(state.assets.size).toBe(1);
+  });
+  it("verifies legacy image proof and promotes it without changing the candidate digest", async () => {
+    const state = fixture();
+    await state.candidate();
+    const manifest = state.manifests.get(`${image}:1.0.0-rc.1`);
+    const key = "org.opensource-repo-manager.publication";
+    const proof = JSON.parse(manifest.annotations[key]);
+    manifest.annotations[key] = JSON.stringify({
+      ...proof,
+      version: 1,
+      release_id: state.releases[0].id,
+    });
+    await state.invoke("publish");
+    state.context.payload.inputs = { source_rc: "v1.0.0-rc.1" };
+    await state.invoke("promote");
+    expect(state.manifests.get(`${image}:1.0.0`).digest).toBe(manifest.digest);
   });
   it("rejects missing native proof without publishing a version", async () => {
     const state = fixture();

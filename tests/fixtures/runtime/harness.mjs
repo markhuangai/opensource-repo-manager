@@ -37,6 +37,7 @@ import {
 import { treeBytes } from "/opt/orm/app/dist/services/workspaces/files.js";
 import { verifyClaude } from "/agent-fixtures/claude.mjs";
 import { verifyCodex } from "/agent-fixtures/codex.mjs";
+import { verifyAiTest } from "/agent-fixtures/ai-test.mjs";
 
 async function collect(iterable) {
   const events = [];
@@ -340,6 +341,7 @@ export async function runRuntimeTests() {
   let tests = 0,
     claudeProof,
     codexProof,
+    aiTestProof,
     storageProbe;
   const errors = [],
     probeOutcomes = [],
@@ -1430,6 +1432,28 @@ int main(int count, char **values) {
       sourceWith,
       bundles,
     });
+    const probeConfig = JSON.parse(
+      JSON.stringify({
+        ...loaded.snapshot.settings,
+        redaction_values: [],
+        github: {
+          ...loaded.snapshot.settings.github,
+          token: loaded.secrets.get("github.token"),
+        },
+        proxy: {
+          ...loaded.snapshot.settings.proxy,
+          key: loaded.secrets.get("proxy.key"),
+        },
+      }),
+    );
+    aiTestProof = await verifyAiTest(probeConfig, {
+      sha,
+      tree_sha: tree,
+      default_branch: "main",
+    });
+    assert.equal(aiTestProof.scenarios.length, 10);
+    assert.equal(aiTestProof.cleanup, "passed");
+    tests++;
     assert.equal(
       terminal(await remaining(shutdownIterator)).outcome,
       "cancelled",
@@ -1577,6 +1601,7 @@ int main(int count, char **values) {
       crash_recovery: "passed",
       claude_sdk: claudeProof,
       codex_sdk: codexProof,
+      ai_test: aiTestProof,
       cleanup: "passed",
     }),
   );
