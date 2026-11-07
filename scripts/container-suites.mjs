@@ -176,10 +176,48 @@ export const implementationScenarios = {
   ],
 };
 
+export const bootstrapScenarios = {
+  "bootstrap-node": {
+    claude: { npm: "passed", "audit-rejection": "blocked" },
+    codex: {
+      npm: "passed",
+      pnpm: "passed",
+      "yarn-classic": "passed",
+      "yarn-modern": "passed",
+      "audit-rejection": "blocked",
+    },
+  },
+  "bootstrap-python": {
+    codex: {
+      pip: "passed",
+      poetry: "passed",
+      uv: "passed",
+      "tracked-node-modules": "blocked",
+      "manager-directory-symlink": "blocked",
+      "manager-lock-symlink": "blocked",
+      "private-registry": "blocked",
+      "missing-lock": "blocked",
+      "root-script": "blocked",
+      "package-unavailable": "blocked",
+      "toolchain-unavailable": "blocked",
+      "lock-mutation": "blocked",
+      "stale-lock": "blocked",
+      "nested-pins-mutation": "blocked",
+      "cancellation-and-concurrency": "passed",
+      "stale-revision": "passed",
+      "cache-tampering": "blocked",
+      "installer-limits": "blocked",
+      "partial-install": "blocked",
+      "restart-recovery": "passed",
+    },
+  },
+  "bootstrap-go": { codex: { "go-cgo": "passed", mixed: "passed" } },
+};
+
 export const containerSuites = [
   "core",
   "investigation",
-  "bootstrap",
+  ...Object.keys(bootstrapScenarios),
   "actions",
   ...Object.keys(implementationScenarios),
 ];
@@ -203,7 +241,7 @@ export function selectContainerSuites(args, arch = process.arch) {
       ].includes(flag) &&
         value &&
         !seen.has(flag),
-      "Usage: npm run test:container -- [--platform linux/amd64|linux/arm64] [--suite all|SUITE] [--actions-concurrency 1..4] [--actions-sdk SDK --actions-group GROUP]",
+      "Usage: npm run test:container -- [--platform linux/amd64|linux/arm64] [--suite all|bootstrap|SUITE] [--actions-concurrency 1..4] [--actions-sdk SDK --actions-group GROUP]",
     );
     seen.add(flag);
     if (flag === "--platform") platform = value;
@@ -227,7 +265,7 @@ export function selectContainerSuites(args, arch = process.arch) {
     "Unsupported test platform",
   );
   assert(
-    suite === "all" || containerSuites.includes(suite),
+    suite === "all" || suite === "bootstrap" || containerSuites.includes(suite),
     "Unknown container suite",
   );
   assert(
@@ -240,9 +278,38 @@ export function selectContainerSuites(args, arch = process.arch) {
   );
   return {
     platform,
-    suites: suite === "all" ? [...containerSuites] : [suite],
+    suites:
+      suite === "all"
+        ? [...containerSuites]
+        : suite === "bootstrap"
+          ? Object.keys(bootstrapScenarios)
+          : [suite],
     ...actions,
   };
+}
+
+export function verifyBootstrapReceipt(suite, receipt) {
+  assert(Object.hasOwn(bootstrapScenarios, suite), "Unknown bootstrap suite");
+  assert.equal(receipt.suite, suite);
+  assert.equal(receipt.bootstrap, "passed");
+  assert.equal(receipt.cleanup, "passed");
+  assert.equal(receipt.malicious_mise, "passed");
+  if (suite === "bootstrap-node")
+    assert.equal(receipt.audit_rejection, "passed");
+  assert(Array.isArray(receipt.cases), "Bootstrap case evidence is missing");
+  assert.deepEqual(
+    receipt.cases
+      .map((item) => `${item?.sdk}/${item?.fixture}:${item?.outcome}`)
+      .sort(),
+    Object.entries(bootstrapScenarios[suite])
+      .flatMap(([sdk, fixtures]) =>
+        Object.entries(fixtures).map(
+          ([fixture, outcome]) => `${sdk}/${fixture}:${outcome}`,
+        ),
+      )
+      .sort(),
+    "Incomplete, duplicate or unexpected bootstrap coverage or outcomes",
+  );
 }
 
 export function selectActionsCpuSet(available) {

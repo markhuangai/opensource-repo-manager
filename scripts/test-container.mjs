@@ -25,6 +25,8 @@ import { parseRepositoryActionsConfiguration } from "../src/config/schema.ts";
 import { parseConfigurationSources } from "../src/config/sources.ts";
 import {
   selectContainerSuites,
+  bootstrapScenarios,
+  verifyBootstrapReceipt,
   implementationScenarios,
   implementationSdks,
   verifyImplementationReceipts,
@@ -1350,7 +1352,7 @@ try {
       }
     }
   }
-  if (suite === "bootstrap") {
+  if (Object.hasOwn(bootstrapScenarios, suite)) {
     console.log("Verifying repository bootstrap");
     register("volume", bootstrapVolume);
     docker(["volume", "create", "--label", `${label}=${id}`, bootstrapVolume]);
@@ -1384,13 +1386,12 @@ try {
           "/opt/orm-runtime/bin/node",
           "--input-type=module",
           "-e",
-          "import {runBootstrapTests} from '/bootstrap-fixtures/harness.mjs'; console.log(JSON.stringify(await runBootstrapTests()));",
+          `import {runBootstrapTests} from '/bootstrap-fixtures/harness.mjs'; console.log(JSON.stringify(await runBootstrapTests(${JSON.stringify(suite)})));`,
         ],
         { timeout: 2_400_000 },
       ),
     );
-    assert.equal(bootstrapProof.bootstrap, "passed");
-    assert.equal(bootstrapProof.cleanup, "passed");
+    verifyBootstrapReceipt(suite, bootstrapProof);
     stopCleanly(bootstrapContainer);
   }
   phase("shutdown-and-persistence");

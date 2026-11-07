@@ -22,6 +22,7 @@ const promotion = await workflow("promote-release");
 const ci = await workflow("ci");
 const codeql = await workflow("codeql");
 const maintenance = await workflow("maintenance");
+const runtimeSelection = await workflow("resolve-runtime");
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const step = (job, name) => job.steps.find((entry) => entry.name === name);
 const sha = "a".repeat(40);
@@ -524,9 +525,10 @@ describe("release and CI boundaries", () => {
       release,
       promotion,
       maintenance,
+      runtimeSelection,
     ]) {
       for (const job of Object.values(document.jobs)) {
-        for (const entry of job.steps) {
+        for (const entry of job.steps ?? []) {
           if (
             entry.uses &&
             entry.uses !== "markhuangai/ai-pr-reviewer@v1-prerelease"
@@ -628,7 +630,7 @@ describe("native suite aggregation", () => {
           job.name ===
           `Container tests (${architecture}, implementation-monitor-state)`,
       );
-    it(`requires all eight ${architecture} suites and reports queue time separately`, async () => {
+    it(`requires all ten ${architecture} suites and reports queue time separately`, async () => {
       const result = await run(script, { env, jobs: jobs() });
       expect(result.failures).toEqual([]);
       expect(result.notices.map((value) => JSON.parse(value))).toEqual(
@@ -643,6 +645,15 @@ describe("native suite aggregation", () => {
         })),
       );
     });
+    for (const suite of ["bootstrap-node", "bootstrap-python", "bootstrap-go"])
+      it(`rejects missing ${architecture} ${suite} coverage`, async () => {
+        const list = jobs().filter(
+          (job) => job.name !== `Container tests (${architecture}, ${suite})`,
+        );
+        expect((await run(script, { env, jobs: list })).failures).toHaveLength(
+          1,
+        );
+      });
     for (const conclusion of [
       "failure",
       "skipped",
@@ -744,7 +755,7 @@ describe("pinned reusable maintenance workflow", () => {
     );
     expect(
       maintenance.on["workflow_call"].inputs["runtime-image"].required,
-    ).toBe(true);
+    ).toBe(false);
     for (const job of [
       maintenance.jobs.resolve,
       maintenance.jobs.maintenance,
@@ -773,9 +784,8 @@ describe("pinned reusable maintenance workflow", () => {
       "closed",
     ]);
     expect(consumer.on.issue_comment.types).toEqual(["created"]);
-    expect(consumer.jobs.maintenance.uses).toMatch(
-      /@REPLACE_WITH_FULL_COMMIT_SHA$/,
-    );
+    expect(consumer.jobs.maintenance.uses).toMatch(/@v1-prerelease$/);
+    expect(consumer.jobs.maintenance.with["runtime-image"]).toBeUndefined();
   });
   for (const mutable of [
     "ghcr.io/owner/image:latest",
@@ -1170,6 +1180,484 @@ describe("native image smoke receipts", () => {
   }
 });
 
+const runtimeScript = step(
+  runtimeSelection.jobs.resolve,
+  "Resolve the workflow runtime",
+).with.script;
+describe("release-bound runtime selection", () => {
+  const source = "b".repeat(40);
+  const identity = (ref = "refs/tags/v1-prerelease") => ({
+    workflow_repository: "markhuangai/opensource-repo-manager",
+    workflow_file_path: ".github/workflows/resolve-runtime.yml",
+    workflow_ref: `markhuangai/opensource-repo-manager/.github/workflows/resolve-runtime.yml@${ref}`,
+    workflow_sha: source,
+    check_run_id: 456,
+  });
+  const manifest = () => ({
+    digest: digest("f"),
+    manifests: [
+      ...nativeReceipts.map(descriptor).reverse(),
+      {
+        digest: digest("e"),
+        platform: { os: "unknown", architecture: "unknown" },
+        annotations: { "vnd.docker.reference.type": "attestation-manifest" },
+      },
+    ],
+    annotations: {
+      "org.opensource-repo-manager.publication": JSON.stringify({
+        version: 2,
+        source_sha: source,
+        release_version: "1.0.0-rc.3",
+        platforms: nativeReceipts.map(({ platform, platform_digest }) => ({
+          platform,
+          platform_digest,
+        })),
+      }),
+    },
+  });
+  async function select({ env = {}, response = {}, transportError } = {}) {
+    const calls = [];
+    const result = await run(runtimeScript, {
+      context: { repo: { owner: "consumer", repo: "project" } },
+      env: {
+        ORM_RUNTIME_IMAGE: "",
+        ORM_WORKFLOW_JOB: JSON.stringify(identity()),
+        GITHUB_JOB: "resolve",
+        GITHUB_SHA: sha,
+        ...env,
+      },
+      executor: {
+        getExecOutput: async (...args) => {
+          calls.push(args);
+          if (transportError) throw transportError;
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify(manifest()),
+            stderr: "",
+            ...response,
+          };
+        },
+      },
+    });
+    return { ...result, calls };
+  }
+  const failure = (result) => {
+    expect(result.outputs).toEqual({});
+    expect(result.failures).toHaveLength(1);
+    return JSON.parse(result.failures[0]);
+  };
+  it("shares one resolver per invocation without forwarding configuration or increasing permissions", () => {
+    expect(runtimeSelection.permissions).toEqual({ contents: "read" });
+    expect(runtimeSelection.on.workflow_call.secrets).toBeUndefined();
+    expect(
+      runtimeSelection.on.workflow_call.outputs["runtime-image"].value,
+    ).toBe("${{ jobs.resolve.outputs.runtime-image }}");
+    const selectionStep = step(
+      runtimeSelection.jobs.resolve,
+      "Resolve the workflow runtime",
+    );
+    expect(selectionStep.env).toEqual({
+      ORM_RUNTIME_IMAGE: "${{ inputs.runtime-image }}",
+      ORM_WORKFLOW_JOB: "${{ toJSON(job) }}",
+    });
+    for (const document of [maintenance, aiTest]) {
+      expect(document.on.workflow_call.inputs["runtime-image"]).toMatchObject({
+        type: "string",
+        required: false,
+        default: "",
+      });
+      expect(document.jobs.runtime).toEqual({
+        uses: "./.github/workflows/resolve-runtime.yml",
+        with: {
+          "runtime-image": "${{ inputs.runtime-image }}",
+          runner: "${{ inputs.runner }}",
+        },
+      });
+      expect(
+        Object.values(document.jobs).filter((job) => job.uses),
+      ).toHaveLength(1);
+    }
+    expect(maintenance.jobs.resolve.needs).toBe("runtime");
+    expect(maintenance.jobs.resolve.outputs["runtime-image"]).toBe(
+      "${{ needs.runtime.outputs.runtime-image }}",
+    );
+    expect(
+      step(maintenance.jobs.resolve, "Route through the pinned controller").env
+        .ORM_RUNTIME_IMAGE,
+    ).toBe("${{ needs.runtime.outputs.runtime-image }}");
+    expect(
+      step(maintenance.jobs.maintenance, "Execute the bounded maintenance task")
+        .env.ORM_RUNTIME_IMAGE,
+    ).toBe("${{ needs.resolve.outputs.runtime-image }}");
+    expect(aiTest.jobs.test.needs).toBe("runtime");
+    expect(
+      step(aiTest.jobs.test, "Test one AI response").env.ORM_RUNTIME_IMAGE,
+    ).toBe("${{ needs.runtime.outputs.runtime-image }}");
+  });
+  for (const ref of [
+    "refs/tags/v1-prerelease",
+    "refs/tags/v1",
+    "refs/tags/v1.0.0-rc.3",
+    "refs/tags/v1.0.0",
+    source,
+  ])
+    it(`selects the loaded workflow source for ${ref}, independently of caller and alias revisions`, async () => {
+      const result = await select({
+        env: { ORM_WORKFLOW_JOB: JSON.stringify(identity(ref)) },
+      });
+      expect(result.failures).toEqual([]);
+      expect(result.outputs).toEqual({
+        "runtime-image": `${image}@${digest("f")}`,
+      });
+      expect(result.calls).toEqual([
+        [
+          "timeout",
+          [
+            "--kill-after=5s",
+            "60s",
+            "docker",
+            "buildx",
+            "imagetools",
+            "inspect",
+            `${image}:sha-${source}`,
+            "--format",
+            "{{json .Manifest}}",
+          ],
+          { silent: true, ignoreReturnCode: true },
+        ],
+      ]);
+      const resolved = result.notices
+        .map(JSON.parse)
+        .find((record) => record.event === "runtime.resolved");
+      expect(resolved).toMatchObject({
+        level: "info",
+        repository: "consumer/project",
+        run_id: 123,
+        attempt: 1,
+        job: "resolve",
+        check_run_id: 456,
+        mode: "default",
+        timeout_ms: 60000,
+        workflow_sha: source,
+        workflow_ref: identity(ref).workflow_ref,
+        runtime_image: result.outputs["runtime-image"],
+        release_version: "1.0.0-rc.3",
+      });
+      expect(resolved.elapsed_ms).toBeGreaterThanOrEqual(0);
+    });
+  for (const override of [
+    `${image}@${digest("a")}`,
+    `registry.example:5000/custom/runtime@${digest("b")}`,
+  ])
+    it(`preserves explicit override ${override} without job identity or registry lookup`, async () => {
+      const result = await select({
+        env: { ORM_RUNTIME_IMAGE: override, ORM_WORKFLOW_JOB: "unavailable" },
+      });
+      expect(result.failures).toEqual([]);
+      expect(result.outputs["runtime-image"]).toBe(override);
+      expect(result.calls).toEqual([]);
+      expect(result.notices.map(JSON.parse).at(-1)).toMatchObject({
+        event: "runtime.resolved",
+        mode: "override",
+      });
+    });
+  for (const override of [
+    "latest",
+    "ghcr.io/owner/runtime:latest",
+    "ghcr.io/owner/runtime@sha256:short",
+    "bad-secret-canary; unsafe",
+  ])
+    it(`rejects invalid override ${override} without echoing the value or looking up a default`, async () => {
+      const result = await select({ env: { ORM_RUNTIME_IMAGE: override } });
+      expect(failure(result)).toMatchObject({
+        event: "runtime.failed",
+        level: "error",
+        stage: "input",
+        cause: { content: "runtime-image must be pinned by digest." },
+      });
+      expect(result.calls).toEqual([]);
+      expect(JSON.stringify(result)).not.toContain(override);
+    });
+  for (const value of [
+    undefined,
+    "{identity-secret-canary",
+    "null",
+    "[]",
+    JSON.stringify({ ...identity(), workflow_repository: "consumer/project" }),
+    JSON.stringify({
+      ...identity(),
+      workflow_file_path: ".github/workflows/caller.yml",
+    }),
+    JSON.stringify({
+      ...identity(),
+      workflow_ref: "consumer/project/.github/workflows/caller.yml@main",
+    }),
+    JSON.stringify({ ...identity(), workflow_sha: undefined }),
+    JSON.stringify({ ...identity(), workflow_sha: source + "\n" }),
+  ])
+    it(`rejects unavailable or invalid called-workflow identity ${value} without caller-SHA fallback`, async () => {
+      const result = await select({ env: { ORM_WORKFLOW_JOB: value } });
+      expect(failure(result)).toMatchObject({
+        stage: "identity",
+        mode: "default",
+      });
+      expect(result.calls).toEqual([]);
+      expect(JSON.stringify(result)).not.toContain("identity-secret-canary");
+    });
+  for (const [exitCode, stderr, cause] of [
+    [1, "manifest unknown: image not found", "Registry inspection failed."],
+    [124, "", "Registry inspection timed out."],
+    [137, "inspection killed after deadline", "Registry inspection timed out."],
+  ])
+    it(`reports registry exit ${exitCode} with correlation and corrective action without retry`, async () => {
+      const result = await select({ response: { exitCode, stderr } });
+      expect(failure(result)).toMatchObject({
+        event: "runtime.failed",
+        level: "error",
+        stage: "registry",
+        repository: "consumer/project",
+        run_id: 123,
+        attempt: 1,
+        check_run_id: 456,
+        workflow_sha: source,
+        reference: `${image}:sha-${source}`,
+        provider_status: exitCode,
+        provider_error: { content: stderr, omitted_bytes: 0 },
+        cause: { content: cause },
+      });
+      expect(failure(result).recovery).toContain(
+        "publication for this workflow commit",
+      );
+      expect(result.calls).toHaveLength(1);
+    });
+  it("reports a registry executable failure without issuing another request", async () => {
+    const result = await select({
+      transportError: new Error("Unable to locate executable file: timeout"),
+    });
+    expect(failure(result)).toMatchObject({
+      stage: "registry",
+      cause: { content: "Unable to locate executable file: timeout" },
+    });
+    expect(result.calls).toHaveLength(1);
+  });
+  it("retains invalid manifest evidence and reports oversized captures explicitly", async () => {
+    const invalid = await select({
+      response: { stdout: "{invalid-public-manifest" },
+    });
+    expect(failure(invalid)).toMatchObject({
+      stage: "manifest",
+      observed: {
+        manifest_capture: {
+          content: "{invalid-public-manifest",
+          omitted_bytes: 0,
+        },
+      },
+    });
+    const oversized = await select({
+      response: { stdout: "x".repeat(64 * 1024 + 1) },
+    });
+    expect(failure(oversized).observed.manifest_capture).toMatchObject({
+      bytes: 64 * 1024 + 1,
+      omitted_bytes: 1,
+    });
+    expect(failure(oversized).cause.content).toContain("64 KiB");
+    const provider = await select({
+      response: { exitCode: 1, stderr: "é".repeat(9000) + "tail" },
+    });
+    const captured = failure(provider).provider_error;
+    expect(Buffer.byteLength(captured.content)).toBeLessThanOrEqual(16 * 1024);
+    expect(captured.bytes - Buffer.byteLength(captured.content)).toBe(
+      captured.omitted_bytes,
+    );
+    expect(captured.omitted_bytes).toBeGreaterThan(0);
+  });
+  const corruptions = [
+    [
+      "missing annotation",
+      (value) => {
+        value.annotations = {};
+      },
+    ],
+    [
+      "malformed proof",
+      (value) => {
+        value.annotations["org.opensource-repo-manager.publication"] =
+          "{invalid-public-proof";
+      },
+    ],
+    [
+      "invalid index digest",
+      (value) => {
+        value.digest = "sha256:short";
+      },
+    ],
+    [
+      "wrong source",
+      (value, proof) => {
+        proof.source_sha = sha;
+      },
+    ],
+    [
+      "unsupported proof version",
+      (value, proof) => {
+        proof.version = 1;
+      },
+    ],
+    [
+      "missing native proof",
+      (value, proof) => {
+        proof.platforms.pop();
+      },
+    ],
+    [
+      "duplicate native proof",
+      (value, proof) => {
+        proof.platforms[1] = proof.platforms[0];
+      },
+    ],
+    [
+      "invalid native digest",
+      (value, proof) => {
+        proof.platforms[0].platform_digest = "sha256:short";
+      },
+    ],
+    [
+      "missing manifest",
+      (value) => {
+        value.manifests.pop();
+        value.manifests.pop();
+      },
+    ],
+    [
+      "extra runnable manifest",
+      (value) => {
+        value.manifests.push(descriptor(nativeReceipts[0]));
+      },
+    ],
+    [
+      "mismatched native digest",
+      (value) => {
+        value.manifests[0].digest = digest("e");
+      },
+    ],
+    [
+      "missing index",
+      (value) => {
+        delete value.manifests;
+      },
+    ],
+    ...["1.0.0-rc.0", "01.0.0", "1.0.0\n", "1.0.9007199254740992"].map(
+      (version) => [
+        `invalid version ${JSON.stringify(version)}`,
+        (value, proof) => {
+          proof.release_version = version;
+        },
+      ],
+    ),
+  ];
+  for (const [name, corrupt] of corruptions)
+    it(`rejects ${name} before producing an image reference`, async () => {
+      const value = manifest();
+      const proof = JSON.parse(
+        value.annotations["org.opensource-repo-manager.publication"],
+      );
+      corrupt(value, proof);
+      if (
+        value.annotations["org.opensource-repo-manager.publication"] ===
+        manifest().annotations["org.opensource-repo-manager.publication"]
+      )
+        value.annotations["org.opensource-repo-manager.publication"] =
+          JSON.stringify(proof);
+      const result = await select({
+        response: { stdout: JSON.stringify(value) },
+      });
+      expect(failure(result)).toMatchObject({
+        stage: "proof",
+        expected: {
+          source_sha: source,
+          proof_version: 2,
+          platforms: ["linux/amd64", "linux/arm64"],
+        },
+      });
+      expect(result.calls).toHaveLength(1);
+      expect(
+        result.notices
+          .map(JSON.parse)
+          .find((record) => record.event === "runtime.manifest").manifest,
+      ).toEqual(value);
+    });
+  it("uses the selected digest for routing, every maintenance issue and the configured AI role", async () => {
+    const selected = await select();
+    const selectedImage = selected.outputs["runtime-image"];
+    const env = {
+      ORM_RUNTIME_IMAGE: selectedImage,
+      ORM_BOOTSTRAP_GITHUB_TOKEN: "bootstrap-secret-canary",
+      ORM_CONFIGURATION_SECRETS: "{}",
+      ORM_CONFIGURATION_VARIABLES: "{}",
+      GITHUB_ACTIONS: "true",
+      GITHUB_REPOSITORY: "consumer/project",
+      GITHUB_REPOSITORY_ID: "42",
+      GITHUB_RUN_ID: "123",
+      GITHUB_SHA: sha,
+      ACTIONS_RUNTIME_TOKEN: "artifact-secret-canary",
+      ACTIONS_RESULTS_URL: "https://results.actions.githubusercontent.com/",
+      GITHUB_EVENT_PATH: "/runner/event.json",
+      GITHUB_JOB: "consume",
+    };
+    const consumed = [];
+    const invoke = async (script, result, extra = {}, context = {}) => {
+      const executed = await run(script, {
+        env: { ...env, ...extra },
+        context,
+        executor: {
+          exec: async (command, args) => {
+            if (args[0] === "pull") consumed.push(args[1]);
+          },
+          getExecOutput: async () => ({
+            exitCode: 0,
+            stdout: JSON.stringify(result),
+            stderr: "",
+          }),
+        },
+      });
+      expect(executed.failures).toEqual([]);
+      expect(
+        executed.notices
+          .map(JSON.parse)
+          .find((record) => record.event === "runtime.used").runtime_image,
+      ).toBe(selectedImage);
+      expect(JSON.stringify(executed.notices)).not.toContain("secret-canary");
+      return executed;
+    };
+    const routed = await invoke(
+      step(maintenance.jobs.resolve, "Route through the pinned controller").with
+        .script,
+      { version: 1, repository_id: 42, issues: [7, 9] },
+    );
+    for (const issue of JSON.parse(routed.outputs.issues))
+      await invoke(
+        step(
+          maintenance.jobs.maintenance,
+          "Execute the bounded maintenance task",
+        ).with.script,
+        { version: 1, outcome: "waiting", reason: "remote_checks" },
+        { ORM_SELECTED_ISSUE: String(issue) },
+      );
+    await invoke(
+      aiTestScript,
+      { version: 1, outcome: "completed", cleanup: "passed" },
+      { ORM_TEST_ROLE: "audit" },
+      {
+        eventName: "workflow_dispatch",
+        ref: "refs/heads/main",
+        payload: { repository: { default_branch: "main" } },
+      },
+    );
+    expect(consumed).toEqual(Array(4).fill(selectedImage));
+    expect(selected.calls).toHaveLength(1);
+  });
+});
+
 const aiTest = await workflow("test-ai");
 const aiTestScript = step(aiTest.jobs.test, "Test one AI response").with.script;
 const aiTestCleanup = step(aiTest.jobs.test, "Remove the AI test container")
@@ -1195,6 +1683,10 @@ describe("manual consumer AI test", () => {
       ),
     );
     expect(Object.keys(caller.on)).toEqual(["workflow_dispatch"]);
+    expect(caller.jobs.test.uses).toBe(
+      "markhuangai/opensource-repo-manager/.github/workflows/test-ai.yml@v1-prerelease",
+    );
+    expect(caller.jobs.test.with["runtime-image"]).toBeUndefined();
     expect(caller.jobs.test.secrets.ORM_CONFIGURATION_VARIABLES).toBe(
       "${{ toJSON(vars) }}",
     );

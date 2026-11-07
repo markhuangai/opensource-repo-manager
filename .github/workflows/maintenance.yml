@@ -4,8 +4,9 @@ on:
   workflow_call:
     inputs:
       runtime-image:
-        description: Immutable runtime image reference including its sha256 digest
-        required: true
+        description: Optional immutable runtime override; defaults to this workflow release's image
+        required: false
+        default: ""
         type: string
       runner:
         description: Compatible Linux AMD64 or ARM64 Docker runner label
@@ -28,11 +29,19 @@ permissions:
   actions: read
 
 jobs:
+  runtime:
+    uses: ./.github/workflows/resolve-runtime.yml
+    with:
+      runtime-image: ${{ inputs.runtime-image }}
+      runner: ${{ inputs.runner }}
+
   resolve:
     name: Resolve maintenance issues
+    needs: runtime
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     outputs:
+      runtime-image: ${{ needs.runtime.outputs.runtime-image }}
       issues: ${{ steps.route.outputs.issues }}
       has_work: ${{ steps.route.outputs.has_work }}
     steps:
@@ -40,7 +49,7 @@ jobs:
         id: route
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
+          ORM_RUNTIME_IMAGE: ${{ needs.runtime.outputs.runtime-image }}
           ORM_ISSUE_NUMBER: ${{ inputs.issue-number }}
           ORM_BOOTSTRAP_GITHUB_TOKEN: ${{ github.token }}
           ORM_CONFIGURATION_SECRETS: ${{ secrets.ORM_CONFIGURATION_SECRETS }}
@@ -60,6 +69,9 @@ jobs:
               Object.values(variables).every(value => typeof value === "string"), "Invalid configuration variable map.");
             const image = process.env.ORM_RUNTIME_IMAGE;
             assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
+            core.info(JSON.stringify({event: "runtime.used", level: "info", repository: process.env.GITHUB_REPOSITORY,
+              run_id: context.runId, attempt: Number(process.env.GITHUB_RUN_ATTEMPT), job: process.env.GITHUB_JOB,
+              operation: "route", runtime_image: image}));
             const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-route`;
             await exec.exec("docker", ["pull", image]);
             const environment = ["ORM_BOOTSTRAP_GITHUB_TOKEN", "ORM_CONFIGURATION_SECRETS", "ORM_CONFIGURATION_VARIABLES",
@@ -111,7 +123,7 @@ jobs:
       - name: Execute the bounded maintenance task
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
+          ORM_RUNTIME_IMAGE: ${{ needs.resolve.outputs.runtime-image }}
           ORM_SELECTED_ISSUE: ${{ matrix.issue }}
           ORM_BOOTSTRAP_GITHUB_TOKEN: ${{ github.token }}
           ORM_CONFIGURATION_SECRETS: ${{ secrets.ORM_CONFIGURATION_SECRETS }}
@@ -132,6 +144,9 @@ jobs:
               Object.values(variables).every(value => typeof value === "string"), "Invalid configuration variable map.");
             assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
             assert(/^[1-9][0-9]*$/.test(issue) && Number.isSafeInteger(Number(issue)), "Invalid selected issue.");
+            core.info(JSON.stringify({event: "runtime.used", level: "info", repository: process.env.GITHUB_REPOSITORY,
+              run_id: context.runId, attempt: Number(process.env.GITHUB_RUN_ATTEMPT), job: process.env.GITHUB_JOB,
+              operation: "maintenance", issue_number: Number(issue), runtime_image: image}));
             const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-issue-${issue}`;
             await exec.exec("docker", ["pull", image]);
             const environment = ["ORM_BOOTSTRAP_GITHUB_TOKEN", "ORM_CONFIGURATION_SECRETS", "ORM_CONFIGURATION_VARIABLES", "GITHUB_ACTIONS", "GITHUB_REPOSITORY",
