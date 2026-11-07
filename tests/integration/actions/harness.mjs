@@ -64,16 +64,54 @@ export async function runActionsTests({
   const toolchainCache = JSON.parse(
     await readFile(join(directory, "toolchain-cache.json"), "utf8"),
   );
-  const upstream = (path, method = "GET") =>
-    docker([
-      "exec",
-      upstreamName,
-      node,
-      "-e",
-      "fetch('http://localhost:8317'+process.argv[1],{method:process.argv[2]}).then(async r=>{if(!r.ok)throw Error('fixture HTTP '+r.status);console.log(await r.text())})",
-      path,
-      method,
-    ]);
+  const upstream = (path, method = "GET") => {
+    try {
+      return docker([
+        "exec",
+        upstreamName,
+        node,
+        "-e",
+        "fetch('http://localhost:8317'+process.argv[1],{method:process.argv[2]}).then(async r=>{if(!r.ok)throw Error('fixture HTTP '+r.status);console.log(await r.text())})",
+        path,
+        method,
+      ]);
+    } catch (error) {
+      let diagnostic;
+      try {
+        const inspection = result([
+          "container",
+          "inspect",
+          "--format",
+          "{{json .State}}",
+          upstreamName,
+        ]);
+        const logs = result([
+          "container",
+          "logs",
+          "--tail",
+          "80",
+          upstreamName,
+        ]);
+        const output = logs.stdout + logs.stderr;
+        diagnostic = {
+          inspection_status: inspection.status,
+          state: inspection.stdout.slice(-1024),
+          inspection_error: inspection.stderr.slice(-512),
+          log_status: logs.status,
+          logs_tail: output.slice(-4096),
+          logs_truncated: output.length > 4096,
+        };
+      } catch (diagnosticError) {
+        diagnostic = { collection_error: diagnosticError.message.slice(-512) };
+      }
+      throw new Error(
+        `${error.message}; upstream fixture ${JSON.stringify(diagnostic)}`,
+        {
+          cause: error,
+        },
+      );
+    }
+  };
   const proof = () => JSON.parse(upstream("/proof"));
   const inspect = (name) =>
     JSON.parse(docker(["container", "inspect", name]))[0];
