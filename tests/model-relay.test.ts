@@ -8,11 +8,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createConnection } from "node:net";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { Store } from "../src/repositories/store.ts";
 import { ModelRelay } from "../src/services/model-relay.ts";
 import { fixtureConfiguration, fixtureSnapshot } from "./fixtures.ts";
 import { makeIssue } from "./fixtures/github.ts";
+import { sdkVersions } from "../src/domain/agents.ts";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -132,6 +134,122 @@ async function setup(
 }
 
 describe("scoped model relay", () => {
+  it.each(
+    (["claude", "codex"] as const).flatMap((sdk) =>
+      (["deadline", "transport", "runtime", "disconnect"] as const).map(
+        (mode) => ({ sdk, mode }),
+      ),
+    ),
+  )("emits the actual $sdk relay failure cause for $mode", ({ sdk, mode }) => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `
+      import {createServer} from 'node:http';
+      import {mkdtemp,rm} from 'node:fs/promises';
+      import {tmpdir} from 'node:os';
+      import {join} from 'node:path';
+      import {setTimeout as delay} from 'node:timers/promises';
+      import {Store} from './src/repositories/store.ts';
+      import {ModelRelay} from './src/services/model-relay.ts';
+      import {fixtureConfiguration,fixtureSnapshot} from './tests/fixtures.ts';
+      import {makeIssue} from './tests/fixtures/github.ts';
+      const [mode,sdk]=process.argv.slice(1);
+      const root=await mkdtemp(join(tmpdir(),'orm-relay-diagnostics-'));
+      const reached=Promise.withResolvers();
+      let requests=0;
+      const server=createServer((req,res)=>{
+        requests++; req.resume(); reached.resolve();
+        if(mode==='transport') req.socket.destroy();
+        if(mode==='runtime') {
+          res.setHeader('content-type','application/json');
+          res.end(JSON.stringify({error:{message:'provider-private-detail'}}));
+        }
+      });
+      await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+      const config=fixtureConfiguration();
+      config.proxy.url='http://127.0.0.1:'+server.address().port+'/v1';
+      const loaded=await fixtureSnapshot('private-model-canary',config);
+      const store=new Store(join(root,'state.sqlite'));
+      store.saveSnapshot(loaded.snapshot);
+      store.applyIssue(store.refreshIssue(1),{...makeIssue(1),comments:[],source:{sha:'a'.repeat(40),tree_sha:'b'.repeat(40),default_branch:'main'}},loaded.snapshot);
+      const lease=store.acquireLease(1,store.job(1).revision);
+      store.startRuntimeLease(lease,60000);
+      const caller=new AbortController(),client=new AbortController();
+      const relay=new ModelRelay(store,config.proxy.url,loaded.secrets);
+      try {
+        await relay.start();
+        const grant=relay.authorize({lease,profile:{sdk,model:'private-model-canary',effort:'high'},deadline:Date.now()+(mode==='deadline'?150:10000),requests:10,bytes:4096,signal:caller.signal,current:()=>store.runtimeCurrent(lease),context:{run_id:'relay-diagnostics',job_id:1,revision:1,role:'audit'}});
+        const response=fetch(grant.url+(sdk==='claude'?'/messages':'/responses'),{method:'POST',headers:{authorization:'Bearer '+grant.authorization,'content-type':'application/json'},body:JSON.stringify({model:'private-model-canary'}),signal:client.signal}).then(async response=>{await response.text();return response.status},error=>{if(mode!=='disconnect')throw error;return null});
+        await reached.promise;
+        if(mode==='disconnect') client.abort();
+        const status=await response;
+        await delay(30);
+        console.log(JSON.stringify({status,requests,charged:JSON.parse(store.job(1).budget_json).model_requests,caller_aborted:caller.signal.aborted}));
+      } finally {
+        caller.abort(); await relay.close(); store.close(); server.closeAllConnections();
+        await new Promise((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+        await rm(root,{recursive:true});
+      }
+    `,
+        mode,
+        sdk,
+      ],
+      {
+        cwd: new URL("../", import.meta.url),
+        encoding: "utf8",
+        timeout: 10000,
+      },
+    );
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({
+      status: mode === "disconnect" ? null : 502,
+      requests: 1,
+      charged: 1,
+      caller_aborted: false,
+    });
+    const logs = result.stderr
+      .split("\n")
+      .filter((line) => line.startsWith("{"))
+      .map((line) => JSON.parse(line));
+    const started = logs.find((log) => log.event === "model.request.started"),
+      failed = logs.find((log) => log.event === "model.request.failed");
+    expect(started).toMatchObject({
+      level: "info",
+      run_id: "relay-diagnostics",
+      job_id: 1,
+      revision: 1,
+      role: "audit",
+      sdk,
+      sdk_version: sdkVersions[sdk],
+      route: sdk === "claude" ? "/v1/messages" : "/v1/responses",
+    });
+    expect(failed).toMatchObject({
+      ...started,
+      event: "model.request.failed",
+      level: "error",
+      outcome: "failed",
+      cause: {
+        deadline: "deadline_exceeded",
+        transport: "upstream_transport_failed",
+        runtime: "relay_response_invalid",
+        disconnect: "request_cancelled",
+      }[mode],
+    });
+    expect(failed.elapsed_ms).toBeGreaterThanOrEqual(0);
+    expect(failed.recovery).toMatch(/Verify.*before retrying/);
+    expect(logs.filter((log) => log.level === "error")).toHaveLength(1);
+    for (const secret of [
+      "github-fixture-token",
+      "proxy-fixture-key",
+      "private-model-canary",
+      "provider-private-detail",
+      "127.0.0.1",
+    ])
+      expect(result.stdout + result.stderr).not.toContain(secret);
+  });
   it("rejects an actual WebSocket upgrade", async () => {
     const f = await setup("codex"),
       url = new URL(f.grant.url);

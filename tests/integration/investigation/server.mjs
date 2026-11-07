@@ -357,10 +357,14 @@ const http = createServer(async (req, res) => {
         from_variable: "LOCAL_ONLY",
         format: "json",
       };
+    if (url.searchParams.get("count") === "secret")
+      operator.limits.repair_cycles = { from_secret: "COUNT", format: "json" };
     const files = {
       ...sourceFiles,
       ".github/orm.yml": stringifyYaml(operator),
     };
+    if (url.searchParams.get("configuration") === "missing")
+      delete files[".github/orm.yml"];
     function bundles(directory, prefix) {
       for (const entry of readdirSync(directory, { withFileTypes: true })) {
         const path = join(directory, entry.name),
