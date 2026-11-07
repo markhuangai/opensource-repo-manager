@@ -205,12 +205,12 @@ describe("Actions lane coverage and identity", () => {
       sessions: 8,
       "pr-recovery": 16,
       clarification: 19,
-      "clarification-recovery": 39,
+      "clarification-recovery": 42,
     });
     const all = Object.values(actionsScenarios).flat();
     expect(all.filter((id) => !id.startsWith("controller-"))).toHaveLength(94);
-    expect(all).toHaveLength(111);
-    expect(new Set(all).size).toBe(111);
+    expect(all).toHaveLength(114);
+    expect(new Set(all).size).toBe(114);
     expect(() => verifyActionsReceipts(lanes(), identity)).not.toThrow();
   });
   it("supports a serial profiling mode and bounded parallelism", () => {

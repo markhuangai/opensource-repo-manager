@@ -52,6 +52,8 @@ export async function runActionsTests({
     TASK_SESSION_KEY: config.session_key,
     PROXY_URL: config.proxy.url,
     WORKER_MODEL: "unused-secret-namespace-model",
+    UNUSED_ZERO: "0",
+    UNUSED_ONE: "1",
   };
   const configurationEnvironment = () =>
     Object.entries({
@@ -141,8 +143,9 @@ export async function runActionsTests({
       `type=bind,src=${join(directory, "ca-bundle.pem")},dst=/etc/ssl/certs/ca-certificates.crt,readonly`,
       "--env",
       "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
-      "--env",
-      `ORM_SESSION_KEY=${config.session_key}`,
+      ...(options.controller
+        ? []
+        : ["--env", `ORM_SESSION_KEY=${config.session_key}`]),
       ...runtimeEnvironment(fresh),
       ...(options.controller ? configurationEnvironment() : []),
       ...Object.entries(options.environment ?? {}).flatMap(([key, value]) => [
@@ -177,6 +180,11 @@ export async function runActionsTests({
       ...(options.session ? [options.session] : []),
     ]);
     const launched = inspect(name);
+    assert.equal(
+      launched.Config.Env.some((value) => value.startsWith("ORM_SESSION_KEY=")),
+      !options.controller,
+      "Controller fixtures must obtain the runtime session key from the configured secret map",
+    );
     assert.deepEqual(launched.Config.Healthcheck.Test, ["NONE"]);
     if (!options.controller && !options.session)
       assert(
@@ -186,7 +194,8 @@ export async function runActionsTests({
       );
     assert.equal(launched.HostConfig.CpusetCpus, cpuSet);
   }
-  async function route(event, payload, issueNumber = "") {
+  let routeLogs = [];
+  async function route(event, payload, issueNumber = "", environment = {}) {
     const path = join(sessionFixtures, `event-${randomUUID()}.json`);
     await writeFile(
       path,
@@ -197,7 +206,7 @@ export async function runActionsTests({
     );
     const name = `${manager}-route-${resets++}`;
     register("container", name);
-    const value = docker([
+    const value = result([
       "run",
       "--rm",
       "--name",
@@ -214,6 +223,10 @@ export async function runActionsTests({
       "--env",
       "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt",
       ...configurationEnvironment(),
+      ...Object.entries(environment).flatMap(([key, value]) => [
+        "--env",
+        `${key}=${value}`,
+      ]),
       "--env",
       "GITHUB_REPOSITORY_ID=42",
       "--env",
@@ -236,7 +249,12 @@ export async function runActionsTests({
       "/opt/orm/app/dist/actions/controller.js",
       "route",
     ]);
-    return JSON.parse(value).issues;
+    assert.equal(value.status, 0, value.stderr);
+    routeLogs = value.stderr
+      .split("\n")
+      .filter((line) => line.startsWith("{"))
+      .map((line) => JSON.parse(line));
+    return JSON.parse(value.stdout).issues;
   }
   function output(name) {
     const logs = result(["logs", name]);
@@ -1573,7 +1591,9 @@ export async function runActionsTests({
       "POST",
     );
     const mutationsBeforeConfiguration = proof().mutations.length;
+    let missingConfigurationSource;
     for (const [scenario, environment, reason, expected] of [
+      ["missing-configuration", {}, "config_unreadable", {}],
       [
         "missing-source",
         {
@@ -1665,6 +1685,10 @@ export async function runActionsTests({
         {},
       ],
     ]) {
+      if (scenario === "missing-configuration")
+        missingConfigurationSource = JSON.parse(
+          upstream("/controller-source?configuration=missing", "POST"),
+        ).sha;
       if (scenario === "variable-credential")
         upstream("/controller-source?credential=variable", "POST");
       if (scenario === "invalid-profile")
@@ -1690,15 +1714,20 @@ export async function runActionsTests({
         /configuration source.*GitHub read access.*rerun/,
       );
       assert.equal(error.run_id, "100");
+      assert.equal(error.run_attempt, "1");
       assert.equal(error.repository, "owner/repo");
       assert.equal(error.issue_number, String(controllerIssue));
       for (const [key, value] of Object.entries(expected))
         assert.equal(error[key], value);
       if (!["bootstrap-denied", "repository-mismatch"].includes(scenario)) {
         assert.match(error.source_sha, /^[a-f0-9]{40}$/);
-        assert(error.line > 0 && error.column > 0);
+        if (scenario === "missing-configuration") {
+          assert.equal(error.source_sha, missingConfigurationSource);
+          assert.equal(error.line, undefined);
+          assert.equal(error.column, undefined);
+        } else assert(error.line > 0 && error.column > 0);
       }
-      assert(error.elapsed_ms >= 0);
+      assert(Number.isSafeInteger(error.elapsed_ms) && error.elapsed_ms >= 0);
       assert.equal(proof().mutations.length, mutationsBeforeConfiguration);
       const configurationRequests =
         proof().configuration_requests.slice(before);
@@ -1713,6 +1742,7 @@ export async function runActionsTests({
       }
       if (
         [
+          "missing-configuration",
           "variable-credential",
           "invalid-profile",
           "invalid-policy",
@@ -1721,6 +1751,62 @@ export async function runActionsTests({
       )
         upstream("/controller-source", "POST");
     }
+    for (const [scenario, value] of [
+      ["zero", "0"],
+      ["one", "1"],
+    ]) {
+      const start = performance.now();
+      const pinned = JSON.parse(
+        upstream("/controller-source?count=secret", "POST"),
+      );
+      assert.deepEqual(
+        await route("issues", { action: "edited", issue: { number: 8 } }, "", {
+          ORM_CONFIGURATION_SECRETS: JSON.stringify({
+            ...sourceSecrets,
+            COUNT: value,
+          }),
+        }),
+        [],
+      );
+      const resolved = routeLogs.find(
+        (log) =>
+          log.event === "configuration_source_resolved" && log.name === "COUNT",
+      );
+      assert(
+        resolved,
+        "Typed secret source was not resolved by the built controller",
+      );
+      assert.equal(resolved.level, "info");
+      assert.equal(resolved.repository, "owner/repo");
+      assert.equal(resolved.run_id, "100");
+      assert.equal(resolved.run_attempt, "1");
+      assert.equal(resolved.source_sha, pinned.sha);
+      assert.equal(resolved.schema_version, 1);
+      assert.equal(resolved.source, "secret");
+      assert.equal(resolved.section, "limits");
+      assert.equal(resolved.observed, "number");
+      assert(Number.isSafeInteger(resolved.elapsed_ms));
+      const serialized = JSON.stringify(routeLogs);
+      for (const secret of [
+        config.github.token,
+        config.proxy.key,
+        config.session_key,
+        config.bootstrap_token,
+        config.proxy.url,
+        "unused-secret-namespace-model",
+      ])
+        assert(
+          !serialized.includes(secret),
+          "Private configuration reached public diagnostics",
+        );
+      assert.equal(proof().mutations.length, mutationsBeforeConfiguration);
+      completed.push({
+        id: `controller-typed-${scenario}-secret`,
+        outcome: "routed",
+        duration_ms: performance.now() - start,
+      });
+    }
+    upstream("/controller-source", "POST");
     assert.deepEqual(
       await route("issues", { action: "edited", issue: { number: 8 } }),
       [],

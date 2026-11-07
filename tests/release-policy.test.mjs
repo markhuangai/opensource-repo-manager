@@ -38,7 +38,7 @@ const scripts = {
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const notFound = () => Object.assign(new Error("Not Found"), { status: 404 });
 
-function fixture() {
+function fixture(emitLogs = false) {
   const state = {
     releases: [],
     refs: new Map(),
@@ -332,7 +332,10 @@ function fixture() {
     setOutput: (key, value) => {
       state.outputs[key] = value;
     },
-    info: (value) => state.logs.push({ level: "info", ...JSON.parse(value) }),
+    info: (value) => {
+      state.logs.push({ level: "info", ...JSON.parse(value) });
+      if (emitLogs) console.log(value);
+    },
     warning: (value) =>
       state.logs.push({ level: "warning", ...JSON.parse(value) }),
     error: (value) => state.logs.push({ level: "error", ...JSON.parse(value) }),
@@ -758,17 +761,61 @@ describe("actual candidate workflow scripts", () => {
       await state.invoke("resolve");
       expect(state.writes).toEqual([]);
       expect(state.logs.at(-1).outcome).toBe("skipped");
+      expect(state.outputs).toEqual({});
       expect(
-        state.logs.find((log) => log.event === "release.version"),
+        state.logs.find((log) => log.event === "release.base"),
       ).toMatchObject({
         source_sha: source,
         base: "v1.0.0",
-        version: "v1.0.0-rc.1",
       });
       const observed = state.logs.filter((log) => log.event === "release.ci");
       expect(observed).toHaveLength(2);
       expect(observed[0].observed.run_url).toContain("/actions/runs/");
     }
+  });
+  it("skips an unpublished stale source after a newer major candidate without allocating a version", async () => {
+    const state = fixture(true);
+    state.main = "b".repeat(40);
+    state.packageVersion = "2.0.0";
+    state.seed("v2.0.0-rc.1", state.main);
+    const refs = [...state.refs.entries()];
+    await state.invoke("resolve");
+    expect(state.outputs).toEqual({});
+    expect(state.writes).toEqual([]);
+    expect([...state.refs.entries()]).toEqual(refs);
+    expect(
+      state.logs.find((log) => log.event === "release.source"),
+    ).toMatchObject({
+      source_sha: source,
+      main_sha: state.main,
+      comparison: "ahead",
+      require_current_main: true,
+    });
+    expect(state.logs.filter((log) => log.event === "release.ci")).toEqual(
+      ["ci.yml", "codeql.yml"].map((workflow) =>
+        expect.objectContaining({ workflow, source_sha: source, ready: true }),
+      ),
+    );
+    expect(
+      state.logs.find((log) => log.event === "release.skipped"),
+    ).toMatchObject({
+      level: "info",
+      repository,
+      run_id: 123,
+      attempt: 2,
+      stage: "resolve",
+      source_sha: source,
+      package_version: "1.0.0",
+      base: "v1.0.0",
+      reason: "source_superseded_or_ci_incomplete",
+    });
+    expect(state.logs.some((log) => log.event === "release.version")).toBe(
+      false,
+    );
+    expect(state.logs.at(-1)).toMatchObject({
+      event: "release.finished",
+      outcome: "skipped",
+    });
   });
   for (const change of [
     { head_sha: "f".repeat(40) },

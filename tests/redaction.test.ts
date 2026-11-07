@@ -51,4 +51,83 @@ describe("known-secret checks and actual logging", () => {
     expect(result.stderr).not.toContain("logging-secret-canary");
     expect(result.stderr.length).toBeLessThanOrEqual(2049);
   });
+  it.each(["0", "1", "info", "owner/repo"])(
+    "preserves public structured provenance independently of secret %s",
+    (secret) => {
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+        import { createKnownSecretChecker, createSafeLogger } from './src/logging/redact.ts';
+        const logger = createSafeLogger(createKnownSecretChecker([process.argv[1], 'private-settings-canary']));
+        const record = {event:'configuration_load_failed',level:'error',repository:'owner/repo',run_id:'100',run_attempt:'1',issue_number:'70',source_sha:'a01'.repeat(13)+'a',cause:'source_missing',name:'MODEL',line:10,column:1,elapsed_ms:101};
+        logger.infoPublic({...record, level:'info', event:'configuration_resolved', schema_version:1, secret:'private-settings-canary', configuration:{token:'private-settings-canary'}});
+        logger.errorPublic(record);
+        logger.error('private-settings-canary');
+      `,
+          secret,
+        ],
+        { cwd: new URL("../", import.meta.url), encoding: "utf8" },
+      );
+      expect(result.status).toBe(0);
+      const info = JSON.parse(result.stdout.trim()),
+        [error, privateText] = result.stderr.trim().split("\n");
+      expect(info).toMatchObject({
+        event: "configuration_resolved",
+        level: "info",
+        repository: "owner/repo",
+        run_id: "100",
+        run_attempt: "1",
+        issue_number: "70",
+        schema_version: 1,
+        elapsed_ms: 101,
+      });
+      expect(JSON.parse(error)).toMatchObject({
+        event: "configuration_load_failed",
+        level: "error",
+        run_id: "100",
+        run_attempt: "1",
+        issue_number: "70",
+        source_sha: "a01".repeat(13) + "a",
+        cause: "source_missing",
+        name: "MODEL",
+        line: 10,
+        column: 1,
+        elapsed_ms: 101,
+      });
+      expect(result.stdout + result.stderr).not.toContain(
+        "private-settings-canary",
+      );
+      expect(info).not.toHaveProperty("secret");
+      expect(info).not.toHaveProperty("configuration");
+      expect(privateText).toBe("[redacted]");
+    },
+  );
+  it("bounds public records at field boundaries and reports omitted metadata", () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `
+      import { createKnownSecretChecker, createSafeLogger } from './src/logging/redact.ts';
+      const logger = createSafeLogger(createKnownSecretChecker([]), true);
+      logger.infoPublic({event:'configuration_load_failed',level:'error',run_id:'100',cause:'source_missing',recovery:'x'.repeat(4096)});
+    `,
+      ],
+      { cwd: new URL("../", import.meta.url), encoding: "utf8" },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr.length).toBeLessThanOrEqual(2049);
+    expect(JSON.parse(result.stderr.trim())).toEqual({
+      event: "configuration_load_failed",
+      level: "error",
+      run_id: "100",
+      cause: "source_missing",
+      omitted_fields: ["recovery"],
+    });
+  });
 });

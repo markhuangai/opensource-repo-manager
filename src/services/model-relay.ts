@@ -109,6 +109,7 @@ export class ModelRelay {
     let context: Record<string, unknown> | undefined;
     let cause = "request_invalid";
     let providerStatus: number | undefined;
+    let upstreamSignal: AbortSignal | undefined;
     let succeeded = false;
     req.on("aborted", () => controller.abort());
     res.on("close", () => {
@@ -254,6 +255,7 @@ export class ModelRelay {
           Math.max(1, Math.min(2_147_483_647, grant.deadline - Date.now())),
         ),
       ]);
+      upstreamSignal = signal;
       cause = "upstream_transport_failed";
       this.logger.info(
         JSON.stringify({
@@ -407,6 +409,12 @@ export class ModelRelay {
     } catch (error) {
       if (error instanceof RuntimeError) cause = error.code;
       else if (controller.signal.aborted) cause = "request_cancelled";
+      else if (
+        upstreamSignal?.aborted &&
+        upstreamSignal.reason instanceof DOMException &&
+        upstreamSignal.reason.name === "TimeoutError"
+      )
+        cause = "deadline_exceeded";
       this.fail(res, 502);
     } finally {
       if (context) {

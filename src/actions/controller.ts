@@ -100,31 +100,27 @@ try {
     true,
   );
   for (const source of loaded.sources)
-    logger.info(
-      JSON.stringify({
-        event: "configuration_source_resolved",
-        level: "info",
-        ...correlation,
-        repository,
-        operation,
-        source_sha: loaded.pinned.source.sha,
-        schema_version: loaded.configuration.version,
-        ...source,
-        elapsed_ms: Math.round(performance.now() - started),
-      }),
-    );
-  logger.info(
-    JSON.stringify({
-      event: "configuration_resolved",
+    logger.infoPublic({
+      event: "configuration_source_resolved",
       level: "info",
       ...correlation,
       repository,
       operation,
       source_sha: loaded.pinned.source.sha,
       schema_version: loaded.configuration.version,
+      ...source,
       elapsed_ms: Math.round(performance.now() - started),
-    }),
-  );
+    });
+  logger.infoPublic({
+    event: "configuration_resolved",
+    level: "info",
+    ...correlation,
+    repository,
+    operation,
+    source_sha: loaded.pinned.source.sha,
+    schema_version: loaded.configuration.version,
+    elapsed_ms: Math.round(performance.now() - started),
+  });
   delete process.env.ORM_BOOTSTRAP_GITHUB_TOKEN;
   delete process.env.ORM_CONFIGURATION_VARIABLES;
   delete process.env.ORM_CONFIGURATION_SECRETS;
@@ -201,25 +197,23 @@ try {
       : operation === "configuration_load" && (status === 401 || status === 403)
         ? "github_access_denied"
         : "controller_failed";
-  logger.error(
-    JSON.stringify({
-      event:
-        operation === "configuration_load"
-          ? "configuration_load_failed"
-          : "controller_failed",
-      level: "error",
-      operation,
-      ...correlation,
-      cause: reason,
-      outcome: "failed",
-      recovery:
-        operation === "configuration_load"
-          ? "Check the named configuration source and GitHub read access on the default branch, then rerun."
-          : "Inspect the operation and cause, correct the configuration or runtime failure, then rerun.",
-      ...(error instanceof ConfigurationError ? error.diagnostic : {}),
-      elapsed_ms: Math.round(performance.now() - started),
-    }),
-  );
+  logger.errorPublic({
+    event:
+      operation === "configuration_load"
+        ? "configuration_load_failed"
+        : "controller_failed",
+    level: "error",
+    operation,
+    ...correlation,
+    cause: reason,
+    outcome: "failed",
+    recovery:
+      operation === "configuration_load"
+        ? "Check the named configuration source and GitHub read access on the default branch, then rerun."
+        : "Inspect the operation and cause, correct the configuration or runtime failure, then rerun.",
+    ...(error instanceof ConfigurationError ? error.diagnostic : {}),
+    elapsed_ms: Math.round(performance.now() - started),
+  });
   console.log(
     JSON.stringify({
       version: 1,

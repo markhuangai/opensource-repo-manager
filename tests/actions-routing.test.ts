@@ -372,6 +372,27 @@ function operatorConfiguration() {
 }
 
 describe("trusted repository Actions configuration", () => {
+  it("identifies the pinned source when repository configuration is missing before task effects", async () => {
+    const f = await setup();
+    const before = f.remote.state.requests.length;
+    await expect(
+      readActionsConfiguration(
+        f.source,
+        "owner/repo",
+        fixtureConfigurationSources(),
+        signal(),
+      ),
+    ).rejects.toMatchObject({
+      code: "config_unreadable",
+      diagnostic: { source_sha: f.remote.source.sha },
+    });
+    const requests = f.remote.state.requests.slice(before);
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
+    expect(
+      requests.some((request) => request.path.includes("/git/blobs/")),
+    ).toBe(false);
+  });
   it("loads pinned Git blobs, overlays bundles and produces protected validated runtime configuration", async () => {
     const f = await setup();
     const pinned = f.remote.commit(
