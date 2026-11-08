@@ -1451,7 +1451,7 @@ int main(int count, char **values) {
       tree_sha: tree,
       default_branch: "main",
     });
-    assert.equal(aiTestProof.scenarios.length, 10);
+    assert.equal(aiTestProof.scenarios.length, 14);
     assert.equal(aiTestProof.cleanup, "passed");
     tests++;
     assert.equal(
