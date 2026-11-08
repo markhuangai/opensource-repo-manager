@@ -60,7 +60,9 @@ jobs:
         suite:
           - core
           - investigation
-          - bootstrap
+          - bootstrap-node
+          - bootstrap-python
+          - bootstrap-go
           - actions
           - implementation-candidates
           - implementation-recovery

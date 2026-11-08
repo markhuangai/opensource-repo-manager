@@ -4,8 +4,9 @@ on:
   workflow_call:
     inputs:
       runtime-image:
-        description: Immutable runtime image reference including its sha256 digest
-        required: true
+        description: Optional immutable runtime override; defaults to this workflow release's image
+        required: false
+        default: ""
         type: string
       runner:
         description: Compatible Linux AMD64 or ARM64 Docker runner label
@@ -27,15 +28,22 @@ permissions:
   contents: read
 
 jobs:
+  runtime:
+    uses: ./.github/workflows/resolve-runtime.yml
+    with:
+      runtime-image: ${{ inputs.runtime-image }}
+      runner: ${{ inputs.runner }}
+
   test:
     name: Test configured AI profile
+    needs: runtime
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     steps:
       - name: Test one AI response
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
+          ORM_RUNTIME_IMAGE: ${{ needs.runtime.outputs.runtime-image }}
           ORM_TEST_ROLE: ${{ inputs.role }}
           ORM_BOOTSTRAP_GITHUB_TOKEN: ${{ github.token }}
           ORM_CONFIGURATION_SECRETS: ${{ secrets.ORM_CONFIGURATION_SECRETS }}
@@ -48,6 +56,9 @@ jobs:
             const image = process.env.ORM_RUNTIME_IMAGE, role = process.env.ORM_TEST_ROLE;
             assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
             assert(["bootstrap", "investigation", "implementation", "audit", "output_review"].includes(role), "Unknown configured role.");
+            core.info(JSON.stringify({event: "runtime.used", level: "info", repository: process.env.GITHUB_REPOSITORY,
+              run_id: context.runId, attempt: Number(process.env.GITHUB_RUN_ATTEMPT), job: process.env.GITHUB_JOB,
+              operation: "test-ai", role, runtime_image: image}));
             const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-ai-test`;
             await exec.exec("docker", ["pull", image]);
             const environment = ["ORM_BOOTSTRAP_GITHUB_TOKEN", "ORM_CONFIGURATION_SECRETS", "ORM_CONFIGURATION_VARIABLES",

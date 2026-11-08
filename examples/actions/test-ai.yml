@@ -16,9 +16,8 @@ permissions:
 
 jobs:
   test:
-    uses: markhuangai/opensource-repo-manager/.github/workflows/test-ai.yml@REPLACE_WITH_FULL_COMMIT_SHA
+    uses: markhuangai/opensource-repo-manager/.github/workflows/test-ai.yml@v1-prerelease
     with:
-      runtime-image: ghcr.io/markhuangai/opensource-repo-manager@sha256:REPLACE_WITH_64_HEX_DIGEST
       runner: ubuntu-24.04
       role: ${{ inputs.role }}
     secrets:

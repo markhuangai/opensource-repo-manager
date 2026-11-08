@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   containerSuites,
+  bootstrapScenarios,
+  verifyBootstrapReceipt,
   implementationScenarios,
   implementationSdks,
   selectContainerSuites,
@@ -87,8 +89,8 @@ describe("container suite selection", () => {
         selectContainerSuites(["--platform", platform, "--suite", "all"], arch),
       ).toEqual({ platform, suites: containerSuites });
     }
-    expect(containerSuites).toHaveLength(8);
-    expect(new Set(containerSuites).size).toBe(8);
+    expect(containerSuites).toHaveLength(10);
+    expect(new Set(containerSuites).size).toBe(10);
     expect(implementationSdks).toEqual(["codex", "claude"]);
   });
 
@@ -99,9 +101,20 @@ describe("container suite selection", () => {
       ).toEqual({ platform: "linux/arm64", suites: [suite] });
       const selected = selectContainerSuites([]);
       selected.suites.pop();
-      expect(containerSuites).toHaveLength(8);
+      expect(containerSuites).toHaveLength(10);
     });
   }
+
+  it("keeps bootstrap as an aggregate of the three independent groups", () => {
+    for (const [arch, platform] of [
+      ["x64", "linux/amd64"],
+      ["arm64", "linux/arm64"],
+    ])
+      expect(selectContainerSuites(["--suite", "bootstrap"], arch)).toEqual({
+        platform,
+        suites: ["bootstrap-node", "bootstrap-python", "bootstrap-go"],
+      });
+  });
 
   for (const args of [
     ["--suite"],
@@ -117,6 +130,109 @@ describe("container suite selection", () => {
       expect(() => selectContainerSuites(args)).toThrow();
     });
   }
+});
+
+describe("bootstrap group coverage", () => {
+  const expected = {
+    "bootstrap-node": [
+      "claude/npm:passed",
+      "claude/audit-rejection:blocked",
+      "codex/npm:passed",
+      "codex/pnpm:passed",
+      "codex/yarn-classic:passed",
+      "codex/yarn-modern:passed",
+      "codex/audit-rejection:blocked",
+    ],
+    "bootstrap-python": [
+      "codex/pip:passed",
+      "codex/poetry:passed",
+      "codex/uv:passed",
+      "codex/tracked-node-modules:blocked",
+      "codex/manager-directory-symlink:blocked",
+      "codex/manager-lock-symlink:blocked",
+      "codex/private-registry:blocked",
+      "codex/missing-lock:blocked",
+      "codex/root-script:blocked",
+      "codex/package-unavailable:blocked",
+      "codex/toolchain-unavailable:blocked",
+      "codex/lock-mutation:blocked",
+      "codex/stale-lock:blocked",
+      "codex/nested-pins-mutation:blocked",
+      "codex/cancellation-and-concurrency:passed",
+      "codex/stale-revision:passed",
+      "codex/cache-tampering:blocked",
+      "codex/installer-limits:blocked",
+      "codex/partial-install:blocked",
+      "codex/restart-recovery:passed",
+    ],
+    "bootstrap-go": ["codex/go-cgo:passed", "codex/mixed:passed"],
+  };
+  const receipt = (suite) => ({
+    suite,
+    bootstrap: "passed",
+    cleanup: "passed",
+    malicious_mise: "passed",
+    ...(suite === "bootstrap-node" ? { audit_rejection: "passed" } : {}),
+    cases: expected[suite].map((value) => {
+      const [sdk, result] = value.split("/");
+      const [fixture, outcome] = result.split(":");
+      return { sdk, fixture, outcome };
+    }),
+  });
+
+  it("preserves every original fixture, SDK and expected rejection", () => {
+    expect(Object.keys(bootstrapScenarios)).toEqual(Object.keys(expected));
+    expect(Object.values(expected).flat()).toHaveLength(29);
+    for (const [suite, sdks] of Object.entries(bootstrapScenarios))
+      expect(
+        Object.entries(sdks)
+          .flatMap(([sdk, fixtures]) =>
+            Object.entries(fixtures).map(
+              ([fixture, outcome]) => `${sdk}/${fixture}:${outcome}`,
+            ),
+          )
+          .sort(),
+      ).toEqual([...expected[suite]].sort());
+  });
+
+  for (const suite of Object.keys(expected)) {
+    it(`accepts complete ${suite} evidence independently of order`, () => {
+      const proof = receipt(suite);
+      proof.cases.reverse();
+      expect(() => verifyBootstrapReceipt(suite, proof)).not.toThrow();
+    });
+
+    for (const [name, mutate] of [
+      ["missing", (proof) => proof.cases.pop()],
+      ["empty", (proof) => (proof.cases = [])],
+      ["duplicate", (proof) => proof.cases.push(proof.cases[0])],
+      ["wrong SDK", (proof) => (proof.cases[0].sdk = "other")],
+      ["substituted", (proof) => (proof.cases[0].fixture = "other")],
+      ["failed", (proof) => (proof.cases[0].outcome = "failed")],
+      ["wrong outcome", (proof) => (proof.cases[0].outcome = "blocked")],
+      ["wrong group", (proof) => (proof.suite = "other")],
+      ["failed cleanup", (proof) => (proof.cleanup = "failed")],
+      ["failed injection check", (proof) => (proof.malicious_mise = "failed")],
+      ["failed aggregate", (proof) => (proof.bootstrap = "failed")],
+    ])
+      it(`rejects ${name} ${suite} evidence`, () => {
+        const proof = receipt(suite);
+        mutate(proof);
+        expect(() => verifyBootstrapReceipt(suite, proof)).toThrow();
+      });
+  }
+
+  it("rejects an unperformed Node audit rejection check", () => {
+    const proof = receipt("bootstrap-node");
+    delete proof.audit_rejection;
+    expect(() => verifyBootstrapReceipt("bootstrap-node", proof)).toThrow();
+  });
+
+  it("rejects unknown bootstrap groups", () => {
+    expect(() =>
+      verifyBootstrapReceipt("bootstrap", receipt("bootstrap-node")),
+    ).toThrow();
+  });
 });
 
 describe("Actions worker CPU selection", () => {

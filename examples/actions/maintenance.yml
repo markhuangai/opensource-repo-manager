@@ -1,6 +1,6 @@
 name: Repository maintenance
 
-# The pinned image defaults to one bounded Actions task; each invocation exits.
+# ORM selects a compatible immutable image; each bounded invocation exits.
 
 on:
   issues:
@@ -24,9 +24,8 @@ permissions:
 
 jobs:
   maintenance:
-    uses: markhuangai/opensource-repo-manager/.github/workflows/maintenance.yml@REPLACE_WITH_FULL_COMMIT_SHA
+    uses: markhuangai/opensource-repo-manager/.github/workflows/maintenance.yml@v1-prerelease
     with:
-      runtime-image: ghcr.io/markhuangai/opensource-repo-manager@sha256:REPLACE_WITH_64_HEX_DIGEST
       runner: ubuntu-24.04
       issue-number: ${{ inputs.issue-number || '' }}
     secrets:

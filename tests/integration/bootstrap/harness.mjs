@@ -29,6 +29,7 @@ import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { digest } from "/opt/orm/app/dist/domain/agents.js";
 import { respond as codex } from "/agent-fixtures/codex.mjs";
 import { respond as claude } from "/agent-fixtures/claude.mjs";
+import { bootstrapScenarios } from "/container-suites.mjs";
 
 async function listen(server) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -53,7 +54,8 @@ async function files(directory, prefix = "") {
   return result;
 }
 
-export async function runBootstrapTests() {
+export async function runBootstrapTests(suite) {
+  assert(Object.hasOwn(bootstrapScenarios, suite), "Unknown bootstrap suite");
   const timingStarted = performance.now(),
     timings = [];
   const root = "/data/bootstrap-proof",
@@ -193,6 +195,7 @@ export async function runBootstrapTests() {
     timings.push(timing);
     appendFileSync(join(root, "timings.jsonl"), JSON.stringify(timing) + "\n");
   };
+  const recordCase = (details) => proof.push({ ...details, sdk: currentSdk });
   const modelServer = createServer((req, res) =>
     (currentSdk === "codex" ? codex : claude)(req, res, fixture),
   );
@@ -281,7 +284,7 @@ export async function runBootstrapTests() {
     ],
   });
   try {
-    for (const sdk of ["claude", "codex"]) {
+    for (const sdk of Object.keys(bootstrapScenarios[suite])) {
       currentSdk = sdk;
       markPhase("sdk:start");
       const config = parseActionsConfiguration(
@@ -340,19 +343,13 @@ export async function runBootstrapTests() {
         },
       };
       const cases =
-        sdk === "codex"
-          ? [
-              "npm",
-              "pnpm",
-              "yarn-classic",
-              "yarn-modern",
-              "pip",
-              "poetry",
-              "uv",
-              "go-cgo",
-              "mixed",
-            ]
-          : ["npm"];
+        suite === "bootstrap-node"
+          ? sdk === "claude"
+            ? ["npm"]
+            : ["npm", "pnpm", "yarn-classic", "yarn-modern"]
+          : suite === "bootstrap-python"
+            ? ["pip", "poetry", "uv"]
+            : ["go-cgo", "mixed"];
       let lastReceipt;
       const runCase = async (name) => {
         markPhase(`${name}:start`);
@@ -772,9 +769,9 @@ export async function runBootstrapTests() {
         for (const uid of [10001, 10002])
           assert.equal((await userProcesses(uid)).length, 0);
         assert.equal(store.leases().length, 0);
-        proof.push({
-          sdk,
+        recordCase({
           fixture: name,
+          outcome: "passed",
           receipt: receipt.id,
           source_sha: source.sha,
           tool_versions: receipt.environment.tools.map(
@@ -784,36 +781,35 @@ export async function runBootstrapTests() {
         });
         markPhase(`${name}:complete`);
       };
-      // Defer the Go tree until fixtures that repeatedly scan shared tool storage finish.
-      for (const name of cases.filter(
-        (name) => !["go-cgo", "mixed"].includes(name),
-      ))
-        await runCase(name);
-      markPhase("audit-rejection:start");
-      currentPlan = makePlan(["node"], "npm");
-      const source = sourceWith(
-        await files("/bootstrap-fixtures/projects/npm"),
-      );
-      const job = seed(snapshot, source);
-      rejectAudit = true;
-      const before = store.db
-        .prepare("SELECT count(*) AS n FROM bootstrap_commands")
-        .get().n;
-      await assert.rejects(
-        supervisor.bootstrap.prepare(
-          supervisor.request(job.id, "bootstrap"),
-          new globalThis.AbortController().signal,
-        ),
-        /bootstrap_audit_rejected/,
-      );
-      assert.equal(
-        store.db.prepare("SELECT count(*) AS n FROM bootstrap_commands").get()
-          .n,
-        before,
-      );
-      rejectAudit = false;
-      markPhase("audit-rejection:complete");
-      if (sdk === "codex") {
+      for (const name of cases) await runCase(name);
+      if (suite === "bootstrap-node") {
+        markPhase("audit-rejection:start");
+        currentPlan = makePlan(["node"], "npm");
+        const source = sourceWith(
+          await files("/bootstrap-fixtures/projects/npm"),
+        );
+        const job = seed(snapshot, source);
+        rejectAudit = true;
+        const before = store.db
+          .prepare("SELECT count(*) AS n FROM bootstrap_commands")
+          .get().n;
+        await assert.rejects(
+          supervisor.bootstrap.prepare(
+            supervisor.request(job.id, "bootstrap"),
+            new globalThis.AbortController().signal,
+          ),
+          /bootstrap_audit_rejected/,
+        );
+        assert.equal(
+          store.db.prepare("SELECT count(*) AS n FROM bootstrap_commands").get()
+            .n,
+          before,
+        );
+        rejectAudit = false;
+        markPhase("audit-rejection:complete");
+        recordCase({ fixture: "audit-rejection", outcome: "blocked" });
+      }
+      if (suite === "bootstrap-python") {
         markPhase("negative-and-recovery:start");
         const npmFiles = await files("/bootstrap-fixtures/projects/npm");
         const fails = async (label, files, change, pattern) => {
@@ -835,7 +831,7 @@ export async function runBootstrapTests() {
             .get(failed.id);
           assert.equal(JSON.parse(row.receipt_json).status, "blocked");
           assert.equal(store.leases().length, 0);
-          proof.push({ fixture: label, outcome: "blocked" });
+          recordCase({ fixture: label, outcome: "blocked" });
           markPhase(`${label}:complete`);
           return JSON.parse(row.receipt_json).id;
         };
@@ -979,7 +975,7 @@ export async function runBootstrapTests() {
           ),
           /bootstrap_command_failed/,
         );
-        proof.push({ fixture: "stale-lock", outcome: "blocked" });
+        recordCase({ fixture: "stale-lock", outcome: "blocked" });
         markPhase("stale-lock:complete");
         markPhase("nested-pins-mutation:start");
         const nestedPins = await files(
@@ -998,7 +994,7 @@ export async function runBootstrapTests() {
           ),
           /bootstrap_lock_mutated/,
         );
-        proof.push({ fixture: "nested-pins-mutation", outcome: "blocked" });
+        recordCase({ fixture: "nested-pins-mutation", outcome: "blocked" });
         markPhase("nested-pins-mutation:complete");
         currentPlan = makePlan(["node"], "npm");
         currentPlan.setup_commands.push({
@@ -1076,7 +1072,7 @@ export async function runBootstrapTests() {
           assert.equal(store.leases().length, 0);
           for (const uid of [10001, 10002])
             assert.equal((await userProcesses(uid)).length, 0);
-          proof.push({
+          recordCase({
             fixture:
               mode === "cancelled"
                 ? "cancellation-and-concurrency"
@@ -1104,7 +1100,7 @@ export async function runBootstrapTests() {
         } finally {
           await unlink(tamper);
         }
-        proof.push({ fixture: "cache-tampering", outcome: "blocked" });
+        recordCase({ fixture: "cache-tampering", outcome: "blocked" });
         markPhase("cache-tampering:complete");
         markPhase("installer-limits:start");
         const limitedCommands = [];
@@ -1149,7 +1145,7 @@ export async function runBootstrapTests() {
               command.argv.includes(`node@${limitedVersion}`),
           ),
         );
-        proof.push({ fixture: "installer-limits", outcome: "blocked" });
+        recordCase({ fixture: "installer-limits", outcome: "blocked" });
         markPhase("installer-limits:complete");
         const partialVersion = "24.18.1";
         await mkdir(
@@ -1215,14 +1211,10 @@ export async function runBootstrapTests() {
           "interrupted",
         );
         assert.equal(store.bootstrap(lastReceipt.id).status, "ready");
-        proof.push({ fixture: "restart-recovery", outcome: "passed" });
+        recordCase({ fixture: "restart-recovery", outcome: "passed" });
         markPhase("restart-recovery:complete");
         markPhase("negative-and-recovery:complete");
       }
-      for (const name of cases.filter((name) =>
-        ["go-cgo", "mixed"].includes(name),
-      ))
-        await runCase(name);
       markPhase("sdk:complete");
       await supervisor.close();
       supervisor = undefined;
@@ -1278,10 +1270,11 @@ export async function runBootstrapTests() {
       `Bootstrap verification or cleanup failed after ${proof.length} completed scenario groups`,
     );
   return {
+    suite,
     bootstrap: "passed",
     cases: proof,
     timings,
-    audit_rejection: "passed",
+    ...(suite === "bootstrap-node" ? { audit_rejection: "passed" } : {}),
     malicious_mise: "passed",
     cleanup: "passed",
   };
