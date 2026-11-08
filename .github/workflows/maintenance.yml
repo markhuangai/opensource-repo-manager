@@ -86,8 +86,31 @@ jobs:
               Object.assign(common, {workflow_repository: identity.workflow_repository,
                 workflow_ref: identity.workflow_ref, workflow_sha: identity.workflow_sha,
                 check_run_id: identity.check_run_id});
+              stage = "revision";
+              const [owner, repo] = repository.split("/");
+              const request = {signal: AbortSignal.timeout(common.timeout_ms)};
+              let revision, workflowObjectType = "tag";
+              try {
+                revision = await github.rest.git.getTag({owner, repo, tag_sha: identity.workflow_sha, request});
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                workflowObjectType = "commit";
+                revision = await github.rest.git.getCommit({owner, repo, commit_sha: identity.workflow_sha, request});
+              }
+              providerStatus = revision?.status;
+              const object = revision?.data;
+              const sourceSha = workflowObjectType === "tag" ? object?.object?.sha : object?.sha;
+              observed = {revision_capture: capture(JSON.stringify({sha: object?.sha,
+                target_type: object?.object?.type, target_sha: object?.object?.sha}), 16 * 1024)};
+              assert(object?.sha === identity.workflow_sha &&
+                (workflowObjectType === "commit" || object?.object?.type === "commit") &&
+                typeof sourceSha === "string" && /^[a-f0-9]{40}$/.test(sourceSha) && sourceSha.length === 40,
+                "Workflow revision must resolve to its captured commit or a direct commit-target tag.");
+              Object.assign(common, {source_sha: sourceSha, workflow_object_type: workflowObjectType});
+              log("revision", {observed});
               stage = "registry";
-              reference = `${imageRepository}:sha-${identity.workflow_sha}`;
+              observed = providerStatus = undefined;
+              reference = `${imageRepository}:sha-${sourceSha}`;
               log("lookup", {reference});
               const result = await exec.getExecOutput("timeout", ["--kill-after=5s", "60s", "docker",
                 "buildx", "imagetools", "inspect", reference, "--format", "{{json .Manifest}}"],
@@ -110,7 +133,7 @@ jobs:
               catch { throw new Error("Image publication proof is invalid JSON."); }
               observed = {digest: manifest?.digest, proof};
               assert(digest(manifest?.digest) && proof?.version === 2 &&
-                proof.source_sha === identity.workflow_sha, "Image publication proof does not match the workflow source.");
+                proof.source_sha === sourceSha, "Image publication proof does not match the workflow source.");
               const version = typeof proof.release_version === "string" &&
                 proof.release_version.match(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?$/);
               assert(version && version[0] === proof.release_version &&
@@ -132,11 +155,13 @@ jobs:
             } catch (error) {
               const recovery = stage === "input" ? "Supply runtime-image as an immutable @sha256: reference." :
                 stage === "identity" ? "Use a released ORM workflow on GitHub.com, or supply a compatible explicit runtime-image digest." :
+                stage === "revision" ? "Verify GitHub access and the captured ORM tag/commit object; use a published direct commit-target tag or a compatible explicit digest." :
                 stage === "registry" ? "Verify GHCR access and publication for this workflow commit; wait for its release or supply a compatible explicit digest." :
                 "Inspect the public manifest and publication proof; use a matching workflow/image pair or correct the trusted publication.";
               core.setFailed(JSON.stringify({event: "runtime.failed", level: "error", ...common, stage, reference,
-                expected: {source_sha: common.workflow_sha, proof_version: 2, platforms: ["linux/amd64", "linux/arm64"]},
-                observed, provider_status: providerStatus, provider_error: providerError,
+                expected: {source_sha: common.source_sha, proof_version: 2, platforms: ["linux/amd64", "linux/arm64"]},
+                observed, provider_status: stage === "revision" ? error.status ?? providerStatus : providerStatus,
+                provider_error: stage === "revision" ? capture(error.cause?.message ?? error.message, 16 * 1024) : providerError,
                 cause: capture(error.code === "ERR_ASSERTION" ? error.message.split("\n")[0] : error.message, 16 * 1024),
                 elapsed_ms: Date.now() - started, recovery}));
             }
