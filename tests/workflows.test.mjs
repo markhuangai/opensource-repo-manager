@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
 import { containerSuites } from "../scripts/container-suites.mjs";
 
@@ -67,6 +67,7 @@ async function run(
         ...transport.repos,
       },
       actions: { listJobsForWorkflowRun: "jobs", ...transport.actions },
+      git: { ...transport.git },
     },
     paginate: async (kind) => {
       if (kind === "pulls") return pulls ?? [current];
@@ -1189,11 +1190,16 @@ describe.each([
     "Resolve the workflow runtime",
   ).with.script;
   const source = "b".repeat(40);
-  const identity = (ref = "refs/tags/v1-prerelease") => ({
+  const tagObject = "c".repeat(40);
+  const notFound = () => Object.assign(new Error("Not Found"), { status: 404 });
+  const identity = (
+    ref = "refs/tags/v1-prerelease",
+    workflowSha = tagObject,
+  ) => ({
     workflow_repository: "markhuangai/opensource-repo-manager",
     workflow_file_path: `.github/workflows/${name}.yml`,
     workflow_ref: `markhuangai/opensource-repo-manager/.github/workflows/${name}.yml@${ref}`,
-    workflow_sha: source,
+    workflow_sha: workflowSha,
     check_run_id: 456,
   });
   const manifest = () => ({
@@ -1218,10 +1224,41 @@ describe.each([
       }),
     },
   });
-  async function select({ env = {}, response = {}, transportError } = {}) {
-    const calls = [];
+  async function select({
+    env = {},
+    response = {},
+    transportError,
+    git = {},
+  } = {}) {
+    const calls = [],
+      revisionCalls = [];
+    const methods = {
+      getTag: async ({ tag_sha }) => {
+        if (tag_sha !== tagObject) throw notFound();
+        return {
+          status: 200,
+          data: { sha: tagObject, object: { type: "commit", sha: source } },
+        };
+      },
+      getCommit: async ({ commit_sha }) => ({
+        status: 200,
+        data: { sha: commit_sha },
+      }),
+      ...git,
+    };
     const result = await run(runtimeScript, {
       context: { repo: { owner: "consumer", repo: "project" } },
+      transport: {
+        git: Object.fromEntries(
+          Object.entries(methods).map(([method, handler]) => [
+            method,
+            async (args) => {
+              revisionCalls.push({ method, ...args });
+              return handler(args);
+            },
+          ]),
+        ),
+      },
       env: {
         ORM_RUNTIME_IMAGE: "",
         ORM_WORKFLOW_JOB: JSON.stringify(identity()),
@@ -1242,7 +1279,7 @@ describe.each([
         },
       },
     });
-    return { ...result, calls };
+    return { ...result, calls, revisionCalls };
   }
   const failure = (result) => {
     expect(result.outputs).toEqual({});
@@ -1292,16 +1329,16 @@ describe.each([
       step(aiTest.jobs.test, "Test one AI response").env.ORM_RUNTIME_IMAGE,
     ).toBe("${{ needs.runtime.outputs.runtime-image }}");
   });
-  for (const ref of [
-    "refs/tags/v1-prerelease",
-    "refs/tags/v1",
-    "refs/tags/v1.0.0-rc.3",
-    "refs/tags/v1.0.0",
-    source,
+  for (const [ref, workflowSha, objectType] of [
+    ["refs/tags/v1-prerelease", tagObject, "tag"],
+    ["refs/tags/v1", tagObject, "tag"],
+    ["refs/tags/v1.0.0-rc.3", source, "commit"],
+    ["refs/tags/v1.0.0", source, "commit"],
+    [source, source, "commit"],
   ])
     it(`selects the loaded workflow source for ${ref}, independently of caller and alias revisions`, async () => {
       const result = await select({
-        env: { ORM_WORKFLOW_JOB: JSON.stringify(identity(ref)) },
+        env: { ORM_WORKFLOW_JOB: JSON.stringify(identity(ref, workflowSha)) },
       });
       expect(result.failures).toEqual([]);
       expect(result.outputs).toEqual({
@@ -1336,13 +1373,286 @@ describe.each([
         check_run_id: 456,
         mode: "default",
         timeout_ms: 60000,
-        workflow_sha: source,
+        workflow_sha: workflowSha,
+        source_sha: source,
+        workflow_object_type: objectType,
         workflow_ref: identity(ref).workflow_ref,
         runtime_image: result.outputs["runtime-image"],
         release_version: "1.0.0-rc.3",
       });
       expect(resolved.elapsed_ms).toBeGreaterThanOrEqual(0);
+      expect(result.revisionCalls).toMatchObject([
+        {
+          method: "getTag",
+          owner: "markhuangai",
+          repo: "opensource-repo-manager",
+          tag_sha: workflowSha,
+        },
+        ...(objectType === "commit"
+          ? [
+              {
+                method: "getCommit",
+                owner: "markhuangai",
+                repo: "opensource-repo-manager",
+                commit_sha: workflowSha,
+              },
+            ]
+          : []),
+      ]);
+      expect(result.revisionCalls[0].request.signal).toBeInstanceOf(
+        AbortSignal,
+      );
+      if (objectType === "commit")
+        expect(result.revisionCalls[1].request).toBe(
+          result.revisionCalls[0].request,
+        );
+      const revision = result.notices
+        .map(JSON.parse)
+        .find((record) => record.event === "runtime.revision");
+      expect(revision).toMatchObject({
+        level: "info",
+        stage: "revision",
+        workflow_sha: workflowSha,
+        source_sha: source,
+        workflow_object_type: objectType,
+      });
+      expect(JSON.parse(revision.observed.revision_capture.content)).toEqual(
+        objectType === "tag"
+          ? { sha: tagObject, target_type: "commit", target_sha: source }
+          : { sha: source },
+      );
     });
+  it("uses the captured tag object after the alias has moved to a newer release", async () => {
+    const newTagObject = "d".repeat(40),
+      newCommit = "e".repeat(40);
+    const result = await select({
+      git: {
+        getRef: async () => ({
+          data: { object: { type: "tag", sha: newTagObject } },
+        }),
+        getTag: async ({ tag_sha }) => ({
+          status: 200,
+          data: {
+            sha: tag_sha,
+            object: {
+              type: "commit",
+              sha: tag_sha === tagObject ? source : newCommit,
+            },
+          },
+        }),
+      },
+    });
+    expect(result.failures).toEqual([]);
+    expect(result.revisionCalls.map(({ method }) => method)).toEqual([
+      "getTag",
+    ]);
+    expect(result.revisionCalls[0].tag_sha).toBe(tagObject);
+    expect(result.calls[0][1]).toContain(`${image}:sha-${source}`);
+    expect(
+      result.notices
+        .map(JSON.parse)
+        .find((record) => record.event === "runtime.revision").source_sha,
+    ).toBe(source);
+  });
+  for (const status of [401, 403, 429, 500, undefined])
+    it(`fails closed on revision provider error ${status} without commit fallback or registry access`, async () => {
+      const error = Object.assign(new Error("Revision provider unavailable"), {
+        status,
+        cause: new Error("Transport interrupted"),
+        request: { headers: { authorization: "provider-secret-canary" } },
+      });
+      const result = await select({
+        git: {
+          getTag: async () => {
+            throw error;
+          },
+        },
+      });
+      expect(failure(result)).toMatchObject({
+        stage: "revision",
+        workflow_sha: tagObject,
+        timeout_ms: 60000,
+        cause: { content: error.message },
+        provider_error: { content: "Transport interrupted" },
+      });
+      expect(failure(result).provider_status).toBe(status);
+      expect(failure(result).recovery).toContain(
+        "captured ORM tag/commit object",
+      );
+      expect(result.revisionCalls.map(({ method }) => method)).toEqual([
+        "getTag",
+      ]);
+      expect(result.calls).toEqual([]);
+      expect(JSON.stringify(result)).not.toContain("provider-secret-canary");
+    });
+  for (const method of ["getTag", "getCommit"])
+    it(`bounds ${method} with the shared revision deadline before registry access`, async () => {
+      const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
+      const timeout = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockImplementation(() => nativeTimeout(10));
+      try {
+        const result = await select({
+          git: {
+            ...(method === "getCommit"
+              ? {
+                  getTag: async () => {
+                    throw notFound();
+                  },
+                }
+              : {}),
+            [method]: async ({ request }) =>
+              new Promise((resolve, reject) => {
+                request.signal.addEventListener(
+                  "abort",
+                  () => reject(request.signal.reason),
+                  { once: true },
+                );
+              }),
+          },
+        });
+        expect(timeout).toHaveBeenCalledExactlyOnceWith(60000);
+        expect(failure(result)).toMatchObject({
+          stage: "revision",
+          workflow_sha: tagObject,
+          timeout_ms: 60000,
+        });
+        expect(failure(result).cause.content).toContain("timeout");
+        expect(result.revisionCalls.at(-1).method).toBe(method);
+        expect(
+          result.revisionCalls.every(
+            ({ request }) =>
+              request.signal === result.revisionCalls[0].request.signal,
+          ),
+        ).toBe(true);
+        expect(result.calls).toEqual([]);
+      } finally {
+        timeout.mockRestore();
+      }
+    });
+  for (const data of [
+    undefined,
+    { sha: source, object: { type: "commit", sha: source } },
+    { sha: tagObject },
+    ...["tag", "tree", "blob"].map((type) => ({
+      sha: tagObject,
+      object: { type, sha: source },
+    })),
+    ...[undefined, "short", source + "\n", 123].map((sha) => ({
+      sha: tagObject,
+      object: { type: "commit", sha },
+    })),
+  ])
+    it(`rejects malformed or unsupported annotated object ${JSON.stringify(data)}`, async () => {
+      const result = await select({
+        git: { getTag: async () => ({ status: 200, data }) },
+      });
+      expect(failure(result)).toMatchObject({
+        stage: "revision",
+        workflow_sha: tagObject,
+        provider_status: 200,
+      });
+      expect(
+        JSON.parse(failure(result).observed.revision_capture.content),
+      ).toEqual(
+        JSON.parse(
+          JSON.stringify({
+            sha: data?.sha,
+            target_type: data?.object?.type,
+            target_sha: data?.object?.sha,
+          }),
+        ),
+      );
+      expect(result.revisionCalls.map(({ method }) => method)).toEqual([
+        "getTag",
+      ]);
+      expect(result.calls).toEqual([]);
+    });
+  for (const data of [
+    undefined,
+    {},
+    { sha: tagObject },
+    { sha: source + "\n" },
+  ])
+    it(`validates typed commit identity after tag 404: ${JSON.stringify(data)}`, async () => {
+      const result = await select({
+        env: { ORM_WORKFLOW_JOB: JSON.stringify(identity(source, source)) },
+        git: { getCommit: async () => ({ status: 200, data }) },
+      });
+      expect(failure(result)).toMatchObject({
+        stage: "revision",
+        workflow_sha: source,
+        provider_status: 200,
+      });
+      expect(result.revisionCalls.map(({ method }) => method)).toEqual([
+        "getTag",
+        "getCommit",
+      ]);
+      expect(result.revisionCalls[1].commit_sha).toBe(source);
+      expect(result.calls).toEqual([]);
+    });
+  it("reports missing commits and preserves the captured identity after tag 404", async () => {
+    const result = await select({
+      env: { ORM_WORKFLOW_JOB: JSON.stringify(identity(source, source)) },
+      git: {
+        getCommit: async () => {
+          throw notFound();
+        },
+      },
+    });
+    expect(failure(result)).toMatchObject({
+      stage: "revision",
+      workflow_sha: source,
+      provider_status: 404,
+      cause: { content: "Not Found" },
+    });
+    expect(result.revisionCalls.map(({ method }) => method)).toEqual([
+      "getTag",
+      "getCommit",
+    ]);
+    expect(result.calls).toEqual([]);
+  });
+  it("bounds malformed revision evidence without dumping unused provider data", async () => {
+    const result = await select({
+      git: {
+        getTag: async () => ({
+          status: 200,
+          data: {
+            sha: tagObject,
+            object: { type: "commit", sha: "x".repeat(20000) },
+            unused: "provider-secret-canary",
+          },
+        }),
+      },
+    });
+    expect(
+      failure(result).observed.revision_capture.omitted_bytes,
+    ).toBeGreaterThan(0);
+    expect(
+      Buffer.byteLength(failure(result).observed.revision_capture.content),
+    ).toBeLessThanOrEqual(16 * 1024);
+    expect(JSON.stringify(result)).not.toContain("provider-secret-canary");
+    expect(result.calls).toEqual([]);
+  });
+  it("rejects a publication proof that names the tag object instead of its commit", async () => {
+    const value = manifest();
+    const annotation = "org.opensource-repo-manager.publication";
+    value.annotations[annotation] = JSON.stringify({
+      ...JSON.parse(value.annotations[annotation]),
+      source_sha: tagObject,
+    });
+    const result = await select({
+      response: { stdout: JSON.stringify(value) },
+    });
+    expect(failure(result)).toMatchObject({
+      stage: "proof",
+      workflow_sha: tagObject,
+      source_sha: source,
+      expected: { source_sha: source },
+      observed: { proof: { source_sha: tagObject } },
+    });
+    expect(result.calls[0][1]).toContain(`${image}:sha-${source}`);
+  });
   for (const override of [
     `${image}@${digest("a")}`,
     `registry.example:5000/custom/runtime@${digest("b")}`,
@@ -1354,6 +1664,7 @@ describe.each([
       expect(result.failures).toEqual([]);
       expect(result.outputs["runtime-image"]).toBe(override);
       expect(result.calls).toEqual([]);
+      expect(result.revisionCalls).toEqual([]);
       expect(result.notices.map(JSON.parse).at(-1)).toMatchObject({
         event: "runtime.resolved",
         mode: "override",
@@ -1374,6 +1685,7 @@ describe.each([
         cause: { content: "runtime-image must be pinned by digest." },
       });
       expect(result.calls).toEqual([]);
+      expect(result.revisionCalls).toEqual([]);
       expect(JSON.stringify(result)).not.toContain(override);
     });
   for (const value of [
@@ -1400,6 +1712,7 @@ describe.each([
         mode: "default",
       });
       expect(result.calls).toEqual([]);
+      expect(result.revisionCalls).toEqual([]);
       expect(JSON.stringify(result)).not.toContain("identity-secret-canary");
     });
   for (const [exitCode, stderr, cause] of [
@@ -1417,7 +1730,8 @@ describe.each([
         run_id: 123,
         attempt: 1,
         check_run_id: 456,
-        workflow_sha: source,
+        workflow_sha: tagObject,
+        source_sha: source,
         reference: `${image}:sha-${source}`,
         provider_status: exitCode,
         provider_error: { content: stderr, omitted_bytes: 0 },
@@ -1437,6 +1751,8 @@ describe.each([
       cause: { content: "Unable to locate executable file: timeout" },
     });
     expect(result.calls).toHaveLength(1);
+    expect(failure(result).provider_status).toBeUndefined();
+    expect(failure(result).observed).toBeUndefined();
   });
   it("retains invalid manifest evidence and reports oversized captures explicitly", async () => {
     const invalid = await select({
