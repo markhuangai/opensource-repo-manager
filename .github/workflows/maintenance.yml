@@ -30,10 +30,116 @@ permissions:
 
 jobs:
   runtime:
-    uses: ./.github/workflows/resolve-runtime.yml
-    with:
-      runtime-image: ${{ inputs.runtime-image }}
-      runner: ${{ inputs.runner }}
+    name: Select compatible runtime
+    permissions:
+      contents: read
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    outputs:
+      runtime-image: ${{ steps.runtime.outputs.runtime-image }}
+    steps:
+      - name: Resolve the workflow runtime
+        id: runtime
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ORM_RUNTIME_IMAGE: ${{ inputs.runtime-image }}
+          # actionlint 1.7.12 predates the job.workflow_* identity fields.
+          ORM_WORKFLOW_JOB: ${{ toJSON(job) }}
+        with:
+          script: |
+            const assert = require("node:assert/strict");
+            const { StringDecoder } = require("node:string_decoder");
+            const started = Date.now(), input = process.env.ORM_RUNTIME_IMAGE ?? "";
+            const repository = "markhuangai/opensource-repo-manager";
+            const imageRepository = `ghcr.io/${repository}`;
+            const digest = value => typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value) && value.length === 71;
+            const common = {repository: `${context.repo.owner}/${context.repo.repo}`,
+              run_id: context.runId, attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+              job: process.env.GITHUB_JOB, mode: input === "" ? "default" : "override", timeout_ms: 60000};
+            let stage = "input", reference, observed, providerStatus, providerError;
+            const capture = (value, limit) => {
+              const bytes = Buffer.from(value ?? "");
+              const content = new StringDecoder("utf8").write(bytes.subarray(0, limit));
+              return {content, bytes: bytes.length, omitted_bytes: bytes.length - Buffer.byteLength(content)};
+            };
+            const log = (event, fields = {}) => core.info(JSON.stringify({event: `runtime.${event}`,
+              level: "info", ...common, stage, elapsed_ms: Date.now() - started, ...fields}));
+            try {
+              log("started");
+              if (input !== "") {
+                assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(input),
+                  "runtime-image must be pinned by digest.");
+                log("resolved", {runtime_image: input});
+                core.setOutput("runtime-image", input);
+                return;
+              }
+              stage = "identity";
+              let identity;
+              try { identity = JSON.parse(process.env.ORM_WORKFLOW_JOB); }
+              catch { throw new Error("Called workflow identity is unavailable."); }
+              assert(identity?.workflow_repository === repository &&
+                identity.workflow_file_path === ".github/workflows/maintenance.yml" &&
+                typeof identity.workflow_ref === "string" &&
+                identity.workflow_ref.startsWith(`${repository}/.github/workflows/maintenance.yml@`) &&
+                typeof identity.workflow_sha === "string" && /^[a-f0-9]{40}$/.test(identity.workflow_sha) &&
+                identity.workflow_sha.length === 40, "Called ORM workflow identity is unavailable or invalid.");
+              Object.assign(common, {workflow_repository: identity.workflow_repository,
+                workflow_ref: identity.workflow_ref, workflow_sha: identity.workflow_sha,
+                check_run_id: identity.check_run_id});
+              stage = "registry";
+              reference = `${imageRepository}:sha-${identity.workflow_sha}`;
+              log("lookup", {reference});
+              const result = await exec.getExecOutput("timeout", ["--kill-after=5s", "60s", "docker",
+                "buildx", "imagetools", "inspect", reference, "--format", "{{json .Manifest}}"],
+                {silent: true, ignoreReturnCode: true});
+              providerStatus = result.exitCode;
+              providerError = capture(result.stderr, 16 * 1024);
+              assert(result.exitCode === 0, result.exitCode === 124 || result.exitCode === 137 ?
+                "Registry inspection timed out." : "Registry inspection failed.");
+              stage = "manifest";
+              const manifestCapture = capture(result.stdout, 64 * 1024);
+              observed = {manifest_capture: manifestCapture};
+              assert(manifestCapture.omitted_bytes === 0, "Registry manifest exceeds the 64 KiB capture limit.");
+              let manifest;
+              try { manifest = JSON.parse(result.stdout); }
+              catch { throw new Error("Registry returned invalid manifest JSON."); }
+              log("manifest", {reference, manifest});
+              stage = "proof";
+              let proof;
+              try { proof = JSON.parse(manifest?.annotations?.["org.opensource-repo-manager.publication"] ?? "null"); }
+              catch { throw new Error("Image publication proof is invalid JSON."); }
+              observed = {digest: manifest?.digest, proof};
+              assert(digest(manifest?.digest) && proof?.version === 2 &&
+                proof.source_sha === identity.workflow_sha, "Image publication proof does not match the workflow source.");
+              const version = typeof proof.release_version === "string" &&
+                proof.release_version.match(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?$/);
+              assert(version && version[0] === proof.release_version &&
+                version.slice(1).every(part => part === undefined || Number.isSafeInteger(Number(part))),
+                "Image publication version is invalid.");
+              assert(Array.isArray(proof.platforms) && proof.platforms.length === 2 &&
+                proof.platforms[0]?.platform === "linux/amd64" && proof.platforms[1]?.platform === "linux/arm64" &&
+                proof.platforms.every(item => digest(item.platform_digest)), "Both native platform proofs are required.");
+              assert(Array.isArray(manifest.manifests) &&
+                manifest.manifests.every(item => item && typeof item === "object"), "A combined image index is required.");
+              const runnable = manifest.manifests.filter(item =>
+                item.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest")
+                .map(item => ({platform: `${item.platform?.os}/${item.platform?.architecture}`,
+                  platform_digest: item.digest})).sort((a, b) => a.platform.localeCompare(b.platform));
+              assert.deepEqual(runnable, proof.platforms, "Manifest differs from the smoke-tested platforms.");
+              const image = `${imageRepository}@${manifest.digest}`;
+              log("resolved", {reference, runtime_image: image, release_version: proof.release_version, platforms: proof.platforms});
+              core.setOutput("runtime-image", image);
+            } catch (error) {
+              const recovery = stage === "input" ? "Supply runtime-image as an immutable @sha256: reference." :
+                stage === "identity" ? "Use a released ORM workflow on GitHub.com, or supply a compatible explicit runtime-image digest." :
+                stage === "registry" ? "Verify GHCR access and publication for this workflow commit; wait for its release or supply a compatible explicit digest." :
+                "Inspect the public manifest and publication proof; use a matching workflow/image pair or correct the trusted publication.";
+              core.setFailed(JSON.stringify({event: "runtime.failed", level: "error", ...common, stage, reference,
+                expected: {source_sha: common.workflow_sha, proof_version: 2, platforms: ["linux/amd64", "linux/arm64"]},
+                observed, provider_status: providerStatus, provider_error: providerError,
+                cause: capture(error.code === "ERR_ASSERTION" ? error.message.split("\n")[0] : error.message, 16 * 1024),
+                elapsed_ms: Date.now() - started, recovery}));
+            }
 
   resolve:
     name: Resolve maintenance issues

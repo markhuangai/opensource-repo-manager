@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { readdir } from "node:fs/promises";
+import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { userProcesses } from "/opt/orm/app/dist/runtime/process.js";
 
@@ -125,7 +126,7 @@ export async function verifyAiTest(configuration, source) {
     void respondAiTest(req, res, profile, configuration.proxy.key, mode)
       .then((body) => {
         assert(!JSON.stringify(body).includes(configuration.github.token));
-        reached = true;
+        reached ||= !req.url.endsWith("count_tokens");
       })
       .catch((error) => {
         errors.push(error);
@@ -143,15 +144,27 @@ export async function verifyAiTest(configuration, source) {
         "empty",
         "cancelled",
         "deadline",
+        "deadline-before-timer",
+        "cancelled-after-deadline",
       ]) {
+        const clockAdvance = [
+          "deadline-before-timer",
+          "cancelled-after-deadline",
+        ].includes(scenario);
         const config = globalThis.structuredClone(configuration);
         config.proxy.url = endpoint;
         config.limits.active_minutes =
-          scenario === "deadline" ? 1 : config.limits.active_minutes;
+          scenario === "deadline" || clockAdvance
+            ? 1
+            : config.limits.active_minutes;
         profile = { sdk, model: `proxy/${sdk}-probe`, effort: "high" };
         config.profiles[config.roles.audit.profile] = profile;
-        mode = ["cancelled", "deadline"].includes(scenario) ? "hold" : scenario;
+        mode =
+          ["cancelled", "deadline"].includes(scenario) || clockAdvance
+            ? "hold"
+            : scenario;
         reached = false;
+        const caseStarted = performance.now();
         const child = spawn(
           process.execPath,
           [
@@ -160,8 +173,14 @@ export async function verifyAiTest(configuration, source) {
             `
           import {testAiConfiguration} from '/opt/orm/app/dist/actions/test-ai.js';
           let input=''; for await (const chunk of process.stdin) input+=chunk;
-          const {config,source}=JSON.parse(input); const controller=new AbortController();
+          const {config,source,scenario}=JSON.parse(input); const controller=new AbortController();
           process.once('SIGTERM',()=>controller.abort());
+          const wallNow=Date.now;
+          process.once('SIGUSR2',()=>{
+            Date.now=()=>wallNow()+60000;
+            console.error(JSON.stringify({event:'fixture.clock.advanced',advance_ms:60000}));
+            if(scenario==='cancelled-after-deadline') controller.abort();
+          });
           const result=await testAiConfiguration(config,'audit',source,controller.signal);
           console.log(JSON.stringify(result)); process.exitCode=result.outcome==='completed'?0:1;
         `,
@@ -180,14 +199,14 @@ export async function verifyAiTest(configuration, source) {
           child.once("error", reject);
           child.once("close", resolve);
         });
-        child.stdin.end(JSON.stringify({ config, source }));
-        if (scenario === "cancelled") {
+        child.stdin.end(JSON.stringify({ config, source, scenario }));
+        if (scenario === "cancelled" || clockAdvance) {
           const until = Date.now() + 45000;
           while (!reached && child.exitCode === null) {
             assert(Date.now() < until, "AI probe did not reach upstream");
             await delay(25);
           }
-          child.kill("SIGTERM");
+          child.kill(clockAdvance ? "SIGUSR2" : "SIGTERM");
         }
         const code = await exited;
         assert(
@@ -201,9 +220,17 @@ export async function verifyAiTest(configuration, source) {
           stdout + stderr,
         );
         assert.equal(code, scenario === "success" ? 0 : 1, stderr);
-        if (scenario === "cancelled") assert.equal(result.reason, "cancelled");
-        if (scenario === "deadline")
-          assert.equal(result.reason, "ai_test_timeout");
+        const diagnostic = JSON.stringify({ sdk, scenario, result, stderr });
+        if (["cancelled", "cancelled-after-deadline"].includes(scenario))
+          assert.equal(result.reason, "cancelled", diagnostic);
+        if (["deadline", "deadline-before-timer"].includes(scenario))
+          assert.equal(result.reason, "ai_test_timeout", diagnostic);
+        if (["rejected", "empty"].includes(scenario))
+          assert.equal(result.reason, "ai_interaction_failed", diagnostic);
+        if (clockAdvance) {
+          assert(performance.now() - caseStarted < 60000, diagnostic);
+          assert(result.elapsed_ms >= 60000, diagnostic);
+        }
         assert.equal(result.sdk, sdk);
         assert.equal(result.role, "audit");
         assert.equal(result.cleanup, "passed");
@@ -222,12 +249,14 @@ export async function verifyAiTest(configuration, source) {
           .split("\n")
           .filter((line) => line.startsWith("{"))
           .map((line) => JSON.parse(line));
-        assert(
-          logs.some(
-            (log) =>
-              log.event === "ai.test.finished" && log.cleanup === "passed",
-          ),
-        );
+        const finished = logs.find((log) => log.event === "ai.test.finished");
+        assert.equal(finished?.cleanup, "passed");
+        assert.equal(finished.run_id, result.run_id);
+        assert.equal(finished.reason, result.reason);
+        if (clockAdvance) {
+          assert(logs.some((log) => log.event === "fixture.clock.advanced"));
+          assert(finished.worker_completed_at >= finished.deadline, diagnostic);
+        }
         if (scenario === "rejected")
           assert(
             logs.some(

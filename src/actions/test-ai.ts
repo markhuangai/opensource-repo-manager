@@ -86,6 +86,7 @@ export async function testAiConfiguration(
   let rootCreated = false,
     cleanupFailed = false;
   let reason: string;
+  let workerCompletedAt: number | undefined;
   let monitor: ReturnType<typeof setInterval> | undefined;
   let monitoring: Promise<void> | undefined;
   let termination: Promise<void> | undefined;
@@ -264,7 +265,10 @@ export async function testAiConfiguration(
       child.stdin!.end(JSON.stringify(request));
       if (controller.signal.aborted) terminate();
     });
+    workerCompletedAt = Date.now();
     controller.signal.throwIfAborted();
+    if (workerCompletedAt >= deadline)
+      throw new RuntimeError("ai_test_timeout");
     if (
       code !== 0 ||
       pending.length ||
@@ -317,6 +321,8 @@ export async function testAiConfiguration(
       event: "ai.test.finished",
       level: result.outcome === "completed" ? "info" : "error",
       ...result,
+      deadline,
+      worker_completed_at: workerCompletedAt,
     }),
   );
   return result;

@@ -22,7 +22,7 @@ const promotion = await workflow("promote-release");
 const ci = await workflow("ci");
 const codeql = await workflow("codeql");
 const maintenance = await workflow("maintenance");
-const runtimeSelection = await workflow("resolve-runtime");
+const aiTest = await workflow("test-ai");
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const step = (job, name) => job.steps.find((entry) => entry.name === name);
 const sha = "a".repeat(40);
@@ -525,7 +525,7 @@ describe("release and CI boundaries", () => {
       release,
       promotion,
       maintenance,
-      runtimeSelection,
+      aiTest,
     ]) {
       for (const job of Object.values(document.jobs)) {
         for (const entry of job.steps ?? []) {
@@ -1180,16 +1180,19 @@ describe("native image smoke receipts", () => {
   }
 });
 
-const runtimeScript = step(
-  runtimeSelection.jobs.resolve,
-  "Resolve the workflow runtime",
-).with.script;
-describe("release-bound runtime selection", () => {
+describe.each([
+  ["maintenance", maintenance],
+  ["test-ai", aiTest],
+])("release-bound runtime selection (%s)", (name, document) => {
+  const runtimeScript = step(
+    document.jobs.runtime,
+    "Resolve the workflow runtime",
+  ).with.script;
   const source = "b".repeat(40);
   const identity = (ref = "refs/tags/v1-prerelease") => ({
     workflow_repository: "markhuangai/opensource-repo-manager",
-    workflow_file_path: ".github/workflows/resolve-runtime.yml",
-    workflow_ref: `markhuangai/opensource-repo-manager/.github/workflows/resolve-runtime.yml@${ref}`,
+    workflow_file_path: `.github/workflows/${name}.yml`,
+    workflow_ref: `markhuangai/opensource-repo-manager/.github/workflows/${name}.yml@${ref}`,
     workflow_sha: source,
     check_run_id: 456,
   });
@@ -1222,7 +1225,7 @@ describe("release-bound runtime selection", () => {
       env: {
         ORM_RUNTIME_IMAGE: "",
         ORM_WORKFLOW_JOB: JSON.stringify(identity()),
-        GITHUB_JOB: "resolve",
+        GITHUB_JOB: "runtime",
         GITHUB_SHA: sha,
         ...env,
       },
@@ -1246,37 +1249,32 @@ describe("release-bound runtime selection", () => {
     expect(result.failures).toHaveLength(1);
     return JSON.parse(result.failures[0]);
   };
-  it("shares one resolver per invocation without forwarding configuration or increasing permissions", () => {
-    expect(runtimeSelection.permissions).toEqual({ contents: "read" });
-    expect(runtimeSelection.on.workflow_call.secrets).toBeUndefined();
-    expect(
-      runtimeSelection.on.workflow_call.outputs["runtime-image"].value,
-    ).toBe("${{ jobs.resolve.outputs.runtime-image }}");
+  it("resolves within the called workflow without nesting, forwarding configuration or increasing permissions", () => {
+    expect(document.jobs.runtime).toMatchObject({
+      permissions: { contents: "read" },
+      "runs-on": "${{ inputs.runner }}",
+      "timeout-minutes": 10,
+      outputs: {
+        "runtime-image": "${{ steps.runtime.outputs.runtime-image }}",
+      },
+    });
+    expect(document.jobs.runtime.secrets).toBeUndefined();
     const selectionStep = step(
-      runtimeSelection.jobs.resolve,
+      document.jobs.runtime,
       "Resolve the workflow runtime",
     );
     expect(selectionStep.env).toEqual({
       ORM_RUNTIME_IMAGE: "${{ inputs.runtime-image }}",
       ORM_WORKFLOW_JOB: "${{ toJSON(job) }}",
     });
-    for (const document of [maintenance, aiTest]) {
-      expect(document.on.workflow_call.inputs["runtime-image"]).toMatchObject({
-        type: "string",
-        required: false,
-        default: "",
-      });
-      expect(document.jobs.runtime).toEqual({
-        uses: "./.github/workflows/resolve-runtime.yml",
-        with: {
-          "runtime-image": "${{ inputs.runtime-image }}",
-          runner: "${{ inputs.runner }}",
-        },
-      });
-      expect(
-        Object.values(document.jobs).filter((job) => job.uses),
-      ).toHaveLength(1);
-    }
+    expect(document.on.workflow_call.inputs["runtime-image"]).toMatchObject({
+      type: "string",
+      required: false,
+      default: "",
+    });
+    expect(Object.values(document.jobs).filter((job) => job.uses)).toHaveLength(
+      0,
+    );
     expect(maintenance.jobs.resolve.needs).toBe("runtime");
     expect(maintenance.jobs.resolve.outputs["runtime-image"]).toBe(
       "${{ needs.runtime.outputs.runtime-image }}",
@@ -1334,7 +1332,7 @@ describe("release-bound runtime selection", () => {
         repository: "consumer/project",
         run_id: 123,
         attempt: 1,
-        job: "resolve",
+        job: "runtime",
         check_run_id: 456,
         mode: "default",
         timeout_ms: 60000,
@@ -1658,7 +1656,6 @@ describe("release-bound runtime selection", () => {
   });
 });
 
-const aiTest = await workflow("test-ai");
 const aiTestScript = step(aiTest.jobs.test, "Test one AI response").with.script;
 const aiTestCleanup = step(aiTest.jobs.test, "Remove the AI test container")
   .with.script;
