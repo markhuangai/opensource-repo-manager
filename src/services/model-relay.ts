@@ -407,6 +407,11 @@ export class ModelRelay {
           if (![...matchers.values()].some((matcher) => matcher.pending))
             await flush();
         } catch (error) {
+          if (
+            error instanceof RuntimeError &&
+            error.code === "relay_frame_limit"
+          )
+            failureBody = undefined;
           if (failureBody !== undefined)
             failureBody = this.protectFrameFragments(failureBody, prefixes);
           if (error instanceof SyntaxError) {

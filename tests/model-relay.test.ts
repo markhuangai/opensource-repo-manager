@@ -173,6 +173,7 @@ describe("scoped model relay", () => {
           "invalid-credential-json",
           "client-json",
           "backpressure",
+          "frame-budget",
           "rejected-interrupted",
           "rejected-cancelled",
           "concurrent",
@@ -250,6 +251,15 @@ describe("scoped model relay", () => {
           const text='validated-payload-canary '+'x'.repeat(512000);
           const value=sdk==='claude'?{type:'content_block_delta',index:0,delta:{type:'text_delta',text}}:{type:'response.output_text.delta',output_index:0,content_index:0,delta:text};
           res.end(('data: '+JSON.stringify(value)+'\\n\\n').repeat(48));
+        }
+        if(mode==='frame-budget') {
+          res.setHeader('content-type','text/event-stream');
+          const payload=Array.from({length:20},(_,index)=>{
+            const text='validated-payload-canary-'+index;
+            const value=sdk==='claude'?{type:'content_block_delta',index,delta:{type:'text_delta',text}}:{type:'response.output_text.delta',output_index:index,content_index:0,delta:text};
+            return 'data: '+JSON.stringify(value)+'\\n\\n';
+          }).join('');
+          res.end(payload);
         }
         if(mode==='transport') req.socket.destroy();
         if(mode==='runtime') {
@@ -375,7 +385,9 @@ describe("scoped model relay", () => {
         mode,
       )
         ? null
-        : 502,
+        : mode === "frame-budget"
+          ? 200
+          : 502,
       requests: mode === "concurrent" ? 2 : 1,
       charged: mode === "concurrent" ? 2 : 1,
       caller_aborted: false,
@@ -437,6 +449,7 @@ describe("scoped model relay", () => {
         "sse-fragmented-tool-array-error": "relay_response_invalid",
         "rejected-malformed": "upstream_rejected",
         backpressure: "request_cancelled",
+        "frame-budget": "relay_frame_limit",
         "invalid-json": "relay_response_invalid",
         "invalid-credential-json": "relay_response_invalid",
         "rejected-interrupted": "upstream_rejected",
@@ -642,6 +655,12 @@ describe("scoped model relay", () => {
       }
     }
     if (mode === "backpressure") {
+      expect(body).toBe("");
+      expect(result.stderr).not.toContain("validated-payload-canary");
+    }
+    if (mode === "frame-budget") {
+      expect(apiFailure.status).toBe(200);
+      expect(JSON.parse(causes).code).toBe("relay_frame_limit");
       expect(body).toBe("");
       expect(result.stderr).not.toContain("validated-payload-canary");
     }
