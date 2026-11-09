@@ -77,17 +77,23 @@ function observeBody(
   exchange: ReturnType<ApiDiagnostics["start"]>,
   finishOnEnd = true,
 ) {
-  const prefix: Buffer[] = [];
+  const prefix: Buffer[] | undefined = finishOnEnd ? undefined : [];
   let captured = 0,
     received = 0;
   const failed = (error: unknown) =>
     exchange.fail(error, {
       status: response.statusCode,
       headers: response.headers,
-      body: new StringDecoder("utf8").write(Buffer.concat(prefix)),
+      body: prefix
+        ? new StringDecoder("utf8").write(Buffer.concat(prefix))
+        : undefined,
       capture: {
         capture_state: "read_failed",
         received_bytes: received,
+        ...(!prefix && {
+          captured_bytes: 0,
+          body_capture: "excluded_successful_response",
+        }),
         omitted_bytes: -1,
       },
     });
@@ -97,9 +103,11 @@ function observeBody(
     if (name === "data") {
       const chunk = values[0] as Buffer;
       received += chunk.length;
-      const next = chunk.subarray(0, Math.max(0, apiCaptureLimit - captured));
-      if (next.length) prefix.push(next);
-      captured += next.length;
+      if (prefix) {
+        const next = chunk.subarray(0, Math.max(0, apiCaptureLimit - captured));
+        if (next.length) prefix.push(next);
+        captured += next.length;
+      }
     } else if (name === "end" && finishOnEnd)
       exchange.finish(response.statusCode, response.headers);
     else if (name === "close") {

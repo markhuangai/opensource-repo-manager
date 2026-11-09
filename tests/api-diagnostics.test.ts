@@ -20,22 +20,30 @@ function run(mode: string, credential = "actual-credential-canary") {
     const credentials=createKnownSecretChecker([credential]);
     const diagnostics=createApiDiagnostics({...credentials,redact:createKnownSecretChecker(['0','1','Denied']).redact,redactCredentials:credentials.redact},{repository:'owner/repo',issue_number:22});
     const message='Denied for issue 22 with status 403; request 100. '+('雪\\n"'.repeat(mode==='large'?12000:1))+' actual-credential-canary';
-    const headerMessage='Provider access denied with context 0 and 1\\nAuthorization: Bearer header-auth-canary\\nProxy-Authorization: Basic header-proxy-canary\\nCookie: session=header-cookie-canary\\nSet-Cookie: session=header-set-cookie-canary; HttpOnly\\nX-Api-Key: unregistered-xapi-canary\\nApi-Key: unregistered-api-canary\\nProvider key link https://storage.invalid/file?x-api-key=url-api-canary\\nProvider reason ends';
+    const headerMessage='Provider access denied with context 0 and 1\\nAuthorization: Bearer header-auth-canary\\nProxy-Authorization: Basic header-proxy-canary\\nCookie: session=header-cookie-canary\\nSet-Cookie: session=header-set-cookie-canary; HttpOnly\\nX-Api-Key: unregistered-xapi-canary\\nApi-Key: unregistered-api-canary\\nProvider key link https://storage.invalid/file?x-api-key=url-api-canary\\nProvider inline authentication context 100 request sent Authorization: Bearer inline-auth-canary\\nProvider reason ends';
     const server=createServer((req,res)=>{
       requests.push(req.method+' '+req.url);req.resume();
       res.setHeader('content-type','application/json');res.setHeader('x-github-request-id','provider-request-100');
       res.setHeader('x-accepted-github-permissions','issues=write');
       res.setHeader('authorization','server-authorization-canary');
       if(mode==='transport') {req.socket.destroy();return;}
+      if(mode==='success-interrupted') {res.writeHead(200);res.write(JSON.stringify({content:Buffer.from('successful-configuration-payload-canary').toString('base64')}).slice(0,-1));setTimeout(()=>res.destroy(),20);return;}
+      if(mode==='expanded') {res.writeHead(403);res.end(JSON.stringify({message:'Request denied 100. '+'z '.repeat(180000)}));return;}
+      if(mode.startsWith('preserve-')) {
+        res.writeHead(404);
+        if(mode==='preserve-large') res.end(JSON.stringify({detail:'x'.repeat(1100000),message:'Branch not protected'}));
+        else {res.write('{"detail":"initial prefix",');setTimeout(()=>res.end('"message":"Branch not protected"}'),6100);}
+        return;
+      }
       if(mode.startsWith('credential-')) {
         const encoded=JSON.stringify(credential).slice(1,-1), opening='{"message":"Denied for issue 22; context 0 and 1. ';
         res.writeHead(403);
         if(mode==='credential-limit') res.end(opening+'x'.repeat(1024*1024-encoded.length+1-Buffer.byteLength(opening))+encoded+'"}');
-        else {res.write(opening+encoded.slice(0,-1));if(mode==='credential-disconnect')setTimeout(()=>res.destroy(),20);}
+        else {res.write(opening+encoded.slice(0,-1));if(mode==='credential-disconnect')setTimeout(()=>res.destroy(),20);else setTimeout(()=>res.end(encoded.slice(-1)+'"}'),6100);}
         return;
       }
       if(mode==='complete-prefix') {res.writeHead(403,{'content-type':'text/plain'});res.end('Denied for issue 22; context 0 and 1; ordinary a');return;}
-      if(mode==='timeout' || mode==='interrupted') {res.writeHead(403);res.write('failure begins');if(mode==='interrupted')setTimeout(()=>res.destroy(),20);return;}
+      if(mode==='timeout' || mode==='interrupted') {res.writeHead(403);res.write('failure begins');if(mode==='interrupted')setTimeout(()=>res.destroy(),20);else setTimeout(()=>res.end(),6100);return;}
       if(mode==='enrollment' && req.method==='GET') {res.writeHead(404);res.end(JSON.stringify({message:'label missing'}));return;}
       if(mode==='success') {res.end(JSON.stringify({message:'success-private-body-canary'}));return;}
       if(mode==='headers') {res.writeHead(403,{'content-type':'text/plain'});res.end(headerMessage);return;}
@@ -48,13 +56,13 @@ function run(mode: string, credential = "actual-credential-canary") {
     await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
     const base='http://127.0.0.1:'+server.address().port;
     const client=createGitHubClient('owner/repo',credential,diagnostics,base);
-    let code;
+    let code,consumerMessagePreserved;
     try {
       if(mode==='enrollment') await new OctokitWriter('owner/repo',client).enrollManaged(22,new AbortController().signal);
       else await client.request(mode==='graphql'?'POST /graphql':'GET /repos/{owner}/{repo}',{owner:'owner',repo:'repo'});
-    } catch(error) {code=error.code??error.status;}
+    } catch(error) {code=error.code??error.status;if(mode.startsWith('preserve-'))consumerMessagePreserved=error.response?.data?.message==='Branch not protected';}
     finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
-    console.log(JSON.stringify({code,requests,message:mode==='large'?message.replaceAll('actual-credential-canary','[redacted]'):undefined}));
+    console.log(JSON.stringify({code,requests,consumerMessagePreserved,message:mode==='large'?message.replaceAll('actual-credential-canary','[redacted]'):undefined}));
   `,
       mode,
       credential,
@@ -181,6 +189,7 @@ describe("actual API diagnostics in Actions stderr", () => {
         "unregistered-xapi-canary",
         "unregistered-api-canary",
         "url-api-canary",
+        "inline-auth-canary",
       ])
         expect(r.output).not.toContain(credential);
     },
@@ -199,6 +208,47 @@ describe("actual API diagnostics in Actions stderr", () => {
     ).toMatchObject({ status: 200 });
     expect(r.output).not.toContain("success-private-body-canary");
     expect(body(r.logs)).toBe("");
+  });
+  it("excludes interrupted successful payloads while retaining transport evidence", () => {
+    const r = run("success-interrupted");
+    expect(body(r.logs)).toBe("");
+    expect(r.output).not.toContain(
+      Buffer.from("successful-configuration-payload-canary").toString("base64"),
+    );
+    expect(
+      r.logs.find((row) => row.event === "api.request.failed"),
+    ).toMatchObject({
+      status: 200,
+      capture_state: "read_failed",
+      body_capture: "excluded_successful_response",
+      captured_bytes: 0,
+    });
+    expect(r.logs.some((row) => row.detail_kind === "cause")).toBe(true);
+  });
+  it.each(["preserve-large", "preserve-slow"])(
+    "preserves the actual Octokit error message for %s bodies",
+    (mode) => {
+      const r = run(mode);
+      expect(r.result.code).toBe(404);
+      expect(r.result.consumerMessagePreserved).toBe(true);
+      expect(
+        r.logs.some(
+          (row) =>
+            row.detail_kind === "body" &&
+            row.capture_state ===
+              (mode === "preserve-large" ? "byte_limit" : "read_timeout"),
+        ),
+      ).toBe(true);
+    },
+    15000,
+  );
+  it("reports byte limits introduced by credential-protection expansion", () => {
+    const r = run("expanded", "z");
+    const parts = r.logs.filter((row) => row.detail_kind === "body");
+    expect(parts.length).toBeGreaterThan(1);
+    expect(parts[0].capture_state).toBe("byte_limit");
+    expect(parts[0].omitted_bytes).toBeGreaterThan(0);
+    expect(Buffer.byteLength(body(r.logs))).toBeLessThanOrEqual(1024 * 1024);
   });
   it("reconstructs long Unicode failures from bounded numbered records", () => {
     const r = run("large");
@@ -389,7 +439,7 @@ describe("actual artifact SDK transport diagnostics", () => {
       try {
         const {DefaultArtifactClient}=await import('@actions/artifact');const client=new DefaultArtifactClient();
         const path=join(root,'fixture.orm');
-        const payload=Buffer.concat([Buffer.from('ORMSESSION1\\n'),Buffer.alloc(mode==='success'?8*1024*1024:65536,120)]);
+        const payload=Buffer.concat([Buffer.from('ORMSESSION1\\nsuccessful-blob-payload-canary\\n'),Buffer.alloc(mode==='success'?8*1024*1024:65536,120)]);
         expected=createHash('sha256').update(payload).digest('hex');await writeFile(path,payload);
         const uploaded=await client.uploadArtifact('fixture.orm',[path],root,{skipArchive:true,retentionDays:14});
         if(mode==='interrupted') fixture.fault(uploaded.id,'drop_download');
@@ -450,6 +500,12 @@ describe("actual artifact SDK transport diagnostics", () => {
           (row) => row.event === "api.request.failed" && row.status === 200,
         );
         expect(failures).toHaveLength(1);
+        expect(body(logs)).toBe("");
+        expect(result.stderr).not.toContain("successful-blob-payload-canary");
+        expect(failures[0]).toMatchObject({
+          body_capture: "excluded_successful_response",
+          captured_bytes: 0,
+        });
         for (const failed of failures) {
           const cause = logs
             .filter(

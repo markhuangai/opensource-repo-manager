@@ -151,7 +151,15 @@ describe("scoped model relay", () => {
           "sse-escaped",
           "sse-multiline-escaped",
           "sse-multiline-auth",
+          "sse-fragmented",
+          "sse-fragmented-escaped",
+          "sse-fragmented-overlap",
+          "sse-fragmented-unicode",
+          "sse-fragmented-cross-block",
+          "sse-fragmented-multiple",
           "invalid-json",
+          "client-json",
+          "backpressure",
           "rejected-interrupted",
           "rejected-cancelled",
           "concurrent",
@@ -165,7 +173,7 @@ describe("scoped model relay", () => {
         "--input-type=module",
         "-e",
         `
-      import {createServer} from 'node:http';
+      import {createServer,ServerResponse} from 'node:http';
       import {mkdtemp,rm} from 'node:fs/promises';
       import {tmpdir} from 'node:os';
       import {join} from 'node:path';
@@ -180,6 +188,24 @@ describe("scoped model relay", () => {
       let requests=0;
       const server=createServer((req,res)=>{
         requests++; req.resume(); reached.resolve();
+        if(mode.startsWith('sse-fragmented')) {
+          const credential=['sse-fragmented-overlap','sse-fragmented-unicode','sse-fragmented-multiple'].includes(mode)?config.github.token:config.proxy.key;
+          const split=mode==='sse-fragmented-unicode'?credential.indexOf('😀')+1:1;
+          const event=(text,index,refusal)=>sdk==='claude'?{type:'content_block_delta',index,delta:{type:'text_delta',text,refusal}}:{type:'response.output_text.delta',output_index:index,content_index:0,delta:text,refusal};
+          const frame=(value,index)=>{
+            let data=JSON.stringify(value);
+            if(mode==='sse-fragmented-escaped') data=data.replace(/[A-Za-z-]/g,char=>String.fromCharCode(92)+'u'+char.charCodeAt(0).toString(16).padStart(4,'0'));
+            return 'event: credential-frame\\nid: frame-'+index+'\\ndata: '+data+'\\n\\n';
+          };
+          res.setHeader('content-type','text/event-stream');
+          res.end(frame(event(credential.slice(0,split),0,mode==='sse-fragmented-multiple'?config.proxy.key.slice(0,1):undefined),1)+frame(event(credential.slice(split)+'; Provider streaming failure 100; public context 0 and 1. https://storage.invalid/file?sig=signed-canary',mode==='sse-fragmented-cross-block'?1:0,mode==='sse-fragmented-multiple'?config.proxy.key.slice(1)+'; Other public failure reason':undefined),2));
+        }
+        if(mode==='backpressure') {
+          res.setHeader('content-type','text/event-stream');
+          const text='validated-payload-canary '+'x'.repeat(512000);
+          const value=sdk==='claude'?{type:'content_block_delta',index:0,delta:{type:'text_delta',text}}:{type:'response.output_text.delta',output_index:0,content_index:0,delta:text};
+          res.end(('data: '+JSON.stringify(value)+'\\n\\n').repeat(48));
+        }
         if(mode==='transport') req.socket.destroy();
         if(mode==='runtime') {
           res.setHeader('content-type','application/json');
@@ -223,6 +249,8 @@ describe("scoped model relay", () => {
       });
       await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
       const config=fixtureConfiguration();
+      if(mode==='sse-fragmented-overlap') config.github.token=config.proxy.key+'-extended';
+      if(mode==='sse-fragmented-unicode') config.github.token='token-😀-credential';
       if(mode==='numeric-redactions' || mode==='rejected-prefix') config.redaction_values=['0','1'];
       config.proxy.url='http://127.0.0.1:'+server.address().port+'/v1';
       const loaded=await fixtureSnapshot('private-model-canary',config);
@@ -233,18 +261,29 @@ describe("scoped model relay", () => {
       store.startRuntimeLease(lease,60000);
       const caller=new AbortController(),client=new AbortController();
       const relay=new ModelRelay(store,config.proxy.url,loaded.secrets);
+      const originalWrite=ServerResponse.prototype.write;
+      let waitingResponse,backpressureWaiting;
       try {
         await relay.start();
-        const grant=relay.authorize({lease,profile:{sdk,model:'private-model-canary',effort:'high'},deadline:Date.now()+(mode==='deadline'?150:10000),requests:10,bytes:4096,signal:caller.signal,current:()=>store.runtimeCurrent(lease),context:{run_id:'relay-diagnostics',job_id:1,revision:1,role:'audit'}});
-        const call=()=>fetch(grant.url+(sdk==='claude'?'/messages':'/responses'),{method:'POST',headers:{authorization:'Bearer '+grant.authorization,'content-type':'application/json'},body:JSON.stringify({model:'private-model-canary'}),signal:client.signal}).then(async response=>{await response.text();return response.status},error=>{if(!['disconnect','rejected-cancelled'].includes(mode))throw error;return null});
+        const grant=relay.authorize({lease,profile:{sdk,model:'private-model-canary',effort:'high'},deadline:Date.now()+(mode==='deadline'?150:10000),requests:10,bytes:mode==='backpressure'?32*1024*1024:4096,signal:caller.signal,current:()=>store.runtimeCurrent(lease),context:{run_id:'relay-diagnostics',job_id:1,revision:1,role:'audit'}});
+        if(mode==='backpressure') ServerResponse.prototype.write=function(...args) {
+          const accepted=Reflect.apply(originalWrite,this,args);
+          if(this.socket?.localPort===Number(new URL(grant.url).port) && !accepted) waitingResponse=this;
+          return accepted;
+        };
+        const call=()=>fetch(grant.url+(sdk==='claude'?'/messages':'/responses'),{method:'POST',headers:{authorization:'Bearer '+grant.authorization,'content-type':'application/json'},body:mode==='client-json'?'{':JSON.stringify({model:'private-model-canary'}),signal:client.signal}).then(async response=>{
+          if(mode==='backpressure'){await delay(500);backpressureWaiting=Boolean(waitingResponse?.writableNeedDrain);client.abort();await response.body?.cancel().catch(()=>{});return null;}
+          await response.text();return response.status;
+        },error=>{if(!['disconnect','rejected-cancelled'].includes(mode))throw error;return null});
         const responses=mode==='concurrent'?[call(),call()]:[call()];
-        await reached.promise;
+        if(mode!=='client-json') await reached.promise;
         if(mode==='disconnect') client.abort();
         if(mode==='rejected-cancelled') {await delay(80);client.abort();}
         const status=(await Promise.all(responses))[0];
         await delay(30);
-        console.log(JSON.stringify({status,requests,charged:JSON.parse(store.job(1).budget_json).model_requests,caller_aborted:caller.signal.aborted}));
+        console.log(JSON.stringify({status,requests,charged:JSON.parse(store.job(1).budget_json).model_requests,caller_aborted:caller.signal.aborted,...(mode==='backpressure'?{backpressure_waiting:backpressureWaiting}:{})}));
       } finally {
+        ServerResponse.prototype.write=originalWrite;
         caller.abort(); await relay.close(); store.close(); server.closeAllConnections();
         await new Promise((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
         await rm(root,{recursive:true});
@@ -260,11 +299,35 @@ describe("scoped model relay", () => {
       },
     );
     expect(result.status, result.stderr).toBe(0);
+    if (mode === "client-json") {
+      expect(JSON.parse(result.stdout.trim())).toEqual({
+        status: 502,
+        requests: 0,
+        charged: 0,
+        caller_aborted: false,
+      });
+      const records = result.stderr
+        .split("\n")
+        .filter((line) => line.startsWith("{"))
+        .map((line) => JSON.parse(line));
+      expect(
+        records.find((row) => row.event === "model.request.failed").cause,
+      ).toBe("request_invalid");
+      expect(records.some((row) => row.event === "api.request.started")).toBe(
+        false,
+      );
+      return;
+    }
     expect(JSON.parse(result.stdout.trim())).toEqual({
-      status: ["disconnect", "rejected-cancelled"].includes(mode) ? null : 502,
+      status: ["disconnect", "rejected-cancelled", "backpressure"].includes(
+        mode,
+      )
+        ? null
+        : 502,
       requests: mode === "concurrent" ? 2 : 1,
       charged: mode === "concurrent" ? 2 : 1,
       caller_aborted: false,
+      ...(mode === "backpressure" ? { backpressure_waiting: true } : {}),
     });
     const logs = result.stderr
       .split("\n")
@@ -303,6 +366,13 @@ describe("scoped model relay", () => {
         "sse-escaped": "relay_response_invalid",
         "sse-multiline-escaped": "relay_response_invalid",
         "sse-multiline-auth": "relay_response_invalid",
+        "sse-fragmented": "relay_response_invalid",
+        "sse-fragmented-escaped": "relay_response_invalid",
+        "sse-fragmented-overlap": "relay_response_invalid",
+        "sse-fragmented-unicode": "relay_response_invalid",
+        "sse-fragmented-cross-block": "relay_response_invalid",
+        "sse-fragmented-multiple": "relay_response_invalid",
+        backpressure: "request_cancelled",
         "invalid-json": "relay_response_invalid",
         "rejected-interrupted": "upstream_rejected",
         "rejected-cancelled": "request_cancelled",
@@ -395,6 +465,32 @@ describe("scoped model relay", () => {
     }
     if (mode.startsWith("sse"))
       expect(body).toContain("Provider streaming failure 100");
+    if (mode.startsWith("sse-fragmented")) {
+      const frame = JSON.parse(
+        body
+          .split("\n")
+          .find((line) => line.startsWith("data:"))!
+          .slice(5),
+      );
+      const text = sdk === "claude" ? frame.delta.text : frame.delta;
+      expect(text).toMatch(
+        /^\[credential fragment excluded\]; Provider streaming failure 100;/,
+      );
+      expect(text).toContain("public context 0 and 1");
+      expect(body).toContain("id: frame-2");
+      expect(text).not.toContain("-extended");
+      if (mode === "sse-fragmented-multiple") {
+        const refusal = sdk === "claude" ? frame.delta.refusal : frame.refusal;
+        expect(refusal).toBe(
+          "[credential fragment excluded]; Other public failure reason",
+        );
+        expect(result.stderr).not.toContain("roxy-fixture-key");
+      }
+    }
+    if (mode === "backpressure") {
+      expect(body).toBe("");
+      expect(result.stderr).not.toContain("validated-payload-canary");
+    }
     if (mode.includes("escaped")) {
       expect(body).toContain("[signed URL excluded]");
       expect(result.stderr).not.toContain("signed-canary");

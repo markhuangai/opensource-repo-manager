@@ -34,6 +34,13 @@ type Protection = {
 };
 const credentialField =
   /^(?:authorization|proxy-authorization|cookie|set-cookie|token|access_token|refresh_token|(?:x[-_]?)?api[-_]?key|password|secret|signed(?:upload|download)?url|signature|sig)$/i;
+const protectedTextPattern = new RegExp(
+  /"(?:\\.|[^"\\])*(?:"|$)/.source +
+    "|((?:^|[\\s(,{;])" +
+    credentialField.source.slice(1, -1) +
+    "[ \\t]*[:=][ \\t]*)[^\\r\\n]*",
+  "gim",
+);
 const responseHeaders = [
   "content-type",
   "x-github-request-id",
@@ -182,14 +189,10 @@ export function createApiDiagnostics(
       return output + value.slice(previous);
     }
     function scrubText(value: string): string {
-      const fieldsExcluded = excludeFields(value).replace(
-        /^([ \t]*([a-z0-9_-]+)[ \t]*[:=][ \t]*)[^\r\n]*/gim,
-        (line, prefix: string, key: string) =>
-          credentialField.test(key) ? prefix + "[credential excluded]" : line,
-      );
-      const text = fieldsExcluded.replace(
-        /"(?:\\.|[^"\\])*(?:"|$)/g,
-        (quoted) => {
+      const text = excludeFields(value).replace(
+        protectedTextPattern,
+        (quoted, prefix: string | undefined) => {
+          if (prefix !== undefined) return prefix + "[credential excluded]";
           const closed = quoted.length > 1 && quoted.endsWith('"');
           try {
             const decoded = JSON.parse(
@@ -298,9 +301,20 @@ export function createApiDiagnostics(
       detail_kind: kind,
       body_bytes: bytes.length,
       captured_bytes: Buffer.byteLength(captured),
-      omitted_bytes: bytes.length - Buffer.byteLength(captured),
-      capture_state: bytes.length > apiCaptureLimit ? "byte_limit" : "complete",
       ...capture,
+      omitted_bytes:
+        capture.omitted_bytes === -1
+          ? -1
+          : bytes.length -
+            Buffer.byteLength(captured) +
+            (typeof capture.omitted_bytes === "number"
+              ? capture.omitted_bytes
+              : 0),
+      capture_state: incomplete
+        ? capture.capture_state
+        : bytes.length > apiCaptureLimit
+          ? "byte_limit"
+          : (capture.capture_state ?? "complete"),
     };
     let offset = 0,
       part = 0;
@@ -502,6 +516,7 @@ export function createApiDiagnostics(
           );
           emit("error", {
             ...base,
+            ...response.capture,
             event: "api.request.failed",
             level: "error",
             status: response.status,
@@ -544,7 +559,7 @@ export function observeApiFetch(
     };
     if (response.status >= 400) {
       const captured = await captureApiBody(
-        response,
+        response.clone(),
         init?.signal ?? undefined,
       );
       exchange.fail(new Error(response.statusText), {
@@ -552,24 +567,23 @@ export function observeApiFetch(
         headers: response.headers,
         ...captured,
       });
-      return replay(captured.body);
+      return response;
     }
     if (!response.body || response.status === 304) {
       if (finishOnBodyEnd) exchange.finish(response.status, response.headers);
       return response;
     }
     const reader = response.body.getReader();
-    const prefix: Uint8Array[] = [];
-    let captured = 0,
-      received = 0;
+    let received = 0;
     const failed = (error: unknown, state: string) =>
       exchange.fail(error, {
         status: response.status,
         headers: response.headers,
-        body: new StringDecoder("utf8").write(Buffer.concat(prefix)),
         capture: {
           capture_state: state,
           received_bytes: received,
+          captured_bytes: 0,
+          body_capture: "excluded_successful_response",
           omitted_bytes: -1,
         },
       });
@@ -584,12 +598,6 @@ export function observeApiFetch(
                 exchange.finish(response.status, response.headers);
             } else {
               received += value.value.length;
-              const next = value.value.subarray(
-                0,
-                Math.max(0, apiCaptureLimit - captured),
-              );
-              if (next.length) prefix.push(next);
-              captured += next.length;
               controller.enqueue(value.value);
             }
           } catch (error) {

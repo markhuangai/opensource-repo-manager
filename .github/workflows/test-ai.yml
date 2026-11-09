@@ -58,6 +58,7 @@ jobs:
             let stage = "input", reference, observed, lastApi;
             const credential = core.getInput?.("github-token") ?? "";
             const credentialField = /^(authorization|proxy-authorization|cookie|set-cookie|token|access_token|refresh_token|(?:x[-_]?)?api[-_]?key|password|secret|signed(upload|download)?url|signature|sig)$/i;
+            const protectedTextPattern = new RegExp(/"(?:\\.|[^"\\])*(?:"|$)/.source + "|((?:^|[\\s(,{;])" + credentialField.source.slice(1,-1) + "[ \\t]*[:=][ \\t]*)[^\\r\\n]*", "gim");
             const protectUrls = text => text.replace(/https?:(?:\/|\\\/){2}[^\s"'<>]+/gi, url => {
               try { const parsed = new URL(url.replaceAll("\\/", "/").replaceAll("&amp;", "&"));
                 if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some(key => credentialField.test(key) || /^(client_secret|x-amz-|x-goog-)/i.test(key))) return "[signed URL excluded]";
@@ -88,8 +89,8 @@ jobs:
             };
             const protectText = value => {
               const redact = text => credential ? text.replaceAll(credential, "[credential excluded]") : text;
-              const fieldsExcluded = excludeFields(value).replace(/^([ \t]*([a-z0-9_-]+)[ \t]*[:=][ \t]*)[^\r\n]*/gim, (line,prefix,key) => credentialField.test(key) ? prefix + "[credential excluded]" : line);
-              const text = fieldsExcluded.replace(/"(?:\\.|[^"\\])*(?:"|$)/g, quoted => {
+              const text = excludeFields(value).replace(protectedTextPattern, (quoted,prefix) => {
+                if (prefix !== undefined) return prefix + "[credential excluded]";
                 const closed = quoted.length > 1 && quoted.endsWith('"');
                 try {
                   const decoded = JSON.parse(closed ? quoted : quoted + '"'), safe = protectText(decoded);
@@ -145,8 +146,9 @@ jobs:
                 if (end > offset && /[\uD800-\uDBFF]/.test(content[end - 1])) end--;
                 let record = {event: "api.response.detail", level: "error", ...metadata,
                   detail_kind: kind, part: ++part, content: content.slice(offset, end), last: end === content.length,
-                  body_bytes: bytes.length, omitted_bytes: bytes.length - Buffer.byteLength(content),
-                  capture_state: bytes.length > limit ? "byte_limit" : "complete", ...captureState};
+                  body_bytes: bytes.length, ...captureState,
+                  omitted_bytes: captureState.omitted_bytes === -1 ? -1 : bytes.length - Buffer.byteLength(content) + (typeof captureState.omitted_bytes === "number" ? captureState.omitted_bytes : 0),
+                  capture_state: incomplete ? captureState.capture_state : bytes.length > limit ? "byte_limit" : (captureState.capture_state ?? "complete")};
                 while (Buffer.byteLength(JSON.stringify(record)) > 2048 && end > offset) {
                   end = offset + Math.floor((end - offset) / 2);
                   if (end > offset && /[\uD800-\uDBFF]/.test(content[end - 1])) end--;
@@ -160,6 +162,7 @@ jobs:
               const requestId = require("node:crypto").randomUUID(), began = Date.now();
               const metadata = {provider, operation, request_id: requestId,
                 repository: common.repository, target_repository: repository,
+                credential_source: provider === "github" ? "workflow.token" : undefined,
                 method: provider === "github" ? operation.split(" ")[0] : undefined,
                 route: provider === "github" ? operation.slice(operation.indexOf(" ") + 1) : undefined,
                 workflow_run_id: common.run_id, run_attempt: common.attempt, workflow_sha: common.workflow_sha};
@@ -173,7 +176,7 @@ jobs:
                 detail(metadata,"cause",cause(error));
                 detail(metadata,"body",response.body,response.capture);
                 if (response.readError) detail(metadata,"read_cause",cause(response.readError));
-                const headers = response.headers instanceof Headers ? Object.fromEntries(response.headers) : response.headers ?? {};
+                const headers = typeof response.headers?.entries === "function" ? Object.fromEntries(response.headers.entries()) : response.headers ?? {};
                 detail(metadata,"headers",Object.fromEntries(Object.entries(headers).filter(([name]) =>
                   /^(x-github-request-id|x-request-id|x-accepted-github-permissions|x-ratelimit-(limit|remaining|reset)|retry-after)$/.test(name))));
               };
@@ -182,7 +185,7 @@ jobs:
                 const response = await baseFetch(input,init);
                 core.info(JSON.stringify({event:"api.response.started",level:"info",...metadata,status:response.status,elapsed_ms:Date.now()-began}));
                 if (response.status < 400) return response;
-                const reader = response.body?.getReader(), chunks = [];
+                const reader = response.clone().body?.getReader(), chunks = [];
                 let size = 0, state = "complete", readError;
                 const timeout = AbortSignal.timeout(5000);
                 const signal = init?.signal ? AbortSignal.any([init.signal,timeout]) : timeout;
@@ -203,9 +206,7 @@ jobs:
                 const body = new StringDecoder("utf8").write(Buffer.concat(chunks));
                 failed(new Error(response.statusText),{status:response.status,headers:response.headers,body,readError,
                   capture:{capture_state:state,...(state!=="complete" && {omitted_bytes:-1})}});
-                const replay = new Response(body,{status:response.status,statusText:response.statusText,headers:response.headers});
-                Object.defineProperty(replay,"url",{value:response.url});
-                return replay;
+                return response;
               };
               core.info(JSON.stringify({event:"api.request.started",level:"info",...metadata}));
               try {
@@ -277,8 +278,9 @@ jobs:
                 "Registry inspection timed out." : "Registry inspection failed.");
               stage = "manifest";
               const manifestCapture = capture(result.stdout, 64 * 1024);
-              observed = {manifest_capture: manifestCapture};
-              assert(manifestCapture.omitted_bytes === 0, "Registry manifest exceeds the 64 KiB capture limit.");
+              const manifestBytes = Buffer.byteLength(result.stdout);
+              observed = {manifest_bytes: manifestBytes, manifest_capture: manifestCapture};
+              assert(manifestBytes <= 64 * 1024, "Registry manifest exceeds the 64 KiB capture limit.");
               let manifest;
               try { manifest = JSON.parse(result.stdout); }
               catch { throw new Error("Registry returned invalid manifest JSON."); }
@@ -325,7 +327,7 @@ jobs:
                 request_id:metadata.request_id,
                 expected:{source_sha:common.source_sha,proof_version:2,platforms:["linux/amd64","linux/arm64"]},
                 provider_status:lastApi?.status,exit_code:lastApi?.exit_code,
-                cause_code:error.code==="ERR_ASSERTION"?"assertion_failed":lastApi?.failed?"provider_failed":"runtime_selection_failed",
+                cause_code:lastApi?.failed?"provider_failed":error.code==="ERR_ASSERTION"?"assertion_failed":"runtime_selection_failed",
                 elapsed_ms:Date.now()-started,recovery}));
             }
 

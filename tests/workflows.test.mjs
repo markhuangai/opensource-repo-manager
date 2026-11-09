@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { createServer } from "node:http";
 import { Octokit } from "@octokit/rest";
+import { fetch as undiciFetch } from "undici";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
@@ -63,6 +64,7 @@ async function run(
   const summaries = [];
   const maskedValues = [];
   const github = {
+    request: transport.request,
     rest: {
       pulls: { get: async () => ({ data: current }), list: "pulls" },
       repos: {
@@ -1247,6 +1249,7 @@ describe.each([
     transportError,
     git = {},
     githubToken = "",
+    request,
   } = {}) {
     const calls = [],
       revisionCalls = [];
@@ -1268,6 +1271,7 @@ describe.each([
       githubToken,
       context: { repo: { owner: "consumer", repo: "project" } },
       transport: {
+        request,
         git: Object.fromEntries(
           Object.entries(methods).map(([method, handler]) => [
             method,
@@ -1791,6 +1795,7 @@ describe.each([
         source_sha: source,
         reference: `${image}:sha-${source}`,
         provider_status: exitCode,
+        cause_code: "provider_failed",
         provider_error: { content: stderr, omitted_bytes: 0 },
         cause: { content: cause },
       });
@@ -1867,11 +1872,24 @@ describe.each([
     expect(reconstructed.provider_error.content).toContain("failure begins");
     expect(reconstructed.provider_error.omitted_bytes).toBeGreaterThan(0);
   });
+  it("enforces the raw manifest limit before credential-field protection", async () => {
+    const value = manifest();
+    value.annotations.secret = "x".repeat(70000);
+    const stdout = JSON.stringify(value);
+    const result = await select({ response: { stdout } });
+    const outcome = failure(result);
+    expect(outcome.stage).toBe("manifest");
+    expect(outcome.cause.content).toContain("64 KiB");
+    expect(outcome.observed.manifest_bytes).toBe(Buffer.byteLength(stdout));
+    expect(outcome.observed.manifest_capture.content).toContain(
+      "[credential excluded]",
+    );
+  });
   it.each(["workflow-token-canary", "key"])(
     "excludes plaintext authentication headers from registry failure logs with credential %s",
     async (credential) => {
       const stderr =
-        "Provider access denied with context 0 and 1\nAuthorization: Bearer header-auth-canary\nProxy-Authorization: Basic header-proxy-canary\nCookie: session=header-cookie-canary\nSet-Cookie: session=header-set-cookie-canary; HttpOnly\nX-Api-Key: unregistered-xapi-canary\nApi-Key: unregistered-api-canary\nProvider key link https://storage.invalid/file?x-api-key=url-api-canary\nProvider reason ends";
+        "Provider access denied with context 0 and 1\nAuthorization: Bearer header-auth-canary\nProxy-Authorization: Basic header-proxy-canary\nCookie: session=header-cookie-canary\nSet-Cookie: session=header-set-cookie-canary; HttpOnly\nX-Api-Key: unregistered-xapi-canary\nApi-Key: unregistered-api-canary\nProvider key link https://storage.invalid/file?x-api-key=url-api-canary\nProvider inline authentication context 100 request sent Authorization: Bearer inline-auth-canary\nProvider reason ends";
       const result = await select({
         githubToken: credential,
         response: { exitCode: 1, stderr },
@@ -1889,6 +1907,7 @@ describe.each([
         "unregistered-xapi-canary",
         "unregistered-api-canary",
         "url-api-canary",
+        "inline-auth-canary",
       ])
         expect(JSON.stringify(result)).not.toContain(credential);
     },
@@ -1921,11 +1940,15 @@ describe.each([
     expect(captured.omitted_bytes).toBeGreaterThan(0);
   });
   it.each(
-    ["stalled", "interrupted", "oversized"].flatMap((mode) => [
-      { mode, credential: "workflow-token-canary", prefix: false },
-      { mode, credential: "workflow-token-canary", prefix: true },
-      { mode, credential: 'quoted-"credential\\suffix', prefix: true },
-    ]),
+    ["stalled", "interrupted", "oversized", "expanded"].flatMap((mode) =>
+      mode === "expanded"
+        ? [{ mode, credential: "z", prefix: false }]
+        : [
+            { mode, credential: "workflow-token-canary", prefix: false },
+            { mode, credential: "workflow-token-canary", prefix: true },
+            { mode, credential: 'quoted-"credential\\suffix', prefix: true },
+          ],
+    ),
   )(
     "captures $mode GitHub bodies through the actual resolver client with credential $credential and prefix $prefix",
     async ({ mode, credential, prefix }) => {
@@ -1934,7 +1957,16 @@ describe.each([
         res.writeHead(403, {
           "content-type": "application/json",
           "x-github-request-id": "resolver-provider-100",
+          "x-accepted-github-permissions": "contents=read",
         });
+        if (mode === "expanded") {
+          res.end(
+            JSON.stringify({
+              message: "Resolver denied request 100. " + "z ".repeat(180000),
+            }),
+          );
+          return;
+        }
         if (prefix) {
           const encoded = JSON.stringify(credential).slice(1, -1);
           const opening =
@@ -1951,11 +1983,14 @@ describe.each([
           else {
             res.write(opening + encoded.slice(0, -1));
             if (mode === "interrupted") setTimeout(() => res.destroy(), 20);
+            if (mode === "stalled")
+              setTimeout(() => res.end(encoded.slice(-1) + '"}'), 6100);
           }
           return;
         }
         res.write('{"message":"Resolver denied request 100"');
         if (mode === "interrupted") setTimeout(() => res.destroy(), 20);
+        if (mode === "stalled") setTimeout(() => res.end("}"), 6100);
         if (mode === "oversized")
           res.end(',"detail":"' + "x".repeat(1100000) + '"}');
       });
@@ -1963,6 +1998,7 @@ describe.each([
       const client = new Octokit({
         baseUrl: "http://127.0.0.1:" + server.address().port,
         auth: credential,
+        request: { fetch: undiciFetch },
         log: {
           debug: () => {},
           info: () => {},
@@ -1973,6 +2009,7 @@ describe.each([
       try {
         const result = await select({
           git: client.rest.git,
+          request: client.request,
           githubToken: credential,
         });
         const records = result.notices
@@ -1982,6 +2019,17 @@ describe.each([
           (row) => row.event === "api.request.failed",
         );
         expect(failed).toMatchObject({ status: 403, response_received: true });
+        expect(failed.credential_source).toBe("workflow.token");
+        const headers = JSON.parse(
+          records
+            .filter((row) => row.detail_kind === "headers")
+            .map((row) => row.content)
+            .join(""),
+        );
+        expect(headers).toMatchObject({
+          "x-github-request-id": "resolver-provider-100",
+          "x-accepted-github-permissions": "contents=read",
+        });
         const body = records
           .filter((row) => row.detail_kind === "body")
           .map((row) => row.content)
@@ -2002,15 +2050,20 @@ describe.each([
                 stalled: "read_timeout",
                 interrupted: "read_failed",
                 oversized: "byte_limit",
+                expanded: "byte_limit",
               }[mode],
           ),
         ).toBe(true);
-        if (mode !== "oversized")
+        if (["stalled", "interrupted"].includes(mode))
           expect(records.some((row) => row.detail_kind === "read_cause")).toBe(
             true,
           );
         expect(result.calls).toEqual([]);
         expect(failure(result).request_id).toBe(failed.request_id);
+        if (mode === "expanded")
+          expect(
+            records.find((row) => row.detail_kind === "body").omitted_bytes,
+          ).toBeGreaterThan(0);
       } finally {
         server.closeAllConnections();
         await new Promise((resolve) => server.close(resolve));

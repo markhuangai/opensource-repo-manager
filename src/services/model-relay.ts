@@ -335,6 +335,7 @@ export class ModelRelay {
         const length = Buffer.byteLength(frame);
         if (length > 1024 * 1024) throw new RuntimeError("relay_frame_limit");
         failureBody = frame;
+        const credentialEnds = new Map<string, number>();
         const value = this.checkFrame(frame),
           fields =
             value && typeof value === "object" && !Array.isArray(value)
@@ -389,8 +390,16 @@ export class ModelRelay {
                 matcher = this.secrets.createCredentialStream();
                 matchers.set(key, matcher);
               }
-              if (matcher.push(item))
-                throw new RuntimeError("relay_response_invalid");
+              const before = matcher.fork();
+              if (matcher.push(item)) {
+                let end = 0;
+                for (let index = 0; index < item.length; index++)
+                  if (before.push(item[index])) end = index + 1;
+                credentialEnds.set(
+                  item,
+                  Math.max(credentialEnds.get(item) ?? 0, end),
+                );
+              }
             }
           } else if (item !== null && typeof item === "object") {
             for (const [key, child] of Object.entries(item))
@@ -398,13 +407,26 @@ export class ModelRelay {
           }
         };
         inspect(value, []);
+        if (credentialEnds.size) {
+          failureBody = [
+            ...frame.split(/\r?\n/).filter((line) => !line.startsWith("data:")),
+            "data: " +
+              JSON.stringify(value, (_key, field) =>
+                typeof field === "string" && credentialEnds.has(field)
+                  ? "[credential fragment excluded]" +
+                    field.slice(credentialEnds.get(field))
+                  : field,
+              ),
+          ].join("\n");
+          throw new RuntimeError("relay_response_invalid");
+        }
         heldBytes += length;
         if (heldBytes > grant.bytes)
           throw new RuntimeError("relay_frame_limit");
         held.push(frame);
+        failureBody = undefined;
         if (![...matchers.values()].some((matcher) => matcher.pending))
           await flush();
-        failureBody = undefined;
       };
       const decoder = new TextDecoder("utf8", { fatal: true });
       for await (const chunk of upstream.body) {
@@ -441,7 +463,8 @@ export class ModelRelay {
     } catch (error) {
       failure = error;
       if (error instanceof RuntimeError) cause = error.code;
-      else if (error instanceof SyntaxError) cause = "relay_response_invalid";
+      else if (error instanceof SyntaxError && providerStatus !== undefined)
+        cause = "relay_response_invalid";
       else if (controller.signal.aborted) cause = "request_cancelled";
       else if (
         upstreamSignal?.aborted &&
