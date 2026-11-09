@@ -1,4 +1,12 @@
 import { Octokit } from "@octokit/rest";
+import { StringDecoder } from "node:string_decoder";
+import { createGitHubClient } from "./client.ts";
+import {
+  createApiDiagnostics,
+  carryApiFailure,
+  tagApiFailure,
+  type ApiDiagnostics,
+} from "../../logging/api.ts";
 import { spawn } from "node:child_process";
 import { readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -56,20 +64,25 @@ export interface ArtifactTransport {
 }
 
 export class GitHubArtifacts implements ArtifactTransport {
+  private readonly diagnostics: ApiDiagnostics;
   private readonly client: Octokit;
   private readonly coordinates: { owner: string; repo: string };
   constructor(
     private readonly context: ActionsContext,
     private readonly secrets: SecretAccessor,
     client?: Octokit,
+    diagnostics?: ApiDiagnostics,
   ) {
-    const silent = () => {};
+    this.diagnostics =
+      diagnostics ??
+      createApiDiagnostics(secrets, { repository: context.repository });
     this.client =
       client ??
-      new Octokit({
-        auth: secrets.get("github.token"),
-        log: { debug: silent, info: silent, warn: silent, error: silent },
-      });
+      createGitHubClient(
+        context.repository,
+        secrets.get("github.token"),
+        this.diagnostics,
+      );
     const [owner, repo] = context.repository.split("/");
     this.coordinates = { owner, repo };
   }
@@ -90,9 +103,12 @@ export class GitHubArtifacts implements ArtifactTransport {
           },
         })
       ).data;
-    } catch {
+    } catch (error) {
       if (signal.aborted) throw signal.reason;
-      throw new StateError("session_transport_unavailable");
+      throw carryApiFailure(
+        new StateError("session_transport_unavailable"),
+        error,
+      );
     }
   }
 
@@ -301,12 +317,31 @@ export class GitHubArtifacts implements ArtifactTransport {
           ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: "1",
         },
         detached: true,
-        stdio: ["pipe", "pipe", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
       });
       let output = "",
         bytes = 0,
         fault: unknown;
       let watching: Promise<void> | undefined;
+      const decoder = new StringDecoder("utf8");
+      let diagnosticPending = "";
+      child.stdio[4]?.on("data", (chunk: Buffer) => {
+        diagnosticPending += decoder.write(chunk);
+        let end: number;
+        while ((end = diagnosticPending.indexOf("\n")) !== -1) {
+          const line = diagnosticPending.slice(0, end);
+          diagnosticPending = diagnosticPending.slice(end + 1);
+          try {
+            if (Buffer.byteLength(line) > 2048)
+              throw new Error("API diagnostic record exceeds limit.");
+            this.diagnostics.forward(JSON.parse(line));
+          } catch (error) {
+            stop(error);
+          }
+        }
+        if (Buffer.byteLength(diagnosticPending) > 2048)
+          stop(new StateError("session_size_limit"));
+      });
       const stop = (error: unknown) => {
         fault ??= error;
         if (child.pid) {
@@ -318,7 +353,10 @@ export class GitHubArtifacts implements ArtifactTransport {
           }
         }
       };
-      const abort = () => stop(combined.reason);
+      const abort = () => {
+        this.diagnostics.interrupt(combined.reason);
+        stop(combined.reason);
+      };
       combined.addEventListener("abort", abort, { once: true });
       const timer = setInterval(() => {
         watching ??= treeBytes(request.directory, limit + 16 * 1024 * 1024)
@@ -337,13 +375,38 @@ export class GitHubArtifacts implements ArtifactTransport {
         stop(new StateError("session_transport_unavailable")),
       );
       child.once("close", async (code) => {
+        if (fault || code !== 0)
+          this.diagnostics.interrupt(
+            fault ?? new StateError("session_transport_unavailable"),
+          );
+        this.diagnostics.flush();
+        if (diagnosticPending)
+          this.diagnostics.event("api.capture.incomplete", {
+            provider: "artifact",
+            operation: String(request.operation),
+            capture_state: "interrupted",
+            omitted_bytes: -1,
+          });
         clearInterval(timer);
         combined.removeEventListener("abort", abort);
         await watching;
-        if (fault || code !== 0)
-          return reject(
-            fault ?? new StateError("session_transport_unavailable"),
-          );
+        if (fault || code !== 0) {
+          const failure =
+            fault ?? new StateError("session_transport_unavailable");
+          if (!fault) {
+            try {
+              const parsed = JSON.parse(output) as { request_id?: unknown };
+              if (
+                typeof parsed.request_id === "string" &&
+                /^[a-f0-9-]{36}$/.test(parsed.request_id)
+              )
+                tagApiFailure(failure, parsed.request_id);
+            } catch {
+              /* A killed helper may not complete its result frame. */
+            }
+          }
+          return reject(failure);
+        }
         try {
           const parsed = JSON.parse(output) as {
             result?: unknown;

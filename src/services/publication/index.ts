@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createApiDiagnostics } from "../../logging/api.ts";
 import { mkdtemp, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -98,6 +99,10 @@ export class PublicationService {
         supervisor.repositoryName(),
         secrets.get("github.token"),
         () => this.repository.providerReady(),
+        createApiDiagnostics(secrets, {
+          repository: supervisor.repositoryName(),
+          issue_number: store.jobs()[0]?.issue_number,
+        }),
       );
   }
 

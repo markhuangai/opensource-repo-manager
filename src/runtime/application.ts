@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { createApiDiagnostics } from "../logging/api.ts";
 import { createGitHubReader } from "../adapters/github/reader.ts";
 import type { RunSnapshot } from "../config/load.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
@@ -75,6 +76,10 @@ export async function createApplication(
     const reader = createGitHubReader(
       loaded.snapshot.settings.github.repository,
       loaded.secrets.get("github.token"),
+      createApiDiagnostics(loaded.secrets, {
+        repository: loaded.snapshot.settings.github.repository,
+        issue_number: store.jobs()[0]?.issue_number,
+      }),
     );
     intake = new IntakeService(store, reader, loaded.snapshot, loaded.secrets, {
       beforeIssue: async (context, signal) =>

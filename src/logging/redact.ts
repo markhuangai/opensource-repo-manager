@@ -21,6 +21,28 @@ export function createKnownSecretChecker(values: readonly string[]) {
     return message;
   }
 
+  const incompleteSecrets = [
+    ...new Set(
+      secrets.flatMap((value) => [value, JSON.stringify(value).slice(1, -1)]),
+    ),
+  ];
+  function redactIncompleteTail(message: string) {
+    let excluded = 0;
+    for (const secret of incompleteSecrets)
+      for (
+        let size = Math.min(secret.length - 1, message.length);
+        size > excluded;
+        size--
+      )
+        if (message.endsWith(secret.slice(0, size))) {
+          excluded = size;
+          break;
+        }
+    return excluded
+      ? message.slice(0, -excluded) + "[credential prefix excluded]"
+      : message;
+  }
+
   type Node = { next: Map<string, number>; fail: number; matched: boolean };
   type Stream = Readonly<{
     pending: boolean;
@@ -80,7 +102,12 @@ export function createKnownSecretChecker(values: readonly string[]) {
     return stream(0);
   }
 
-  return Object.freeze({ contains, redact, createStream });
+  return Object.freeze({
+    contains,
+    redact,
+    redactIncompleteTail,
+    createStream,
+  });
 }
 
 export type KnownSecretChecker = ReturnType<typeof createKnownSecretChecker>;
@@ -88,6 +115,7 @@ export type KnownSecretChecker = ReturnType<typeof createKnownSecretChecker>;
 const publicLogFields = [
   "event",
   "level",
+  "request_id",
   "operation",
   "repository",
   "run_id",
@@ -136,8 +164,19 @@ function publicRecord(record: PublicLogRecord) {
   });
 }
 
-export function createSafeLogger(checker: KnownSecretChecker, stderr = false) {
+export function createSafeLogger(
+  checker: KnownSecretChecker,
+  stderr = false,
+  diagnosticSink?: (line: string) => void,
+) {
   return Object.freeze({
+    diagnostic: (level: "info" | "error", record: Record<string, unknown>) => {
+      const line = JSON.stringify(record);
+      if (Buffer.byteLength(line) > 2048)
+        throw new RangeError("Diagnostic record exceeds 2 KiB.");
+      if (diagnosticSink) diagnosticSink(line);
+      else (level === "error" || stderr ? console.error : console.log)(line);
+    },
     info: (message: string) =>
       (stderr ? console.error : console.log)(
         checker.redact(message).slice(0, 2048),

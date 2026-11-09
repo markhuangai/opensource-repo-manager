@@ -1,4 +1,6 @@
 import { Octokit } from "@octokit/rest";
+import { createGitHubClient } from "./client.ts";
+import { carryApiFailure, type ApiDiagnostics } from "../../logging/api.ts";
 import { z } from "zod";
 import type { Discussion } from "../../services/clarification-contracts.ts";
 import {
@@ -72,14 +74,11 @@ const status = z.object({
 export function createGitHubReader(
   repository: string,
   token: string,
+  diagnostics?: ApiDiagnostics,
 ): GitHubReader {
-  const silent = () => {};
   return new OctokitReader(
     repository,
-    new Octokit({
-      auth: token,
-      log: { debug: silent, info: silent, warn: silent, error: silent },
-    }),
+    createGitHubClient(repository, token, diagnostics),
   );
 }
 
@@ -137,7 +136,10 @@ export class OctokitReader implements GitHubReader {
           })
           .safeParse(error).success
       )
-        throw new IntakeError("github_branch_unprotected");
+        throw carryApiFailure(
+          new IntakeError("github_branch_unprotected"),
+          error,
+        );
       const headers = parsed.success
         ? parsed.data.response?.headers
         : undefined;
@@ -155,16 +157,22 @@ export class OctokitReader implements GitHubReader {
             : Number.isFinite(reset) && reset > Date.now()
               ? reset
               : Date.now() + 60_000;
-        throw new IntakeError("github_rate_limited", retryAt);
+        throw carryApiFailure(
+          new IntakeError("github_rate_limited", retryAt),
+          error,
+        );
       }
-      throw new IntakeError(
-        code === 401
-          ? "github_authentication"
-          : code === 403
-            ? "github_access_denied"
-            : code === 404 || code === 410
-              ? "github_not_found"
-              : "github_read_failed",
+      throw carryApiFailure(
+        new IntakeError(
+          code === 401
+            ? "github_authentication"
+            : code === 403
+              ? "github_access_denied"
+              : code === 404 || code === 410
+                ? "github_not_found"
+                : "github_read_failed",
+        ),
+        error,
       );
     }
   }

@@ -25,6 +25,9 @@ export function separateSecrets(
     );
   }
   const checker = createKnownSecretChecker(sensitive);
+  const diagnosticCredentials = createKnownSecretChecker(
+    sensitive.flatMap((value) => [value, JSON.stringify(value).slice(1, -1)]),
+  );
   const redactor = createKnownSecretChecker([
     ...sensitive,
     config.proxy.url,
@@ -33,6 +36,7 @@ export function separateSecrets(
   const secrets = Object.freeze({
     ...checker,
     redact: redactor.redact,
+    redactCredentials: diagnosticCredentials.redact,
     containsCredentials: checker.contains,
     createCredentialStream: checker.createStream,
     get(name: string) {

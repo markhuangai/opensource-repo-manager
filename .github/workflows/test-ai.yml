@@ -55,14 +55,174 @@ jobs:
             const common = {repository: `${context.repo.owner}/${context.repo.repo}`,
               run_id: context.runId, attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
               job: process.env.GITHUB_JOB, mode: input === "" ? "default" : "override", timeout_ms: 60000};
-            let stage = "input", reference, observed, providerStatus, providerError;
+            let stage = "input", reference, observed, lastApi;
+            const credential = core.getInput?.("github-token") ?? "";
+            const credentialField = /^(authorization|proxy-authorization|cookie|set-cookie|token|access_token|refresh_token|(?:x[-_]?)?api[-_]?key|password|secret|signed(upload|download)?url|signature|sig)$/i;
+            const protectUrls = text => text.replace(/https?:(?:\/|\\\/){2}[^\s"'<>]+/gi, url => {
+              try { const parsed = new URL(url.replaceAll("\\/", "/").replaceAll("&amp;", "&"));
+                if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some(key => credentialField.test(key) || /^(client_secret|x-amz-|x-goog-)/i.test(key))) return "[signed URL excluded]";
+              } catch {}
+              return url;
+            });
+            const excludeFields = value => {
+              const keys = /("(?:\\.|[^"\\])*")\s*:\s*/g;
+              let output = "", previous = 0, match;
+              while ((match = keys.exec(value))) {
+                try { if (!credentialField.test(JSON.parse(match[1]))) continue; } catch { continue; }
+                let depth = 0, quoted = false, escaped = false, end = keys.lastIndex;
+                for (; end < value.length; end++) {
+                  const character = value[end];
+                  if (quoted) {
+                    if (escaped) escaped = false;
+                    else if (character === "\\") escaped = true;
+                    else if (character === '"') { quoted = false; if (!depth) { end++; break; } }
+                  } else if (character === '"') quoted = true;
+                  else if (character === "[" || character === "{") depth++;
+                  else if (character === "]" || character === "}") { if (!depth) break; if (!--depth) { end++; break; } }
+                  else if (!depth && (character === "," || /\s/.test(character))) break;
+                }
+                output += value.slice(previous, keys.lastIndex) + '"[credential excluded]"';
+                previous = end; keys.lastIndex = end;
+              }
+              return output + value.slice(previous);
+            };
+            const protectText = value => {
+              const redact = text => credential ? text.replaceAll(credential, "[credential excluded]") : text;
+              const fieldsExcluded = excludeFields(value).replace(/^([ \t]*([a-z0-9_-]+)[ \t]*[:=][ \t]*)[^\r\n]*/gim, (line,prefix,key) => credentialField.test(key) ? prefix + "[credential excluded]" : line);
+              const text = fieldsExcluded.replace(/"(?:\\.|[^"\\])*(?:"|$)/g, quoted => {
+                const closed = quoted.length > 1 && quoted.endsWith('"');
+                try {
+                  const decoded = JSON.parse(closed ? quoted : quoted + '"'), safe = protectText(decoded);
+                  if (safe === decoded) return quoted;
+                  const encoded = JSON.stringify(safe);
+                  return closed ? encoded : encoded.slice(0,-1);
+                } catch { return quoted; }
+              });
+              return redact(protectUrls(text));
+            };
+            const scrub = value => {
+              if (Array.isArray(value)) return `[${value.map(scrub).join(",")}]`;
+              if (value && typeof value === "object") return `{${Object.entries(value).map(([key,item]) =>
+                `${JSON.stringify(protectText(key))}:${credentialField.test(key) ? '"[credential excluded]"' : scrub(item)}`).join(",")}}`;
+              return JSON.stringify(typeof value === "string" ? protectText(value) : value);
+            };
+            const protect = (value, incomplete = false) => {
+              const text = typeof value === "string" ? value : JSON.stringify(value);
+              let safe;
+              try { safe = scrub(JSON.parse(text)); } catch { safe = protectText(text ?? ""); }
+              if (incomplete) {
+                let excluded = 0;
+                for (const secret of [credential, JSON.stringify(credential).slice(1,-1)].filter(Boolean))
+                  for (let size = Math.min(secret.length - 1, safe.length); size > excluded; size--)
+                    if (safe.endsWith(secret.slice(0,size))) { excluded = size; break; }
+                if (excluded) safe = safe.slice(0,-excluded) + "[credential prefix excluded]";
+              }
+              return safe;
+            };
             const capture = (value, limit) => {
-              const bytes = Buffer.from(value ?? "");
+              const bytes = Buffer.from(protect(value ?? ""));
               const content = new StringDecoder("utf8").write(bytes.subarray(0, limit));
               return {content, bytes: bytes.length, omitted_bytes: bytes.length - Buffer.byteLength(content)};
             };
             const log = (event, fields = {}) => core.info(JSON.stringify({event: `runtime.${event}`,
               level: "info", ...common, stage, elapsed_ms: Date.now() - started, ...fields}));
+            const cause = (error, seen = new Set()) => {
+              if (!error || typeof error !== "object") return {message: String(error)};
+              if (seen.has(error)) return {message: "Circular error cause"};
+              seen.add(error);
+              return {name: error.name, message: error.message, code: error.code,
+                errors: Array.isArray(error.errors) ? error.errors.map(item => cause(item, seen)) : undefined,
+                cause: error.cause === undefined ? undefined : cause(error.cause, seen)};
+            };
+            const detail = (metadata, kind, value, captureState = {}) => {
+              if (value === undefined) return;
+              const incomplete = captureState.capture_state && captureState.capture_state !== "complete" && captureState.capture_state !== "empty";
+              const bytes = Buffer.from(protect(value, incomplete)), limit = 1024 * 1024;
+              const content = new StringDecoder("utf8").write(bytes.subarray(0, limit));
+              let offset = 0, part = 0;
+              do {
+                let end = Math.min(content.length, offset + 512);
+                if (end > offset && /[\uD800-\uDBFF]/.test(content[end - 1])) end--;
+                let record = {event: "api.response.detail", level: "error", ...metadata,
+                  detail_kind: kind, part: ++part, content: content.slice(offset, end), last: end === content.length,
+                  body_bytes: bytes.length, omitted_bytes: bytes.length - Buffer.byteLength(content),
+                  capture_state: bytes.length > limit ? "byte_limit" : "complete", ...captureState};
+                while (Buffer.byteLength(JSON.stringify(record)) > 2048 && end > offset) {
+                  end = offset + Math.floor((end - offset) / 2);
+                  if (end > offset && /[\uD800-\uDBFF]/.test(content[end - 1])) end--;
+                  record = {...record, content: content.slice(offset, end), last: end === content.length};
+                }
+                core.error(JSON.stringify(record));
+                offset = end;
+              } while (offset < content.length);
+            };
+            const apiCall = async (operation, invoke, provider = "github") => {
+              const requestId = require("node:crypto").randomUUID(), began = Date.now();
+              const metadata = {provider, operation, request_id: requestId,
+                repository: common.repository, target_repository: repository,
+                method: provider === "github" ? operation.split(" ")[0] : undefined,
+                route: provider === "github" ? operation.slice(operation.indexOf(" ") + 1) : undefined,
+                workflow_run_id: common.run_id, run_attempt: common.attempt, workflow_sha: common.workflow_sha};
+              lastApi = {metadata, failed: false};
+              const failed = (error, response = {}) => {
+                if (lastApi.failed) return;
+                Object.assign(lastApi, {failed:true, status:response.status, exit_code:response.exit_code});
+                core.error(JSON.stringify({event:"api.request.failed",level:"error",...metadata,
+                  status:response.status,error_status:error.status,exit_code:response.exit_code,
+                  response_received:response.status !== undefined,elapsed_ms:Date.now()-began}));
+                detail(metadata,"cause",cause(error));
+                detail(metadata,"body",response.body,response.capture);
+                if (response.readError) detail(metadata,"read_cause",cause(response.readError));
+                const headers = response.headers instanceof Headers ? Object.fromEntries(response.headers) : response.headers ?? {};
+                detail(metadata,"headers",Object.fromEntries(Object.entries(headers).filter(([name]) =>
+                  /^(x-github-request-id|x-request-id|x-accepted-github-permissions|x-ratelimit-(limit|remaining|reset)|retry-after)$/.test(name))));
+              };
+              const observedFetch = async (input, init) => {
+                const baseFetch = github.request?.endpoint?.DEFAULTS?.request?.fetch ?? fetch;
+                const response = await baseFetch(input,init);
+                core.info(JSON.stringify({event:"api.response.started",level:"info",...metadata,status:response.status,elapsed_ms:Date.now()-began}));
+                if (response.status < 400) return response;
+                const reader = response.body?.getReader(), chunks = [];
+                let size = 0, state = "complete", readError;
+                const timeout = AbortSignal.timeout(5000);
+                const signal = init?.signal ? AbortSignal.any([init.signal,timeout]) : timeout;
+                const stop = () => { void reader?.cancel().catch(() => {}); };
+                signal.addEventListener("abort",stop,{once:true});
+                try {
+                  while (reader && !signal.aborted) {
+                    const value = await reader.read();
+                    if (value.done) break;
+                    const remaining = 1024*1024-size;
+                    chunks.push(value.value.subarray(0,Math.max(0,remaining)));
+                    size += Math.min(remaining,value.value.length);
+                    if (value.value.length > remaining) {state="byte_limit";break;}
+                  }
+                  if (signal.aborted) {state=timeout.aborted?"read_timeout":"cancelled";readError=signal.reason;}
+                } catch (error) {state="read_failed";readError=error;}
+                finally {signal.removeEventListener("abort",stop);void reader?.cancel().catch(() => {});}
+                const body = new StringDecoder("utf8").write(Buffer.concat(chunks));
+                failed(new Error(response.statusText),{status:response.status,headers:response.headers,body,readError,
+                  capture:{capture_state:state,...(state!=="complete" && {omitted_bytes:-1})}});
+                const replay = new Response(body,{status:response.status,statusText:response.statusText,headers:response.headers});
+                Object.defineProperty(replay,"url",{value:response.url});
+                return replay;
+              };
+              core.info(JSON.stringify({event:"api.request.started",level:"info",...metadata}));
+              try {
+                const response = await invoke(observedFetch);
+                Object.assign(lastApi,{status:response.status,exit_code:response.exitCode});
+                if (response.exitCode) {
+                  failed(new Error(response.exitCode===124 || response.exitCode===137 ? "Registry inspection timed out." : "Registry inspection failed."),{exit_code:response.exitCode,body:response.stderr});
+                  return response;
+                }
+                core.info(JSON.stringify({event:"api.request.finished",level:"info",...metadata,
+                  status:response.status,exit_code:response.exitCode,elapsed_ms:Date.now()-began}));
+                return response;
+              } catch (error) {
+                failed(error,{status:error.response?.status,headers:error.response?.headers,body:error.response?.data});
+                throw error;
+              }
+            };
             try {
               log("started");
               if (input !== "") {
@@ -90,13 +250,12 @@ jobs:
               const request = {signal: AbortSignal.timeout(common.timeout_ms)};
               let revision, workflowObjectType = "tag";
               try {
-                revision = await github.rest.git.getTag({owner, repo, tag_sha: identity.workflow_sha, request});
+                revision = await apiCall("GET /repos/{owner}/{repo}/git/tags/{tag_sha}", fetch => github.rest.git.getTag({owner, repo, tag_sha: identity.workflow_sha, request:{...request,fetch}}));
               } catch (error) {
                 if (error.status !== 404) throw error;
                 workflowObjectType = "commit";
-                revision = await github.rest.git.getCommit({owner, repo, commit_sha: identity.workflow_sha, request});
+                revision = await apiCall("GET /repos/{owner}/{repo}/git/commits/{commit_sha}", fetch => github.rest.git.getCommit({owner, repo, commit_sha: identity.workflow_sha, request:{...request,fetch}}));
               }
-              providerStatus = revision?.status;
               const object = revision?.data;
               const sourceSha = workflowObjectType === "tag" ? object?.object?.sha : object?.sha;
               observed = {revision_capture: capture(JSON.stringify({sha: object?.sha,
@@ -108,14 +267,12 @@ jobs:
               Object.assign(common, {source_sha: sourceSha, workflow_object_type: workflowObjectType});
               log("revision", {observed});
               stage = "registry";
-              observed = providerStatus = undefined;
+              observed = undefined;
               reference = `${imageRepository}:sha-${sourceSha}`;
               log("lookup", {reference});
-              const result = await exec.getExecOutput("timeout", ["--kill-after=5s", "60s", "docker",
+              const result = await apiCall("docker buildx imagetools inspect", () => exec.getExecOutput("timeout", ["--kill-after=5s", "60s", "docker",
                 "buildx", "imagetools", "inspect", reference, "--format", "{{json .Manifest}}"],
-                {silent: true, ignoreReturnCode: true});
-              providerStatus = result.exitCode;
-              providerError = capture(result.stderr, 16 * 1024);
+                {silent: true, ignoreReturnCode: true}), "registry");
               assert(result.exitCode === 0, result.exitCode === 124 || result.exitCode === 137 ?
                 "Registry inspection timed out." : "Registry inspection failed.");
               stage = "manifest";
@@ -125,7 +282,7 @@ jobs:
               let manifest;
               try { manifest = JSON.parse(result.stdout); }
               catch { throw new Error("Registry returned invalid manifest JSON."); }
-              log("manifest", {reference, manifest});
+              log("manifest", {reference, digest: manifest?.digest, manifest_bytes: Buffer.byteLength(result.stdout)});
               stage = "proof";
               let proof;
               try { proof = JSON.parse(manifest?.annotations?.["org.opensource-repo-manager.publication"] ?? "null"); }
@@ -157,12 +314,19 @@ jobs:
                 stage === "revision" ? "Verify GitHub access and the captured ORM tag/commit object; use a published direct commit-target tag or a compatible explicit digest." :
                 stage === "registry" ? "Verify GHCR access and publication for this workflow commit; wait for its release or supply a compatible explicit digest." :
                 "Inspect the public manifest and publication proof; use a matching workflow/image pair or correct the trusted publication.";
-              core.setFailed(JSON.stringify({event: "runtime.failed", level: "error", ...common, stage, reference,
-                expected: {source_sha: common.source_sha, proof_version: 2, platforms: ["linux/amd64", "linux/arm64"]},
-                observed, provider_status: stage === "revision" ? error.status ?? providerStatus : providerStatus,
-                provider_error: stage === "revision" ? capture(error.cause?.message ?? error.message, 16 * 1024) : providerError,
-                cause: capture(error.code === "ERR_ASSERTION" ? error.message.split("\n")[0] : error.message, 16 * 1024),
-                elapsed_ms: Date.now() - started, recovery}));
+              const metadata = lastApi?.metadata ?? {provider:"runtime",operation:stage,
+                request_id:require("node:crypto").randomUUID(),repository:common.repository,
+                workflow_run_id:common.run_id,run_attempt:common.attempt};
+              if (!lastApi?.failed) {
+                detail(metadata,"cause",cause(error));
+                detail(metadata,"observed",observed);
+              }
+              core.setFailed(JSON.stringify({event:"runtime.failed",level:"error",...common,stage,reference,
+                request_id:metadata.request_id,
+                expected:{source_sha:common.source_sha,proof_version:2,platforms:["linux/amd64","linux/arm64"]},
+                provider_status:lastApi?.status,exit_code:lastApi?.exit_code,
+                cause_code:error.code==="ERR_ASSERTION"?"assertion_failed":lastApi?.failed?"provider_failed":"runtime_selection_failed",
+                elapsed_ms:Date.now()-started,recovery}));
             }
 
   test:
@@ -198,8 +362,21 @@ jobs:
               "--label", `org.opensource-repo-manager.ai-test=${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`,
               ...environment.flatMap(key => ["--env", key]),
               "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "test-ai", role]);
-            const output = await exec.getExecOutput("docker", ["start", "--attach", name], {silent: true, ignoreReturnCode: true});
-            if (output.stderr) core.info(output.stderr);
+            const decoder = new (require("node:string_decoder").StringDecoder)("utf8");
+            let pending = "";
+            const forward = chunk => {
+              pending += decoder.write(chunk);
+              let end;
+              while ((end = pending.indexOf("\n")) !== -1) {
+                core.info(pending.slice(0, end));
+                pending = pending.slice(end + 1);
+              }
+            };
+            const output = await exec.getExecOutput("docker", ["start", "--attach", name], {
+              silent: true, ignoreReturnCode: true, listeners: {stderr: forward},
+            });
+            pending += decoder.end();
+            if (pending) core.info(pending);
             const result = JSON.parse(output.stdout.trim());
             assert(result.version === 1 && ["completed", "failed"].includes(result.outcome), "Missing bounded AI test result.");
             await core.summary.addHeading("AI configuration test").addCodeBlock(JSON.stringify({ ...result, runtime_image: image }, null, 2), "json").write();

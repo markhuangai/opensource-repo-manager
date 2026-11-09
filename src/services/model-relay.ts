@@ -10,6 +10,7 @@ import type { ModelProfile } from "../config/schema.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
 import { RuntimeError, sdkVersions } from "../domain/agents.ts";
 import { createSafeLogger } from "../logging/redact.ts";
+import { captureApiBody, createApiDiagnostics } from "../logging/api.ts";
 import type { Store } from "../repositories/store.ts";
 
 type Grant = {
@@ -111,6 +112,14 @@ export class ModelRelay {
     let providerStatus: number | undefined;
     let upstreamSignal: AbortSignal | undefined;
     let succeeded = false;
+    const diagnostics = createApiDiagnostics(this.secrets);
+    let exchange: ReturnType<typeof diagnostics.start> | undefined;
+    let failure: unknown;
+    let failureBody: string | undefined;
+    let failureReadError: unknown;
+    let failureCapture:
+      Record<string, string | number | boolean | undefined> | undefined;
+    let providerHeaders: Headers | undefined;
     req.on("aborted", () => controller.abort());
     res.on("close", () => {
       if (!res.writableEnded) controller.abort();
@@ -257,13 +266,20 @@ export class ModelRelay {
       ]);
       upstreamSignal = signal;
       cause = "upstream_transport_failed";
-      this.logger.info(
-        JSON.stringify({
-          event: "model.request.started",
-          level: "info",
-          ...context,
-        }),
-      );
+      this.logger.diagnostic("info", {
+        event: "model.request.started",
+        level: "info",
+        ...context,
+      });
+      exchange = diagnostics.start("model", route.pathname, {
+        ...grant.context,
+        sdk: grant.profile.sdk,
+        sdk_version: sdkVersions[grant.profile.sdk],
+        method: "POST",
+        route: route.pathname,
+        credential_source: "proxy.key",
+        request_id: requestId,
+      });
       const upstream = await fetch(destination, {
         method: "POST",
         headers,
@@ -272,9 +288,21 @@ export class ModelRelay {
         signal,
       });
       providerStatus = upstream.status;
+      providerHeaders = upstream.headers;
+      exchange.response(upstream.status, upstream.headers);
       if (!upstream.ok || !upstream.body) {
         cause = "upstream_rejected";
-        await upstream.body?.cancel();
+        const captured = await captureApiBody(upstream, signal, grant.bytes);
+        failureBody = captured.body;
+        failureCapture = captured.capture;
+        failureReadError = captured.readError;
+        if (controller.signal.aborted) cause = "request_cancelled";
+        else if (signal.aborted)
+          cause =
+            signal.reason instanceof DOMException &&
+            signal.reason.name === "TimeoutError"
+              ? "deadline_exceeded"
+              : "request_cancelled";
         this.fail(res, 502);
         return;
       }
@@ -306,6 +334,7 @@ export class ModelRelay {
       const forwardFrame = async (frame: string) => {
         const length = Buffer.byteLength(frame);
         if (length > 1024 * 1024) throw new RuntimeError("relay_frame_limit");
+        failureBody = frame;
         const value = this.checkFrame(frame),
           fields =
             value && typeof value === "object" && !Array.isArray(value)
@@ -375,6 +404,7 @@ export class ModelRelay {
         held.push(frame);
         if (![...matchers.values()].some((matcher) => matcher.pending))
           await flush();
+        failureBody = undefined;
       };
       const decoder = new TextDecoder("utf8", { fatal: true });
       for await (const chunk of upstream.body) {
@@ -399,15 +429,19 @@ export class ModelRelay {
         if (pending.trim()) await forwardFrame(pending);
         await flush();
       } else {
+        failureBody = pending;
         const value = JSON.parse(pending) as { error?: unknown };
         if (value?.error || this.secrets.containsCredentials(value))
           throw new RuntimeError("relay_response_invalid");
         res.write(pending);
+        failureBody = undefined;
       }
       res.end();
       succeeded = true;
     } catch (error) {
+      failure = error;
       if (error instanceof RuntimeError) cause = error.code;
+      else if (error instanceof SyntaxError) cause = "relay_response_invalid";
       else if (controller.signal.aborted) cause = "request_cancelled";
       else if (
         upstreamSignal?.aborted &&
@@ -417,6 +451,15 @@ export class ModelRelay {
         cause = "deadline_exceeded";
       this.fail(res, 502);
     } finally {
+      if (succeeded) exchange?.finish(providerStatus, providerHeaders);
+      else
+        exchange?.fail(failure ?? new RuntimeError(cause), {
+          status: providerStatus,
+          headers: providerHeaders,
+          body: failureBody,
+          capture: failureCapture,
+          readError: failureReadError,
+        });
       if (context) {
         const details = {
           ...context,
@@ -425,24 +468,20 @@ export class ModelRelay {
           outcome: succeeded ? "completed" : "failed",
         };
         if (succeeded)
-          this.logger.info(
-            JSON.stringify({
-              event: "model.request.finished",
-              level: "info",
-              ...details,
-            }),
-          );
+          this.logger.diagnostic("info", {
+            event: "model.request.finished",
+            level: "info",
+            ...details,
+          });
         else
-          this.logger.error(
-            JSON.stringify({
-              event: "model.request.failed",
-              level: "error",
-              ...details,
-              cause,
-              recovery:
-                "Verify the selected profile and proxy settings, or restore provider connectivity, before retrying.",
-            }),
-          );
+          this.logger.diagnostic("error", {
+            event: "model.request.failed",
+            level: "error",
+            ...details,
+            cause,
+            recovery:
+              "Verify the selected profile and proxy settings, or restore provider connectivity, before retrying.",
+          });
       }
       controller.abort();
     }
