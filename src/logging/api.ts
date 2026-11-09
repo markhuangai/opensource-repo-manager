@@ -137,16 +137,27 @@ export function createApiDiagnostics(
   const redact =
     protection.redactCredentials?.bind(protection) ??
     protection.redact.bind(protection);
-  function protect(text: string): string {
+  function protect(text: string, parserErrors = false): string {
     const scrub = (value: unknown): string => {
       if (Array.isArray(value)) return `[${value.map(scrub).join(",")}]`;
-      if (value && typeof value === "object")
+      if (value && typeof value === "object") {
+        const parserCause =
+          parserErrors && "name" in value && value.name === "SyntaxError";
         return `{${Object.entries(value)
           .map(
             ([key, item]) =>
-              `${JSON.stringify(scrubText(key))}:${credentialField.test(key) ? JSON.stringify("[credential excluded]") : scrub(item)}`,
+              `${JSON.stringify(scrubText(key))}:${
+                credentialField.test(key)
+                  ? JSON.stringify("[credential excluded]")
+                  : parserCause &&
+                      (key === "message" || key === "stack") &&
+                      typeof item === "string"
+                    ? JSON.stringify(scrubText(item, true))
+                    : scrub(item)
+              }`,
           )
           .join(",")}}`;
+      }
       return JSON.stringify(
         typeof value === "string" ? scrubText(value) : value,
       );
@@ -218,7 +229,7 @@ export function createApiDiagnostics(
       }
       return output + value.slice(previous);
     }
-    function scrubText(value: string): string {
+    function scrubText(value: string, parserPreview = false): string {
       const text = excludeFields(value).replace(
         protectedTextPattern,
         (quoted, prefix: string | undefined) => {
@@ -230,7 +241,10 @@ export function createApiDiagnostics(
             protectedPrefix ||= safe !== text;
             return safe;
           });
-          const safe = scrubText(decoded);
+          const scrubbed = scrubText(decoded);
+          const safe = parserPreview
+            ? (protection.redactIncompleteTail?.(scrubbed) ?? scrubbed)
+            : scrubbed;
           if (safe === decoded && !protectedPrefix) return quoted;
           const encoded = JSON.stringify(safe);
           return closed ? encoded : encoded.slice(0, -1);
@@ -308,7 +322,10 @@ export function createApiDiagnostics(
               ).toString("utf8")
             : JSON.stringify(value);
     if (raw === undefined) return;
-    const protectedText = protect(raw);
+    const protectedText = protect(
+      raw,
+      kind === "cause" || kind === "read_cause",
+    );
     const incomplete =
       capture.capture_state !== undefined &&
       capture.capture_state !== "complete" &&

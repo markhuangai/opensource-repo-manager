@@ -409,6 +409,11 @@ export class ModelRelay {
         } catch (error) {
           if (failureBody !== undefined)
             failureBody = this.protectFrameFragments(failureBody, prefixes);
+          if (error instanceof SyntaxError) {
+            error.message = this.protectFrameFragments(error.message, prefixes);
+            if (error.stack)
+              error.stack = this.protectFrameFragments(error.stack, prefixes);
+          }
           throw error;
         }
       };
@@ -511,18 +516,20 @@ export class ModelRelay {
     for (const match of frame.matchAll(quoted)) {
       if (/^\s*:/.test(frame.slice(match.index + match[0].length))) {
         field = modelTextFields.get(decodeDiagnosticString(match[0]));
-      } else if (field) {
-        let stream = streams.get(field);
+        continue;
+      }
+      const parts: string[] = [];
+      const value = decodeDiagnosticString(match[0], (part) => {
+        parts.push(part);
+        return part;
+      });
+      parts.push(value);
+      for (const key of field ? ["all", field] : ["all"]) {
+        let stream = streams.get(key);
         if (!stream) {
           stream = { current: this.secrets.createCredentialStream() };
-          streams.set(field, stream);
+          streams.set(key, stream);
         }
-        const parts: string[] = [];
-        const value = decodeDiagnosticString(match[0], (part) => {
-          parts.push(part);
-          return part;
-        });
-        parts.push(value);
         if (stream.current.pending) {
           const prefix = stream.current.prefixMatcher();
           prefixes.add(prefix);
@@ -545,13 +552,8 @@ export class ModelRelay {
         : text;
       return safe;
     };
-    field = undefined;
     const safe = frame.replace(quoted, (value, offset: number) => {
-      if (/^\s*:/.test(frame.slice(offset + value.length))) {
-        field = modelTextFields.get(decodeDiagnosticString(value));
-        return value;
-      }
-      if (!field) return value;
+      if (/^\s*:/.test(frame.slice(offset + value.length))) return value;
       let protectedPrefix = false;
       const decoded = decodeDiagnosticString(value, (text) => {
         const safe = this.secrets.redactIncompleteTail(protect(text));

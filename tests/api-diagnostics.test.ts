@@ -121,6 +121,47 @@ function body(logs: Array<Record<string, unknown>>, requestId?: unknown) {
 }
 
 describe("actual API diagnostics in Actions stderr", () => {
+  it("protects parser previews while preserving complete non-parser failure messages", () => {
+    const credential = "parser-private-credential-canary";
+    const lines: string[] = [];
+    const diagnostics = createApiDiagnostics(
+      createKnownSecretChecker([credential]),
+      { repository: "owner/repo" },
+      (line) => lines.push(line),
+    );
+    let parserError: unknown;
+    try {
+      JSON.parse(credential + "; public context 0 and 1");
+    } catch (error) {
+      parserError = error;
+    }
+    expect(parserError).toBeInstanceOf(SyntaxError);
+    const message = `Provider failed request 100; ordinary "${credential.slice(0, 10)}"; values 0 and 1.`;
+    diagnostics
+      .start("model", "decode")
+      .fail(new Error(message, { cause: parserError }), {
+        status: 200,
+        body:
+          credential +
+          "; Provider malformed JSON failure 100; public context 0 and 1.",
+      });
+    const logs = lines.map((line) => JSON.parse(line));
+    const cause = JSON.parse(
+      logs
+        .filter((row) => row.detail_kind === "cause")
+        .map((row) => row.content)
+        .join(""),
+    );
+    expect(cause.message).toBe(message);
+    expect(cause.cause.name).toBe("SyntaxError");
+    expect(cause.cause.message).toContain("Unexpected token");
+    expect(cause.cause.message).not.toContain(credential.slice(0, 10));
+    expect(cause.cause.stack).not.toContain(credential.slice(0, 10));
+    expect(lines.join("\n")).not.toContain(credential);
+    expect(body(logs)).toContain(
+      "Provider malformed JSON failure 100; public context 0 and 1.",
+    );
+  });
   it.each([401, 422, 429, 503])(
     "preserves status %s and provider evidence",
     (status) => {

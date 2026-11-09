@@ -166,8 +166,11 @@ describe("scoped model relay", () => {
           "sse-fragmented-within-frame-long",
           "sse-fragmented-numeric-context",
           "sse-fragmented-partial",
+          "sse-fragmented-cross-category-error",
+          "sse-fragmented-tool-array-error",
           "rejected-malformed",
           "invalid-json",
+          "invalid-credential-json",
           "client-json",
           "backpressure",
           "rejected-interrupted",
@@ -199,7 +202,7 @@ describe("scoped model relay", () => {
       const server=createServer((req,res)=>{
         requests++; req.resume(); reached.resolve();
         if(mode.startsWith('sse-fragmented')) {
-          const credential=['sse-fragmented-overlap','sse-fragmented-unicode','sse-fragmented-multiple','sse-fragmented-complete-secondary','sse-fragmented-error-event','sse-fragmented-invalid-json','sse-fragmented-plaintext','sse-fragmented-local','sse-fragmented-within-frame','sse-fragmented-within-frame-long','sse-fragmented-numeric-context','sse-fragmented-partial'].includes(mode)?config.github.token:config.proxy.key;
+          const credential=['sse-fragmented-overlap','sse-fragmented-unicode','sse-fragmented-multiple','sse-fragmented-complete-secondary','sse-fragmented-error-event','sse-fragmented-invalid-json','sse-fragmented-plaintext','sse-fragmented-local','sse-fragmented-within-frame','sse-fragmented-within-frame-long','sse-fragmented-numeric-context','sse-fragmented-partial','sse-fragmented-cross-category-error','sse-fragmented-tool-array-error'].includes(mode)?config.github.token:config.proxy.key;
           const split=mode==='sse-fragmented-unicode'?credential.indexOf('😀')+1:mode==='sse-fragmented-within-frame-long'?credential.length-1:1;
           const event=(text,index,refusal)=>sdk==='claude'?{type:'content_block_delta',index,delta:{type:'text_delta',text,refusal}}:{type:'response.output_text.delta',output_index:index,content_index:0,delta:text,refusal};
           const frame=(value,index)=>{
@@ -231,6 +234,14 @@ describe("scoped model relay", () => {
           if(mode==='sse-fragmented-partial') {
             const slash=String.fromCharCode(92), escaped=credential.slice(split).split('').map(char=>slash+'u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('');
             second='event: credential-frame\\nid: frame-2\\n: Provider streaming failure 100; public context 0 and 1\\ndata: {"text":"'+escaped.slice(0,-3)+'\\n\\n';
+          }
+          if(['sse-fragmented-cross-category-error','sse-fragmented-tool-array-error'].includes(mode)) {
+            first='';
+            const value=mode==='sse-fragmented-tool-array-error'
+              ? {type:'content_block_start',index:0,content_block:{type:'tool_use',id:'tool-1',name:'fixture',input:{parts:[credential.slice(0,split),text]}}}
+              : event(credential.slice(0,split),0);
+            if(mode==='sse-fragmented-cross-category-error') (sdk==='claude'?value.delta:value).message=text;
+            second='event: error\\n'+frame(value,2);
           }
           res.end(first+second);
         }
@@ -275,6 +286,7 @@ describe("scoped model relay", () => {
           res.end('event: error\\ndata: '+data+'\\n\\n');
         }
         if(mode==='invalid-json') {res.setHeader('content-type','application/json');res.end('invalid provider JSON 100');}
+        if(mode==='invalid-credential-json') {res.setHeader('content-type','application/json');res.end(config.github.token+'; Provider malformed JSON failure 100; public context 0 and 1.');}
         if(mode==='rejected-interrupted' || mode==='rejected-cancelled') {
           res.writeHead(403,{'content-type':'application/json'});
           res.write('{"error":{"message":"Provider body failure 100"');
@@ -291,7 +303,7 @@ describe("scoped model relay", () => {
       if(mode==='sse-fragmented-overlap') config.github.token=config.proxy.key+'-extended';
       if(mode==='sse-fragmented-unicode') config.github.token='token-😀-credential';
       if(mode==='sse-fragmented-numeric-context') {config.proxy.key='0-provider-key';config.redaction_values=['0','1'];}
-      if(mode==='numeric-redactions' || mode==='rejected-prefix') config.redaction_values=['0','1'];
+      if(mode==='numeric-redactions' || mode==='rejected-prefix' || mode==='invalid-credential-json') config.redaction_values=['0','1'];
       config.proxy.url='http://127.0.0.1:'+server.address().port+'/v1';
       const loaded=await fixtureSnapshot('private-model-canary',config);
       const store=new Store(join(root,'state.sqlite'));
@@ -421,9 +433,12 @@ describe("scoped model relay", () => {
         "sse-fragmented-within-frame-long": "relay_response_invalid",
         "sse-fragmented-numeric-context": "relay_response_invalid",
         "sse-fragmented-partial": "relay_response_invalid",
+        "sse-fragmented-cross-category-error": "relay_response_invalid",
+        "sse-fragmented-tool-array-error": "relay_response_invalid",
         "rejected-malformed": "upstream_rejected",
         backpressure: "request_cancelled",
         "invalid-json": "relay_response_invalid",
+        "invalid-credential-json": "relay_response_invalid",
         "rejected-interrupted": "upstream_rejected",
         "rejected-cancelled": "request_cancelled",
         concurrent: "upstream_rejected",
@@ -496,6 +511,29 @@ describe("scoped model relay", () => {
       )
       .map((log) => log.content)
       .join("");
+    const causes = logs
+      .filter(
+        (log) =>
+          log.event === "api.response.detail" &&
+          log.detail_kind === "cause" &&
+          log.request_id === started.request_id,
+      )
+      .map((log) => log.content)
+      .join("");
+    if (mode === "sse-fragmented-plaintext") {
+      expect(causes).toContain("Unexpected token");
+      expect(causes).not.toContain(
+        fixtureConfiguration().github.token.slice(1, 11),
+      );
+    }
+    if (mode === "invalid-credential-json") {
+      expect(causes).toContain("Unexpected token");
+      expect(causes).not.toContain(
+        fixtureConfiguration().github.token.slice(0, 10),
+      );
+      expect(body).toContain("Provider malformed JSON failure 100");
+      expect(body).toContain("public context 0 and 1");
+    }
     if (mode === "runtime") expect(body).toContain("provider-private-detail");
     if (mode === "rejected" || mode === "numeric-redactions") {
       expect(apiFailure.status).toBe(403);
@@ -522,6 +560,31 @@ describe("scoped model relay", () => {
       expect(body).not.toContain("\\u0070\\u0072\\u006f\\u0078\\u0079");
     }
     if (
+      [
+        "sse-fragmented-cross-category-error",
+        "sse-fragmented-tool-array-error",
+      ].includes(mode)
+    ) {
+      const frame = JSON.parse(
+        body
+          .split("\n")
+          .find((line) => line.startsWith("data:"))!
+          .slice(5),
+      );
+      const values =
+        mode === "sse-fragmented-tool-array-error"
+          ? frame.content_block.input.parts
+          : sdk === "claude"
+            ? [frame.delta.text, frame.delta.message]
+            : [frame.delta, frame.message];
+      expect(values[0]).toBe("[credential prefix excluded]");
+      expect(values[1]).toMatch(
+        /^\[credential fragment excluded\]; Provider streaming failure 100;/,
+      );
+      expect(values[1]).toContain("public context 0 and 1");
+      expect(body).toContain("id: frame-2");
+      expect(body).not.toContain(fixtureConfiguration().github.token.slice(1));
+    } else if (
       [
         "sse-fragmented-invalid-json",
         "sse-fragmented-plaintext",
