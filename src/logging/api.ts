@@ -3,6 +3,36 @@ import { StringDecoder } from "node:string_decoder";
 import { createKnownSecretChecker, createSafeLogger } from "./redact.ts";
 
 export const apiCaptureLimit = 1024 * 1024;
+export function decodeDiagnosticString(
+  quoted: string,
+  protectIncomplete: (text: string) => string = (text) => text,
+): string {
+  try {
+    return JSON.parse(quoted) as string;
+  } catch {
+    try {
+      return protectIncomplete(JSON.parse(quoted + '"') as string);
+    } catch {
+      // An undecodable escape must not hide credentials in the recoverable text.
+      const closed = quoted.length > 1 && /(?:^|[^\\])(?:\\\\)*"$/.test(quoted);
+      const content = quoted.slice(1, closed ? -1 : undefined);
+      const parts: string[] = [];
+      let decoded = "";
+      for (const [token] of content.matchAll(
+        /\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])|\\(?:u[0-9a-fA-F]{0,3}(?=$)|[\s\S]?)|[^\\]+/g,
+      )) {
+        if (/^\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])$/.test(token))
+          decoded += JSON.parse('"' + token + '"') as string;
+        else if (token.startsWith("\\")) {
+          parts.push(protectIncomplete(decoded), token);
+          decoded = "";
+        } else decoded += token;
+      }
+      parts.push(protectIncomplete(decoded));
+      return parts.join("");
+    }
+  }
+}
 let lastFailureId: string | undefined;
 const failureReferences = new WeakMap<object, string>();
 export function tagApiFailure(error: unknown, id: string) {
@@ -35,7 +65,7 @@ type Protection = {
 const credentialField =
   /^(?:authorization|proxy-authorization|cookie|set-cookie|token|access_token|refresh_token|(?:x[-_]?)?api[-_]?key|password|secret|signed(?:upload|download)?url|signature|sig)$/i;
 const protectedTextPattern = new RegExp(
-  /"(?:\\.|[^"\\])*(?:"|$)/.source +
+  /"(?:\\[\s\S]?|[^"\\])*(?:"|$)/.source +
     "|((?:^|[\\s(,{;])" +
     credentialField.source.slice(1, -1) +
     "[ \\t]*[:=][ \\t]*)[^\\r\\n]*",
@@ -194,17 +224,16 @@ export function createApiDiagnostics(
         (quoted, prefix: string | undefined) => {
           if (prefix !== undefined) return prefix + "[credential excluded]";
           const closed = quoted.length > 1 && quoted.endsWith('"');
-          try {
-            const decoded = JSON.parse(
-              closed ? quoted : quoted + '"',
-            ) as string;
-            const safe = scrubText(decoded);
-            if (safe === decoded) return quoted;
-            const encoded = JSON.stringify(safe);
-            return closed ? encoded : encoded.slice(0, -1);
-          } catch {
-            return quoted;
-          }
+          let protectedPrefix = false;
+          const decoded = decodeDiagnosticString(quoted, (text) => {
+            const safe = protection.redactIncompleteTail?.(text) ?? text;
+            protectedPrefix ||= safe !== text;
+            return safe;
+          });
+          const safe = scrubText(decoded);
+          if (safe === decoded && !protectedPrefix) return quoted;
+          const encoded = JSON.stringify(safe);
+          return closed ? encoded : encoded.slice(0, -1);
         },
       );
       return redact(protectUrls(text));

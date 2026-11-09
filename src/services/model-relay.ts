@@ -10,8 +10,26 @@ import type { ModelProfile } from "../config/schema.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
 import { RuntimeError, sdkVersions } from "../domain/agents.ts";
 import { createSafeLogger } from "../logging/redact.ts";
-import { captureApiBody, createApiDiagnostics } from "../logging/api.ts";
+import {
+  captureApiBody,
+  createApiDiagnostics,
+  decodeDiagnosticString,
+} from "../logging/api.ts";
 import type { Store } from "../repositories/store.ts";
+
+const modelTextFields = new Map([
+  ["text", "content"],
+  ["delta", "content"],
+  ["thinking", "content"],
+  ["partial_json", "content"],
+  ["arguments", "content"],
+  ["signature", "signature"],
+  ["refusal", "refusal"],
+  ["message", "message"],
+  ["content", "content"],
+  ["output_text", "output_text"],
+  ["input_text", "input_text"],
+]);
 
 type Grant = {
   lease: string;
@@ -335,98 +353,64 @@ export class ModelRelay {
         const length = Buffer.byteLength(frame);
         if (length > 1024 * 1024) throw new RuntimeError("relay_frame_limit");
         failureBody = frame;
-        const credentialEnds = new Map<string, number>();
-        const value = this.checkFrame(frame),
-          fields =
-            value && typeof value === "object" && !Array.isArray(value)
-              ? (value as Record<string, unknown>)
-              : {},
-          channel = [
-            fields.type,
-            fields.index,
-            fields.output_index,
-            fields.content_index,
-            fields.summary_index,
-            fields.item_id,
-          ];
-        const inspect = (item: unknown, path: string[]) => {
-          if (typeof item === "string") {
-            const leaf = path.at(-1),
-              field = [
-                "text",
-                "delta",
-                "thinking",
-                "partial_json",
-                "arguments",
-              ].includes(leaf ?? "")
-                ? "content"
-                : leaf;
-            if (
-              ![
-                "text",
-                "delta",
-                "thinking",
-                "partial_json",
-                "arguments",
-                "signature",
-                "refusal",
-                "message",
-                "content",
-                "output_text",
-                "input_text",
-              ].includes(leaf ?? "")
-            )
-              return;
-            for (const key of [
-              JSON.stringify([channel, path]),
-              JSON.stringify(["channel", channel.slice(1), field]),
-              JSON.stringify(["field", field]),
-            ]) {
-              let matcher = matchers.get(key);
-              if (!matcher) {
-                matcherBytes += Buffer.byteLength(key) + 64;
-                if (matcherBytes > grant.bytes)
-                  throw new RuntimeError("relay_frame_limit");
-                matcher = this.secrets.createCredentialStream();
-                matchers.set(key, matcher);
+        const prefixes = new Set(
+          [...matchers.values()]
+            .filter((matcher) => matcher.pending)
+            .map((matcher) => matcher.prefixMatcher()),
+        );
+        try {
+          const value = this.checkFrame(frame),
+            fields =
+              value && typeof value === "object" && !Array.isArray(value)
+                ? (value as Record<string, unknown>)
+                : {},
+            channel = [
+              fields.type,
+              fields.index,
+              fields.output_index,
+              fields.content_index,
+              fields.summary_index,
+              fields.item_id,
+            ];
+          const inspect = (item: unknown, path: string[]) => {
+            if (typeof item === "string") {
+              const field = modelTextFields.get(path.at(-1) ?? "");
+              if (!field) return;
+              for (const key of [
+                JSON.stringify([channel, path]),
+                JSON.stringify(["channel", channel.slice(1), field]),
+                JSON.stringify(["field", field]),
+              ]) {
+                let matcher = matchers.get(key);
+                if (!matcher) {
+                  matcherBytes += Buffer.byteLength(key) + 64;
+                  if (matcherBytes > grant.bytes)
+                    throw new RuntimeError("relay_frame_limit");
+                  matcher = this.secrets.createCredentialStream();
+                  matchers.set(key, matcher);
+                }
+                if (matcher.pending) prefixes.add(matcher.prefixMatcher());
+                if (matcher.push(item))
+                  throw new RuntimeError("relay_response_invalid");
               }
-              const before = matcher.fork();
-              if (matcher.push(item)) {
-                let end = 0;
-                for (let index = 0; index < item.length; index++)
-                  if (before.push(item[index])) end = index + 1;
-                credentialEnds.set(
-                  item,
-                  Math.max(credentialEnds.get(item) ?? 0, end),
-                );
-              }
+            } else if (item !== null && typeof item === "object") {
+              for (const [key, child] of Object.entries(item))
+                inspect(child, [...path, key]);
             }
-          } else if (item !== null && typeof item === "object") {
-            for (const [key, child] of Object.entries(item))
-              inspect(child, [...path, key]);
-          }
-        };
-        inspect(value, []);
-        if (credentialEnds.size) {
-          failureBody = [
-            ...frame.split(/\r?\n/).filter((line) => !line.startsWith("data:")),
-            "data: " +
-              JSON.stringify(value, (_key, field) =>
-                typeof field === "string" && credentialEnds.has(field)
-                  ? "[credential fragment excluded]" +
-                    field.slice(credentialEnds.get(field))
-                  : field,
-              ),
-          ].join("\n");
-          throw new RuntimeError("relay_response_invalid");
+          };
+          inspect(value, []);
+          heldBytes += length;
+          if (heldBytes > grant.bytes)
+            throw new RuntimeError("relay_frame_limit");
+          held.push(frame);
+          failureBody = undefined;
+          if (![...matchers.values()].some((matcher) => matcher.pending))
+            await flush();
+        } catch (error) {
+          if (failureBody !== undefined)
+            failureBody = this.protectFrameFragments(failureBody, prefixes);
+          throw error;
         }
-        heldBytes += length;
-        if (heldBytes > grant.bytes)
-          throw new RuntimeError("relay_frame_limit");
-        held.push(frame);
-        failureBody = undefined;
-        if (![...matchers.values()].some((matcher) => matcher.pending))
-          await flush();
       };
       const decoder = new TextDecoder("utf8", { fatal: true });
       for await (const chunk of upstream.body) {
@@ -508,6 +492,94 @@ export class ModelRelay {
       }
       controller.abort();
     }
+  }
+
+  private protectFrameFragments(
+    frame: string,
+    prefixes: Set<(text: string, incomplete?: boolean) => number>,
+  ) {
+    const quoted = /"(?:\\[\s\S]?|[^"\\])*(?:"|$)/g;
+    const streams = new Map<
+      string,
+      {
+        current: ReturnType<SecretAccessor["createCredentialStream"]>;
+        previous?: number;
+      }
+    >();
+    const contributing = new Set<number>();
+    let field: string | undefined;
+    for (const match of frame.matchAll(quoted)) {
+      if (/^\s*:/.test(frame.slice(match.index + match[0].length))) {
+        field = modelTextFields.get(decodeDiagnosticString(match[0]));
+      } else if (field) {
+        let stream = streams.get(field);
+        if (!stream) {
+          stream = { current: this.secrets.createCredentialStream() };
+          streams.set(field, stream);
+        }
+        const parts: string[] = [];
+        const value = decodeDiagnosticString(match[0], (part) => {
+          parts.push(part);
+          return part;
+        });
+        parts.push(value);
+        if (stream.current.pending) {
+          const prefix = stream.current.prefixMatcher();
+          prefixes.add(prefix);
+          if (
+            stream.previous !== undefined &&
+            parts.some((part) => prefix(part, true) > 0)
+          )
+            contributing.add(stream.previous);
+        }
+        stream.current.push(value);
+        if (value) stream.previous = match.index;
+      }
+    }
+    if (!prefixes.size) return frame;
+    const protect = (text: string) => {
+      let end = 0;
+      for (const match of prefixes) end = Math.max(end, match(text, true));
+      const safe = end
+        ? "[credential fragment excluded]" + text.slice(end)
+        : text;
+      return safe;
+    };
+    field = undefined;
+    const safe = frame.replace(quoted, (value, offset: number) => {
+      if (/^\s*:/.test(frame.slice(offset + value.length))) {
+        field = modelTextFields.get(decodeDiagnosticString(value));
+        return value;
+      }
+      if (!field) return value;
+      let protectedPrefix = false;
+      const decoded = decodeDiagnosticString(value, (text) => {
+        const safe = this.secrets.redactIncompleteTail(protect(text));
+        protectedPrefix ||= safe !== text;
+        return safe;
+      });
+      const protectedValue = protect(decoded);
+      const content = contributing.has(offset)
+        ? this.secrets.redactIncompleteTail(protectedValue)
+        : protectedValue;
+      const closed = value.length > 1 && value.endsWith('"');
+      if (content === decoded && !protectedPrefix) return value;
+      const encoded = JSON.stringify(content);
+      return closed ? encoded : encoded.slice(0, -1);
+    });
+    return safe
+      .split(/\r?\n/)
+      .map((line) => {
+        if (!line.startsWith("data:")) return line;
+        const payload = line.slice(5),
+          content = payload.trimStart();
+        return (
+          "data:" +
+          payload.slice(0, payload.length - content.length) +
+          protect(content)
+        );
+      })
+      .join("\n");
   }
 
   private checkFrame(frame: string) {

@@ -1940,18 +1940,41 @@ describe.each([
     expect(captured.omitted_bytes).toBeGreaterThan(0);
   });
   it.each(
-    ["stalled", "interrupted", "oversized", "expanded"].flatMap((mode) =>
+    [
+      "stalled",
+      "interrupted",
+      "oversized",
+      "expanded",
+      "literal",
+      "malformed",
+      "malformed-prefix",
+      "malformed-auth",
+      "malformed-interrupted",
+    ].flatMap((mode) =>
       mode === "expanded"
         ? [{ mode, credential: "z", prefix: false }]
-        : [
-            { mode, credential: "workflow-token-canary", prefix: false },
-            { mode, credential: "workflow-token-canary", prefix: true },
-            { mode, credential: 'quoted-"credential\\suffix', prefix: true },
-          ],
+        : mode === "literal"
+          ? [{ mode, credential: "workflow-token-canary", prefix: false }]
+          : mode.startsWith("malformed")
+            ? [
+                "workflow-token-canary",
+                'quoted-"credential\\suffix',
+                "token-credential-é",
+              ].map((credential) => ({ mode, credential, prefix: true }))
+            : [
+                { mode, credential: "workflow-token-canary", prefix: false },
+                { mode, credential: "workflow-token-canary", prefix: true },
+                {
+                  mode,
+                  credential: 'quoted-"credential\\suffix',
+                  prefix: true,
+                },
+              ],
     ),
   )(
     "captures $mode GitHub bodies through the actual resolver client with credential $credential and prefix $prefix",
     async ({ mode, credential, prefix }) => {
+      const literalMessage = String.raw`Resolver denied request 100; literal "\u0030\u0031" and invalid "\q"; public context 0 and 1.`;
       const server = createServer((req, res) => {
         req.resume();
         res.writeHead(403, {
@@ -1965,6 +1988,39 @@ describe.each([
               message: "Resolver denied request 100. " + "z ".repeat(180000),
             }),
           );
+          return;
+        }
+        if (mode === "literal") {
+          res.end(literalMessage);
+          return;
+        }
+        if (mode.startsWith("malformed")) {
+          const slash = String.fromCharCode(92);
+          const encoded = credential
+            .split("")
+            .map(
+              (char) =>
+                slash + "u" + char.charCodeAt(0).toString(16).padStart(4, "0"),
+            )
+            .join("");
+          const opening =
+            '{"message":"Resolver denied request 100; context 0 and 1. ';
+          const body =
+            mode === "malformed-prefix"
+              ? opening + encoded.slice(0, -3)
+              : opening +
+                encoded +
+                (mode === "malformed-auth"
+                  ? "; request sent Authorization: Bearer unregistered-malformed-auth" +
+                    slash +
+                    "n"
+                  : "; ") +
+                "public reason 0 and 1 " +
+                slash;
+          if (mode === "malformed-interrupted") {
+            res.write(body);
+            setTimeout(() => res.destroy(), 20);
+          } else res.end(body);
           return;
         }
         if (prefix) {
@@ -2035,12 +2091,28 @@ describe.each([
           .map((row) => row.content)
           .join("");
         expect(body.includes("Resolver denied request 100")).toBe(true);
+        if (mode === "literal") expect(body).toBe(literalMessage);
         if (prefix) {
           expect(body.includes("context 0 and 1.")).toBe(true);
           expect(body.includes(credential.slice(0, -1))).toBe(false);
           expect(
             body.includes(JSON.stringify(credential).slice(1, -1).slice(0, -1)),
           ).toBe(false);
+        }
+        if (mode.startsWith("malformed")) {
+          const encoded = credential
+            .split("")
+            .map(
+              (char) =>
+                "\\u" + char.charCodeAt(0).toString(16).padStart(4, "0"),
+            )
+            .join("");
+          expect(body).not.toContain(encoded.slice(0, -6));
+          expect(JSON.stringify(result)).not.toContain(
+            "unregistered-malformed-auth",
+          );
+          if (mode !== "malformed-prefix")
+            expect(body).toContain("public reason 0 and 1");
         }
         expect(
           records.some(
@@ -2051,10 +2123,15 @@ describe.each([
                 interrupted: "read_failed",
                 oversized: "byte_limit",
                 expanded: "byte_limit",
+                literal: "complete",
+                malformed: "complete",
+                "malformed-prefix": "complete",
+                "malformed-auth": "complete",
+                "malformed-interrupted": "read_failed",
               }[mode],
           ),
         ).toBe(true);
-        if (["stalled", "interrupted"].includes(mode))
+        if (["stalled", "interrupted", "malformed-interrupted"].includes(mode))
           expect(records.some((row) => row.detail_kind === "read_cause")).toBe(
             true,
           );

@@ -20,6 +20,7 @@ function run(mode: string, credential = "actual-credential-canary") {
     const credentials=createKnownSecretChecker([credential]);
     const diagnostics=createApiDiagnostics({...credentials,redact:createKnownSecretChecker(['0','1','Denied']).redact,redactCredentials:credentials.redact},{repository:'owner/repo',issue_number:22});
     const message='Denied for issue 22 with status 403; request 100. '+('雪\\n"'.repeat(mode==='large'?12000:1))+' actual-credential-canary';
+    const literalMessage='Provider literal pattern "'+String.fromCharCode(92)+'u0030'+String.fromCharCode(92)+'u0031" and invalid "'+String.fromCharCode(92)+'q"; public context 0 and 1.';
     const headerMessage='Provider access denied with context 0 and 1\\nAuthorization: Bearer header-auth-canary\\nProxy-Authorization: Basic header-proxy-canary\\nCookie: session=header-cookie-canary\\nSet-Cookie: session=header-set-cookie-canary; HttpOnly\\nX-Api-Key: unregistered-xapi-canary\\nApi-Key: unregistered-api-canary\\nProvider key link https://storage.invalid/file?x-api-key=url-api-canary\\nProvider inline authentication context 100 request sent Authorization: Bearer inline-auth-canary\\nProvider reason ends';
     const server=createServer((req,res)=>{
       requests.push(req.method+' '+req.url);req.resume();
@@ -27,6 +28,19 @@ function run(mode: string, credential = "actual-credential-canary") {
       res.setHeader('x-accepted-github-permissions','issues=write');
       res.setHeader('authorization','server-authorization-canary');
       if(mode==='transport') {req.socket.destroy();return;}
+      if(mode==='literal-escapes') {res.writeHead(403,{'content-type':'text/plain'});res.end(literalMessage);return;}
+      if(mode.startsWith('malformed-')) {
+        const slash=String.fromCharCode(92), encoded=credential.split('').map(char=>slash+'u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('');
+        let body='{"message":"Provider malformed denial 100; ';
+        if(mode==='malformed-internal') body+='invalid escape '+slash+'q before '+encoded+'; public reason 0 and 1"}';
+        else if(mode==='malformed-prefix') body+=encoded.slice(0,-3);
+        else if(mode==='malformed-auth') body+=encoded+'; request sent Authorization: Bearer unregistered-malformed-auth'+slash+'n'+'public reason 0 and 1 '+slash;
+        else body+=encoded+'; public reason 0 and 1 '+slash;
+        res.writeHead(403);
+        if(mode==='malformed-interrupted') {res.write(body);setTimeout(()=>res.destroy(),20);}
+        else res.end(body);
+        return;
+      }
       if(mode==='success-interrupted') {res.writeHead(200);res.write(JSON.stringify({content:Buffer.from('successful-configuration-payload-canary').toString('base64')}).slice(0,-1));setTimeout(()=>res.destroy(),20);return;}
       if(mode==='expanded') {res.writeHead(403);res.end(JSON.stringify({message:'Request denied 100. '+'z '.repeat(180000)}));return;}
       if(mode.startsWith('preserve-')) {
@@ -62,7 +76,7 @@ function run(mode: string, credential = "actual-credential-canary") {
       else await client.request(mode==='graphql'?'POST /graphql':'GET /repos/{owner}/{repo}',{owner:'owner',repo:'repo'});
     } catch(error) {code=error.code??error.status;if(mode.startsWith('preserve-'))consumerMessagePreserved=error.response?.data?.message==='Branch not protected';}
     finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
-    console.log(JSON.stringify({code,requests,consumerMessagePreserved,message:mode==='large'?message.replaceAll('actual-credential-canary','[redacted]'):undefined}));
+    console.log(JSON.stringify({code,requests,consumerMessagePreserved,message:mode==='literal-escapes'?literalMessage:mode==='large'?message.replaceAll('actual-credential-canary','[redacted]'):undefined}));
   `,
       mode,
       credential,
@@ -201,6 +215,50 @@ describe("actual API diagnostics in Actions stderr", () => {
     ).toMatchObject({ status: 200, route: "/graphql" });
     expect(body(r.logs)).toContain("GraphQL permission denied");
   });
+  it("preserves literal escapes in ordinary failure bodies", () => {
+    const r = run("literal-escapes");
+    expect(body(r.logs)).toBe(r.result.message);
+  });
+  it.each(
+    [
+      "malformed-complete",
+      "malformed-interrupted",
+      "malformed-prefix",
+      "malformed-internal",
+      "malformed-auth",
+    ].flatMap((mode) =>
+      [
+        "actual-credential-canary",
+        'quoted-"credential\\suffix',
+        "token-credential-é",
+      ].map((credential) => ({ mode, credential })),
+    ),
+  )(
+    "protects $mode quoted failures with credential $credential",
+    ({ mode, credential }) => {
+      const r = run(mode, credential);
+      expect(
+        r.logs.find((row) => row.event === "api.request.failed"),
+      ).toMatchObject({ status: 403 });
+      const captured = body(r.logs);
+      expect(captured).toContain("Provider malformed denial 100");
+      if (mode !== "malformed-prefix")
+        expect(captured).toContain("public reason 0 and 1");
+      expect(r.output).not.toContain(credential);
+      const encoded = credential
+        .split("")
+        .map((char) => "\\u" + char.charCodeAt(0).toString(16).padStart(4, "0"))
+        .join("");
+      expect(captured).not.toContain(encoded.slice(0, -6));
+      expect(captured).not.toContain(credential.slice(0, -1));
+      expect(r.output).not.toContain("unregistered-malformed-auth");
+      if (mode === "malformed-internal")
+        expect(captured).toContain("invalid escape");
+      expect(
+        r.logs.find((row) => row.detail_kind === "body").capture_state,
+      ).toBe(mode === "malformed-interrupted" ? "read_failed" : "complete");
+    },
+  );
   it("logs success metadata without a response body", () => {
     const r = run("success");
     expect(

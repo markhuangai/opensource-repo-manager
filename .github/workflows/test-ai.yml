@@ -58,7 +58,7 @@ jobs:
             let stage = "input", reference, observed, lastApi;
             const credential = core.getInput?.("github-token") ?? "";
             const credentialField = /^(authorization|proxy-authorization|cookie|set-cookie|token|access_token|refresh_token|(?:x[-_]?)?api[-_]?key|password|secret|signed(upload|download)?url|signature|sig)$/i;
-            const protectedTextPattern = new RegExp(/"(?:\\.|[^"\\])*(?:"|$)/.source + "|((?:^|[\\s(,{;])" + credentialField.source.slice(1,-1) + "[ \\t]*[:=][ \\t]*)[^\\r\\n]*", "gim");
+            const protectedTextPattern = new RegExp(/"(?:\\[\s\S]?|[^"\\])*(?:"|$)/.source + "|((?:^|[\\s(,{;])" + credentialField.source.slice(1,-1) + "[ \\t]*[:=][ \\t]*)[^\\r\\n]*", "gim");
             const protectUrls = text => text.replace(/https?:(?:\/|\\\/){2}[^\s"'<>]+/gi, url => {
               try { const parsed = new URL(url.replaceAll("\\/", "/").replaceAll("&amp;", "&"));
                 if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some(key => credentialField.test(key) || /^(client_secret|x-amz-|x-goog-)/i.test(key))) return "[signed URL excluded]";
@@ -87,17 +87,43 @@ jobs:
               }
               return output + value.slice(previous);
             };
+            const protectTail = safe => {
+              let excluded = 0;
+              for (const secret of [credential, JSON.stringify(credential).slice(1,-1)].filter(Boolean))
+                for (let size = Math.min(secret.length - 1, safe.length); size > excluded; size--)
+                  if (safe.endsWith(secret.slice(0,size))) { excluded = size; break; }
+              return excluded ? safe.slice(0,-excluded) + "[credential prefix excluded]" : safe;
+            };
+            const decodeQuoted = (quoted, protectIncomplete) => {
+              try { return JSON.parse(quoted); }
+              catch {
+                try { return protectIncomplete(JSON.parse(quoted + '"')); }
+                catch {
+                  const closed = quoted.length > 1 && /(?:^|[^\\])(?:\\\\)*"$/.test(quoted);
+                  const content = quoted.slice(1,closed ? -1 : undefined), parts = [];
+                  let decoded = "";
+                  for (const [token] of content.matchAll(/\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])|\\(?:u[0-9a-fA-F]{0,3}(?=$)|[\s\S]?)|[^\\]+/g)) {
+                    if (/^\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])$/.test(token)) decoded += JSON.parse('"' + token + '"');
+                    else if (token.startsWith("\\")) { parts.push(protectIncomplete(decoded),token); decoded = ""; }
+                    else decoded += token;
+                  }
+                  parts.push(protectIncomplete(decoded));
+                  return parts.join("");
+                }
+              }
+            };
             const protectText = value => {
               const redact = text => credential ? text.replaceAll(credential, "[credential excluded]") : text;
               const text = excludeFields(value).replace(protectedTextPattern, (quoted,prefix) => {
                 if (prefix !== undefined) return prefix + "[credential excluded]";
                 const closed = quoted.length > 1 && quoted.endsWith('"');
-                try {
-                  const decoded = JSON.parse(closed ? quoted : quoted + '"'), safe = protectText(decoded);
-                  if (safe === decoded) return quoted;
-                  const encoded = JSON.stringify(safe);
-                  return closed ? encoded : encoded.slice(0,-1);
-                } catch { return quoted; }
+                let protectedPrefix = false;
+                const decoded = decodeQuoted(quoted,text => {
+                  const safe = protectTail(text); protectedPrefix ||= safe !== text; return safe;
+                }), safe = protectText(decoded);
+                if (safe === decoded && !protectedPrefix) return quoted;
+                const encoded = JSON.stringify(safe);
+                return closed ? encoded : encoded.slice(0,-1);
               });
               return redact(protectUrls(text));
             };
@@ -111,13 +137,7 @@ jobs:
               const text = typeof value === "string" ? value : JSON.stringify(value);
               let safe;
               try { safe = scrub(JSON.parse(text)); } catch { safe = protectText(text ?? ""); }
-              if (incomplete) {
-                let excluded = 0;
-                for (const secret of [credential, JSON.stringify(credential).slice(1,-1)].filter(Boolean))
-                  for (let size = Math.min(secret.length - 1, safe.length); size > excluded; size--)
-                    if (safe.endsWith(secret.slice(0,size))) { excluded = size; break; }
-                if (excluded) safe = safe.slice(0,-excluded) + "[credential prefix excluded]";
-              }
+              if (incomplete) safe = protectTail(safe);
               return safe;
             };
             const capture = (value, limit) => {

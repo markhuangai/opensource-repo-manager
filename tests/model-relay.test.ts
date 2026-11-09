@@ -157,6 +157,16 @@ describe("scoped model relay", () => {
           "sse-fragmented-unicode",
           "sse-fragmented-cross-block",
           "sse-fragmented-multiple",
+          "sse-fragmented-complete-secondary",
+          "sse-fragmented-error-event",
+          "sse-fragmented-invalid-json",
+          "sse-fragmented-plaintext",
+          "sse-fragmented-local",
+          "sse-fragmented-within-frame",
+          "sse-fragmented-within-frame-long",
+          "sse-fragmented-numeric-context",
+          "sse-fragmented-partial",
+          "rejected-malformed",
           "invalid-json",
           "client-json",
           "backpressure",
@@ -189,8 +199,8 @@ describe("scoped model relay", () => {
       const server=createServer((req,res)=>{
         requests++; req.resume(); reached.resolve();
         if(mode.startsWith('sse-fragmented')) {
-          const credential=['sse-fragmented-overlap','sse-fragmented-unicode','sse-fragmented-multiple'].includes(mode)?config.github.token:config.proxy.key;
-          const split=mode==='sse-fragmented-unicode'?credential.indexOf('😀')+1:1;
+          const credential=['sse-fragmented-overlap','sse-fragmented-unicode','sse-fragmented-multiple','sse-fragmented-complete-secondary','sse-fragmented-error-event','sse-fragmented-invalid-json','sse-fragmented-plaintext','sse-fragmented-local','sse-fragmented-within-frame','sse-fragmented-within-frame-long','sse-fragmented-numeric-context','sse-fragmented-partial'].includes(mode)?config.github.token:config.proxy.key;
+          const split=mode==='sse-fragmented-unicode'?credential.indexOf('😀')+1:mode==='sse-fragmented-within-frame-long'?credential.length-1:1;
           const event=(text,index,refusal)=>sdk==='claude'?{type:'content_block_delta',index,delta:{type:'text_delta',text,refusal}}:{type:'response.output_text.delta',output_index:index,content_index:0,delta:text,refusal};
           const frame=(value,index)=>{
             let data=JSON.stringify(value);
@@ -198,7 +208,31 @@ describe("scoped model relay", () => {
             return 'event: credential-frame\\nid: frame-'+index+'\\ndata: '+data+'\\n\\n';
           };
           res.setHeader('content-type','text/event-stream');
-          res.end(frame(event(credential.slice(0,split),0,mode==='sse-fragmented-multiple'?config.proxy.key.slice(0,1):undefined),1)+frame(event(credential.slice(split)+'; Provider streaming failure 100; public context 0 and 1. https://storage.invalid/file?sig=signed-canary',mode==='sse-fragmented-cross-block'?1:0,mode==='sse-fragmented-multiple'?config.proxy.key.slice(1)+'; Other public failure reason':undefined),2));
+          const text=credential.slice(split)+'; Provider streaming failure 100; public context 0 and 1. https://storage.invalid/file?sig=signed-canary';
+          let first=frame(event(credential.slice(0,split),0,mode==='sse-fragmented-multiple'?config.proxy.key.slice(0,1):undefined),1);
+          let second=frame(event(text,mode==='sse-fragmented-cross-block'?1:0,mode==='sse-fragmented-multiple'?config.proxy.key.slice(1)+'; Other public failure reason':['sse-fragmented-complete-secondary','sse-fragmented-local'].includes(mode)?config.proxy.key:undefined),mode==='sse-fragmented-local'?3:2);
+          if(mode==='sse-fragmented-error-event') second='event: error\\n'+second;
+          if(mode==='sse-fragmented-invalid-json') second=second.slice(0,-4)+'\\n\\n';
+          if(mode==='sse-fragmented-plaintext') second='id: frame-2\\ndata: '+text+'\\n\\n';
+          if(mode==='sse-fragmented-local') first+=frame(event('public interruption context',1),2);
+          if(['sse-fragmented-within-frame','sse-fragmented-within-frame-long'].includes(mode)) {
+            first='';
+            const value=event(credential.slice(0,split),0);
+            const target=sdk==='claude'?value.delta:value;
+            target.arguments=text;target.refusal=config.proxy.key;
+            second=frame(value,2);
+          }
+          if(mode==='sse-fragmented-numeric-context') {
+            const value=event(text,0,config.proxy.key), target=sdk==='claude'?value.delta:value;
+            const slash=String.fromCharCode(92);
+            target.message='Provider ordinary value 0; pattern "'+slash+'u0030'+slash+'u0031"; invalid "'+slash+'q"';target.content='Provider ordinary value 1';
+            second=frame(value,2);
+          }
+          if(mode==='sse-fragmented-partial') {
+            const slash=String.fromCharCode(92), escaped=credential.slice(split).split('').map(char=>slash+'u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('');
+            second='event: credential-frame\\nid: frame-2\\n: Provider streaming failure 100; public context 0 and 1\\ndata: {"text":"'+escaped.slice(0,-3)+'\\n\\n';
+          }
+          res.end(first+second);
         }
         if(mode==='backpressure') {
           res.setHeader('content-type','text/event-stream');
@@ -219,6 +253,11 @@ describe("scoped model relay", () => {
           const opening='{"error":{"message":"Provider denied model request 100; context 0 and 1. ',credential=config.proxy.key;
           res.writeHead(403,{'content-type':'application/json','x-request-id':'model-provider-100'});
           res.end(opening+'x'.repeat(4096-credential.length+1-Buffer.byteLength(opening))+credential+'"}}');
+        }
+        if(mode==='rejected-malformed') {
+          const slash=String.fromCharCode(92), encoded=config.proxy.key.split('').map(char=>slash+'u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('');
+          res.writeHead(403,{'content-type':'application/json'});
+          res.end('{"error":{"message":"Provider denied model request 100; '+encoded+'; public reason 0 and 1 '+slash);
         }
         if(mode==='sse') {
           res.setHeader('content-type','text/event-stream');
@@ -251,6 +290,7 @@ describe("scoped model relay", () => {
       const config=fixtureConfiguration();
       if(mode==='sse-fragmented-overlap') config.github.token=config.proxy.key+'-extended';
       if(mode==='sse-fragmented-unicode') config.github.token='token-😀-credential';
+      if(mode==='sse-fragmented-numeric-context') {config.proxy.key='0-provider-key';config.redaction_values=['0','1'];}
       if(mode==='numeric-redactions' || mode==='rejected-prefix') config.redaction_values=['0','1'];
       config.proxy.url='http://127.0.0.1:'+server.address().port+'/v1';
       const loaded=await fixtureSnapshot('private-model-canary',config);
@@ -372,6 +412,16 @@ describe("scoped model relay", () => {
         "sse-fragmented-unicode": "relay_response_invalid",
         "sse-fragmented-cross-block": "relay_response_invalid",
         "sse-fragmented-multiple": "relay_response_invalid",
+        "sse-fragmented-complete-secondary": "relay_response_invalid",
+        "sse-fragmented-error-event": "relay_response_invalid",
+        "sse-fragmented-invalid-json": "relay_response_invalid",
+        "sse-fragmented-plaintext": "relay_response_invalid",
+        "sse-fragmented-local": "relay_response_invalid",
+        "sse-fragmented-within-frame": "relay_response_invalid",
+        "sse-fragmented-within-frame-long": "relay_response_invalid",
+        "sse-fragmented-numeric-context": "relay_response_invalid",
+        "sse-fragmented-partial": "relay_response_invalid",
+        "rejected-malformed": "upstream_rejected",
         backpressure: "request_cancelled",
         "invalid-json": "relay_response_invalid",
         "rejected-interrupted": "upstream_rejected",
@@ -465,20 +515,61 @@ describe("scoped model relay", () => {
     }
     if (mode.startsWith("sse"))
       expect(body).toContain("Provider streaming failure 100");
-    if (mode.startsWith("sse-fragmented")) {
+    if (mode === "rejected-malformed") {
+      expect(apiFailure.status).toBe(403);
+      expect(body).toContain("Provider denied model request 100");
+      expect(body).toContain("public reason 0 and 1");
+      expect(body).not.toContain("\\u0070\\u0072\\u006f\\u0078\\u0079");
+    }
+    if (
+      [
+        "sse-fragmented-invalid-json",
+        "sse-fragmented-plaintext",
+        "sse-fragmented-partial",
+      ].includes(mode)
+    ) {
+      expect(body).toContain("[credential fragment excluded]");
+      expect(body).toContain("public context 0 and 1");
+      expect(body).toContain("id: frame-2");
+      expect(body).not.toContain(
+        fixtureConfiguration().github.token.slice(1, -1),
+      );
+    } else if (mode.startsWith("sse-fragmented")) {
       const frame = JSON.parse(
         body
           .split("\n")
           .find((line) => line.startsWith("data:"))!
           .slice(5),
       );
-      const text = sdk === "claude" ? frame.delta.text : frame.delta;
+      const text = [
+        "sse-fragmented-within-frame",
+        "sse-fragmented-within-frame-long",
+      ].includes(mode)
+        ? sdk === "claude"
+          ? frame.delta.arguments
+          : frame.arguments
+        : sdk === "claude"
+          ? frame.delta.text
+          : frame.delta;
       expect(text).toMatch(
         /^\[credential fragment excluded\]; Provider streaming failure 100;/,
       );
       expect(text).toContain("public context 0 and 1");
-      expect(body).toContain("id: frame-2");
+      expect(body).toContain(
+        mode === "sse-fragmented-local" ? "id: frame-3" : "id: frame-2",
+      );
       expect(text).not.toContain("-extended");
+      if (mode === "sse-fragmented-within-frame-long")
+        expect(body).not.toContain(
+          fixtureConfiguration().github.token.slice(0, -1),
+        );
+      if (mode === "sse-fragmented-numeric-context") {
+        const target = sdk === "claude" ? frame.delta : frame;
+        expect(target.message).toBe(
+          String.raw`Provider ordinary value 0; pattern "\u0030\u0031"; invalid "\q"`,
+        );
+        expect(target.content).toBe("Provider ordinary value 1");
+      }
       if (mode === "sse-fragmented-multiple") {
         const refusal = sdk === "claude" ? frame.delta.refusal : frame.refusal;
         expect(refusal).toBe(

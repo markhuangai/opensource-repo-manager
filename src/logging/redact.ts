@@ -43,16 +43,30 @@ export function createKnownSecretChecker(values: readonly string[]) {
       : message;
   }
 
-  type Node = { next: Map<string, number>; fail: number; matched: boolean };
+  type Node = {
+    next: Map<string, number>;
+    fail: number;
+    matched: number;
+    depth: number;
+  };
   type Stream = Readonly<{
     pending: boolean;
     push(text: string): boolean;
     fork(): Stream;
+    prefixMatcher(): (text: string, incomplete?: boolean) => number;
   }>;
   let nodes: Node[] | undefined;
+  const prefixMatchers = new Map<
+    number,
+    (text: string, incomplete?: boolean) => number
+  >();
+  const maximumLength = secrets.reduce(
+    (maximum, secret) => Math.max(maximum, secret.length),
+    0,
+  );
   function createStream(): Stream {
     if (!nodes) {
-      nodes = [{ next: new Map(), fail: 0, matched: false }];
+      nodes = [{ next: new Map(), fail: 0, matched: 0, depth: 0 }];
       for (const secret of secrets) {
         let state = 0;
         for (let index = 0; index < secret.length; index++) {
@@ -61,11 +75,16 @@ export function createKnownSecretChecker(values: readonly string[]) {
           if (next === undefined) {
             next = nodes.length;
             nodes[state].next.set(character, next);
-            nodes.push({ next: new Map(), fail: 0, matched: false });
+            nodes.push({
+              next: new Map(),
+              fail: 0,
+              matched: 0,
+              depth: nodes[state].depth + 1,
+            });
           }
           state = next;
         }
-        nodes[state].matched = true;
+        nodes[state].matched = Math.max(nodes[state].matched, secret.length);
       }
       const queue = [...nodes[0].next.values()];
       for (let cursor = 0; cursor < queue.length; cursor++) {
@@ -75,7 +94,10 @@ export function createKnownSecretChecker(values: readonly string[]) {
           while (fallback && !nodes[fallback].next.has(character))
             fallback = nodes[fallback].fail;
           nodes[child].fail = nodes[fallback].next.get(character) ?? 0;
-          nodes[child].matched ||= nodes[nodes[child].fail].matched;
+          nodes[child].matched = Math.max(
+            nodes[child].matched,
+            nodes[nodes[child].fail].matched,
+          );
           queue.push(child);
         }
       }
@@ -93,11 +115,40 @@ export function createKnownSecretChecker(values: readonly string[]) {
             while (state && !compiled[state].next.has(character))
               state = compiled[state].fail;
             state = compiled[state].next.get(character) ?? 0;
-            matched ||= compiled[state].matched;
+            matched ||= compiled[state].matched > 0;
           }
           return matched;
         },
         fork: () => stream(state),
+        prefixMatcher() {
+          let match = prefixMatchers.get(state);
+          if (!match) {
+            const initial = state;
+            match = (text, incomplete = false) => {
+              let current = initial,
+                end = 0;
+              const length = Math.min(text.length, maximumLength);
+              for (let index = 0; index < length; index++) {
+                const character = text[index];
+                while (current && !compiled[current].next.has(character))
+                  current = compiled[current].fail;
+                current = compiled[current].next.get(character) ?? 0;
+                // Only matches beginning before this string identify a leading credential fragment.
+                if (compiled[current].matched > index + 1) end = index + 1;
+                if (compiled[current].depth <= index + 1) break;
+              }
+              if (
+                incomplete &&
+                length === text.length &&
+                compiled[current].depth > length
+              )
+                end = length;
+              return end;
+            };
+            prefixMatchers.set(state, match);
+          }
+          return match;
+        },
       });
     return stream(0);
   }
