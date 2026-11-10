@@ -7,7 +7,8 @@ export function artifactFixture(config) {
     requests = [],
     errors = [];
   let next = 4000,
-    dropFinalize = false;
+    dropFinalize = false,
+    diagnosticFault = "";
   const head = "f".repeat(40);
   const run = (id) => ({
     id,
@@ -48,6 +49,7 @@ export function artifactFixture(config) {
       request_bytes: 0,
       status: null,
       interrupted: false,
+      read_delays: 0,
     };
     requests.push(receipt);
     const completed = () => {
@@ -60,10 +62,48 @@ export function artifactFixture(config) {
     res.once("close", completed);
     try {
       const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
+      for await (const chunk of req) {
+        if (
+          config.artifact_read_delay_ms &&
+          req.method === "PUT" &&
+          url.pathname.startsWith("/_artifacts/")
+        ) {
+          receipt.read_delays++;
+          await new Promise((resolve) =>
+            setTimeout(resolve, config.artifact_read_delay_ms),
+          );
+        }
+        chunks.push(chunk);
+      }
       const bytes = Buffer.concat(chunks);
       receipt.request_bytes = bytes.length;
       res.setHeader("content-type", "application/json");
+      if (
+        (["diagnostic_list", "diagnostic_stalled_list"].includes(
+          diagnosticFault,
+        ) &&
+          url.pathname.endsWith("/ListArtifacts")) ||
+        (diagnosticFault === "diagnostic_metadata" &&
+          url.pathname.includes("/actions/runs/"))
+      ) {
+        const operation = diagnosticFault;
+        diagnosticFault = "";
+        res.writeHead(403, { "x-request-id": "artifact-diagnostic-100" });
+        if (operation === "diagnostic_stalled_list") {
+          receipt.capture_waiting = true;
+          res.write('{"msg":"Artifact capture waiting for workflow 100"');
+          return true;
+        }
+        res.end(
+          JSON.stringify({
+            msg: `Artifact ${operation} denied for workflow 100`,
+            message: `Artifact ${operation} denied for workflow 100`,
+            context: "x".repeat(3000) + config.session_key + " end of failure",
+            token: config.github.token,
+          }),
+        );
+        return true;
+      }
       if (url.pathname.startsWith("/twirp/")) {
         const current = Object.entries(config.artifact_tokens).find(
           ([, token]) => req.headers.authorization === `Bearer ${token}`,
@@ -120,7 +160,7 @@ export function artifactFixture(config) {
           res.end(
             JSON.stringify({
               ok: true,
-              signedUploadUrl: `https://api.github.com/_artifacts/${item.id}?sig=fixture-only`,
+              signedUploadUrl: `${config.artifact_origin ?? "https://api.github.com"}/_artifacts/${item.id}?sig=fixture-only`,
             }),
           );
         } else if (method === "FinalizeArtifact") {
@@ -204,6 +244,11 @@ export function artifactFixture(config) {
             "content-disposition": `attachment; filename="${item.name}"`,
             "content-length": data.length,
           });
+          if (item.drop_download) {
+            res.write(data.subarray(0, 16384));
+            setTimeout(() => res.destroy(), 20);
+            return true;
+          }
           res.end(data);
         } else throw new Error("Unexpected artifact blob request");
       } else {
@@ -238,7 +283,7 @@ export function artifactFixture(config) {
           );
           assert(item?.finalized && !item.deleted);
           res.writeHead(302, {
-            location: `https://api.github.com/_artifacts/${item.id}?sig=fixture-only`,
+            location: `${config.artifact_origin ?? "https://api.github.com"}/_artifacts/${item.id}?sig=fixture-only`,
           });
           res.end();
         } else throw new Error("Unexpected artifact REST request");
@@ -253,12 +298,26 @@ export function artifactFixture(config) {
   return {
     handle,
     fault(id, kind) {
+      if (
+        [
+          "diagnostic_list",
+          "diagnostic_metadata",
+          "diagnostic_stalled_list",
+        ].includes(kind)
+      ) {
+        diagnosticFault = kind;
+        return;
+      }
       if (kind === "drop_finalize") {
         dropFinalize = true;
         return;
       }
       const artifact = artifacts.find((item) => item.id === id);
       assert(artifact);
+      if (kind === "drop_download") {
+        artifact.drop_download = true;
+        return;
+      }
       for (const name of ["expired", "deleted", "corrupt", "foreign"])
         artifact[name] = kind === name;
     },

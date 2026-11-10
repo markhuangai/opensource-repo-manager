@@ -2,6 +2,9 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
+import { createServer } from "node:http";
+import { Octokit } from "@octokit/rest";
+import { fetch as undiciFetch } from "undici";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
@@ -50,6 +53,8 @@ async function run(
     jobs = [],
     transport = {},
     executor = {},
+    onInfo,
+    githubToken = "",
   } = {},
 ) {
   const outputs = {};
@@ -59,6 +64,7 @@ async function run(
   const summaries = [];
   const maskedValues = [];
   const github = {
+    request: transport.request,
     rest: {
       pulls: { get: async () => ({ data: current }), list: "pulls" },
       repos: {
@@ -86,11 +92,15 @@ async function run(
   };
   const core = {
     summary,
+    getInput: (name) => (name === "github-token" ? githubToken : ""),
     setSecret: (value) => maskedValues.push(value),
     notice: (message) => notices.push(message),
     setOutput: (key, value) => (outputs[key] = value),
     setFailed: (message) => failures.push(message),
-    info: (message) => notices.push(message),
+    info: (message) => {
+      notices.push(message);
+      onInfo?.(message);
+    },
     error: (message) => notices.push(message),
     warning: (message) => notices.push(message),
   };
@@ -860,15 +870,18 @@ describe("pinned reusable maintenance workflow", () => {
         env,
         executor: {
           exec: async () => {},
-          getExecOutput: async () => ({
-            stdout: JSON.stringify({
-              version: 1,
-              repository_id: 42,
-              issues: [1, 10],
-            }),
-            stderr: diagnostic,
-            exitCode: 0,
-          }),
+          getExecOutput: async (_command, _args, options) => {
+            options.listeners.stderr(Buffer.from(diagnostic));
+            return {
+              stdout: JSON.stringify({
+                version: 1,
+                repository_id: 42,
+                issues: [1, 10],
+              }),
+              stderr: diagnostic,
+              exitCode: 0,
+            };
+          },
         },
       });
       expect(routed.outputs).toEqual({ issues: "[1,10]", has_work: "true" });
@@ -878,15 +891,18 @@ describe("pinned reusable maintenance workflow", () => {
         env,
         executor: {
           exec: async () => {},
-          getExecOutput: async () => ({
-            stdout: JSON.stringify({
-              version: 1,
-              outcome: "waiting",
-              reason: "remote_checks",
-            }),
-            stderr: diagnostic,
-            exitCode: 0,
-          }),
+          getExecOutput: async (_command, _args, options) => {
+            options.listeners.stderr(Buffer.from(diagnostic));
+            return {
+              stdout: JSON.stringify({
+                version: 1,
+                outcome: "waiting",
+                reason: "remote_checks",
+              }),
+              stderr: diagnostic,
+              exitCode: 0,
+            };
+          },
         },
       });
       expect(executed.maskedValues).toEqual([]);
@@ -904,15 +920,18 @@ describe("pinned reusable maintenance workflow", () => {
       env: environment,
       executor: {
         exec: async () => {},
-        getExecOutput: async () => ({
-          exitCode: 1,
-          stderr: diagnostic,
-          stdout: JSON.stringify({
-            version: 1,
-            outcome: "failed",
-            reason: "source_missing",
-          }),
-        }),
+        getExecOutput: async (_command, _args, options) => {
+          options.listeners.stderr(Buffer.from(diagnostic));
+          return {
+            exitCode: 1,
+            stderr: diagnostic,
+            stdout: JSON.stringify({
+              version: 1,
+              outcome: "failed",
+              reason: "source_missing",
+            }),
+          };
+        },
       },
     });
     expect(result.notices).toContain(diagnostic);
@@ -1229,6 +1248,8 @@ describe.each([
     response = {},
     transportError,
     git = {},
+    githubToken = "",
+    request,
   } = {}) {
     const calls = [],
       revisionCalls = [];
@@ -1247,8 +1268,10 @@ describe.each([
       ...git,
     };
     const result = await run(runtimeScript, {
+      githubToken,
       context: { repo: { owner: "consumer", repo: "project" } },
       transport: {
+        request,
         git: Object.fromEntries(
           Object.entries(methods).map(([method, handler]) => [
             method,
@@ -1284,7 +1307,45 @@ describe.each([
   const failure = (result) => {
     expect(result.outputs).toEqual({});
     expect(result.failures).toHaveLength(1);
-    return JSON.parse(result.failures[0]);
+    const outcome = JSON.parse(result.failures[0]);
+    expect(Buffer.byteLength(result.failures[0])).toBeLessThanOrEqual(2048);
+    expect(outcome).not.toHaveProperty("provider_error");
+    expect(outcome).not.toHaveProperty("observed");
+    const records = result.notices
+      .filter((line) => line.startsWith("{"))
+      .map(JSON.parse)
+      .filter((row) => row.request_id === outcome.request_id);
+    const parts = (kind) =>
+      records.filter(
+        (row) =>
+          row.event === "api.response.detail" && row.detail_kind === kind,
+      );
+    const text = (kind) =>
+      parts(kind)
+        .map((row) => row.content)
+        .join("");
+    const causal = JSON.parse(text("cause") || "{}");
+    const captured = (content, kind) => ({
+      content,
+      bytes: parts(kind)[0]?.body_bytes ?? Buffer.byteLength(content),
+      omitted_bytes: parts(kind)[0]?.omitted_bytes ?? 0,
+    });
+    const failed = records.find((row) => row.event === "api.request.failed");
+    return {
+      ...outcome,
+      cause: captured((causal.message ?? "").split("\n")[0], "cause"),
+      provider_status:
+        outcome.provider_status ?? outcome.exit_code ?? failed?.error_status,
+      provider_error: failed
+        ? captured(
+            parts("body").length
+              ? text("body")
+              : (causal.cause?.message ?? causal.message),
+            "body",
+          )
+        : undefined,
+      observed: text("observed") ? JSON.parse(text("observed")) : undefined,
+    };
   };
   it("resolves within the called workflow without nesting, forwarding configuration or increasing permissions", () => {
     expect(document.jobs.runtime).toMatchObject({
@@ -1403,8 +1464,8 @@ describe.each([
         AbortSignal,
       );
       if (objectType === "commit")
-        expect(result.revisionCalls[1].request).toBe(
-          result.revisionCalls[0].request,
+        expect(result.revisionCalls[1].request.signal).toBe(
+          result.revisionCalls[0].request.signal,
         );
       const revision = result.notices
         .map(JSON.parse)
@@ -1734,6 +1795,7 @@ describe.each([
         source_sha: source,
         reference: `${image}:sha-${source}`,
         provider_status: exitCode,
+        cause_code: "provider_failed",
         provider_error: { content: stderr, omitted_bytes: 0 },
         cause: { content: cause },
       });
@@ -1779,11 +1841,324 @@ describe.each([
       response: { exitCode: 1, stderr: "é".repeat(9000) + "tail" },
     });
     const captured = failure(provider).provider_error;
-    expect(Buffer.byteLength(captured.content)).toBeLessThanOrEqual(16 * 1024);
+    expect(Buffer.byteLength(captured.content)).toBeLessThanOrEqual(
+      1024 * 1024,
+    );
     expect(captured.bytes - Buffer.byteLength(captured.content)).toBe(
       captured.omitted_bytes,
     );
+    expect(captured.omitted_bytes).toBe(0);
+  });
+  it("protects every resolver failure record and keeps outcomes bounded", async () => {
+    const token = "workflow-token-canary";
+    const stderr =
+      "failure begins " +
+      token +
+      " https://storage.invalid/file?sig=signed-failure-canary " +
+      "雪".repeat(400000);
+    const result = await select({
+      githubToken: token,
+      response: { exitCode: 1, stderr },
+    });
+    for (const line of [
+      ...result.notices.filter((line) => line.startsWith("{")),
+      ...result.failures,
+    ]) {
+      expect(Buffer.byteLength(line)).toBeLessThanOrEqual(2048);
+      expect(line).not.toContain(token);
+      expect(line).not.toContain("signed-failure-canary");
+    }
+    const reconstructed = failure(result);
+    expect(reconstructed.provider_error.content).toContain("failure begins");
+    expect(reconstructed.provider_error.omitted_bytes).toBeGreaterThan(0);
+  });
+  it("enforces the raw manifest limit before credential-field protection", async () => {
+    const value = manifest();
+    value.annotations.secret = "x".repeat(70000);
+    const stdout = JSON.stringify(value);
+    const result = await select({ response: { stdout } });
+    const outcome = failure(result);
+    expect(outcome.stage).toBe("manifest");
+    expect(outcome.cause.content).toContain("64 KiB");
+    expect(outcome.observed.manifest_bytes).toBe(Buffer.byteLength(stdout));
+    expect(outcome.observed.manifest_capture.content).toContain(
+      "[credential excluded]",
+    );
+  });
+  it.each(["workflow-token-canary", "key"])(
+    "excludes plaintext authentication headers from registry failure logs with credential %s",
+    async (credential) => {
+      const stderr =
+        "Provider access denied with context 0 and 1\nAuthorization: Bearer header-auth-canary\nProxy-Authorization: Basic header-proxy-canary\nCookie: session=header-cookie-canary\nSet-Cookie: session=header-set-cookie-canary; HttpOnly\nX-Api-Key: unregistered-xapi-canary\nApi-Key: unregistered-api-canary\nProvider key link https://storage.invalid/file?x-api-key=url-api-canary\nProvider inline authentication context 100 request sent Authorization: Bearer inline-auth-canary\nProvider reason ends";
+      const result = await select({
+        githubToken: credential,
+        response: { exitCode: 1, stderr },
+      });
+      const captured = failure(result).provider_error;
+      expect(captured.content).toContain(
+        "Provider access denied with context 0 and 1",
+      );
+      expect(captured.content).toContain("Provider reason ends");
+      for (const credential of [
+        "header-auth-canary",
+        "header-proxy-canary",
+        "header-cookie-canary",
+        "header-set-cookie-canary",
+        "unregistered-xapi-canary",
+        "unregistered-api-canary",
+        "url-api-canary",
+        "inline-auth-canary",
+      ])
+        expect(JSON.stringify(result)).not.toContain(credential);
+    },
+  );
+  it("protects escaped signed URLs before truncating malformed failure JSON", async () => {
+    const stderr = JSON.stringify({
+      message:
+        "Provider failure https://storage.invalid/file?sig=escaped-workflow-signature",
+      "x-api-key": "structured-x-api-key-canary",
+      "api-key": "structured-api-key-canary",
+      "set-cookie": [
+        "session=private-workflow-cookie",
+        { nested: "nested-workflow-cookie" },
+      ],
+      after_auth: "provider context after authentication",
+      detail: "x".repeat(1100000),
+    })
+      .replaceAll("/", String.fromCharCode(92) + "u002f")
+      .slice(0, -1);
+    const result = await select({ response: { exitCode: 1, stderr } });
+    const captured = failure(result).provider_error;
+    expect(captured.content).toContain("Provider failure");
+    expect(captured.content).toContain("[signed URL excluded]");
+    expect(JSON.stringify(result)).not.toContain("escaped-workflow-signature");
+    expect(JSON.stringify(result)).not.toContain("private-workflow-cookie");
+    expect(JSON.stringify(result)).not.toContain("nested-workflow-cookie");
+    expect(JSON.stringify(result)).not.toContain("structured-x-api-key-canary");
+    expect(JSON.stringify(result)).not.toContain("structured-api-key-canary");
+    expect(captured.content).toContain("provider context after authentication");
     expect(captured.omitted_bytes).toBeGreaterThan(0);
+  });
+  it.each(
+    [
+      "stalled",
+      "interrupted",
+      "oversized",
+      "expanded",
+      "literal",
+      "malformed",
+      "malformed-prefix",
+      "malformed-auth",
+      "malformed-interrupted",
+    ].flatMap((mode) =>
+      mode === "expanded"
+        ? [{ mode, credential: "z", prefix: false }]
+        : mode === "literal"
+          ? [{ mode, credential: "workflow-token-canary", prefix: false }]
+          : mode.startsWith("malformed")
+            ? [
+                "workflow-token-canary",
+                'quoted-"credential\\suffix',
+                "token-credential-é",
+              ].map((credential) => ({ mode, credential, prefix: true }))
+            : [
+                { mode, credential: "workflow-token-canary", prefix: false },
+                { mode, credential: "workflow-token-canary", prefix: true },
+                {
+                  mode,
+                  credential: 'quoted-"credential\\suffix',
+                  prefix: true,
+                },
+              ],
+    ),
+  )(
+    "captures $mode GitHub bodies through the actual resolver client with credential $credential and prefix $prefix",
+    async ({ mode, credential, prefix }) => {
+      const literalMessage = String.raw`Resolver denied request 100; literal "\u0030\u0031" and invalid "\q"; public context 0 and 1.`;
+      const server = createServer((req, res) => {
+        req.resume();
+        res.writeHead(403, {
+          "content-type": "application/json",
+          "x-github-request-id": "resolver-provider-100",
+          "x-accepted-github-permissions": "contents=read",
+        });
+        if (mode === "expanded") {
+          res.end(
+            JSON.stringify({
+              message: "Resolver denied request 100. " + "z ".repeat(180000),
+            }),
+          );
+          return;
+        }
+        if (mode === "literal") {
+          res.end(literalMessage);
+          return;
+        }
+        if (mode.startsWith("malformed")) {
+          const slash = String.fromCharCode(92);
+          const encoded = credential
+            .split("")
+            .map(
+              (char) =>
+                slash + "u" + char.charCodeAt(0).toString(16).padStart(4, "0"),
+            )
+            .join("");
+          const opening =
+            '{"message":"Resolver denied request 100; context 0 and 1. ';
+          const body =
+            mode === "malformed-prefix"
+              ? opening + encoded.slice(0, -3)
+              : opening +
+                encoded +
+                (mode === "malformed-auth"
+                  ? "; request sent Authorization: Bearer unregistered-malformed-auth" +
+                    slash +
+                    "n"
+                  : "; ") +
+                "public reason 0 and 1 " +
+                slash;
+          if (mode === "malformed-interrupted") {
+            res.write(body);
+            setTimeout(() => res.destroy(), 20);
+          } else res.end(body);
+          return;
+        }
+        if (prefix) {
+          const encoded = JSON.stringify(credential).slice(1, -1);
+          const opening =
+            '{"message":"Resolver denied request 100; context 0 and 1. ';
+          if (mode === "oversized")
+            res.end(
+              opening +
+                "x".repeat(
+                  1024 * 1024 - encoded.length + 1 - Buffer.byteLength(opening),
+                ) +
+                encoded +
+                '"}',
+            );
+          else {
+            res.write(opening + encoded.slice(0, -1));
+            if (mode === "interrupted") setTimeout(() => res.destroy(), 20);
+            if (mode === "stalled")
+              setTimeout(() => res.end(encoded.slice(-1) + '"}'), 6100);
+          }
+          return;
+        }
+        res.write('{"message":"Resolver denied request 100"');
+        if (mode === "interrupted") setTimeout(() => res.destroy(), 20);
+        if (mode === "stalled") setTimeout(() => res.end("}"), 6100);
+        if (mode === "oversized")
+          res.end(',"detail":"' + "x".repeat(1100000) + '"}');
+      });
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const client = new Octokit({
+        baseUrl: "http://127.0.0.1:" + server.address().port,
+        auth: credential,
+        request: { fetch: undiciFetch },
+        log: {
+          debug: () => {},
+          info: () => {},
+          warn: () => {},
+          error: () => {},
+        },
+      });
+      try {
+        const result = await select({
+          git: client.rest.git,
+          request: client.request,
+          githubToken: credential,
+        });
+        const records = result.notices
+          .filter((line) => line.startsWith("{"))
+          .map(JSON.parse);
+        const failed = records.find(
+          (row) => row.event === "api.request.failed",
+        );
+        expect(failed).toMatchObject({ status: 403, response_received: true });
+        expect(failed.credential_source).toBe("workflow.token");
+        const headers = JSON.parse(
+          records
+            .filter((row) => row.detail_kind === "headers")
+            .map((row) => row.content)
+            .join(""),
+        );
+        expect(headers).toMatchObject({
+          "x-github-request-id": "resolver-provider-100",
+          "x-accepted-github-permissions": "contents=read",
+        });
+        const body = records
+          .filter((row) => row.detail_kind === "body")
+          .map((row) => row.content)
+          .join("");
+        expect(body.includes("Resolver denied request 100")).toBe(true);
+        if (mode === "literal") expect(body).toBe(literalMessage);
+        if (prefix) {
+          expect(body.includes("context 0 and 1.")).toBe(true);
+          expect(body.includes(credential.slice(0, -1))).toBe(false);
+          expect(
+            body.includes(JSON.stringify(credential).slice(1, -1).slice(0, -1)),
+          ).toBe(false);
+        }
+        if (mode.startsWith("malformed")) {
+          const encoded = credential
+            .split("")
+            .map(
+              (char) =>
+                "\\u" + char.charCodeAt(0).toString(16).padStart(4, "0"),
+            )
+            .join("");
+          expect(body).not.toContain(encoded.slice(0, -6));
+          expect(JSON.stringify(result)).not.toContain(
+            "unregistered-malformed-auth",
+          );
+          if (mode !== "malformed-prefix")
+            expect(body).toContain("public reason 0 and 1");
+        }
+        expect(
+          records.some(
+            (row) =>
+              row.capture_state ===
+              {
+                stalled: "read_timeout",
+                interrupted: "read_failed",
+                oversized: "byte_limit",
+                expanded: "byte_limit",
+                literal: "complete",
+                malformed: "complete",
+                "malformed-prefix": "complete",
+                "malformed-auth": "complete",
+                "malformed-interrupted": "read_failed",
+              }[mode],
+          ),
+        ).toBe(true);
+        if (["stalled", "interrupted", "malformed-interrupted"].includes(mode))
+          expect(records.some((row) => row.detail_kind === "read_cause")).toBe(
+            true,
+          );
+        expect(result.calls).toEqual([]);
+        expect(failure(result).request_id).toBe(failed.request_id);
+        if (mode === "expanded")
+          expect(
+            records.find((row) => row.detail_kind === "body").omitted_bytes,
+          ).toBeGreaterThan(0);
+      } finally {
+        server.closeAllConnections();
+        await new Promise((resolve) => server.close(resolve));
+      }
+    },
+    15000,
+  );
+  it("preserves ordinary credential-prefix text in complete registry failures", async () => {
+    const result = await select({
+      githubToken: "workflow-token-canary",
+      response: {
+        exitCode: 1,
+        stderr: "Provider denied 0 and 1; ordinary w",
+      },
+    });
+    expect(failure(result).provider_error.content).toBe(
+      "Provider denied 0 and 1; ordinary w",
+    );
   });
   const corruptions = [
     [
@@ -1897,8 +2272,8 @@ describe.each([
       expect(
         result.notices
           .map(JSON.parse)
-          .find((record) => record.event === "runtime.manifest").manifest,
-      ).toEqual(value);
+          .find((record) => record.event === "runtime.manifest").digest,
+      ).toEqual(value.digest);
     });
   it("uses the selected digest for routing, every maintenance issue and the configured AI role", async () => {
     const selected = await select();
@@ -2025,6 +2400,43 @@ describe("manual consumer AI test", () => {
     expect(calls[1][1]).toContain("ORM_CONFIGURATION_SECRETS");
     expect(result.failures).toEqual([]);
     expect(result.summaries[0].runtime_image).toBe(env.ORM_RUNTIME_IMAGE);
+  });
+  it("forwards complete stderr lines before the container exits, preserving UTF-8 and the stdout result", async () => {
+    const forwarded = [];
+    const line = JSON.stringify({
+      event: "api.request.failed",
+      message: "Provider denied 雪",
+    });
+    const bytes = Buffer.from(line + "\n" + "final diagnostic");
+    const result = await run(aiTestScript, {
+      context,
+      env,
+      onInfo: (message) => forwarded.push(message),
+      executor: {
+        exec: async () => {},
+        getExecOutput: async (_command, _args, options) => {
+          const boundary = bytes.indexOf(Buffer.from("雪")) + 1;
+          options.listeners.stderr(bytes.subarray(0, boundary));
+          expect(forwarded).not.toContain(line);
+          options.listeners.stderr(bytes.subarray(boundary));
+          expect(forwarded).toContain(line);
+          expect(forwarded).not.toContain("final diagnostic");
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              version: 1,
+              outcome: "completed",
+              reason: "ai_interaction_completed",
+              cleanup: "passed",
+            }),
+            stderr: bytes.toString(),
+          };
+        },
+      },
+    });
+    expect(result.failures).toEqual([]);
+    expect(forwarded.filter((value) => value === line)).toHaveLength(1);
+    expect(forwarded).toContain("final diagnostic");
   });
   for (const override of [
     { eventName: "pull_request" },

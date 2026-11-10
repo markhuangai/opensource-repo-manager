@@ -10,7 +10,26 @@ import type { ModelProfile } from "../config/schema.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
 import { RuntimeError, sdkVersions } from "../domain/agents.ts";
 import { createSafeLogger } from "../logging/redact.ts";
+import {
+  captureApiBody,
+  createApiDiagnostics,
+  decodeDiagnosticString,
+} from "../logging/api.ts";
 import type { Store } from "../repositories/store.ts";
+
+const modelTextFields = new Map([
+  ["text", "content"],
+  ["delta", "content"],
+  ["thinking", "content"],
+  ["partial_json", "content"],
+  ["arguments", "content"],
+  ["signature", "signature"],
+  ["refusal", "refusal"],
+  ["message", "message"],
+  ["content", "content"],
+  ["output_text", "output_text"],
+  ["input_text", "input_text"],
+]);
 
 type Grant = {
   lease: string;
@@ -111,6 +130,14 @@ export class ModelRelay {
     let providerStatus: number | undefined;
     let upstreamSignal: AbortSignal | undefined;
     let succeeded = false;
+    const diagnostics = createApiDiagnostics(this.secrets);
+    let exchange: ReturnType<typeof diagnostics.start> | undefined;
+    let failure: unknown;
+    let failureBody: string | undefined;
+    let failureReadError: unknown;
+    let failureCapture:
+      Record<string, string | number | boolean | undefined> | undefined;
+    let providerHeaders: Headers | undefined;
     req.on("aborted", () => controller.abort());
     res.on("close", () => {
       if (!res.writableEnded) controller.abort();
@@ -257,13 +284,20 @@ export class ModelRelay {
       ]);
       upstreamSignal = signal;
       cause = "upstream_transport_failed";
-      this.logger.info(
-        JSON.stringify({
-          event: "model.request.started",
-          level: "info",
-          ...context,
-        }),
-      );
+      this.logger.diagnostic("info", {
+        event: "model.request.started",
+        level: "info",
+        ...context,
+      });
+      exchange = diagnostics.start("model", route.pathname, {
+        ...grant.context,
+        sdk: grant.profile.sdk,
+        sdk_version: sdkVersions[grant.profile.sdk],
+        method: "POST",
+        route: route.pathname,
+        credential_source: "proxy.key",
+        request_id: requestId,
+      });
       const upstream = await fetch(destination, {
         method: "POST",
         headers,
@@ -272,9 +306,21 @@ export class ModelRelay {
         signal,
       });
       providerStatus = upstream.status;
+      providerHeaders = upstream.headers;
+      exchange.response(upstream.status, upstream.headers);
       if (!upstream.ok || !upstream.body) {
         cause = "upstream_rejected";
-        await upstream.body?.cancel();
+        const captured = await captureApiBody(upstream, signal, grant.bytes);
+        failureBody = captured.body;
+        failureCapture = captured.capture;
+        failureReadError = captured.readError;
+        if (controller.signal.aborted) cause = "request_cancelled";
+        else if (signal.aborted)
+          cause =
+            signal.reason instanceof DOMException &&
+            signal.reason.name === "TimeoutError"
+              ? "deadline_exceeded"
+              : "request_cancelled";
         this.fail(res, 502);
         return;
       }
@@ -306,75 +352,75 @@ export class ModelRelay {
       const forwardFrame = async (frame: string) => {
         const length = Buffer.byteLength(frame);
         if (length > 1024 * 1024) throw new RuntimeError("relay_frame_limit");
-        const value = this.checkFrame(frame),
-          fields =
-            value && typeof value === "object" && !Array.isArray(value)
-              ? (value as Record<string, unknown>)
-              : {},
-          channel = [
-            fields.type,
-            fields.index,
-            fields.output_index,
-            fields.content_index,
-            fields.summary_index,
-            fields.item_id,
-          ];
-        const inspect = (item: unknown, path: string[]) => {
-          if (typeof item === "string") {
-            const leaf = path.at(-1),
-              field = [
-                "text",
-                "delta",
-                "thinking",
-                "partial_json",
-                "arguments",
-              ].includes(leaf ?? "")
-                ? "content"
-                : leaf;
-            if (
-              ![
-                "text",
-                "delta",
-                "thinking",
-                "partial_json",
-                "arguments",
-                "signature",
-                "refusal",
-                "message",
-                "content",
-                "output_text",
-                "input_text",
-              ].includes(leaf ?? "")
-            )
-              return;
-            for (const key of [
-              JSON.stringify([channel, path]),
-              JSON.stringify(["channel", channel.slice(1), field]),
-              JSON.stringify(["field", field]),
-            ]) {
-              let matcher = matchers.get(key);
-              if (!matcher) {
-                matcherBytes += Buffer.byteLength(key) + 64;
-                if (matcherBytes > grant.bytes)
-                  throw new RuntimeError("relay_frame_limit");
-                matcher = this.secrets.createCredentialStream();
-                matchers.set(key, matcher);
+        failureBody = frame;
+        const prefixes = new Set(
+          [...matchers.values()]
+            .filter((matcher) => matcher.pending)
+            .map((matcher) => matcher.prefixMatcher()),
+        );
+        try {
+          const value = this.checkFrame(frame),
+            fields =
+              value && typeof value === "object" && !Array.isArray(value)
+                ? (value as Record<string, unknown>)
+                : {},
+            channel = [
+              fields.type,
+              fields.index,
+              fields.output_index,
+              fields.content_index,
+              fields.summary_index,
+              fields.item_id,
+            ];
+          const inspect = (item: unknown, path: string[]) => {
+            if (typeof item === "string") {
+              const field = modelTextFields.get(path.at(-1) ?? "");
+              if (!field) return;
+              for (const key of [
+                JSON.stringify([channel, path]),
+                JSON.stringify(["channel", channel.slice(1), field]),
+                JSON.stringify(["field", field]),
+              ]) {
+                let matcher = matchers.get(key);
+                if (!matcher) {
+                  matcherBytes += Buffer.byteLength(key) + 64;
+                  if (matcherBytes > grant.bytes)
+                    throw new RuntimeError("relay_frame_limit");
+                  matcher = this.secrets.createCredentialStream();
+                  matchers.set(key, matcher);
+                }
+                if (matcher.pending) prefixes.add(matcher.prefixMatcher());
+                if (matcher.push(item))
+                  throw new RuntimeError("relay_response_invalid");
               }
-              if (matcher.push(item))
-                throw new RuntimeError("relay_response_invalid");
+            } else if (item !== null && typeof item === "object") {
+              for (const [key, child] of Object.entries(item))
+                inspect(child, [...path, key]);
             }
-          } else if (item !== null && typeof item === "object") {
-            for (const [key, child] of Object.entries(item))
-              inspect(child, [...path, key]);
+          };
+          inspect(value, []);
+          heldBytes += length;
+          if (heldBytes > grant.bytes)
+            throw new RuntimeError("relay_frame_limit");
+          held.push(frame);
+          failureBody = undefined;
+          if (![...matchers.values()].some((matcher) => matcher.pending))
+            await flush();
+        } catch (error) {
+          if (
+            error instanceof RuntimeError &&
+            error.code === "relay_frame_limit"
+          )
+            failureBody = undefined;
+          if (failureBody !== undefined)
+            failureBody = this.protectFrameFragments(failureBody, prefixes);
+          if (error instanceof SyntaxError) {
+            error.message = this.protectFrameFragments(error.message, prefixes);
+            if (error.stack)
+              error.stack = this.protectFrameFragments(error.stack, prefixes);
           }
-        };
-        inspect(value, []);
-        heldBytes += length;
-        if (heldBytes > grant.bytes)
-          throw new RuntimeError("relay_frame_limit");
-        held.push(frame);
-        if (![...matchers.values()].some((matcher) => matcher.pending))
-          await flush();
+          throw error;
+        }
       };
       const decoder = new TextDecoder("utf8", { fatal: true });
       for await (const chunk of upstream.body) {
@@ -399,15 +445,20 @@ export class ModelRelay {
         if (pending.trim()) await forwardFrame(pending);
         await flush();
       } else {
+        failureBody = pending;
         const value = JSON.parse(pending) as { error?: unknown };
         if (value?.error || this.secrets.containsCredentials(value))
           throw new RuntimeError("relay_response_invalid");
         res.write(pending);
+        failureBody = undefined;
       }
       res.end();
       succeeded = true;
     } catch (error) {
+      failure = error;
       if (error instanceof RuntimeError) cause = error.code;
+      else if (error instanceof SyntaxError && providerStatus !== undefined)
+        cause = "relay_response_invalid";
       else if (controller.signal.aborted) cause = "request_cancelled";
       else if (
         upstreamSignal?.aborted &&
@@ -417,6 +468,15 @@ export class ModelRelay {
         cause = "deadline_exceeded";
       this.fail(res, 502);
     } finally {
+      if (succeeded) exchange?.finish(providerStatus, providerHeaders);
+      else
+        exchange?.fail(failure ?? new RuntimeError(cause), {
+          status: providerStatus,
+          headers: providerHeaders,
+          body: failureBody,
+          capture: failureCapture,
+          readError: failureReadError,
+        });
       if (context) {
         const details = {
           ...context,
@@ -425,27 +485,108 @@ export class ModelRelay {
           outcome: succeeded ? "completed" : "failed",
         };
         if (succeeded)
-          this.logger.info(
-            JSON.stringify({
-              event: "model.request.finished",
-              level: "info",
-              ...details,
-            }),
-          );
+          this.logger.diagnostic("info", {
+            event: "model.request.finished",
+            level: "info",
+            ...details,
+          });
         else
-          this.logger.error(
-            JSON.stringify({
-              event: "model.request.failed",
-              level: "error",
-              ...details,
-              cause,
-              recovery:
-                "Verify the selected profile and proxy settings, or restore provider connectivity, before retrying.",
-            }),
-          );
+          this.logger.diagnostic("error", {
+            event: "model.request.failed",
+            level: "error",
+            ...details,
+            cause,
+            recovery:
+              "Verify the selected profile and proxy settings, or restore provider connectivity, before retrying.",
+          });
       }
       controller.abort();
     }
+  }
+
+  private protectFrameFragments(
+    frame: string,
+    prefixes: Set<(text: string, incomplete?: boolean) => number>,
+  ) {
+    const quoted = /"(?:\\[\s\S]?|[^"\\])*(?:"|$)/g;
+    const streams = new Map<
+      string,
+      {
+        current: ReturnType<SecretAccessor["createCredentialStream"]>;
+        previous?: number;
+      }
+    >();
+    const contributing = new Set<number>();
+    let field: string | undefined;
+    for (const match of frame.matchAll(quoted)) {
+      if (/^\s*:/.test(frame.slice(match.index + match[0].length))) {
+        field = modelTextFields.get(decodeDiagnosticString(match[0]));
+        continue;
+      }
+      const parts: string[] = [];
+      const value = decodeDiagnosticString(match[0], (part) => {
+        parts.push(part);
+        return part;
+      });
+      parts.push(value);
+      for (const key of field ? ["all", field] : ["all"]) {
+        let stream = streams.get(key);
+        if (!stream) {
+          stream = { current: this.secrets.createCredentialStream() };
+          streams.set(key, stream);
+        }
+        if (stream.current.pending) {
+          const prefix = stream.current.prefixMatcher();
+          prefixes.add(prefix);
+          if (
+            stream.previous !== undefined &&
+            parts.some((part) => prefix(part, true) > 0)
+          )
+            contributing.add(stream.previous);
+        }
+        stream.current.push(value);
+        if (value) stream.previous = match.index;
+      }
+    }
+    if (!prefixes.size) return frame;
+    const protect = (text: string) => {
+      let end = 0;
+      for (const match of prefixes) end = Math.max(end, match(text, true));
+      const safe = end
+        ? "[credential fragment excluded]" + text.slice(end)
+        : text;
+      return safe;
+    };
+    const safe = frame.replace(quoted, (value, offset: number) => {
+      if (/^\s*:/.test(frame.slice(offset + value.length))) return value;
+      let protectedPrefix = false;
+      const decoded = decodeDiagnosticString(value, (text) => {
+        const safe = this.secrets.redactIncompleteTail(protect(text));
+        protectedPrefix ||= safe !== text;
+        return safe;
+      });
+      const protectedValue = protect(decoded);
+      const content = contributing.has(offset)
+        ? this.secrets.redactIncompleteTail(protectedValue)
+        : protectedValue;
+      const closed = value.length > 1 && value.endsWith('"');
+      if (content === decoded && !protectedPrefix) return value;
+      const encoded = JSON.stringify(content);
+      return closed ? encoded : encoded.slice(0, -1);
+    });
+    return safe
+      .split(/\r?\n/)
+      .map((line) => {
+        if (!line.startsWith("data:")) return line;
+        const payload = line.slice(5),
+          content = payload.trimStart();
+        return (
+          "data:" +
+          payload.slice(0, payload.length - content.length) +
+          protect(content)
+        );
+      })
+      .join("\n");
   }
 
   private checkFrame(frame: string) {

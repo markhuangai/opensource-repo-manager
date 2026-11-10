@@ -1,9 +1,24 @@
 import { createWriteStream } from "node:fs";
-import { DefaultArtifactClient } from "@actions/artifact";
+import { createApiDiagnostics, apiFailureId } from "../../logging/api.ts";
+import { createKnownSecretChecker } from "../../logging/redact.ts";
+import { observeArtifactHttp } from "./artifact-http.ts";
 
 if (process.getuid?.() !== 0) throw new Error("supervisor_requires_root");
 process.umask(0o077);
 const output = createWriteStream("/dev/null", { fd: 3 });
+const diagnosticOutput = createWriteStream("/dev/null", { fd: 4 });
+const diagnostics = createApiDiagnostics(
+  createKnownSecretChecker([
+    process.env.ACTIONS_RUNTIME_TOKEN ?? "",
+    process.env.ORM_ARTIFACT_TOKEN ?? "",
+  ]),
+  {},
+  (line) => {
+    diagnosticOutput.write(line + "\n");
+  },
+);
+let exchange: ReturnType<typeof diagnostics.start> | undefined;
+let restore: (() => void) | undefined;
 try {
   let input = "";
   for await (const chunk of process.stdin) {
@@ -19,6 +34,9 @@ try {
     digest: string;
     run: number;
   };
+  exchange = diagnostics.start("artifact", request.operation);
+  restore = observeArtifactHttp(diagnostics, exchange.id);
+  const { DefaultArtifactClient } = await import("@actions/artifact");
   const client = new DefaultArtifactClient();
   let result: unknown;
   if (request.operation === "upload") {
@@ -47,7 +65,17 @@ try {
     result = { count: listed.artifacts.length };
   } else throw new Error("request_invalid");
   output.end(JSON.stringify({ result }));
-} catch {
-  output.end(JSON.stringify({ error: "session_transport_unavailable" }));
+  exchange.finish();
+} catch (error) {
+  exchange?.fail(error);
+  output.end(
+    JSON.stringify({
+      error: "session_transport_unavailable",
+      request_id: apiFailureId(error),
+    }),
+  );
   process.exitCode = 1;
+} finally {
+  restore?.();
+  diagnosticOutput.end();
 }

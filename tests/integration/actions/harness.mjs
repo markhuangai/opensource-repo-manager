@@ -654,6 +654,93 @@ export async function runActionsTests({
       launch(name, number);
       await finished(name, "failed", reason);
     }
+    const requestsBeforeDiagnostics = proof().requests.length;
+    for (const kind of ["diagnostic_list", "diagnostic_metadata"]) {
+      const name = `${manager}-${kind.replace("_", "-")}`;
+      upstream(`/artifact-fault?kind=${kind}`, "POST");
+      launch(name, 999);
+      await finished(name, "blocked", "session_transport_unavailable");
+      const diagnosticLogs = output(name)
+        .logs.stderr.split("\n")
+        .filter((line) => line.startsWith("{"))
+        .map((line) => JSON.parse(line));
+      assert(
+        diagnosticLogs.some(
+          (row) => row.event === "api.request.failed" && row.status === 403,
+        ),
+      );
+      const detail = diagnosticLogs
+        .filter(
+          (row) =>
+            row.event === "api.response.detail" && row.detail_kind === "body",
+        )
+        .map((row) => row.content)
+        .join("");
+      assert(detail.includes(`Artifact ${kind} denied for workflow 100`));
+      assert(detail.includes("end of failure"));
+      assert(!detail.includes(config.session_key));
+      assert(
+        diagnosticLogs.some(
+          (row) =>
+            row.event === "actions.failed" &&
+            row.cause === "session_transport_unavailable",
+        ),
+      );
+      for (const line of output(name)
+        .logs.stderr.split("\n")
+        .filter((line) => line.startsWith("{")))
+        assert(
+          Buffer.byteLength(line) <= 2048,
+          "Oversized API diagnostic record",
+        );
+    }
+    const cancelledCapture = `${manager}-diagnostic-cancelled`;
+    upstream("/artifact-fault?kind=diagnostic_stalled_list", "POST");
+    launch(cancelledCapture, 999);
+    await waitUntil(
+      () =>
+        proof().artifacts.requests.some(
+          (row) => row.capture_waiting && row.duration_ms === null,
+        ),
+      "Artifact SDK did not begin the delayed response capture",
+      30000,
+    );
+    await waitUntil(
+      () =>
+        result(["logs", cancelledCapture]).stderr.includes(
+          '"event":"api.response.started"',
+        ) && result(["logs", cancelledCapture]).stderr.includes('"status":403'),
+      "Artifact response headers did not reach the log",
+      10000,
+    );
+    docker(["stop", "--time", "15", cancelledCapture]);
+    await finished(cancelledCapture, "failed", "cancelled");
+    const cancelledLogs = output(cancelledCapture)
+      .logs.stderr.split("\n")
+      .filter((line) => line.startsWith("{"))
+      .map((line) => JSON.parse(line));
+    assert(
+      cancelledLogs.some(
+        (row) =>
+          row.event === "api.capture.incomplete" &&
+          row.capture_state === "interrupted" &&
+          row.status === 403,
+      ),
+    );
+    assert(
+      cancelledLogs.some(
+        (row) =>
+          row.event === "actions.failed" &&
+          row.reason === "cancelled" &&
+          row.cause === "cancelled",
+      ),
+    );
+    assert(
+      proof().artifacts.requests.some(
+        (row) => row.capture_waiting && row.interrupted,
+      ),
+    );
+    assert.equal(proof().requests.length, requestsBeforeDiagnostics);
     const readyState = durable(1);
     assert.equal(readyState.pending.status, "uncertain");
     const publicationCount = proof().mutations.filter(
@@ -1743,8 +1830,29 @@ export async function runActionsTests({
         .logs.stderr.split("\n")
         .filter(Boolean)
         .map((line) => JSON.parse(line));
-      const error = evidence.find((item) => item.level === "error");
-      assert.equal(error.event, "configuration_load_failed");
+      const error = evidence.find(
+        (item) => item.event === "configuration_load_failed",
+      );
+      assert(error, "Missing configuration outcome");
+      if (scenario === "bootstrap-denied") {
+        const failed = evidence.find(
+          (row) => row.event === "api.request.failed",
+        );
+        assert.equal(failed.status, 401);
+        assert.equal(failed.credential_source, "bootstrap_token");
+        assert.equal(failed.method, "GET");
+        assert(evidence.indexOf(failed) < evidence.indexOf(error));
+        const body = evidence
+          .filter(
+            (row) =>
+              row.event === "api.response.detail" &&
+              row.request_id === failed.request_id &&
+              row.detail_kind === "body",
+          )
+          .map((row) => row.content)
+          .join("");
+        assert.deepEqual(JSON.parse(body), {});
+      }
       assert.equal(error.cause, reason);
       assert.equal(error.outcome, "failed");
       assert.match(

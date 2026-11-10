@@ -12,6 +12,7 @@ import { createApplication, type Application } from "../runtime/application.ts";
 import { assertRuntimeIdentity } from "../runtime/process.ts";
 import { rootDirectory } from "../services/workspaces/files.ts";
 import { ActionsState } from "./persistence.ts";
+import { createApiDiagnostics, apiFailureId } from "../logging/api.ts";
 import { ActionsArtifacts } from "./artifacts.ts";
 import { GitHubArtifacts } from "../adapters/github/artifacts.ts";
 import { StateError } from "./state.ts";
@@ -24,6 +25,7 @@ import {
 } from "./task.ts";
 
 let logger = createSafeLogger(createKnownSecretChecker([]), true);
+let diagnostics = createApiDiagnostics(createKnownSecretChecker([]));
 let redact = (value: string) => value;
 let application: Application | undefined;
 let store: Store | undefined;
@@ -68,6 +70,10 @@ try {
   const request = parseTaskRequest(process.argv.slice(2));
   const loaded = await loadProtectedActionsConfiguration();
   logger = createSafeLogger(loaded.secrets, true);
+  diagnostics = createApiDiagnostics(loaded.secrets, {
+    repository: loaded.actions.repository,
+    issue_number: request.issue_number,
+  });
   redact = loaded.secrets.redact;
   controller.signal.throwIfAborted();
   await assertRuntimeIdentity();
@@ -81,7 +87,7 @@ try {
     loaded.snapshot,
     loaded.secrets,
     join(root, "runtime"),
-    new GitHubArtifacts(loaded.actions, loaded.secrets),
+    new GitHubArtifacts(loaded.actions, loaded.secrets, undefined, diagnostics),
   );
   await artifacts.initialize(controller.signal);
   state = await ActionsState.open(
@@ -119,6 +125,18 @@ try {
   );
   if (error instanceof StateError) result = { ...result, outcome: "blocked" };
   logger.error(`Actions execution stopped (${result.reason}).`);
+  diagnostics.event("actions.failed", {
+    reason: result.reason,
+    request_id: apiFailureId(error),
+    cause: controller.signal.aborted
+      ? "cancelled"
+      : error instanceof IntakeError ||
+          error instanceof StateError ||
+          error instanceof RuntimeError ||
+          error instanceof ConfigurationError
+        ? error.code
+        : "runtime_failed",
+  });
 } finally {
   startDeadline();
   try {

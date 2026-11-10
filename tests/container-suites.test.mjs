@@ -317,16 +317,16 @@ describe("Actions lane coverage and identity", () => {
         actionsGroups.map((group) => [group, actionsScenarios[group].length]),
       ),
     ).toEqual({
-      lifecycle: 29,
+      lifecycle: 32,
       sessions: 8,
       "pr-recovery": 16,
       clarification: 19,
       "clarification-recovery": 42,
     });
     const all = Object.values(actionsScenarios).flat();
-    expect(all.filter((id) => !id.startsWith("controller-"))).toHaveLength(94);
-    expect(all).toHaveLength(114);
-    expect(new Set(all).size).toBe(114);
+    expect(all.filter((id) => !id.startsWith("controller-"))).toHaveLength(97);
+    expect(all).toHaveLength(117);
+    expect(new Set(all).size).toBe(117);
     expect(() => verifyActionsReceipts(lanes(), identity)).not.toThrow();
   });
   it("supports a serial profiling mode and bounded parallelism", () => {

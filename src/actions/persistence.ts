@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createApiDiagnostics } from "../logging/api.ts";
 import {
   createGitHubReader,
   type GitHubReader,
@@ -153,18 +154,24 @@ export class ActionsState implements TaskDurability {
       artifacts?: ActionsArtifacts;
     } = {},
   ) {
+    const diagnostics = createApiDiagnostics(secrets, {
+      repository: snapshot.settings.github.repository,
+      issue_number: number,
+    });
     const transport =
       options.writer ??
       createGitHubWriter(
         snapshot.settings.github.repository,
         secrets.get("github.token"),
         () => {},
+        diagnostics,
       );
     const reader =
       options.reader ??
       createGitHubReader(
         snapshot.settings.github.repository,
         secrets.get("github.token"),
+        diagnostics,
       );
     const manager = new ActionsState(
       store,

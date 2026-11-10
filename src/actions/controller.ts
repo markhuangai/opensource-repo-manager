@@ -1,4 +1,5 @@
-import { Octokit } from "@octokit/rest";
+import { createGitHubClient } from "../adapters/github/client.ts";
+import { createApiDiagnostics, apiFailureId } from "../logging/api.ts";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -59,7 +60,6 @@ try {
         !roleNames.includes(number as Role)))
   )
     throw new StateError("state_invalid");
-  const silent = () => {};
   const sources = parseConfigurationSources(
     process.env.ORM_CONFIGURATION_VARIABLES,
     process.env.ORM_CONFIGURATION_SECRETS,
@@ -71,13 +71,21 @@ try {
     ]),
     true,
   );
+  let diagnostics = createApiDiagnostics(
+    createKnownSecretChecker([bootstrapToken]),
+    correlation,
+  );
+  let credentialSource = "bootstrap_token";
   const client = (token: string) =>
     new GitHubActionsSource(
       repository,
-      new Octokit({
-        auth: token,
-        log: { debug: silent, info: silent, warn: silent, error: silent },
-      }),
+      createGitHubClient(
+        repository,
+        token,
+        diagnostics,
+        undefined,
+        credentialSource,
+      ),
     );
   const signal = controller.signal;
   const request =
@@ -91,6 +99,16 @@ try {
   );
   if (String(loaded.repository.id) !== process.env.GITHUB_REPOSITORY_ID)
     throw new StateError("state_invalid");
+  credentialSource = "github.token";
+  diagnostics = createApiDiagnostics(
+    createKnownSecretChecker([
+      bootstrapToken,
+      loaded.configuration.github.token,
+      loaded.configuration.proxy.key,
+      loaded.sessionKey,
+    ]),
+    { ...correlation, source_sha: loaded.pinned.source.sha },
+  );
   logger = createSafeLogger(
     createKnownSecretChecker([
       bootstrapToken,
@@ -206,6 +224,7 @@ try {
     operation,
     ...correlation,
     cause: reason,
+    request_id: apiFailureId(error),
     outcome: "failed",
     recovery:
       operation === "configuration_load"

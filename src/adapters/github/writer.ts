@@ -1,4 +1,6 @@
 import { Octokit } from "@octokit/rest";
+import { createGitHubClient } from "./client.ts";
+import { carryApiFailure, type ApiDiagnostics } from "../../logging/api.ts";
 import { z } from "zod";
 import {
   githubId,
@@ -84,14 +86,11 @@ export function createGitHubWriter(
   repository: string,
   token: string,
   ready: () => void,
+  diagnostics?: ApiDiagnostics,
 ) {
-  const silent = () => {};
   return new OctokitWriter(
     repository,
-    new Octokit({
-      auth: token,
-      log: { debug: silent, info: silent, warn: silent, error: silent },
-    }),
+    createGitHubClient(repository, token, diagnostics),
     ready,
   );
 }
@@ -158,17 +157,23 @@ export class OctokitWriter implements GitHubWriter {
               : date,
             reset,
           ].filter((deadline) => deadline > Date.now());
-        throw new IntakeError(
-          "github_rate_limited",
-          deadlines.length ? Math.max(...deadlines) : Date.now() + 60000,
+        throw carryApiFailure(
+          new IntakeError(
+            "github_rate_limited",
+            deadlines.length ? Math.max(...deadlines) : Date.now() + 60000,
+          ),
+          error,
         );
       }
-      throw new IntakeError(
-        status === 404
-          ? "github_not_found"
-          : status === 401 || status === 403
-            ? "github_access_denied"
-            : "github_publication_failed",
+      throw carryApiFailure(
+        new IntakeError(
+          status === 404
+            ? "github_not_found"
+            : status === 401 || status === 403
+              ? "github_access_denied"
+              : "github_publication_failed",
+        ),
+        error,
       );
     }
   }
