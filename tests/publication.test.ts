@@ -25,7 +25,10 @@ import {
 import { proposalSchema } from "../src/services/publication/contracts.ts";
 import { fixtureConfiguration, fixtureSnapshot } from "./fixtures.ts";
 import type { ArtifactManifest } from "../src/domain/agents.ts";
-import { createPublicationFixture } from "./fixtures/publication.ts";
+import {
+  createPublicationFixture,
+  makeThread,
+} from "./fixtures/publication.ts";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -348,6 +351,54 @@ describe("publication policy and immutable Git export", () => {
 });
 
 describe("GitHub publication HTTP adapter", () => {
+  it("authenticates with plain /user while preserving repository and GraphQL requests", async () => {
+    const { fixture } = await setup(),
+      signal = new AbortController().signal;
+    const firstRequest = fixture.state.requests.length;
+    const client = new Octokit({
+      auth: fixture.state.token,
+      baseUrl: fixture.url,
+      log: { debug() {}, info() {}, warn() {}, error() {} },
+    });
+    const writer = new OctokitWriter("owner/repo", client);
+    await expect(
+      client.request("GET /user", { owner: "owner", repo: "repo" }),
+    ).rejects.toMatchObject({ status: 404 });
+    expect(await writer.actor(signal)).toEqual(fixture.state.actor);
+    expect(await writer.repository(signal)).toMatchObject({
+      id: 42,
+      full_name: "owner/repo",
+    });
+    const comments = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1,
+      body: `Comment ${index + 1}`,
+      author_id: fixture.state.actor.id,
+    }));
+    fixture.state.comments.set(1, comments);
+    expect(await writer.comments(1, signal)).toEqual(comments);
+    const thread = makeThread(1, fixture.source.sha);
+    fixture.state.threads.set(1, [thread]);
+    await writer.resolveThread(thread.id, signal);
+    expect(thread.isResolved).toBe(true);
+    expect(
+      fixture.state.requests
+        .slice(firstRequest)
+        .map(({ method, url }) => ({ method, url })),
+    ).toEqual([
+      { method: "GET", url: "/user?owner=owner&repo=repo" },
+      { method: "GET", url: "/user" },
+      { method: "GET", url: "/repos/owner/repo" },
+      {
+        method: "GET",
+        url: "/repos/owner/repo/issues/1/comments?per_page=100&page=1",
+      },
+      {
+        method: "GET",
+        url: "/repos/owner/repo/issues/1/comments?per_page=100&page=2",
+      },
+      { method: "POST", url: "/graphql" },
+    ]);
+  });
   it("uses scoped routes for real comment and PR effects and reports protection and response loss", async () => {
     const { fixture } = await setup(),
       signal = new AbortController().signal;
