@@ -118,7 +118,7 @@ export class OctokitWriter implements GitHubWriter {
     try {
       return (
         await this.client.request(route, {
-          ...(route === "POST /graphql" ? {} : this.coordinates),
+          ...(route.includes("{owner}/{repo}") ? this.coordinates : {}),
           ...parameters,
           request: {
             signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),

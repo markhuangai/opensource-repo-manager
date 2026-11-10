@@ -201,7 +201,7 @@ export async function createPublicationFixture(root: string) {
     afterMutation: undefined as undefined | ((kind: string) => void),
     beforeRequest: undefined as
       undefined | ((method: string, path: string) => Promise<void>),
-    requests: [] as Array<{ method: string; path: string }>,
+    requests: [] as Array<{ method: string; path: string; url: string }>,
     configurationRequests: [] as Array<{
       method: string;
       path: string;
@@ -268,7 +268,7 @@ export async function createPublicationFixture(root: string) {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify(value));
     };
-    state.requests.push({ method: req.method!, path });
+    state.requests.push({ method: req.method!, path, url: req.url! });
     const bootstrap =
       !!state.bootstrapToken &&
       ["token ", "Bearer "].some(
@@ -406,10 +406,15 @@ export async function createPublicationFixture(root: string) {
     if (path === "/graphql" && req.method === "POST") {
       let body = "";
       for await (const chunk of req) body += chunk;
-      const { query, variables } = JSON.parse(body) as {
+      const parameters = JSON.parse(body) as {
         query: string;
         variables: Record<string, unknown>;
       };
+      if ("owner" in parameters || "repo" in parameters) {
+        send({ message: "Unexpected repository coordinates" }, 400);
+        return;
+      }
+      const { query, variables } = parameters;
       const thread = [...state.threads.values()]
         .flat()
         .find((item) => item.id === variables.id);
@@ -510,6 +515,10 @@ export async function createPublicationFixture(root: string) {
       return;
     }
     if (path === "/user") {
+      if (url.searchParams.has("owner") || url.searchParams.has("repo")) {
+        send({ message: "Not Found" }, 404);
+        return;
+      }
       send(state.actor);
       return;
     }
