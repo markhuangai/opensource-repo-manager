@@ -4,6 +4,12 @@ GitHub Actions maintenance that investigates selected issues, prepares audited a
 
 The image's default entrypoint is the bounded Actions runtime. Authenticated GitHub comments hold task authority; encrypted Actions artifacts retain recoverable controller checkpoints. Human review and merge remain required.
 
+## Run remote development
+
+Open **Actions → Remote development → Run workflow** on `main`. Choose Codex or Claude and enter an approved plan that calls for a task branch, the required checks, and a PR for human review. To resume a conversation, select its original runner and supply its `resume-run-id`. Eligible timeouts resume from a saved session up to three times. Push work you want to recover across runs.
+
+The [manual workflow](.github/workflows/remote-dev.yml) follows `agent-remote-dev@v1`. Set `REMOTE_DEV_PAT` to a repository-scoped credential for pushing task branches and opening PRs. Use an account without a bypass on `main`. Configure `CODEX_CONFIG_TOML` and `CODEX_API_KEY` for Codex, or `CLAUDE_SETTINGS_JSON` and `ANTHROPIC_API_KEY` for Claude. The dispatch allowlist is in [`.remote-dev.yml`](.remote-dev.yml). Use plans suitable for this public repository because repository readers can download session artifacts.
+
 ## Install bounded Actions maintenance
 
 1. Copy [maintenance.yml](examples/actions/maintenance.yml) and [orm-agent.yml](examples/actions/orm-agent.yml) to the consumer's `.github/workflows/` on its default branch. ORM's callers use `@v1-prerelease` and resolve a compatible image by digest. An exact ORM release tag or reviewed commit also works when its matching image is published.
