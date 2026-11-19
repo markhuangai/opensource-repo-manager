@@ -51,6 +51,7 @@ export type AuditReceipt = {
   evidence_id: string | null;
 };
 export type VerificationReceipt = {
+  candidate_sha: string;
   id: string;
   job_id: number;
   revision: number;

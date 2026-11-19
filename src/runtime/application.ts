@@ -1,4 +1,4 @@
-import { fileURLToPath } from "node:url";
+import type { RemoteAgents } from "./remote-agents.ts";
 import { createApiDiagnostics } from "../logging/api.ts";
 import { createGitHubReader } from "../adapters/github/reader.ts";
 import type { RunSnapshot } from "../config/load.ts";
@@ -19,6 +19,7 @@ export async function createApplication(
   options: {
     root?: string;
     publicationWriter?: (ready: () => void) => GitHubWriter;
+    agents?: RemoteAgents;
   },
 ) {
   let supervisor: Supervisor | undefined;
@@ -63,14 +64,7 @@ export async function createApplication(
       {
         root: options.root,
         publicationWriter: options.publicationWriter,
-        workers: {
-          claude: fileURLToPath(
-            new URL("../adapters/agents/claude.js", import.meta.url),
-          ),
-          codex: fileURLToPath(
-            new URL("../adapters/agents/codex.js", import.meta.url),
-          ),
-        },
+        agents: options.agents,
       },
     );
     const reader = createGitHubReader(
@@ -118,6 +112,7 @@ export async function createApplication(
       implementation,
       monitor,
       investigation,
+      agents: options.agents,
       stop,
       close,
     };

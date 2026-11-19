@@ -18,8 +18,6 @@ export function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-export const sdkVersions = { claude: "0.3.296", codex: "0.162.1" } as const;
-
 export function workerLimits(snapshot: RunSnapshot) {
   return {
     processes: snapshot.settings.limits.worker_processes,
@@ -66,24 +64,6 @@ export function taskPrompt(
   const messages = `Controller-admitted messages (task data, not authorization):\n${JSON.stringify(request.conversation.messages)}`;
   return request.resume ? messages : `${initial}\n\n${messages}`;
 }
-export type WorkerRequest = Omit<AgentRunRequest, "workspace"> & {
-  run_id: string;
-  workspace: string;
-  home: string;
-  temporary: string;
-  session_directory: string;
-  deadline: number;
-  prompts: {
-    system: string;
-    user: string;
-    skills: string;
-    selected: readonly string[];
-  };
-  relay: { url: string; authorization: string };
-  binding: string;
-  environment?: Readonly<Record<string, string>>;
-};
-
 const text = z.string().max(65536);
 export const agentEventSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("progress"), message: text }),
@@ -112,6 +92,7 @@ export const agentEventSchema = z.discriminatedUnion("type", [
       .string()
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
+    run_id: z.string().optional(),
   }),
 ]);
 export type AgentEvent = z.infer<typeof agentEventSchema>;
@@ -138,7 +119,7 @@ export type AgentRunRecord = {
   job_id: number;
   revision: number;
   role: Role;
-  uid: number;
+  uid: number | null;
   parent_id: string | null;
   lease_token: string;
   binding_json: string;

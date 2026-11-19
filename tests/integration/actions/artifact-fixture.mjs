@@ -29,7 +29,7 @@ export function artifactFixture(config) {
       id: artifact.run,
       repository_id: artifact.foreign ? 999 : 42,
       head_repository_id: 42,
-      head_sha: head,
+      head_sha: artifact.head ?? head,
     },
   });
   async function handle(req, res) {
@@ -132,7 +132,8 @@ export function artifactFixture(config) {
         } else if (method === "CreateArtifact") {
           assert.equal(body.version, 7);
           assert(
-            body.name.endsWith(".orm"),
+            body.name.endsWith(".orm") ||
+              /^orm-agent-input-[a-f0-9-]{36}\.json$/.test(body.name),
             "Uploaded a non-encrypted artifact",
           );
           const expires = body.expiresAt ?? body.expires_at;
@@ -175,11 +176,11 @@ export function artifactFixture(config) {
             `sha256:${createHash("sha256").update(item.bytes).digest("hex")}`,
           );
           assert(
-            item.bytes.subarray(0, 12).equals(Buffer.from("ORMSESSION1\n")),
+            !item.name.endsWith(".orm") ||
+              item.bytes.subarray(0, 12).equals(Buffer.from("ORMSESSION1\n")),
           );
           for (const secret of [
             config.github.token,
-            config.proxy.key,
             config.session_key,
             ...Object.values(config.artifact_tokens),
           ])
@@ -193,7 +194,8 @@ export function artifactFixture(config) {
             "unfinished.txt",
           ])
             assert(
-              !item.bytes.includes(Buffer.from(marker)),
+              !item.name.endsWith(".orm") ||
+                !item.bytes.includes(Buffer.from(marker)),
               "Uploaded raw session data",
             );
           item.finalized = true;
@@ -259,11 +261,10 @@ export function artifactFixture(config) {
         if (attempt) res.end(JSON.stringify(run(Number(attempt[1]))));
         else if (listing) {
           const name = url.searchParams.get("name");
-          assert(/^orm-session-[a-f0-9-]{36}\.orm$/.test(name ?? ""));
           const selected = artifacts.filter(
             (item) =>
               item.run === Number(listing[1]) &&
-              item.name === name &&
+              (!name || item.name === name) &&
               item.finalized &&
               !item.deleted,
           );
@@ -297,6 +298,27 @@ export function artifactFixture(config) {
   }
   return {
     handle,
+    bytes(id) {
+      const item = artifacts.find(
+        (artifact) =>
+          artifact.id === id && artifact.finalized && !artifact.deleted,
+      );
+      assert(item);
+      return item.bytes;
+    },
+    native(run, name, bytes) {
+      artifacts.push({
+        id: next++,
+        run: run.id,
+        head: run.head_sha,
+        name,
+        bytes,
+        digest: "sha256:" + createHash("sha256").update(bytes).digest("hex"),
+        expires_at: new Date(Date.now() + 14 * 86400000).toISOString(),
+        created_at: new Date().toISOString(),
+        finalized: true,
+      });
+    },
     fault(id, kind) {
       if (
         [

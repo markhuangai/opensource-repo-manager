@@ -4,6 +4,10 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { GitHubActionsSource } from "../adapters/github/actions-source.ts";
+import {
+  RemoteDevActions,
+  assertRemoteDevPin,
+} from "../adapters/github/remote-dev.ts";
 import { StateError } from "./state.ts";
 import { routeActions } from "./routing.ts";
 import {
@@ -14,7 +18,12 @@ import { parseTaskRequest } from "./task.ts";
 import { ConfigurationError } from "../config/errors.ts";
 import { parseConfigurationSources } from "../config/sources.ts";
 import { roleNames, type Role } from "../config/schema.ts";
-import { testAiConfiguration } from "./test-ai.ts";
+import {
+  authorizeAgent,
+  probeProfile,
+  requireAgentConfiguration,
+} from "./authorize-agent.ts";
+import { RuntimeError } from "../domain/agents.ts";
 import {
   createKnownSecretChecker,
   createSafeLogger,
@@ -53,11 +62,12 @@ try {
     !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
     !bootstrapToken ||
     extra.length ||
-    !["route", "run", "test-ai"].includes(mode) ||
+    !["route", "run", "test-ai", "authorize-agent"].includes(mode) ||
     (mode === "route" && number) ||
-    (mode === "test-ai" &&
+    (["test-ai", "authorize-agent"].includes(mode) &&
       (process.env.GITHUB_EVENT_NAME !== "workflow_dispatch" ||
-        !roleNames.includes(number as Role)))
+        process.env.GITHUB_RUN_ATTEMPT !== "1")) ||
+    (mode === "test-ai" && !roleNames.includes(number as Role))
   )
     throw new StateError("state_invalid");
   const sources = parseConfigurationSources(
@@ -104,7 +114,6 @@ try {
     createKnownSecretChecker([
       bootstrapToken,
       loaded.configuration.github.token,
-      loaded.configuration.proxy.key,
       loaded.sessionKey,
     ]),
     { ...correlation, source_sha: loaded.pinned.source.sha },
@@ -144,21 +153,57 @@ try {
   delete process.env.ORM_CONFIGURATION_SECRETS;
   const source = client(loaded.configuration.github.token);
   const key = loaded.sessionKey;
-  if (mode === "test-ai") {
+  const agents = () =>
+    new RemoteDevActions(
+      repository,
+      createGitHubClient(
+        repository,
+        loaded.configuration.github.token,
+        diagnostics,
+      ),
+    );
+  if (mode === "authorize-agent") {
+    operation = "authorize_agent";
+    const issue = parseTaskRequest(number ? [number] : []).issue_number;
+    if (!/^[1-9][0-9]*$/.test(process.env.GITHUB_RUN_ID ?? ""))
+      throw new StateError("state_invalid");
+    console.log(
+      JSON.stringify(
+        await authorizeAgent(
+          source,
+          agents(),
+          loaded.repository,
+          {
+            issue,
+            turn: process.env.ORM_AGENT_TURN ?? "",
+            plan: process.env.ORM_AGENT_PLAN ?? "",
+            run: Number(process.env.GITHUB_RUN_ID),
+            configSha: loaded.pinned.source.sha,
+            config: loaded.configuration,
+          },
+          key,
+          signal,
+        ),
+      ),
+    );
+  } else if (mode === "test-ai") {
     if (
       process.env.GITHUB_REF !==
       `refs/heads/${loaded.repository.default_branch}`
     )
       throw new StateError("state_invalid");
     operation = "ai_test";
-    const result = await testAiConfiguration(
-      loaded.configuration,
-      number as Role,
-      loaded.pinned.source,
-      signal,
-    );
+    const run = await agents().run(Number(process.env.GITHUB_RUN_ID), signal);
+    assertRemoteDevPin(run);
+    if (
+      run.run_attempt !== 1 ||
+      run.head_repository.id !== loaded.repository.id ||
+      run.head_sha !== loaded.pinned.source.sha
+    )
+      throw new RuntimeError("agent_run_mismatch");
+    await requireAgentConfiguration(source, loaded.repository, run, signal);
+    const result = probeProfile(loaded.configuration, number as Role);
     console.log(JSON.stringify(result));
-    process.exitCode = result.outcome === "completed" ? 0 : 1;
   } else if (mode === "route" && !number) {
     operation = "route";
     const payload = JSON.parse(
@@ -210,6 +255,7 @@ try {
   const reason =
     error instanceof StateError ||
     error instanceof ConfigurationError ||
+    error instanceof RuntimeError ||
     error instanceof IntakeError
       ? error.code
       : operation === "configuration_load" && (status === 401 || status === 403)
@@ -228,7 +274,7 @@ try {
     outcome: "failed",
     recovery:
       operation === "configuration_load"
-        ? "Check the named configuration source and GitHub read access on the default branch, then rerun."
+        ? "Install the version 2 ORM consumer examples and check the named configuration source and GitHub read access on the default branch."
         : "Inspect the operation and cause, correct the configuration or runtime failure, then rerun.",
     ...(error instanceof ConfigurationError ? error.diagnostic : {}),
     elapsed_ms: Math.round(performance.now() - started),

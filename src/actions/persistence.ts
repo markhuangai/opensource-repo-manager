@@ -36,6 +36,7 @@ import {
 } from "./state.ts";
 import type { TaskResult } from "./task.ts";
 import type { ActionsArtifacts } from "./artifacts.ts";
+import type { RemoteTurn } from "../domain/remote-turns.ts";
 
 export interface TaskStateTransport extends GitHubWriter {
   taskIssue(
@@ -228,7 +229,7 @@ export class ActionsState implements TaskDurability {
       const instance = randomUUID(),
         limits = this.snapshot.settings.limits;
       const state: TaskState = {
-        version: 1,
+        version: 2,
         repository,
         issue: { id: issue.id, number },
         task_id: randomUUID(),
@@ -241,7 +242,7 @@ export class ActionsState implements TaskDurability {
         budget: { ...initialBudget },
         limits: {
           active_ms: limits.active_minutes * 60000,
-          model_requests: limits.model_requests,
+          agent_runs: limits.agent_runs,
           repair_cycles: limits.repair_cycles,
           infrastructure_retries: limits.infrastructure_retries,
           wait_ms: limits.wait_hours * 3600000,
@@ -259,6 +260,7 @@ export class ActionsState implements TaskDurability {
         head: null,
         pull: null,
         pending: null,
+        agent_turn: null,
         session_artifact: null,
       };
       const narrative =
@@ -376,8 +378,10 @@ export class ActionsState implements TaskDurability {
         pull.branch !== state.branch ||
         pull.repository_id !== repository.id ||
         pull.base_repository_id !== repository.id
-      )
-        throw new StateError("state_conflict");
+      ) {
+        this.superseded("state_conflict");
+        return;
+      }
     }
     if (
       context.state !== "closed" &&
@@ -385,8 +389,10 @@ export class ActionsState implements TaskDurability {
       state.scope &&
       ((!pull && digest(context.source) !== digest(state.scope.source)) ||
         issueDigest(context) !== state.job?.issue_digest)
-    )
-      throw new StateError("state_incompatible");
+    ) {
+      this.superseded("state_incompatible");
+      return;
+    }
     if (
       state.pr &&
       !deferredRepair &&
@@ -646,6 +652,20 @@ export class ActionsState implements TaskDurability {
   result() {
     return this.restoredResult;
   }
+
+  private superseded(reason: "state_conflict" | "state_incompatible") {
+    const state = this.comment.state;
+    if (!state.agent_turn) throw new StateError(reason);
+    this.restoredResult = {
+      version: 1,
+      repository: state.repository.full_name,
+      issue_number: state.issue.number,
+      job_id: state.job?.id,
+      revision: state.job?.revision,
+      outcome: "blocked",
+      reason,
+    };
+  }
   failure() {
     return this.fault;
   }
@@ -658,6 +678,31 @@ export class ActionsState implements TaskDurability {
   }
   publishedHead() {
     return this.comment.state.pr?.head;
+  }
+  agentState() {
+    const { repository, issue, task_id, author_id, agent_turn } =
+      this.comment.state;
+    return { repository, issue, task_id, author_id, agent_turn };
+  }
+
+  setAgentTurn(turn: RemoteTurn | null, signal: AbortSignal, elapsed = 0) {
+    return this.serial(async () => {
+      this.bindComment();
+      const state = this.restoredResult
+        ? {
+            ...this.comment.state,
+            budget: {
+              ...this.comment.state.budget,
+              active_ms: this.comment.state.budget.active_ms + elapsed,
+            },
+          }
+        : this.repository.project(this.comment.state, this.snapshot);
+      await this.write(
+        { ...state, agent_turn: turn },
+        this.comment.narrative,
+        signal,
+      );
+    }, signal);
   }
   question(): Question | null {
     const question = this.comment?.state.question;

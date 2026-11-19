@@ -16,6 +16,18 @@ on:
         description: Configured role whose profile should receive one test prompt
         default: implementation
         type: string
+      issue-number:
+        description: Issue bound to an ORM agent dispatch
+        type: string
+        default: ""
+      turn:
+        description: ORM dispatch operation UUID
+        type: string
+        default: ""
+      plan:
+        description: Plan authenticated by the ORM issue state
+        type: string
+        default: ""
     secrets:
       ORM_CONFIGURATION_VARIABLES:
         description: JSON of the caller vars context
@@ -23,9 +35,21 @@ on:
       ORM_CONFIGURATION_SECRETS:
         description: JSON map of explicitly forwarded repository secrets
         required: true
+      ORM_AGENT_PROFILES:
+        description: Explicit map of profile names to native settings
+        required: true
+      ORM_CODEX_API_KEY:
+        required: false
+      ORM_CLAUDE_API_KEY:
+        required: false
+      ORM_AGENT_READ_TOKEN:
+        required: true
+      ORM_AGENT_WORK_TOKEN:
+        required: false
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   runtime:
@@ -351,17 +375,27 @@ jobs:
                 elapsed_ms:Date.now()-started,recovery}));
             }
 
-  test:
-    name: Test configured AI profile
+  authorize:
+    name: Authorize the agent run
     needs: runtime
+    if: github.run_attempt == '1'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
+    outputs:
+      runner: ${{ steps.prepare.outputs.runner }}
+      profile: ${{ steps.prepare.outputs.profile }}
+      write: ${{ steps.prepare.outputs.write }}
+      timeout: ${{ steps.prepare.outputs.timeout }}
     steps:
-      - name: Test one AI response
+      - name: Check the dispatch and select its profile
+        id: prepare
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           ORM_RUNTIME_IMAGE: ${{ needs.runtime.outputs.runtime-image }}
           ORM_TEST_ROLE: ${{ inputs.role }}
+          ORM_AGENT_ISSUE: ${{ inputs.issue-number }}
+          ORM_AGENT_TURN: ${{ inputs.turn }}
+          ORM_AGENT_PLAN: ${{ inputs.plan }}
           ORM_BOOTSTRAP_GITHUB_TOKEN: ${{ github.token }}
           ORM_CONFIGURATION_SECRETS: ${{ secrets.ORM_CONFIGURATION_SECRETS }}
           ORM_CONFIGURATION_VARIABLES: ${{ secrets.ORM_CONFIGURATION_VARIABLES }}
@@ -371,6 +405,9 @@ jobs:
             assert(context.eventName === "workflow_dispatch", "AI tests require a manual caller.");
             assert(context.ref === `refs/heads/${context.payload.repository.default_branch}`, "Run the caller from its default branch.");
             const image = process.env.ORM_RUNTIME_IMAGE, role = process.env.ORM_TEST_ROLE;
+            const issue = process.env.ORM_AGENT_ISSUE;
+            assert(Boolean(issue) === Boolean(process.env.ORM_AGENT_TURN), "Invalid agent request.");
+            assert(Boolean(issue) === Boolean(process.env.ORM_AGENT_PLAN), "Invalid agent plan.");
             assert(/^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[a-f0-9]{64}$/.test(image), "runtime-image must be pinned by digest.");
             assert(["bootstrap", "investigation", "implementation", "audit", "output_review"].includes(role), "Unknown configured role.");
             core.info(JSON.stringify({event: "runtime.used", level: "info", repository: process.env.GITHUB_REPOSITORY,
@@ -379,11 +416,11 @@ jobs:
             const name = `orm-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}-ai-test`;
             await exec.exec("docker", ["pull", image]);
             const environment = ["ORM_BOOTSTRAP_GITHUB_TOKEN", "ORM_CONFIGURATION_SECRETS", "ORM_CONFIGURATION_VARIABLES",
-              "GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_EVENT_NAME", "GITHUB_REF"];
+              "GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_EVENT_NAME", "GITHUB_REF", "ORM_AGENT_TURN", "ORM_AGENT_PLAN"];
             await exec.exec("docker", ["create", "--name", name,
               "--label", `org.opensource-repo-manager.ai-test=${context.runId}-${process.env.GITHUB_RUN_ATTEMPT}`,
               ...environment.flatMap(key => ["--env", key]),
-              "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", "test-ai", role]);
+              "--entrypoint", "/usr/bin/tini", image, "--", "/opt/orm-runtime/bin/node", "/opt/orm/app/dist/actions/controller.js", issue ? "authorize-agent" : "test-ai", issue || role]);
             const decoder = new (require("node:string_decoder").StringDecoder)("utf8");
             let pending = "";
             const forward = chunk => {
@@ -400,9 +437,14 @@ jobs:
             pending += decoder.end();
             if (pending) core.info(pending);
             const result = JSON.parse(output.stdout.trim());
-            assert(result.version === 1 && ["completed", "failed"].includes(result.outcome), "Missing bounded AI test result.");
-            await core.summary.addHeading("AI configuration test").addCodeBlock(JSON.stringify({ ...result, runtime_image: image }, null, 2), "json").write();
-            if (output.exitCode || result.outcome !== "completed" || result.cleanup !== "passed") core.setFailed(`AI test stopped: ${result.reason}`);
+            assert(!output.exitCode && ["codex", "claude"].includes(result.runner) &&
+              /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(result.profile) && typeof result.write === "boolean" &&
+              Number.isSafeInteger(result.timeout_minutes) && result.timeout_minutes >= 1 && result.timeout_minutes <= 360,
+              "Agent authorization failed. Inspect the controller diagnostics.");
+            core.setOutput("runner", result.runner);
+            core.setOutput("profile", result.profile);
+            core.setOutput("write", String(result.write));
+            core.setOutput("timeout", result.timeout_minutes);
       - name: Remove the AI test container
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
@@ -417,3 +459,51 @@ jobs:
             await exec.exec("docker", ["stop", "--time", "15", name]);
             await exec.exec("docker", ["rm", "--volumes", name]);
             core.info(JSON.stringify({container: name, cleanup: "passed"}));
+
+  agent:
+    name: Run configured harness
+    needs: authorize
+    if: github.run_attempt == '1'
+    permissions:
+      contents: read
+      actions: write
+    uses: markhuangai/agent-remote-dev/.github/workflows/remote-dev.yml@v1.0.0
+    with:
+      runner: ${{ needs.authorize.outputs.runner }}
+      plan: ${{ inputs.issue-number != '' && inputs.plan || 'This is an ORM connectivity probe. Keep the repository unchanged. Reply with the text ORM probe completed.' }}
+      runs-on: ${{ format('[{0}]', toJSON(inputs.runner)) }}
+      timeout-minutes: ${{ fromJSON(needs.authorize.outputs.timeout) }}
+    secrets:
+      codex-config: ${{ github.run_attempt == '1' && needs.authorize.outputs.runner == 'codex' && fromJSON(secrets.ORM_AGENT_PROFILES)[needs.authorize.outputs.profile] || '' }}
+      claude-settings: ${{ github.run_attempt == '1' && needs.authorize.outputs.runner == 'claude' && fromJSON(secrets.ORM_AGENT_PROFILES)[needs.authorize.outputs.profile] || '' }}
+      codex-api-key: ${{ github.run_attempt == '1' && needs.authorize.outputs.runner == 'codex' && secrets.ORM_CODEX_API_KEY || '' }}
+      claude-api-key: ${{ github.run_attempt == '1' && needs.authorize.outputs.runner == 'claude' && secrets.ORM_CLAUDE_API_KEY || '' }}
+      github-token: ${{ github.run_attempt == '1' && (needs.authorize.outputs.write == 'true' && secrets.ORM_AGENT_WORK_TOKEN || needs.authorize.outputs.write == 'false' && secrets.ORM_AGENT_READ_TOKEN) || '' }}
+
+  probe:
+    name: Verify the AI configuration probe
+    if: inputs.issue-number == ''
+    needs: [authorize, agent]
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: remote-dev-result-r${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/orm-agent-probe
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ORM_PROBE_RUNNER: ${{ needs.authorize.outputs.runner }}
+        with:
+          script: |
+            const assert = require('node:assert/strict');
+            const {readFileSync, lstatSync} = require('node:fs');
+            const {join} = require('node:path');
+            const path = join(process.env.RUNNER_TEMP, 'orm-agent-probe', 'record.json');
+            const stat = lstatSync(path);
+            assert(stat.isFile() && stat.size <= 2 * 1024 * 1024, 'Invalid native result artifact.');
+            const record = JSON.parse(readFileSync(path, 'utf8'));
+            assert(record.runner === process.env.ORM_PROBE_RUNNER && record.native_outcome === 'completed' &&
+              typeof record.response === 'string' && record.response.trim() === 'ORM probe completed.',
+              'The configured harness did not complete the fixed probe.');
+            await core.summary.addHeading('AI configuration test').addRaw('The configured harness returned the expected response.').write();

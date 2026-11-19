@@ -21,20 +21,20 @@
   },
   "dependencies": {
     "@actions/artifact": "6.3.1",
-    "@anthropic-ai/claude-agent-sdk": "0.3.296",
     "@octokit/rest": "22.0.1",
-    "@openai/codex-sdk": "0.162.1",
     "ajv": "8.20.0",
     "better-sqlite3": "13.0.3",
     "re2js": "2.8.6",
     "smol-toml": "1.9.1",
     "yaml": "2.9.1",
+    "yauzl": "3.4.0",
     "zod": "4.6.7"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/better-sqlite3": "9.6.0",
     "@types/node": "24.19.2",
+    "@types/yauzl": "3.4.0",
     "eslint": "10.12.0",
     "prettier": "3.9.10",
     "typescript": "6.0.3",

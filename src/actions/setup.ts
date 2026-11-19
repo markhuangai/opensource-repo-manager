@@ -92,7 +92,6 @@ export async function prepareActionsConfiguration(
   const runtime = {
     version: config.version,
     github: config.github,
-    proxy: config.proxy,
     profiles: config.profiles,
     redaction_values: config.redaction_values,
     pr_monitor: config.pr_monitor,

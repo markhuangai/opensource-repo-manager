@@ -28,8 +28,6 @@ import { InvestigationRepository } from "../src/repositories/investigation.ts";
 import { PrMonitorRepository } from "../src/repositories/pr-monitor.ts";
 import { ImplementationRepository } from "../src/repositories/implementation.ts";
 import { IntakeService } from "../src/services/intake.ts";
-import { ModelRelay } from "../src/services/model-relay.ts";
-import { createServer } from "node:http";
 import { separateSecrets } from "../src/config/secrets.ts";
 import { digest } from "../src/domain/agents.ts";
 import { fixtureConfiguration, fixtureSnapshot } from "./fixtures.ts";
@@ -173,7 +171,7 @@ describe("authenticated Actions task authority", () => {
     expect(recovered.identifiers().state_comment_id).toBe(
       identity.state_comment_id,
     );
-    expect(f.read().state.budget.model_requests).toBe(1);
+    expect(f.read().state.budget.agent_runs).toBe(1);
     expect(f.read().state.budget.active_ms).toBe(before.budget.active_ms);
     expect(new PublicationRepository(fresh).instance()).toBe(
       before.publication_instance,
@@ -284,7 +282,7 @@ describe("authenticated Actions task authority", () => {
         f.remote.state.comments.get(1)!.push({ ...row, id: row.id + 1000 });
       if (failure === "foreign") row.id += 1000;
       if (failure === "schema")
-        row.body = row.body.replace("orm:task-state:v1:", "orm:task-state:v2:");
+        row.body = row.body.replace("orm:task-state:v2:", "orm:task-state:v1:");
       if (failure === "key") {
         const config = fixtureConfiguration();
         await fixtureSnapshot("fixture-model", config);
@@ -305,7 +303,9 @@ describe("authenticated Actions task authority", () => {
               ? "state_missing"
               : failure === "duplicate"
                 ? "state_conflict"
-                : "state_invalid",
+                : failure === "schema"
+                  ? "state_legacy_unbound"
+                  : "state_invalid",
         });
       expect(f.remote.state.mutations).toHaveLength(before);
     });
@@ -341,7 +341,7 @@ describe("authenticated Actions task authority", () => {
         await f.store.checkpoint(signal());
       }),
     );
-    expect(f.read().state.budget.model_requests).toBe(3);
+    expect(f.read().state.budget.agent_runs).toBe(3);
     const second = f.database();
     await f.open(second);
     const generation = f.read().state.generation;
@@ -463,7 +463,7 @@ describe("authenticated Actions task authority", () => {
       ),
     ).toThrow("state_invalid");
     expect(() =>
-      f.codec.encode({ ...saved.state, version: 2 } as never, saved.narrative),
+      f.codec.encode({ ...saved.state, version: 1 } as never, saved.narrative),
     ).toThrow("state_invalid");
     const large = structuredClone(saved.state);
     large.scope = {
@@ -503,74 +503,6 @@ describe("authenticated Actions task authority", () => {
     expect(JSON.stringify(f.read().state)).not.toMatch(
       /system_prompt|session_id|OPERATOR_SYSTEM_CANARY/,
     );
-  });
-
-  it("acknowledges a model reservation before any provider request and blocks forwarding when the state write fails", async () => {
-    const f = await setup();
-    await f.open(f.store);
-    let providerRequests = 0;
-    const upstream = createServer((_request, response) => {
-      providerRequests++;
-      response.setHeader("content-type", "application/json");
-      response.end('{"ok":true}');
-    });
-    await new Promise<void>((resolve) =>
-      upstream.listen(0, "127.0.0.1", resolve),
-    );
-    cleanups.push(async () => {
-      upstream.closeAllConnections();
-      await new Promise<void>((resolve) => upstream.close(() => resolve()));
-    });
-    const lease = f.store.acquireLease(1, 1)!;
-    const deadline = f.store.startRuntimeLease(lease, 60000);
-    const relay = new ModelRelay(
-      f.store,
-      `http://127.0.0.1:${(upstream.address() as { port: number }).port}/v1`,
-      f.secrets,
-    );
-    await relay.start();
-    cleanups.push(() => relay.close());
-    const grant = relay.authorize({
-      lease,
-      deadline,
-      requests: 10,
-      bytes: 1048576,
-      profile: { sdk: "codex", model: "fixture-model", effort: "high" },
-      signal: signal(),
-      current: () => f.store.runtimeCurrent(lease),
-    });
-    let release: () => void = () => {},
-      arrived: () => void = () => {};
-    const held = new Promise<void>((resolve) => {
-        release = resolve;
-      }),
-      entered = new Promise<void>((resolve) => {
-        arrived = resolve;
-      });
-    f.remote.state.holdBefore = async () => {
-      arrived();
-      await held;
-    };
-    const request = () =>
-      fetch(grant.url + "/responses", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${grant.authorization}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ model: "fixture-model" }),
-      });
-    const response = request();
-    await entered;
-    expect(providerRequests).toBe(0);
-    release();
-    expect((await response).status).toBe(200);
-    expect(f.read().state.budget.model_requests).toBe(1);
-    expect(providerRequests).toBe(1);
-    f.remote.state.holdBefore = undefined;
-    f.remote.state.rejectBefore = "comment";
-    expect((await request()).status).toBeGreaterThanOrEqual(400);
-    expect(providerRequests).toBe(1);
   });
 
   it("allows fresh recovery after confirmed artifact deletion when no PR is owned", async () => {

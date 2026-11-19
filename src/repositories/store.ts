@@ -10,6 +10,8 @@ import {
 import { dirname, join, parse, relative, resolve } from "node:path";
 import Database from "better-sqlite3";
 import type { TaskDurability } from "../domain/durability.ts";
+import type { CandidateCommit } from "../domain/remote-turns.ts";
+import type { RemoteAgentResult } from "../runtime/remote-agents.ts";
 import { immutable } from "../config/bundles.ts";
 import type { RunSnapshot } from "../config/load.ts";
 import type {
@@ -91,7 +93,7 @@ export class Store {
     this.db = new Database(path);
     try {
       const version = this.db.pragma("user_version", { simple: true });
-      if (version !== 0 && version !== 12)
+      if (version !== 0 && version !== 13)
         throw new IntakeError("schema_unsupported");
       this.db.pragma("foreign_keys = ON");
       this.db.pragma("journal_mode = WAL");
@@ -131,7 +133,7 @@ CREATE TABLE runtime_leases (
           );
 CREATE TABLE agent_runs (
             id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
-            revision INTEGER NOT NULL, role TEXT NOT NULL, uid INTEGER NOT NULL,
+            revision INTEGER NOT NULL, role TEXT NOT NULL, uid INTEGER,
             parent_id TEXT REFERENCES agent_runs(id), lease_token TEXT NOT NULL,
             binding_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running',
             session_id TEXT, artifact_digest TEXT,
@@ -190,8 +192,15 @@ CREATE TABLE agent_conversations (
             id TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id),
             revision INTEGER NOT NULL, content TEXT NOT NULL
           );
+CREATE TABLE remote_agent_results (
+            request_digest TEXT PRIMARY KEY, content TEXT NOT NULL
+          );
+CREATE TABLE remote_candidates (
+            artifact_digest TEXT PRIMARY KEY REFERENCES artifacts(digest),
+            branch TEXT NOT NULL, sha TEXT NOT NULL
+          );
 CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT NULL);
-            PRAGMA user_version = 12;
+            PRAGMA user_version = 13;
           `);
             this.db
               .prepare("INSERT INTO publication_instance(id) VALUES(?)")
@@ -565,9 +574,9 @@ CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT
     return (
       this.db
         .prepare(
-          `UPDATE jobs SET budget_json=json_set(budget_json,'$.model_requests',
-      json_extract(budget_json,'$.model_requests')+1) WHERE status='pending'
-      AND json_extract(budget_json,'$.model_requests')<? AND EXISTS
+          `UPDATE jobs SET budget_json=json_set(budget_json,'$.agent_runs',
+      json_extract(budget_json,'$.agent_runs')+1) WHERE status='pending'
+      AND json_extract(budget_json,'$.agent_runs')<? AND EXISTS
       (SELECT 1 FROM coding_lease JOIN runtime_leases ON coding_lease.token=runtime_leases.token
        WHERE coding_lease.token=? AND coding_lease.job_id=jobs.id
        AND coding_lease.revision=jobs.revision AND runtime_leases.deadline>?)`,
@@ -723,6 +732,83 @@ CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT
       })
       .immediate();
     return hash;
+  }
+
+  replaceBudget(job: number, revision: number, budget: BudgetUsage) {
+    if (
+      this.db
+        .prepare("UPDATE jobs SET budget_json=? WHERE id=? AND revision=?")
+        .run(JSON.stringify(budgetUsage.parse(budget)), job, revision)
+        .changes !== 1
+    )
+      throw new RuntimeError("revision_stale");
+  }
+
+  remoteResult(key: string) {
+    const row = this.db
+      .prepare(
+        "SELECT content FROM remote_agent_results WHERE request_digest=?",
+      )
+      .get(key) as { content: string } | undefined;
+    return row && (JSON.parse(row.content) as RemoteAgentResult);
+  }
+
+  saveRemoteResult(key: string, result: RemoteAgentResult) {
+    this.db
+      .prepare("INSERT INTO remote_agent_results VALUES(?,?)")
+      .run(key, JSON.stringify(result));
+  }
+
+  registerRemoteRun(
+    id: string,
+    job: number,
+    revision: number,
+    role: AgentRunRecord["role"],
+    result: RemoteAgentResult,
+  ) {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO agent_runs
+      (id,job_id,revision,role,uid,lease_token,binding_json,status,started_at,finished_at)
+      SELECT ?,id,revision,?,NULL,'',?,'completed',?,? FROM jobs WHERE id=? AND revision=? AND status='pending'`,
+      )
+      .run(
+        id,
+        role,
+        JSON.stringify({
+          run_id: result.run_id,
+          run_attempt: 1,
+          starting_sha: result.starting_sha,
+          elapsed_ms: result.elapsed_ms,
+        }),
+        result.started_at,
+        Date.now(),
+        job,
+        revision,
+      );
+    const row = this.run(id);
+    if (
+      !row ||
+      row.job_id !== job ||
+      row.revision !== revision ||
+      row.role !== role ||
+      row.uid !== null
+    )
+      throw new RuntimeError("revision_stale");
+  }
+
+  candidate(artifact: string): CandidateCommit | undefined {
+    return this.db
+      .prepare(
+        "SELECT branch,sha FROM remote_candidates WHERE artifact_digest=?",
+      )
+      .get(artifact) as CandidateCommit | undefined;
+  }
+
+  recordCandidate(artifact: string, candidate: CandidateCommit) {
+    this.db
+      .prepare("INSERT INTO remote_candidates VALUES(?,?,?)")
+      .run(artifact, candidate.branch, candidate.sha);
   }
 
   artifact(hash: string, jobId: number, revision: number): ArtifactManifest {

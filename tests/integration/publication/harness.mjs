@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { createServer } from "node:http";
 import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -17,14 +16,8 @@ import {
 } from "/opt/orm/app/dist/config/load.js";
 import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
-import { respond as claude } from "/agent-fixtures/claude.mjs";
-import { respond as codex } from "/agent-fixtures/codex.mjs";
+import { RuntimeError } from "/opt/orm/app/dist/domain/agents.js";
 
-async function events(stream) {
-  const result = [];
-  for await (const event of stream) result.push(event);
-  return result;
-}
 async function until(check) {
   const deadline = Date.now() + 20000;
   while (!(await check())) {
@@ -40,36 +33,16 @@ export async function runPublicationTests() {
     database = join(root, "state", "publication.sqlite");
   let store = new Store(database),
     supervisor,
-    fixture,
     sdk,
     rejectReview = false,
     wrongBinding = false,
     modelDown = false,
-    nested = false,
     holdReview,
     reviewEntered = false;
   const errors = [],
     requests = [],
-    proof = [],
-    reviewProgress = [];
-  const model = createServer((req, res) => {
-    if (modelDown) {
-      res.statusCode = 503;
-      res.end("unavailable");
-      return;
-    }
-    return (sdk === "claude" ? claude : codex)(req, res, fixture);
-  });
-  await new Promise((resolve) => model.listen(0, "127.0.0.1", resolve));
-  const proxy = `http://127.0.0.1:${model.address().port}/v1`;
-  const profiles = {
-    codex: { sdk: "codex", model: "gpt-5.5", effort: "xhigh" },
-    claude: {
-      sdk: "claude",
-      model: "auto",
-      effort: "xhigh",
-    },
-  };
+    proof = [];
+  const profiles = { codex: { sdk: "codex" }, claude: { sdk: "claude" } };
   let number = 8000;
   const signal = () => new globalThis.AbortController().signal;
   store.enroll({
@@ -97,37 +70,21 @@ export async function runPublicationTests() {
     return store.job(number);
   };
   const candidate = async (job, label, binary = false, structured) => {
-    fixture.environmentCommand = `printf '${label}\\n' > app.txt; ${binary ? "printf '\\000\\377' > image.bin; " : ""}${structured ? `printf '%s' '${Buffer.from(structured.content).toString("base64")}' | base64 -d > '${structured.path}'; ` : ""}test "$(cat app.txt)" = '${label}' && printf '\\nBOOTSTRAP_TESTS_PASSED\\n'`;
-    const implementation = (
-      await events(
-        supervisor.run(
-          supervisor.request(job.id, "implementation", {
-            task: "bootstrap_environment",
-          }),
-          signal(),
-        ),
-      )
-    ).at(-1);
-    assert.equal(implementation.outcome, "completed");
-    assert(implementation.artifact);
-    fixture.environmentCommand = `test "$(cat app.txt)" = '${label}' && printf '\\nBOOTSTRAP_TESTS_PASSED\\n'`;
-    const audit = (
-      await events(
-        supervisor.run(
-          supervisor.request(
-            job.id,
-            "audit",
-            { task: "bootstrap_environment" },
-            implementation.artifact,
-          ),
-          signal(),
-        ),
-      )
-    ).at(-1);
-    assert.equal(audit.outcome, "completed");
-    const auditRun = store
-      .runs()
-      .findLast((run) => run.role === "audit" && run.job_id === job.id);
+    const target = supervisor.publication.repository.target(job.id);
+    const files = { ...remote.initial, "app.txt": label + "\n" };
+    if (binary) files["image.bin"] = Buffer.from([0, 255]);
+    if (structured) files[structured.path] = structured.content;
+    const start = target.head ?? remote.source.sha;
+    const head = remote.commit(files, start).sha;
+    const branch = `orm-work/${randomUUID()}/${randomUUID()}`;
+    remote.git(["update-ref", `refs/heads/${branch}`, head]);
+    const inspection = supervisor.request(job.id, "audit");
+    const artifact = await supervisor.captureCandidate(
+      inspection,
+      { branch, sha: head },
+      start,
+      signal(),
+    );
     const ids = [];
     for (const kind of ["audit", "test"])
       ids.push(
@@ -137,12 +94,11 @@ export async function runPublicationTests() {
             revision: job.revision,
             kind,
             source_sha: remote.source.sha,
-            artifact_digest: implementation.artifact,
+            artifact_digest: artifact,
             outcome: "passed",
             details: {
-              run_id: auditRun.id,
-              command: fixture.environmentCommand,
-              result: "BOOTSTRAP_TESTS_PASSED",
+              candidate_sha: head,
+              source: remote.source.sha,
             },
           },
           signal(),
@@ -152,7 +108,7 @@ export async function runPublicationTests() {
       job_id: job.id,
       revision: job.revision,
       kind: "change",
-      artifact_digest: implementation.artifact,
+      artifact_digest: artifact,
       expected_head: supervisor.publication.repository.target(job.id).head,
       evidence_ids: ids,
       title: `Fix ${label}`,
@@ -175,8 +131,7 @@ export async function runPublicationTests() {
       );
       config.github.repository = "owner/repo";
       config.github.token = remote.state.token;
-      config.proxy.url = proxy;
-      config.proxy.key = `folded password ${randomUUID()}`;
+      const scanCanary = `folded password ${randomUUID()}`;
       const scannerRuntimeToken = `line-one\nline-two ${randomUUID()}`;
       config.limits.infrastructure_retries = 20;
       config.profiles = Object.fromEntries(
@@ -201,7 +156,11 @@ export async function runPublicationTests() {
           }
         bundles[role] = bundle;
       }
-      const separated = separateSecrets(config, undefined, scannerRuntimeToken);
+      const separated = separateSecrets(
+        config,
+        scanCanary,
+        scannerRuntimeToken,
+      );
       secrets = separated.secrets;
       snapshot = createRunSnapshot(separated.settings, bundles, secrets);
       const silent = () => {};
@@ -218,50 +177,42 @@ export async function runPublicationTests() {
             }),
             ready,
           ),
-        workers: { [sdk]: `/opt/orm/app/dist/adapters/agents/${sdk}.js` },
-      };
-      supervisor = await Supervisor.create(store, snapshot, secrets, options);
-      const runJobAgent = supervisor.runJobAgent.bind(supervisor);
-      supervisor.runJobAgent = async function* (...args) {
-        for await (const event of runJobAgent(...args)) {
-          if (event.type === "progress" && /^[a-z_]{1,64}$/.test(event.message))
-            reviewProgress.push(event.message);
-          yield event;
-        }
-      };
-      fixture = {
-        config,
-        store,
-        root: options.root,
-        requests,
-        errors,
-        histories: new Map(),
-        async outputReview(text) {
-          if (holdReview) {
-            reviewEntered = true;
-            await holdReview;
-          }
-          const run = store.runs().findLast((run) => run.finished_at === null);
-          assert.equal(run.role, "output_review");
-          assert.equal(run.uid, 10003);
-          assert.equal(run.session_id, null);
-          assert.equal(store.leases().length, 1);
-          if (nested) {
-            assert(run.parent_id);
-            assert(
-              (await userProcesses(10001)).some(
-                (process) => process.state === "T",
-              ),
+        agents: {
+          async execute(request, signal) {
+            assert.equal(request.role, "output_review");
+            signal.throwIfAborted();
+            const budget = JSON.parse(
+              store.jobById(request.job_id).budget_json,
             );
-          }
-          const binding = /"binding":"([a-f0-9]{64})"/.exec(text)[1];
-          return {
-            approved: !rejectReview,
-            binding: wrongBinding ? "0".repeat(64) : binding,
-            findings: rejectReview ? ["unsupported fixture claim"] : [],
-          };
+            if (budget.agent_runs >= config.limits.agent_runs)
+              throw new RuntimeError("agent_run_limit");
+            budget.agent_runs++;
+            store.replaceBudget(request.job_id, request.revision, budget);
+            requests.push(request.role);
+            if (holdReview) {
+              reviewEntered = true;
+              await holdReview;
+            }
+            signal.throwIfAborted();
+            if (modelDown) throw new RuntimeError("agent_run_failed");
+            const { binding } = request.input;
+            return {
+              id: randomUUID(),
+              run_id: requests.length,
+              starting_sha: request.workspace.source.sha,
+              started_at: Date.now(),
+              elapsed_ms: 0,
+              candidate: null,
+              result: {
+                approved: !rejectReview,
+                binding: wrongBinding ? "0".repeat(64) : binding,
+                findings: rejectReview ? ["unsupported fixture claim"] : [],
+              },
+            };
+          },
         },
       };
+      supervisor = await Supervisor.create(store, snapshot, secrets, options);
       const scanner = supervisor.publication.outputReview.scanner;
       await scanner.scan({ ordinary: "verified text" }, signal());
       const sourceText = String.raw`const emoji = "\u{1F600}";` + "\n";
@@ -341,7 +292,7 @@ export async function runPublicationTests() {
             );
         }
       }
-      const foldedSecret = config.proxy.key.replace(" ", "\n  ");
+      const foldedSecret = scanCanary.replace(" ", "\n  ");
       for (const quote of ["'", '"'])
         for (const text of [
           `password: ${quote}${foldedSecret}${quote}\n`,
@@ -351,7 +302,7 @@ export async function runPublicationTests() {
             scanner.scan(text, signal()),
             /publication_secret/,
           );
-      const blockPassword = config.proxy.key.replace(" ", "\n");
+      const blockPassword = scanCanary.replace(" ", "\n");
       const blockSecrets = [
         `password: ${foldedSecret}\n`,
         `? ${foldedSecret}\n: value\n`,
@@ -401,8 +352,7 @@ export async function runPublicationTests() {
         JSON.stringify({
           failure: commentReceipt.failure,
           fixture_errors: errors.map((error) => error.message),
-          review_progress: reviewProgress,
-          model_requests: requests.length,
+          agent_runs: requests.length,
           runs: store
             .runs()
             .map((run) => ({ role: run.role, status: run.status })),
@@ -555,7 +505,6 @@ export async function runPublicationTests() {
         if (cause === "shutdown") {
           store.close();
           store = new Store(database);
-          fixture.store = store;
           supervisor = await Supervisor.create(
             store,
             snapshot,
@@ -737,9 +686,11 @@ export async function runPublicationTests() {
 
       const protectedJob = seed(),
         protectedChange = await candidate(protectedJob, `${sdk}-protected`);
-      remote.state.protected.add(
-        supervisor.publication.repository.target(protectedJob.id).branch,
+      const protectedTarget = supervisor.publication.repository.target(
+        protectedJob.id,
       );
+      protectedTarget.branch = "main";
+      supervisor.publication.repository.saveTarget(protectedTarget);
       assert.equal(
         (await publish(protectedChange)).failure,
         "publication_branch_protected",
@@ -853,7 +804,6 @@ export async function runPublicationTests() {
           await supervisor.close();
           store.close();
           store = new Store(database);
-          fixture.store = store;
           supervisor = await Supervisor.create(
             store,
             snapshot,
@@ -993,7 +943,6 @@ export async function runPublicationTests() {
       await supervisor.close();
       store.close();
       store = new Store(database);
-      fixture.store = store;
       supervisor = await Supervisor.create(store, snapshot, secrets, options);
       const recovered = await supervisor.publication.reconcile(
         interrupted.id,
@@ -1025,7 +974,6 @@ export async function runPublicationTests() {
         await supervisor.close();
         store.close();
         store = new Store(database);
-        fixture.store = store;
         supervisor = await Supervisor.create(store, snapshot, secrets, options);
         let releaseReconciliation;
         let reconciliationEntered = false;
@@ -1153,55 +1101,6 @@ export async function runPublicationTests() {
       );
       proof.push({ sdk, superseded_operation_recovery: "passed" });
 
-      const nestedJob = seed(),
-        cancellation = new globalThis.AbortController();
-      fixture.held = false;
-      const parentTask = events(
-        supervisor.run(
-          supervisor.request(nestedJob.id, "implementation", {
-            scenario: "cancel",
-          }),
-          cancellation.signal,
-        ),
-      );
-      await until(() => fixture.held);
-      const parent = store
-        .runs()
-        .findLast(
-          (run) => run.job_id === nestedJob.id && run.finished_at === null,
-        );
-      nested = true;
-      const nestedRequest = {
-        ...request,
-        job_id: nestedJob.id,
-        revision: nestedJob.revision,
-        parent_run_id: parent.id,
-      };
-      const used = JSON.parse(
-        store.jobById(nestedJob.id).budget_json,
-      ).model_requests;
-      const nestedReceipt = await supervisor.publication.outputReview.review(
-        nestedRequest,
-        signal(),
-      );
-      nested = false;
-      assert.equal(store.leases().length, 1);
-      assert(
-        JSON.parse(store.jobById(nestedJob.id).budget_json).model_requests >
-          used,
-      );
-      cancellation.abort();
-      assert.equal((await parentTask).at(-1).outcome, "cancelled");
-      assert.throws(
-        () =>
-          supervisor.publication.outputReview.verify(
-            nestedReceipt.id,
-            nestedRequest,
-          ),
-        /output_review_cancelled/,
-      );
-      proof.push({ sdk, one_slot_review: "passed" });
-
       const noticeCrashJob = seed(),
         noticeCrashProposal = {
           job_id: noticeCrashJob.id,
@@ -1231,7 +1130,6 @@ export async function runPublicationTests() {
       await supervisor.close();
       store.close();
       store = new Store(database);
-      fixture.store = store;
       supervisor = await Supervisor.create(store, snapshot, secrets, options);
       const recoveredNotice = await publish(noticeCrashProposal);
       assert.equal(recoveredNotice.status, "confirmed");
@@ -1262,7 +1160,7 @@ export async function runPublicationTests() {
       modelDown = true;
       assert.equal(
         (await publish(status(outageJob, "Generated narrative"))).failure,
-        "output_review_rejected",
+        "agent_run_failed",
       );
       const beforeTemplate = requests.length;
       assert.equal(
@@ -1281,9 +1179,9 @@ export async function runPublicationTests() {
       const exhausted = seed();
       store.db
         .prepare(
-          "UPDATE jobs SET budget_json=json_set(budget_json,'$.model_requests',?) WHERE id=?",
+          "UPDATE jobs SET budget_json=json_set(budget_json,'$.agent_runs',?) WHERE id=?",
         )
-        .run(snapshot.settings.limits.model_requests, exhausted.id);
+        .run(snapshot.settings.limits.agent_runs, exhausted.id);
       assert.equal(
         (await publish(status(exhausted, "No model budget"))).status,
         "blocked",
@@ -1336,7 +1234,7 @@ export async function runPublicationTests() {
         store.jobById(activeExhausted.id).budget_json,
       );
       assert.equal(activeUsage.active_ms, activeLimit);
-      assert.equal(activeUsage.model_requests, 0);
+      assert.equal(activeUsage.agent_runs, 0);
       modelDown = false;
       assert.equal(store.leases().length, 0);
       assert.equal(
@@ -1412,8 +1310,6 @@ export async function runPublicationTests() {
   } finally {
     await supervisor?.close();
     if (store.db.open) store.close();
-    model.closeAllConnections();
-    await new Promise((resolve) => model.close(resolve));
     await remote.close();
   }
 }

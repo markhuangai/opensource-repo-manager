@@ -8,10 +8,11 @@ import {
   type ApiDiagnostics,
 } from "../../logging/api.ts";
 import { spawn } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { openPromise as openZip } from "yauzl";
 import type { ActionsContext } from "../../actions/context.ts";
 import {
   fileDigest,
@@ -22,6 +23,7 @@ import { StateError } from "../../actions/state.ts";
 import type { SecretAccessor } from "../../config/secrets.ts";
 import { cleanEnvironment, trustedExecutable } from "../../runtime/process.ts";
 import { treeBytes } from "../../services/workspaces/files.ts";
+import type { RemoteRun } from "../../domain/remote-turns.ts";
 
 const positive = z.number().int().positive().safe();
 const runSchema = z.object({
@@ -144,7 +146,11 @@ export class GitHubArtifacts implements ArtifactTransport {
     await this.helper({ operation: "list", directory }, 1024 * 1024, signal);
   }
 
-  private async artifacts(run: number, name: string, signal: AbortSignal) {
+  private async artifacts(
+    run: number,
+    name: string | undefined,
+    signal: AbortSignal,
+  ) {
     const rows: Artifact[] = [];
     for (let page = 1; page <= 10; page++) {
       const result = z
@@ -169,6 +175,156 @@ export class GitHubArtifacts implements ArtifactTransport {
         break;
     }
     throw new StateError("session_transport_unavailable");
+  }
+
+  async uploadAgentInput(path: string, limit: number, signal: AbortSignal) {
+    const expected = await fileDigest(path, limit, signal);
+    const run = await this.run(
+      this.context.run_id,
+      this.context.run_attempt,
+      signal,
+    );
+    const name = basename(path);
+    await this.helper(
+      { operation: "upload", name, path, directory: dirname(path) },
+      limit,
+      signal,
+    );
+    const rows = await this.artifacts(run.id, name, signal);
+    if (rows.length !== 1 || rows[0].name !== name)
+      throw new StateError("session_upload_uncertain");
+    const artifact = rows[0];
+    this.provenance(artifact, run);
+    if (
+      artifact.digest !== `sha256:${expected.digest}` ||
+      artifact.size_in_bytes !== expected.size ||
+      artifact.expired
+    )
+      throw new StateError("session_provenance_invalid");
+    return { run: run.id, name, id: artifact.id, digest: expected.digest };
+  }
+
+  async agentResult(run: RemoteRun, directory: string, signal: AbortSignal) {
+    const rows = await this.artifacts(run.id, undefined, signal);
+    const resultName = `remote-dev-result-r${run.id}-a${run.run_attempt}`;
+    const result = rows.filter((artifact) => artifact.name === resultName);
+    const prefix = `remote-dev-session-r${run.id}-a${run.run_attempt}-`;
+    const checkpoints = rows
+      .filter(
+        (artifact) =>
+          artifact.name.startsWith(prefix) &&
+          /^[1-9][0-9]*$/.test(artifact.name.slice(prefix.length)),
+      )
+      .sort(
+        (left, right) =>
+          Number(right.name.slice(prefix.length)) -
+          Number(left.name.slice(prefix.length)),
+      );
+    if (
+      result.length !== 1 ||
+      !checkpoints.length ||
+      checkpoints[0].name === checkpoints[1]?.name
+    )
+      throw new StateError("agent_artifact_unavailable");
+    return {
+      result: await this.agentRecord(
+        run,
+        result[0],
+        directory,
+        "record.json",
+        2 * 1024 * 1024,
+        signal,
+      ),
+      checkpoint: await this.agentRecord(
+        run,
+        checkpoints[0],
+        directory,
+        "manifest.json",
+        256 * 1024 * 1024,
+        signal,
+      ),
+      result_id: result[0].id,
+      checkpoint_id: checkpoints[0].id,
+      sequence: Number(checkpoints[0].name.slice(prefix.length)),
+    };
+  }
+
+  private async agentRecord(
+    run: RemoteRun,
+    artifact: Artifact,
+    directory: string,
+    entryName: string,
+    limit: number,
+    signal: AbortSignal,
+  ) {
+    this.provenance(artifact, run);
+    if (
+      artifact.expired ||
+      Date.parse(artifact.expires_at) <= Date.now() ||
+      artifact.size_in_bytes > limit
+    )
+      throw new StateError("agent_artifact_unavailable");
+    const folder = join(directory, String(artifact.id));
+    await mkdir(folder, { mode: 0o700 });
+    const digest = artifact.digest.slice("sha256:".length);
+    const downloaded = (await this.helper(
+      {
+        operation: "download",
+        id: artifact.id,
+        digest,
+        run: run.id,
+        directory: folder,
+      },
+      limit,
+      signal,
+    )) as { digestMismatch?: boolean };
+    const files = await readdir(folder);
+    if (downloaded.digestMismatch || files.length !== 1)
+      throw new StateError("session_corrupt");
+    const path = join(folder, files[0]);
+    const actual = await fileDigest(path, limit, signal);
+    if (actual.digest !== digest || actual.size !== artifact.size_in_bytes)
+      throw new StateError("session_corrupt");
+    const zip = await openZip(path, {
+      autoClose: false,
+      strictFileNames: true,
+    });
+    try {
+      if (
+        zip.entryCount < 1 ||
+        zip.entryCount > 10001 ||
+        (entryName === "record.json" && zip.entryCount !== 1)
+      )
+        throw new StateError("session_corrupt");
+      let value: unknown;
+      let found = false;
+      for await (const entry of zip.eachEntry()) {
+        signal.throwIfAborted();
+        if (entry.fileName !== entryName) continue;
+        if (
+          found ||
+          entry.isEncrypted() ||
+          entry.uncompressedSize > 2 * 1024 * 1024
+        )
+          throw new StateError("session_corrupt");
+        found = true;
+        const stream = await zip.openReadStreamPromise(entry);
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          signal.throwIfAborted();
+          chunks.push(chunk);
+        }
+        value = JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(
+            Buffer.concat(chunks),
+          ),
+        );
+      }
+      if (!found) throw new StateError("session_corrupt");
+      return value;
+    } finally {
+      zip.close();
+    }
   }
 
   private provenance(artifact: Artifact, run: z.infer<typeof runSchema>) {

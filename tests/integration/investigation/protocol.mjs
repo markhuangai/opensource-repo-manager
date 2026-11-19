@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { RuntimeError, taskPrompt } from "/opt/orm/app/dist/domain/agents.js";
+import { compile } from "/opt/orm/app/dist/adapters/agents/schema.js";
 
 export const sourceFiles = {
   ".node-version": "24.18.0\n",
@@ -51,11 +55,12 @@ export function bundlesWithCanaries(loaded) {
   return bundles;
 }
 
-export function modelFixture(config, store, root, controls = {}) {
+export function modelFixture(config, store, root, controls = {}, remote) {
   const errors = [],
     requests = [];
+  const active = new AsyncLocalStorage();
   const current = () => {
-    const run = store.runs().findLast((entry) => entry.finished_at === null);
+    const run = active.getStore();
     const job = store.jobById(run.job_id);
     const context = JSON.parse(job.input_json);
     const mode = context.title;
@@ -144,7 +149,7 @@ export function modelFixture(config, store, root, controls = {}) {
       },
     };
   }
-  return {
+  const fixture = {
     config,
     store,
     root,
@@ -178,20 +183,6 @@ export function modelFixture(config, store, root, controls = {}) {
         "Native implementation input included a rejected reply",
       );
       const { run, job, mode } = current();
-      if (run.role === "implementation") {
-        const target = store.db
-          .prepare("SELECT content FROM publication_targets WHERE job_id=?")
-          .get(job.id);
-        assert.equal(
-          (
-            await readFile(
-              join(root, "runs", run.id, "workspace", ".git", "HEAD"),
-              "utf8",
-            )
-          ).trim(),
-          `ref: refs/heads/${JSON.parse(target.content).branch}`,
-        );
-      }
       const row = store.db
         .prepare(
           "SELECT content FROM implementations WHERE job_id=? AND revision=?",
@@ -236,22 +227,6 @@ export function modelFixture(config, store, root, controls = {}) {
         if (task === "implementation_change" && !results.length)
           return { command: maintenanceCommand() };
         return question;
-      }
-      if (
-        (mode === "clarification_coding" || mode === "monitor_clarification") &&
-        task === "implementation_change" &&
-        record?.continuation?.messages.length &&
-        record.continuation.question?.conversation_id === record.continuation.id
-      ) {
-        assert(
-          (
-            await readFile(
-              join(root, "runs", run.id, "workspace", "bug.mjs"),
-              "utf8",
-            )
-          ).includes("+ 1"),
-          "Partial coding workspace was not restored",
-        );
       }
       if (task === "implementation_review_feedback") {
         const input = taskInput(text);
@@ -304,7 +279,6 @@ export function modelFixture(config, store, root, controls = {}) {
           },
         };
       assert.equal(task, "implementation_change");
-      assert.equal(run.uid, 10001);
       if (!results.length)
         return {
           command: maintenanceCommand(
@@ -334,7 +308,6 @@ export function modelFixture(config, store, root, controls = {}) {
     async outputReview(text) {
       const { run, mode } = current();
       assert.equal(run.role, "output_review");
-      assert.equal(run.uid, 10003);
       const binding = /"binding":"([a-f0-9]{64})"/.exec(text)[1];
       await controls.review?.(text);
       const rejected =
@@ -358,7 +331,6 @@ export function modelFixture(config, store, root, controls = {}) {
       );
       const { run, job, mode, record } = current();
       assert.equal(run.role, "investigation");
-      assert.equal(run.uid, 10001);
       assert(text.includes("Features remain manual"));
       await controls.investigate?.(task, { run, job, mode, record, results });
       const question = clarification(record, task, mode, text);
@@ -447,4 +419,104 @@ export function modelFixture(config, store, root, controls = {}) {
       return { result };
     },
   };
+  fixture.agents = {
+    async execute(request, signal) {
+      const job = store.jobById(request.job_id);
+      const budget = JSON.parse(job.budget_json);
+      const limits = store.snapshot(job.snapshot_digest).settings.limits;
+      if (budget.active_ms >= limits.active_minutes * 60_000)
+        throw new RuntimeError("active_budget_exhausted");
+      if (budget.agent_runs >= limits.agent_runs)
+        throw new RuntimeError("agent_run_limit");
+      budget.agent_runs++;
+      store.replaceBudget(job.id, job.revision, budget);
+      const { input, role } = request;
+      const task = input.task;
+      const run = {
+        id: randomUUID(),
+        job_id: job.id,
+        revision: job.revision,
+        role,
+      };
+      const candidate =
+        request.workspace.artifact &&
+        store.candidate(request.workspace.artifact);
+      const starting_sha = candidate?.sha ?? request.workspace.source.sha;
+      const started_at = Date.now();
+      const workspace = join(root, "runs", run.id, "workspace");
+      const text = taskPrompt(request, "");
+      const git = (...args) =>
+        execFileSync("/usr/bin/git", args, {
+          cwd: workspace,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            PATH: "/usr/bin:/bin",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_AUTHOR_NAME: "Fixture",
+            GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+            GIT_COMMITTER_NAME: "Fixture",
+            GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+          },
+        }).trim();
+      let result,
+        change = null;
+      const run_id = requests.push({ task, role, starting_sha });
+      if (fixture.unavailable) throw new RuntimeError("agent_run_failed");
+      try {
+        if (role === "implementation" || task === "implementation_audit") {
+          await mkdir(workspace, { recursive: true });
+          git("init");
+          git("fetch", remote.repository, starting_sha);
+          git("checkout", "--detach", starting_sha);
+        }
+        await active.run(run, async () => {
+          if (task.startsWith("bootstrap_"))
+            result = fixture.bootstrap(task, text);
+          else if (role === "output_review")
+            result = await fixture.outputReview(text);
+          else if (role === "investigation")
+            result = (await fixture.investigation(task, text, [])).result;
+          else {
+            let value = await fixture.implementation(task, text, []);
+            if (value.command) {
+              assert.equal(task, "implementation_change");
+              execFileSync("/bin/sh", ["-c", value.command], {
+                cwd: workspace,
+                stdio: "pipe",
+              });
+              value = await fixture.implementation(task, text, ["executed"]);
+            }
+            result = value.result;
+            if (
+              task === "implementation_change" &&
+              result.response?.outcome !== "needs_information"
+            ) {
+              const branch = `orm-work/${randomUUID()}/${run.id}`;
+              git("add", ".");
+              git("commit", "--allow-empty", "-m", "Fixture change");
+              git("push", remote.repository, `HEAD:refs/heads/${branch}`);
+              change = { branch, sha: git("rev-parse", "HEAD") };
+            }
+          }
+        });
+        signal.throwIfAborted();
+        if (request.output_schema && !compile(request.output_schema)(result))
+          throw new RuntimeError("agent_result_invalid");
+        return {
+          id: run.id,
+          run_id,
+          started_at,
+          starting_sha,
+          elapsed_ms: Date.now() - started_at,
+          candidate: change,
+          result,
+        };
+      } finally {
+        await rm(join(root, "runs", run.id), { recursive: true, force: true });
+      }
+    },
+  };
+  return fixture;
 }

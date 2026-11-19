@@ -148,7 +148,7 @@ describe("durable investigations", () => {
       f.repository.save(record);
       f.store.db
         .prepare(
-          "UPDATE jobs SET phase=?,budget_json=json_set(budget_json,'$.model_requests',19)",
+          "UPDATE jobs SET phase=?,budget_json=json_set(budget_json,'$.agent_runs',19)",
         )
         .run(stage === "completed" ? "implementation" : "investigation");
       f.context.source = { ...f.context.source, sha: "d".repeat(40) };
@@ -157,7 +157,7 @@ describe("durable investigations", () => {
         revision: 2,
         phase: "investigation",
       });
-      expect(JSON.parse(f.store.job(1)!.budget_json).model_requests).toBe(19);
+      expect(JSON.parse(f.store.job(1)!.budget_json).agent_runs).toBe(19);
       expect(() => f.repository.assertCurrent(record)).toThrow(
         "revision_stale",
       );

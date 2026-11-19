@@ -196,6 +196,7 @@ export class WorkspaceService {
     limits: { processes: number; storage: number },
     signal: AbortSignal,
     publishedHead?: string,
+    requiredAncestor?: string,
   ): Promise<PreparedWorkspace> {
     const user = roleUsers[role],
       root = join(this.runsRoot, id),
@@ -313,6 +314,21 @@ export class WorkspaceService {
           ],
           { cwd: stage, env, signal: combined },
         );
+        if (requiredAncestor) {
+          if (!/^[a-f0-9]{40}$/.test(requiredAncestor))
+            throw new RuntimeError("source_invalid");
+          await gitCommand(
+            [
+              "--git-dir",
+              sourceGit,
+              "merge-base",
+              "--is-ancestor",
+              requiredAncestor,
+              publishedHead,
+            ],
+            { cwd: stage, env, signal: combined },
+          );
+        }
       }
       await treeBytes(stage, limits.storage);
       const workspace = join(root, "workspace"),

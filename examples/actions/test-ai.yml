@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   test:
@@ -25,7 +26,13 @@ jobs:
       ORM_CONFIGURATION_SECRETS: |
         {
           "ORM_GITHUB_TOKEN": ${{ toJSON(secrets.ORM_GITHUB_TOKEN) }},
-          "ORM_PROXY_KEY": ${{ toJSON(secrets.ORM_PROXY_KEY) }},
-          "ORM_SESSION_KEY": ${{ toJSON(secrets.ORM_SESSION_KEY) }},
-          "PROXY_URL": ${{ toJSON(secrets.PROXY_URL) }}
+          "ORM_SESSION_KEY": ${{ toJSON(secrets.ORM_SESSION_KEY) }}
         }
+      ORM_AGENT_PROFILES: |
+        {
+          "coding": ${{ toJSON(secrets.ORM_CODING_SETTINGS) }},
+          "review": ${{ toJSON(secrets.ORM_REVIEW_SETTINGS) }}
+        }
+      ORM_CODEX_API_KEY: ${{ secrets.ORM_CODEX_API_KEY }}
+      ORM_CLAUDE_API_KEY: ${{ secrets.ORM_CLAUDE_API_KEY }}
+      ORM_AGENT_READ_TOKEN: ${{ secrets.ORM_AGENT_READ_TOKEN }}

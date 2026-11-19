@@ -358,7 +358,6 @@ function operatorConfiguration() {
     version: config.version,
     github: { token: { from_secret: "ORM_GITHUB_TOKEN" } },
     session_key: { from_secret: "ORM_SESSION_KEY" },
-    proxy: { url: config.proxy.url, key: { from_secret: "ORM_PROXY_KEY" } },
     profiles: config.profiles,
     pr_monitor: config.pr_monitor,
     limits: config.limits,
@@ -481,7 +480,7 @@ describe("trusted repository Actions configuration", () => {
         ),
       ).toThrow();
     const input = operatorConfiguration();
-    Object.assign(input.proxy, { key: "leaked" });
+    Object.assign(input.github, { token: "leaked" });
     expect(() =>
       parseRepositoryActionsConfiguration(
         stringify(input),

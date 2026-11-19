@@ -1,3 +1,4 @@
+import { RemoteTurnPending } from "../../domain/remote-turns.ts";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { SecretAccessor } from "../../config/secrets.ts";
@@ -108,9 +109,11 @@ export class BootstrapService {
             }),
           };
           receipt.plan = bootstrapPlanSchema.parse(
-            await terminalResult(
-              this.supervisor.runBootstrapAgent(session, planner),
-            ),
+            (
+              await terminalResult(
+                this.supervisor.runBootstrapAgent(session, planner),
+              )
+            ).result,
           );
           receipt.plan_digest = digest(receipt.plan);
           await this.supervisor.bootstrapWorkspace(
@@ -146,24 +149,17 @@ export class BootstrapService {
               target: "draft-7",
             }),
           };
-          const priorRuns = new Set(this.store.runs().map((run) => run.id));
-          const audit = bootstrapAuditSchema.parse(
-            await terminalResult(
-              this.supervisor.runBootstrapAgent(session, auditor),
-            ),
+          const terminal = await terminalResult(
+            this.supervisor.runBootstrapAgent(session, auditor),
           );
-          const run = this.store
-            .runs()
-            .find(
-              (run) =>
-                !priorRuns.has(run.id) &&
-                run.job_id === request.job_id &&
-                run.revision === request.revision &&
-                run.role === "audit" &&
-                run.status === "completed",
-            );
+          const audit = bootstrapAuditSchema.parse(terminal.result);
+          const run = terminal.run_id && this.store.run(terminal.run_id);
           if (
             !run ||
+            run.role !== "audit" ||
+            run.job_id !== request.job_id ||
+            run.revision !== request.revision ||
+            run.status !== "completed" ||
             !audit.approved ||
             audit.findings.length ||
             audit.plan_digest !== receipt.plan_digest ||
@@ -230,6 +226,7 @@ export class BootstrapService {
           this.prepared.add(receipt.id);
           return this.store.bootstrap(receipt.id);
         } catch (error) {
+          if (error instanceof RemoteTurnPending) throw error;
           receipt.status = session.signal.aborted ? "interrupted" : "blocked";
           receipt.failure =
             error instanceof RuntimeError
@@ -312,5 +309,5 @@ async function terminalResult(events: AsyncIterable<AgentEvent>) {
     if (event.type === "terminal") terminal = event;
   if (!terminal || terminal.outcome !== "completed")
     throw new RuntimeError("bootstrap_agent_failed");
-  return terminal.result;
+  return terminal;
 }

@@ -15,6 +15,11 @@ import { ActionsState } from "./persistence.ts";
 import { createApiDiagnostics, apiFailureId } from "../logging/api.ts";
 import { ActionsArtifacts } from "./artifacts.ts";
 import { GitHubArtifacts } from "../adapters/github/artifacts.ts";
+import { GitHubActionsSource } from "../adapters/github/actions-source.ts";
+import { createGitHubClient } from "../adapters/github/client.ts";
+import { RemoteDevActions } from "../adapters/github/remote-dev.ts";
+import { RemoteAgents } from "../runtime/remote-agents.ts";
+import { RemoteTurnPending } from "../domain/remote-turns.ts";
 import { StateError } from "./state.ts";
 import {
   assertTaskStore,
@@ -82,12 +87,18 @@ try {
   await rootDirectory(root, 0o711);
   store = new Store(join(root, "state", "manager.sqlite"));
   assertTaskStore(store, request, loaded.snapshot.settings.github.repository);
+  const transport = new GitHubArtifacts(
+    loaded.actions,
+    loaded.secrets,
+    undefined,
+    diagnostics,
+  );
   const artifacts = new ActionsArtifacts(
     loaded.actions,
     loaded.snapshot,
     loaded.secrets,
     join(root, "runtime"),
-    new GitHubArtifacts(loaded.actions, loaded.secrets, undefined, diagnostics),
+    transport,
   );
   await artifacts.initialize(controller.signal);
   state = await ActionsState.open(
@@ -98,11 +109,41 @@ try {
     controller.signal,
     { artifacts },
   );
-  if (state.result()) result = state.result()!;
-  else {
+  const repository = loaded.actions.repository;
+  const client = createGitHubClient(
+    repository,
+    loaded.secrets.get("github.token"),
+    diagnostics,
+  );
+  const agents = new RemoteAgents(
+    store,
+    state,
+    new RemoteDevActions(repository, client),
+    new GitHubActionsSource(repository, client),
+    transport,
+    loaded.secrets,
+    join(root, "runtime"),
+    diagnostics,
+  );
+  const restored = state.result();
+  if (restored) {
+    result = restored;
+    if (
+      restored.outcome === "closed" ||
+      ["state_incompatible", "state_conflict"].includes(restored.reason)
+    ) {
+      try {
+        await agents.cancelSuperseded(controller.signal, true);
+      } catch (error) {
+        if (!(error instanceof RemoteTurnPending)) throw error;
+        result = { ...restored, outcome: "waiting", reason: "agent_run" };
+      }
+    }
+  } else {
     application = await createApplication(store, loaded, logger, {
       root: join(root, "runtime"),
       publicationWriter: () => state!.writer,
+      agents,
     });
     controller.signal.throwIfAborted();
     result = await executeTask(application, request, controller.signal);
@@ -116,7 +157,9 @@ try {
           ? "arguments_invalid"
           : "configuration_invalid"
         : error instanceof IntakeError
-          ? "intake_failed"
+          ? error.code === "schema_unsupported"
+            ? "state_incompatible"
+            : "intake_failed"
           : error instanceof RuntimeError && error.code === "task_state_invalid"
             ? "task_state_invalid"
             : error instanceof StateError
@@ -128,6 +171,16 @@ try {
   diagnostics.event("actions.failed", {
     reason: result.reason,
     request_id: apiFailureId(error),
+    ...([
+      "state_incompatible",
+      "state_legacy_unbound",
+      "session_schema_unsupported",
+    ].includes(result.reason)
+      ? {
+          recovery:
+            "Use the matching pinned ORM release for existing data. Install the version 2 examples for new tasks.",
+        }
+      : {}),
     cause: controller.signal.aborted
       ? "cancelled"
       : error instanceof IntakeError ||

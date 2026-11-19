@@ -17,6 +17,8 @@ import {
   dependencyExclusions,
 } from "../bootstrap/environment.ts";
 import { walkTree } from "../workspaces/files.ts";
+import { gitCommand } from "../workspaces/index.ts";
+import { cleanEnvironment } from "../../runtime/process.ts";
 import type { Implementation, VerificationReceipt } from "./contracts.ts";
 
 export function artifactFiles(manifest: ArtifactManifest) {
@@ -56,7 +58,7 @@ export async function captureBaseline(
   publishedHead?: string,
 ) {
   const request = supervisor.request(jobId, "audit");
-  return supervisor.withJobLease(request, signal, (lease) =>
+  const artifact = await supervisor.withJobLease(request, signal, (lease) =>
     supervisor.bootstrapWorkspace(
       lease,
       request,
@@ -77,6 +79,12 @@ export async function captureBaseline(
       publishedHead,
     ),
   );
+  if (publishedHead)
+    store.recordCandidate(artifact, {
+      branch: supervisor.publication.repository.target(jobId).branch,
+      sha: publishedHead,
+    });
+  return artifact;
 }
 
 export async function assertWorkspace(
@@ -168,6 +176,8 @@ export async function verifyCandidate(
     record.job_id,
     record.revision,
   );
+  const candidate = store.candidate(record.artifact_digest);
+  if (!candidate) throw new RuntimeError("publication_candidate_changed");
   let receipt: VerificationReceipt | undefined;
   try {
     await supervisor.withJobLease(request, signal, (lease) =>
@@ -176,6 +186,7 @@ export async function verifyCandidate(
         request,
         async (workspace, runId) => {
           receipt = {
+            candidate_sha: candidate.sha,
             id: randomUUID(),
             job_id: record.job_id,
             revision: record.revision,
@@ -198,7 +209,22 @@ export async function verifyCandidate(
             evidence_id: null,
           };
           save(receipt);
-          await assertWorkspace(workspace.workspace, manifest);
+          const verify = async () => {
+            const head = await gitCommand(["rev-parse", "--verify", "HEAD"], {
+              cwd: workspace.workspace,
+              env: cleanEnvironment(
+                workspace.home,
+                workspace.temporary,
+                "audit",
+              ),
+              signal: lease.signal,
+              role: "audit",
+            });
+            if (head.trim() !== candidate.sha)
+              throw new RuntimeError("implementation_source_mutated");
+            await assertWorkspace(workspace.workspace, manifest);
+          };
+          await verify();
           const setup = await supervisor.bootstrap.materialize(
             request,
             workspace,
@@ -217,7 +243,7 @@ export async function verifyCandidate(
                 operation,
               ),
           );
-          await assertWorkspace(workspace.workspace, manifest);
+          await verify();
           for (const [index, command] of record.scope!.checks.entries()) {
             const output = await supervisor.bootstrapCommand(
               lease,
@@ -246,7 +272,7 @@ export async function verifyCandidate(
               throw new RuntimeError("implementation_test_receipt_missing");
             receipt.commands.push({ ...actual, cwd: command.cwd });
             save(receipt);
-            await assertWorkspace(workspace.workspace, manifest);
+            await verify();
             if (output.exit_code !== 0)
               throw new RuntimeError("implementation_test_failed");
           }

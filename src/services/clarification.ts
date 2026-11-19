@@ -210,6 +210,18 @@ export async function runClarifyingPhase(
     const run = previous && store.run(previous.run_id);
     request = {
       ...continuation.request,
+      ...(continuation.question
+        ? {
+            input: {
+              ...(continuation.request.input as object),
+              clarification: {
+                summary: continuation.question.summary,
+                questions: continuation.question.questions,
+                audience: continuation.question.audience,
+              },
+            },
+          }
+        : {}),
       conversation: {
         version: 1,
         id: continuation.id,
