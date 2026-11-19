@@ -313,7 +313,7 @@ export class Supervisor implements AgentRunner {
     request: AgentRunRequest,
     operation: (workspace: PreparedWorkspace, runId: string) => Promise<T>,
     publishedHead?: string,
-    requiredAncestor?: string,
+    requiredParent?: string,
   ): Promise<T> {
     this.validateBootstrapLease(session, request);
     const candidate =
@@ -322,7 +322,7 @@ export class Supervisor implements AgentRunner {
     if (
       publishedHead &&
       (request.role !== "audit" ||
-        (!requiredAncestor &&
+        (!requiredParent &&
           publishedHead !== this.store.durability?.publishedHead()))
     )
       throw new RuntimeError("publication_head_changed");
@@ -389,7 +389,7 @@ export class Supervisor implements AgentRunner {
         limits,
         signal,
         publishedHead ?? (candidate ? candidate.sha : undefined),
-        requiredAncestor,
+        requiredParent,
       );
       if (request.workspace.artifact && !candidate) {
         const artifact = this.store.artifact(
@@ -613,7 +613,8 @@ export class Supervisor implements AgentRunner {
       artifact = await this.captureCandidate(
         inspection,
         accepted.candidate,
-        accepted.starting_sha,
+        this.publication.repository.target(request.job_id).head ??
+          request.workspace.source.sha,
         current,
       );
     }
@@ -636,7 +637,7 @@ export class Supervisor implements AgentRunner {
   async captureCandidate(
     request: AgentRunRequest,
     candidate: CandidateCommit,
-    ancestor: string,
+    parent: string,
     signal: AbortSignal,
   ) {
     const artifact = await this.withJobLease(request, signal, (lease) =>
@@ -658,7 +659,7 @@ export class Supervisor implements AgentRunner {
           return this.store.recordArtifact(manifest);
         },
         candidate.sha,
-        ancestor,
+        parent,
       ),
     );
     this.store.recordCandidate(artifact, candidate);

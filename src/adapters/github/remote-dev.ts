@@ -80,7 +80,7 @@ export class RemoteDevActions {
     const run = remoteRunSchema.parse(
       (
         await this.request(
-          "GET /repos/{owner}/{repo}/actions/runs/{run_id}",
+          "GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/1",
           { run_id: id },
           signal,
         )
@@ -97,12 +97,19 @@ export class RemoteDevActions {
     turn: RemoteTurn,
     signal: AbortSignal,
   ) {
-    const runs = z
-      .object({
-        total_count: z.number().int().nonnegative(),
-        workflow_runs: z.array(remoteRunSchema),
-      })
-      .parse(
+    const schema = z.object({
+      total_count: z.number().int().nonnegative(),
+      workflow_runs: z.array(
+        z.object({ id: githubId, display_title: z.string() }),
+      ),
+    });
+    const matches = new Set<number>();
+    const start = new Date(turn.created_at - 60_000).toISOString();
+    const end = new Date(
+      turn.created_at + remoteDev.registrationMs,
+    ).toISOString();
+    for (let page = 1; page <= 10; page++) {
+      const runs = schema.parse(
         (
           await this.request(
             "GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs",
@@ -111,22 +118,24 @@ export class RemoteDevActions {
               actor: actor.login,
               branch: repository.default_branch,
               event: "workflow_dispatch",
-              created: `>=${new Date(turn.created_at - 60000).toISOString()}`,
+              created: `${start}..${end}`,
               per_page: 100,
+              page,
             },
             signal,
           )
         ).data,
       );
-    if (runs.total_count > runs.workflow_runs.length)
-      throw new RuntimeError("agent_dispatch_uncertain");
-    const matches = runs.workflow_runs.filter(
-      (run) => run.display_title === turnTitle(issue, turn.id),
-    );
-    if (matches.length > 1) throw new RuntimeError("agent_dispatch_uncertain");
-    const run = matches[0];
-    if (run) assertTurnRun(repository, actor.id, issue, turn, run);
-    return run;
+      if (runs.total_count > 1000)
+        throw new RuntimeError("agent_dispatch_uncertain");
+      for (const run of runs.workflow_runs)
+        if (run.display_title === turnTitle(issue, turn.id))
+          matches.add(run.id);
+      if (matches.size > 1) throw new RuntimeError("agent_dispatch_uncertain");
+      if (page * 100 >= runs.total_count) break;
+    }
+    const [id] = matches;
+    return id === undefined ? undefined : this.run(id, signal);
   }
 
   async executionTime(run: RemoteRun, signal: AbortSignal) {
@@ -138,8 +147,14 @@ export class RemoteDevActions {
               .array(
                 z.object({
                   name: z.string(),
-                  started_at: z.iso.datetime().nullable().optional(),
-                  completed_at: z.iso.datetime().nullable().optional(),
+                  started_at: z.iso
+                    .datetime({ offset: true })
+                    .nullable()
+                    .optional(),
+                  completed_at: z.iso
+                    .datetime({ offset: true })
+                    .nullable()
+                    .optional(),
                 }),
               )
               .optional(),
@@ -180,7 +195,7 @@ export class RemoteDevActions {
   }
 }
 
-export function assertTurnRun(
+export function assertDispatchRun(
   repository: RepositoryIdentity,
   actorId: number,
   issue: number,
@@ -198,12 +213,23 @@ export function assertTurnRun(
     run.event !== "workflow_dispatch" ||
     run.display_title !== turnTitle(issue, turn.id) ||
     run.head_branch !== repository.default_branch ||
-    run.head_sha !== turn.caller_sha ||
     run.run_attempt !== 1 ||
     run.actor.id !== actorId ||
     run.triggering_actor.id !== actorId ||
     Date.parse(run.created_at) < turn.created_at - 60000
   )
+    throw new RuntimeError("agent_run_mismatch");
+}
+
+export function assertTurnRun(
+  repository: RepositoryIdentity,
+  actorId: number,
+  issue: number,
+  turn: RemoteTurn,
+  run: RemoteRun,
+) {
+  assertDispatchRun(repository, actorId, issue, turn, run);
+  if (run.head_sha !== turn.caller_sha)
     throw new RuntimeError("agent_run_mismatch");
 }
 

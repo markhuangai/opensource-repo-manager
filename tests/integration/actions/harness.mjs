@@ -20,6 +20,7 @@ export async function runActionsTests({
   docker,
   result,
   register,
+  waitForContainer,
   sessionFixtures,
 }) {
   const node = "/opt/orm-runtime/bin/node";
@@ -94,9 +95,11 @@ export async function runActionsTests({
           }),
       ...environment,
     };
-    const state = result(
+    const sample = !resourceSamples.length;
+    let state = result(
       [
         "run",
+        ...(sample ? ["--detach"] : []),
         "--name",
         name,
         "--label",
@@ -135,8 +138,36 @@ export async function runActionsTests({
       ],
       { timeout: 120_000 },
     );
-    logs.push(state.stderr);
-    assert.equal(state.status, expected, state.stdout + state.stderr);
+    if (sample) {
+      assert.equal(
+        state.status,
+        0,
+        "Could not start the Actions task container",
+      );
+      const status = await waitForContainer(name, {
+        timeout: 120_000,
+        sample: () => {
+          if (resourceSamples.length) return;
+          const output = docker([
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{json .}}",
+            name,
+          ]);
+          if (!output) return;
+          const stats = JSON.parse(output);
+          if (parseFloat(stats.MemUsage) > 0)
+            resourceSamples.push({
+              observed_at: new Date().toISOString(),
+              ...stats,
+            });
+        },
+      });
+      const output = result(["logs", name]);
+      assert.equal(output.status, 0, "Could not read the Actions task output");
+      state = { ...output, status };
+    }
     for (const secret of [
       config.github.token,
       config.session_key,
@@ -147,18 +178,14 @@ export async function runActionsTests({
         !(state.stdout + state.stderr).includes(secret),
         "Credential in task output",
       );
+    logs.push(state.stderr);
+    assert.equal(state.status, expected, state.stdout + state.stderr);
     const [inspection] = JSON.parse(docker(["container", "inspect", name]));
     assert.equal(inspection.State.Running, false);
     assert.equal(inspection.State.OOMKilled, false);
     assert.equal(inspection.State.Pid, 0);
     assert.equal(inspection.HostConfig.CpusetCpus, cpuSet);
     assert.equal(Object.keys(inspection.NetworkSettings.Ports ?? {}).length, 0);
-    if (!resourceSamples.length)
-      resourceSamples.push({
-        id: name,
-        observed_at: new Date().toISOString(),
-        cpu_set: inspection.HostConfig.CpusetCpus,
-      });
     return JSON.parse(state.stdout.trim());
   }
   const invoke = (issue, options) => {
@@ -300,6 +327,19 @@ export async function runActionsTests({
       setup(99, "unrelated");
       const status = await drain(1);
       assertPublished(1, status);
+      const outage = proof(1).events.find(
+        (event) => event.type === "collection_unavailable",
+      );
+      assert(outage);
+      assert.equal(
+        proof(1).events.filter(
+          (event) => event.type === "dispatch" && event.turn === outage.turn,
+        ).length,
+        1,
+      );
+      assert(
+        logs.some((log) => log.includes('"event":"agent.collection_failed"')),
+      );
       const unrelated = proof(99);
       assert.deepEqual(unrelated.comments, []);
       assert.deepEqual(unrelated.pulls, []);
@@ -314,12 +354,15 @@ export async function runActionsTests({
       return status;
     });
     await scenario("audit-rejection", async () => {
-      setup(2, "audit_rejection");
+      const { sha } = setup(2, "audit_rejection");
       const status = await drain(2);
       assertPublished(2, status);
       const audits = nativeEvents(2, "implementation_audit");
       assert.equal(audits.length, 2);
       assert.notEqual(audits[0].head, status.head_sha);
+      const repairs = nativeEvents(2, "implementation_change");
+      assert.equal(repairs[1].start, audits[0].head);
+      assert.equal(repairs[1].parent, sha);
       return status;
     });
     await scenario("missing-push", async () => {
@@ -418,7 +461,25 @@ export async function runActionsTests({
       setup(1, "monitor_repair");
       const initial = assertPublished(1, await drain(1));
       upstream("/checks?issue=1&repair=true");
+      const assessment = await invoke(1);
+      assert.equal(assessment.reason, "agent_run");
+      const [obsolete] = pending(1);
+      await native(obsolete);
+      upstream(`/start?run=${obsolete.run.id}`);
+      upstream("/checks?issue=1&repair=false");
+      const retiring = await invoke(1, { fresh: true });
+      assert.equal(retiring.reason, "agent_run");
+      const ready = await drain(1, undefined, { fresh: true });
+      assert.equal(ready.reason, "human_review");
+      assert.equal(ready.head_sha, initial.head);
+      assert(
+        proof(1).events.some(
+          (event) => event.type === "cancel" && event.run === obsolete.run.id,
+        ),
+      );
+      upstream("/checks?issue=1&repair=true");
       const status = await drain(1, undefined, {
+        fresh: true,
         onTurn(turn) {
           if (turn.turn.role === "audit")
             assert.equal(proof(1).pulls[0].head, initial.head);
@@ -427,6 +488,10 @@ export async function runActionsTests({
       const repaired = assertPublished(1, status);
       assert.equal(repaired.number, initial.number);
       assert.notEqual(repaired.head, initial.head);
+      assert.equal(
+        nativeEvents(1, "implementation_change").at(-1).parent,
+        initial.head,
+      );
       return status;
     });
     await scenario("cancel-stale-repair", async () => {
@@ -509,7 +574,8 @@ export async function runActionsTests({
     });
     await scenario("feature-remains-manual", async () => {
       setup(2, "manual_feature");
-      const status = await drain(2);
+      const status = await drain(2, undefined, { main: true });
+      assert.equal(status.outcome, "out_of_scope");
       assert.equal(status.reason, "manual_feature");
       assert.equal(nativeEvents(2, "implementation_change").length, 0);
       return status;
@@ -540,6 +606,8 @@ export async function runActionsTests({
         ORM_AGENT_PLAN: "Substituted instructions.",
       });
       assert.equal(wrongPlan.reason, "agent_request_unauthorized");
+      upstream(`/complete?run=${turn.run.id}`, await native(turn));
+      upstream(`/rerun?run=${turn.run.id}`);
       const status = await drain(1, undefined, { fresh: true });
       assertPublished(1, status);
       return status;
@@ -583,6 +651,46 @@ export async function runActionsTests({
       assert.equal(pending(3).length, 0);
       diagnosticEvents.push(event);
       return status;
+    });
+    await scenario("caller-revision-changed", async () => {
+      setup(4, "caller_revision_changed");
+      const first = await invoke(4);
+      assert.equal(first.reason, "agent_run");
+      assert.equal(pending(4).length, 0);
+      assert.equal((await invoke(4, { fresh: true })).reason, "agent_run");
+      const waiting = await invoke(4, { fresh: true });
+      assert.equal(waiting.reason, "agent_run");
+      const [authorized] = pending(4);
+      assert(authorized);
+      await native(authorized);
+      const events = proof(4).events;
+      assert.equal(
+        events.filter((event) => event.type === "dispatch").length,
+        2,
+      );
+      assert.equal(events.filter((event) => event.type === "cancel").length, 1);
+      return waiting;
+    });
+    await scenario("agent-run-limit", async () => {
+      setup(5, "source_only");
+      assert.equal((await invoke(5)).reason, "agent_run");
+      const [first] = pending(5);
+      upstream(`/budget?issue=5&used=${config.limits.agent_runs - 1}`);
+      const waiting = await advance(5, first, undefined, { fresh: true });
+      assert.equal(waiting.reason, "agent_run");
+      const [last] = pending(5);
+      const blocked = await advance(5, last, undefined, {
+        fresh: true,
+        expected: 1,
+      });
+      assert.equal(blocked.reason, "investigation_blocked");
+      assert.equal(pending(5).length, 0);
+      assert.equal(
+        proof(5).events.filter((event) => event.type === "dispatch").length,
+        2,
+      );
+      assert(logs.at(-1).includes("agent_run_limit"));
+      return blocked;
     });
   }
   return {

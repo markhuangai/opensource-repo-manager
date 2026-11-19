@@ -759,6 +759,12 @@ CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT
       .run(key, JSON.stringify(result));
   }
 
+  forgetRemoteResult(key: string) {
+    this.db
+      .prepare("DELETE FROM remote_agent_results WHERE request_digest=?")
+      .run(key);
+  }
+
   registerRemoteRun(
     id: string,
     job: number,

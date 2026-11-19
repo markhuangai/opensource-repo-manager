@@ -196,7 +196,7 @@ export class WorkspaceService {
     limits: { processes: number; storage: number },
     signal: AbortSignal,
     publishedHead?: string,
-    requiredAncestor?: string,
+    requiredParent?: string,
   ): Promise<PreparedWorkspace> {
     const user = roleUsers[role],
       root = join(this.runsRoot, id),
@@ -314,20 +314,36 @@ export class WorkspaceService {
           ],
           { cwd: stage, env, signal: combined },
         );
-        if (requiredAncestor) {
-          if (!/^[a-f0-9]{40}$/.test(requiredAncestor))
+        if (requiredParent) {
+          if (!/^[a-f0-9]{40}$/.test(requiredParent))
             throw new RuntimeError("source_invalid");
-          await gitCommand(
+          const lineage = await gitCommand(
             [
               "--git-dir",
               sourceGit,
-              "merge-base",
-              "--is-ancestor",
-              requiredAncestor,
+              "rev-list",
+              "--parents",
+              "-n",
+              "1",
               publishedHead,
             ],
             { cwd: stage, env, signal: combined },
           );
+          if (lineage !== `${publishedHead} ${requiredParent}`)
+            throw new RuntimeError("source_candidate_parent_invalid");
+          const trees = await gitCommand(
+            [
+              "--git-dir",
+              sourceGit,
+              "rev-parse",
+              `${publishedHead}^{tree}`,
+              `${requiredParent}^{tree}`,
+            ],
+            { cwd: stage, env, signal: combined },
+          );
+          const [candidateTree, parentTree] = trees.split("\n");
+          if (candidateTree === parentTree)
+            throw new RuntimeError("implementation_no_change");
         }
       }
       await treeBytes(stage, limits.storage);

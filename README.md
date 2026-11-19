@@ -86,7 +86,7 @@ When every current-head gate and finding disposition is complete, the existing o
 
 Agent turns run in `agent-remote-dev@v1.0.0`. The controller supplies pinned phase instructions and a starting Git revision. It limits inline instructions to the provider's 65,535-byte plan contract and uses a digested Actions artifact for larger input. It validates the native result and completed checkpoint manifest against the authorized run. The supplied audit request binds the frozen scope, source and exact candidate commit.
 
-Coding and repair publish only the assigned `orm-work/<task>/<turn>` branch. The controller checks its remote head and ancestry. A fresh audit verifies the candidate. The controller then runs the required local checks on that same Git commit in its credential-free verification workspace. The PR branch advances to the verified commit, so a repair stays on its work branch while the open PR retains the last verified head.
+Coding and repair publish one commit to the assigned `orm-work/<task>/<turn>` branch. Its parent is the frozen source for the first change or the last verified PR head for an update. Repairs can start with the rejected tree and carry its corrections into a new commit on that parent. A fresh audit verifies the pushed SHA. The controller runs the required local checks on that commit in its credential-free workspace and advances the PR branch only after verification.
 
 Controller workspace and toolchain commands use separate unprivileged users and clean environments. UID-wide process cleanup and bounded disk, process and output checks apply to those commands. Disk usage is a monitored soft limit. Native jobs follow the upstream execution policy and use the consumer's Actions artifact access and retention settings.
 

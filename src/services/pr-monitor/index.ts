@@ -536,6 +536,11 @@ export class PrMonitorService {
         record.pending_agent = null;
         record.assessment_digest = digest(surfaces);
         snapshot = refreshed;
+      } else if (record.pending_agent) {
+        record.pending_agent = null;
+        const implementation = this.repository.implementation(record);
+        implementation.agent_pending = null;
+        this.implementation.repository.save(implementation);
       }
       record.stage = "queued";
       record.snapshot_digest = this.repository.evidence({
@@ -895,9 +900,13 @@ export class PrMonitorService {
     }
     this.invalidate(record);
     this.repository.accountWait(record);
+    const pending = this.supervisor.publication.repository.pending(
+      record.job_id,
+    );
     if (
       transient.has(code) &&
-      this.store.reserveInfrastructureRetry(record.job_id)
+      ((pending?.retry_pending && pending.failure === code) ||
+        this.store.reserveInfrastructureRetry(record.job_id))
     ) {
       record.stage = "waiting";
       record.wait_accounted_at ??= Date.now();

@@ -326,7 +326,7 @@ describe("Actions lane coverage and identity", () => {
       sessions: 2,
       "pr-recovery": 3,
       clarification: 2,
-      "clarification-recovery": 3,
+      "clarification-recovery": 5,
     });
     const all = Object.values(actionsScenarios).flat();
     expect(new Set(all).size).toBe(all.length);
@@ -456,6 +456,14 @@ describe("Actions lane coverage and identity", () => {
       "missing resource observations",
       (rows) => {
         delete rows[0].bounded_actions[0].resource_samples;
+      },
+    ],
+    [
+      "CPU affinity without live resource observations",
+      (rows) => {
+        rows[0].bounded_actions[0].resource_samples = [
+          { cpu_set: identity.actions_cpu_set },
+        ];
       },
     ],
     [

@@ -541,6 +541,31 @@ int main(int count, char **values) {
       ),
       /source_/,
     );
+    const grandchild = remote.commit(
+      { ...remote.initial, "app.txt": "another change\n" },
+      child.sha,
+    );
+    remote.git(["update-ref", "refs/heads/" + branch, grandchild.sha]);
+    await assert.rejects(
+      supervisor.captureCandidate(
+        request,
+        { branch, sha: grandchild.sha },
+        remote.source.sha,
+        signal,
+      ),
+      /source_candidate_parent_invalid/,
+    );
+    const unchanged = remote.commit(remote.initial, remote.source.sha);
+    remote.git(["update-ref", "refs/heads/" + branch, unchanged.sha]);
+    await assert.rejects(
+      supervisor.captureCandidate(
+        request,
+        { branch, sha: unchanged.sha },
+        remote.source.sha,
+        signal,
+      ),
+      /implementation_no_change/,
+    );
     assert.equal(store.leases().length, 0);
     assert.deepEqual(await readdir(join(root, "runs")), []);
     tests++;

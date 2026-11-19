@@ -73,9 +73,16 @@ export async function runPublicationTests() {
     const target = supervisor.publication.repository.target(job.id);
     const files = { ...remote.initial, "app.txt": label + "\n" };
     if (binary) files["image.bin"] = Buffer.from([0, 255]);
-    if (structured) files[structured.path] = structured.content;
+    if (structured?.path) files[structured.path] = structured.content;
     const start = target.head ?? remote.source.sha;
-    const head = remote.commit(files, start).sha;
+    let head = remote.commit(files, start).sha;
+    if (structured?.author) {
+      const raw = remote.git(["cat-file", "commit", head]);
+      head = remote.git(
+        ["hash-object", "-t", "commit", "-w", "--stdin"],
+        raw.replace("author Fixture ", `author ${structured.author} `) + "\n",
+      );
+    }
     const branch = `orm-work/${randomUUID()}/${randomUUID()}`;
     remote.git(["update-ref", `refs/heads/${branch}`, head]);
     const inspection = supervisor.request(job.id, "audit");
@@ -752,6 +759,12 @@ export async function runPublicationTests() {
       const beforeBlocks = remote.state.mutations.length;
       assert.equal((await publish(blockChange)).failure, "publication_secret");
       assert.equal(remote.state.mutations.length, beforeBlocks);
+      const authorChange = await candidate(seed(), `${sdk}-author`, false, {
+        author: config.github.token,
+      });
+      const beforeAuthor = remote.state.mutations.length;
+      assert.equal((await publish(authorChange)).failure, "publication_secret");
+      assert.equal(remote.state.mutations.length, beforeAuthor);
       for (const kind of ["issue_comment", "pull_request"]) {
         const legacyJob = seed();
         store.recordPublication({
@@ -1158,10 +1171,9 @@ export async function runPublicationTests() {
 
       const outageJob = seed();
       modelDown = true;
-      assert.equal(
-        (await publish(status(outageJob, "Generated narrative"))).failure,
-        "agent_run_failed",
-      );
+      const outage = await publish(status(outageJob, "Generated narrative"));
+      assert.equal(outage.failure, "agent_run_failed");
+      assert.equal(outage.status, "prepared");
       const beforeTemplate = requests.length;
       assert.equal(
         (
@@ -1175,6 +1187,10 @@ export async function runPublicationTests() {
         "confirmed",
       );
       assert.equal(requests.length, beforeTemplate);
+      assert.equal(
+        supervisor.publication.repository.operation(outage.id).status,
+        "blocked",
+      );
       modelDown = false;
       const exhausted = seed();
       store.db

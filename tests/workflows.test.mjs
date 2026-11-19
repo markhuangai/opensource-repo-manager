@@ -2501,6 +2501,9 @@ describe("consumer agent dispatch", () => {
         /ORM_CONFIGURATION|ORM_GITHUB_TOKEN|ORM_SESSION_KEY/,
       );
     }
+    expect(agent.secrets["github-token"]).toBe(
+      "${{ github.run_attempt == '1' && (needs.authorize.outputs.write == 'true' && secrets.ORM_AGENT_WORK_TOKEN || needs.authorize.outputs.write == 'false' && secrets.ORM_AGENT_READ_TOKEN) || '' }}",
+    );
     const caller = parse(
       await readFile(
         new URL("../examples/actions/orm-agent.yml", import.meta.url),

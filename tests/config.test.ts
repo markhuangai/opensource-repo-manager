@@ -60,6 +60,17 @@ describe("repository configuration sources", () => {
         variables: { ...variables, TOKEN: "fixture-unsafe-token" },
       }),
     ).toThrow("source_reference_invalid");
+    for (const session_key of [
+      sources.secrets.ORM_SESSION_KEY,
+      { from_variable: "KEY" },
+    ]) {
+      expect(() =>
+        parse(Object.assign(repositoryConfiguration(), { session_key }), {
+          ...sources,
+          variables: { KEY: sources.secrets.ORM_SESSION_KEY },
+        }),
+      ).toThrow("source_reference_invalid");
+    }
   });
   it("retains source locations through profile and cross-field policy validation", () => {
     const defaults = fixtureConfigurationSources();

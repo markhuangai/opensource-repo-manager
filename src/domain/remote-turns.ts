@@ -9,6 +9,7 @@ export const remoteDev = {
   sha: "b25da0394133b6bf31c8d68cfa06766ddfffe092",
   dispatcher: "orm-agent.yml",
   planBytes: 65535,
+  registrationMs: 10 * 60_000,
 } as const;
 
 export const harness = z.enum(["codex", "claude"]);
@@ -112,4 +113,5 @@ export const remoteRetryReasons = [
   "agent_result_invalid",
   "agent_push_missing",
   "agent_checkout_mismatch",
+  "session_transport_unavailable",
 ];

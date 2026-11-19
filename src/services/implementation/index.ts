@@ -62,6 +62,7 @@ const safeFailures = new Set([
   "implementation_handoff_invalid",
   "implementation_out_of_scope",
   "implementation_no_change",
+  "source_candidate_parent_invalid",
   "implementation_agent_failed",
   "implementation_result_invalid",
   "implementation_audit_mismatch",
@@ -190,7 +191,8 @@ export class ImplementationService {
     if (record.stage === "blocked" && !record.retry_stage) {
       try {
         await this.report(record, signal);
-      } catch {
+      } catch (error) {
+        if (error instanceof RemoteTurnPending) throw error;
         this.failure = "implementation_status_unconfirmed";
       }
 
@@ -978,7 +980,8 @@ export class ImplementationService {
     );
     try {
       await this.report(record, signal);
-    } catch {
+    } catch (error) {
+      if (error instanceof RemoteTurnPending) throw error;
       this.failure = "implementation_status_unconfirmed";
     }
   }

@@ -19,6 +19,8 @@ export const actionsScenarios = {
     "ambiguous-dispatch",
     "cancel-superseded",
     "denied-dispatch",
+    "caller-revision-changed",
+    "agent-run-limit",
   ],
 };
 export const actionsGroups = Object.keys(actionsScenarios);
@@ -325,7 +327,11 @@ export function verifyActionsReceipts(receipts, identity) {
       );
       assert(
         Array.isArray(proof.resource_samples) &&
-          proof.resource_samples.length > 0,
+          proof.resource_samples.some(
+            (sample) =>
+              Number.isFinite(parseFloat(sample.CPUPerc)) &&
+              parseFloat(sample.MemUsage) > 0,
+          ),
         "Missing Actions resource observations",
       );
       if (group === "lifecycle") {

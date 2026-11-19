@@ -253,7 +253,7 @@ export class GitHubArtifacts implements ArtifactTransport {
     run: RemoteRun,
     artifact: Artifact,
     directory: string,
-    entryName: string,
+    entryName: "record.json" | "manifest.json",
     limit: number,
     signal: AbortSignal,
   ) {
@@ -289,6 +289,8 @@ export class GitHubArtifacts implements ArtifactTransport {
       autoClose: false,
       strictFileNames: true,
     });
+    // The pinned runner allows a 10,000-file inventory with paths up to 512 characters.
+    const entryLimit = entryName === "manifest.json" ? 32 * 1024 * 1024 : limit;
     try {
       if (
         zip.entryCount < 1 ||
@@ -301,11 +303,7 @@ export class GitHubArtifacts implements ArtifactTransport {
       for await (const entry of zip.eachEntry()) {
         signal.throwIfAborted();
         if (entry.fileName !== entryName) continue;
-        if (
-          found ||
-          entry.isEncrypted() ||
-          entry.uncompressedSize > 2 * 1024 * 1024
-        )
+        if (found || entry.isEncrypted() || entry.uncompressedSize > entryLimit)
           throw new StateError("session_corrupt");
         found = true;
         const stream = await zip.openReadStreamPromise(entry);

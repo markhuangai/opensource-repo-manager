@@ -99,9 +99,44 @@ describe("published remote development workflow", () => {
         } else if (
           req.url?.startsWith("/repos/owner/repo/actions/workflows/91/runs")
         ) {
-          res.end(JSON.stringify({ total_count: 1, workflow_runs: [run] }));
-        } else if (req.url === "/repos/owner/repo/actions/runs/9000") {
+          const query = new URL(req.url, "http://fixture").searchParams;
+          res.end(
+            JSON.stringify({
+              total_count: 101,
+              workflow_runs:
+                query.get("page") === "2"
+                  ? [{ ...run, run_attempt: 2 }]
+                  : Array.from({ length: 100 }, (_, offset) => ({
+                      id: 9100 + offset,
+                      display_title: `Unrelated dispatch ${offset}`,
+                    })),
+            }),
+          );
+        } else if (
+          req.url === "/repos/owner/repo/actions/runs/9000/attempts/1"
+        ) {
           res.end(JSON.stringify(run));
+        } else if (
+          req.url?.startsWith(
+            "/repos/owner/repo/actions/runs/9000/attempts/1/jobs?",
+          )
+        ) {
+          res.end(
+            JSON.stringify({
+              total_count: 1,
+              jobs: [
+                {
+                  steps: [
+                    {
+                      name: "Execute agent",
+                      started_at: "2026-11-19T01:00:00-08:00",
+                      completed_at: "2026-11-19T09:00:03Z",
+                    },
+                  ],
+                },
+              ],
+            }),
+          );
         } else {
           res
             .writeHead(404)
@@ -125,7 +160,9 @@ describe("published remote development workflow", () => {
         ).toBe(run.id);
         const recovered = await api.find(repository, actor, 18, turn, signal);
         expect(recovered?.id).toBe(run.id);
+        expect(recovered?.run_attempt).toBe(1);
         expect(await api.run(run.id, signal)).toEqual(run);
+        expect(await api.executionTime(run, signal)).toBe(3000);
         expect(requests.filter((request) => request.method === "POST")).toEqual(
           [
             {
@@ -162,6 +199,14 @@ describe("published remote development workflow", () => {
         head_repository: { id: 100 },
       }),
     ).toThrow("agent_run_mismatch");
+    for (const changed of [
+      { actor: { ...actor, id: 100 } },
+      { triggering_actor: { id: 100 } },
+      { head_sha: start },
+    ])
+      expect(() =>
+        assertTurnRun(repository, actor.id, 18, turn, { ...run, ...changed }),
+      ).toThrow("agent_run_mismatch");
     expect(() =>
       assertRemoteDevPin({
         ...run,

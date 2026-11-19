@@ -1,4 +1,7 @@
-import { RemoteTurnPending } from "../../domain/remote-turns.ts";
+import {
+  RemoteTurnPending,
+  remoteRetryReasons,
+} from "../../domain/remote-turns.ts";
 import { randomUUID } from "node:crypto";
 import {
   createApiDiagnostics,
@@ -214,6 +217,21 @@ export class PublicationService {
       lease?: BootstrapLease,
     ) => {
       const job = this.repository.current(proposal.job_id, proposal.revision);
+      if (proposal.kind === "notice") {
+        const pending = this.repository.pending(job.id);
+        if (
+          pending?.status === "prepared" &&
+          pending.retry_pending &&
+          pending.failure &&
+          remoteRetryReasons.includes(pending.failure) &&
+          !pending.review_id &&
+          pending.steps.every((step) => step.state === "prepared")
+        ) {
+          pending.status = "blocked";
+          pending.retry_pending = false;
+          this.repository.save(pending);
+        }
+      }
       const source = (
         JSON.parse(job.input_json) as { source: PublicationReceipt["source"] }
       ).source;
@@ -420,11 +438,15 @@ export class PublicationService {
         const cancelled =
           publicationSignal.aborted && error === publicationSignal.reason;
         this.failed(receipt, error);
+        const retryableAgent =
+          error instanceof RuntimeError &&
+          remoteRetryReasons.includes(error.code);
         receipt.status = receipt.steps.some(
           (step) => step.state === "dispatching" || step.state === "uncertain",
         )
           ? "uncertain"
           : cancelled ||
+              retryableAgent ||
               (error instanceof IntakeError &&
                 ["github_rate_limited", "github_publication_failed"].includes(
                   error.code,
@@ -437,7 +459,7 @@ export class PublicationService {
               ? "reviewed"
               : "prepared"
             : "blocked";
-        if (cancelled) receipt.retry_pending = true;
+        if (cancelled || retryableAgent) receipt.retry_pending = true;
         this.repository.save(receipt);
         return receipt;
       } finally {

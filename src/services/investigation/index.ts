@@ -636,7 +636,7 @@ export class InvestigationService {
     const publication = this.supervisor.publication.repository.pending(job.id);
     const publicationRetry =
       publication &&
-      [
+      ([
         "publication_effect_uncertain",
         "investigation_publication_unconfirmed",
         "publication_pending",
@@ -644,7 +644,10 @@ export class InvestigationService {
         "github_publication_failed",
         "github_rate_limited",
         "publication_git_failed",
-      ].includes(code);
+      ].includes(code) ||
+        (publication.retry_pending &&
+          publication.failure === code &&
+          remoteRetryReasons.includes(code)));
     if (
       (publicationRetry || transient.has(code)) &&
       failedStage !== "completed" &&

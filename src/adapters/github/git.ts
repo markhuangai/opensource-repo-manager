@@ -281,25 +281,32 @@ export class PublicationGit {
         .trim();
       if (actual !== `${remoteCommit}\n${tree}`)
         throw new RuntimeError("publication_candidate_changed");
-      await this.command(
-        ["merge-base", "--is-ancestor", parent, remoteCommit],
-        signal,
-      );
-      const messages = (
-        await this.command(
-          ["log", "--format=%B", "-z", `${parent}..${remoteCommit}`],
-          signal,
+      let candidateMessage = "";
+      if (remoteCommit !== parent) {
+        if (!changes.length) throw new RuntimeError("publication_no_change");
+        const raw = (
+          await this.command(["cat-file", "commit", remoteCommit], signal)
+        ).toString();
+        const boundary = raw.indexOf("\n\n");
+        const parents = raw
+          .slice(0, boundary)
+          .split("\n")
+          .filter((line) => line.startsWith("parent "));
+        if (
+          boundary < 0 ||
+          parents.length !== 1 ||
+          parents[0] !== `parent ${parent}`
         )
-      )
-        .toString()
-        .replaceAll("\0", "\n");
-      if (this.secrets.containsCredentials(messages))
-        throw new RuntimeError("publication_secret");
+          throw new RuntimeError("publication_candidate_changed");
+        if (this.secrets.containsCredentials(raw))
+          throw new RuntimeError("publication_secret");
+        candidateMessage = raw.slice(boundary + 2);
+      }
       return {
         commit: remoteCommit,
         tree,
         parent,
-        message: messages,
+        message: candidateMessage,
         actor,
         timestamp,
         changes,

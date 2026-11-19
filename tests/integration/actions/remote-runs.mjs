@@ -43,20 +43,24 @@ export function remoteRuns(remote, artifacts, config, model) {
     default_branch: "main",
     private: false,
   };
-  const state = (number) => {
+  const signed = (number) => {
     const row = remote.state.comments
       .get(number)
       ?.find((item) => item.body.includes("<!-- orm:task-state:"));
-    return (
-      row &&
-      new StateCodec(config.session_key).decode(row.body, {
+    if (!row) return;
+    const codec = new StateCodec(config.session_key);
+    return {
+      row,
+      codec,
+      decoded: codec.decode(row.body, {
         repository_id: repository.id,
         issue_id: remote.state.issues.get(number).id,
         comment_id: row.id,
         author_id: remote.state.actor.id,
-      }).state
-    );
+      }),
+    };
   };
+  const state = (number) => signed(number)?.decoded.state;
   async function handle(req, res) {
     const path = new URL(req.url, "https://api.github.com").pathname;
     const workflow = path.match(
@@ -92,6 +96,11 @@ export function remoteRuns(remote, artifacts, config, model) {
       assert.equal(turn.run_id, null);
       assert.equal(turn.caller_sha, remote.head("main"));
       const mode = remote.state.issues.get(number).title;
+      const substituted =
+        mode === "caller_revision_changed" &&
+        !events.some(
+          (event) => event.issue === number && event.type === "dispatch",
+        );
       events.push({
         type: "dispatch",
         issue: number,
@@ -109,7 +118,7 @@ export function remoteRuns(remote, artifacts, config, model) {
         event: "workflow_dispatch",
         display_title: `ORM agent #${number} ${turn.id}`,
         head_branch: "main",
-        head_sha: turn.caller_sha,
+        head_sha: substituted ? "e".repeat(40) : turn.caller_sha,
         repository,
         head_repository: repository,
         actor: remote.state.actor,
@@ -147,16 +156,18 @@ export function remoteRuns(remote, artifacts, config, model) {
       });
     }
     if (workflow?.[2] === "/runs" && req.method === "GET") {
-      const created = new URL(
-        req.url,
-        "https://api.github.com",
-      ).searchParams.get("created");
+      const query = new URL(req.url, "https://api.github.com").searchParams;
+      const [start, end] = query.get("created").split("..");
+      const page = Number(query.get("page"));
       const workflow_runs = [...runs.values()]
-        .map(({ run }) => run)
-        .filter((run) => !created || run.created_at >= created.slice(2));
+        .map(({ run, latestAttempt }) => ({
+          ...run,
+          run_attempt: latestAttempt ?? 1,
+        }))
+        .filter((run) => run.created_at >= start && run.created_at <= end);
       return send({
         total_count: workflow_runs.length,
-        workflow_runs: workflow_runs.slice(0, 100),
+        workflow_runs: workflow_runs.slice((page - 1) * 100, page * 100),
       });
     }
     const entry = runs.get(Number(runPath?.[1]));
@@ -165,7 +176,27 @@ export function remoteRuns(remote, artifacts, config, model) {
       req.method === "GET" &&
       ["", "/attempts/1"].includes(runPath[2])
     )
-      return send(entry.run);
+      return send(
+        runPath[2] === "" && entry.latestAttempt
+          ? { ...entry.run, run_attempt: entry.latestAttempt }
+          : entry.run,
+      );
+    if (
+      entry?.mode === "reproduced" &&
+      entry.turn.role === "output_review" &&
+      entry.run.status === "completed" &&
+      req.method === "GET" &&
+      runPath[2] === "/artifacts" &&
+      !events.some((event) => event.type === "collection_unavailable")
+    ) {
+      events.push({
+        type: "collection_unavailable",
+        issue: entry.number,
+        run: entry.run.id,
+        turn: entry.turn.id,
+      });
+      return send({ message: "Temporary artifact transport failure" }, 503);
+    }
     if (entry && req.method === "GET" && runPath[2] === "/attempts/1/jobs") {
       const steps = entry.elapsed
         ? [
@@ -286,8 +317,12 @@ export function remoteRuns(remote, artifacts, config, model) {
         result.response?.outcome !== "needs_information" &&
         mode !== "missing_push";
       if (shouldPush) {
+        const current = state(number);
+        const parent = current.pr?.head ?? current.job.source.sha;
+        assert(text.includes(`whose only parent is ${parent}`));
         git("switch", "-c", turn.work_branch);
         git("add", ".");
+        if (turn.starting_sha !== parent) git("reset", "--soft", parent);
         git(
           "commit",
           "-m",
@@ -327,7 +362,15 @@ export function remoteRuns(remote, artifacts, config, model) {
         lineage: releasedPlan.lineage,
         workspace: root,
         runner_home: join(root, turn.runner),
-        files: [],
+        files:
+          process.env.ORM_TEST_FIXTURE_GROUP === "sessions" &&
+          task === "investigation_triage"
+            ? Array.from({ length: 4500 }, (_, i) => ({
+                path: `${turn.runner === "codex" ? "codex/sessions" : "claude/projects/fixture/memory"}/${"a".repeat(465)}/${i}.${turn.runner === "codex" ? "jsonl" : "md"}`,
+                sha256: "b".repeat(64),
+                bytes: 1,
+              }))
+            : [],
       };
       artifacts.native(
         run,
@@ -354,6 +397,7 @@ export function remoteRuns(remote, artifacts, config, model) {
         runner: turn.runner,
         start: turn.starting_sha,
         head: revision,
+        parent: shouldPush ? git("rev-parse", "HEAD^") : null,
         branch: manifest.branch,
         task,
       });
@@ -405,6 +449,19 @@ export function remoteRuns(remote, artifacts, config, model) {
     },
     discard(id) {
       runs.delete(id);
+    },
+    rerun(id) {
+      const entry = runs.get(id);
+      assert.equal(entry?.run.status, "completed");
+      entry.latestAttempt = 2;
+    },
+    budget(number, used) {
+      const { row, codec, decoded } = signed(number);
+      const { state, narrative } = decoded;
+      assert.equal(state.budget.agent_runs, 1);
+      state.budget.agent_runs = used;
+      state.session_artifact = null;
+      row.body = codec.encode(state, narrative);
     },
     pending: (number) =>
       [...runs.values()].filter(

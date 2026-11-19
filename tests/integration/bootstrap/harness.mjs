@@ -600,7 +600,7 @@ export async function runBootstrapTests(suite) {
           (name === "npm" ? "test ! -e .yarn/cache/late.zip\n" : "") +
           probes +
           "\n" +
-          testCommand +
+          `(${testCommand}) || exit` +
           (name === "npm"
             ? "\nprintf SDK-generated > .yarn/cache/late.zip\n"
             : "") +

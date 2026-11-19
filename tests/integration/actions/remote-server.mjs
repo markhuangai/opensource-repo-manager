@@ -132,6 +132,12 @@ const http = createServer(async (req, res) => {
       case "/discard-duplicate":
         runs.discard(Number(url.searchParams.get("run")));
         return send({});
+      case "/rerun":
+        runs.rerun(Number(url.searchParams.get("run")));
+        return send({});
+      case "/budget":
+        runs.budget(issue, Number(url.searchParams.get("used")));
+        return send({});
       case "/close":
         remote.state.closed.add(issue);
         return send({});
@@ -156,7 +162,8 @@ const http = createServer(async (req, res) => {
           remote.state.threads.set(pull.number, [
             makeThread(9000 + pull.number, head),
           ]);
-        }
+        } else if (url.searchParams.get("repair") === "false")
+          remote.state.threads.delete(pull.number);
         return send({ head, number: pull.number });
       }
       case "/fault":

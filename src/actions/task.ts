@@ -234,7 +234,11 @@ export async function executeTask(
 ): Promise<TaskResult> {
   const { intake, store, investigation, monitor } = application;
   const waitingForAgent = async (): Promise<TaskResult> => {
-    await application.agents?.flush(signal);
+    try {
+      await application.agents?.flush(signal);
+    } catch (error) {
+      if (!(error instanceof RemoteTurnPending)) throw error;
+    }
     return {
       version: 1,
       ...taskIdentity(store, request),
@@ -287,6 +291,7 @@ export async function executeTask(
       signal.throwIfAborted();
       await monitor.reconcile(signal);
       signal.throwIfAborted();
+      await application.agents?.cancelSuperseded(signal);
       await store.checkpoint(signal, true);
       const outcome = taskOutcome(store, request, monitor.enabled());
       if (outcome) return outcome;

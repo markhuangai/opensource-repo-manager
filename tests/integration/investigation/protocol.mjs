@@ -6,6 +6,7 @@ import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { RuntimeError, taskPrompt } from "/opt/orm/app/dist/domain/agents.js";
 import { compile } from "/opt/orm/app/dist/adapters/agents/schema.js";
+import { PublicationRepository } from "/opt/orm/app/dist/repositories/publication.js";
 
 export const sourceFiles = {
   ".node-version": "24.18.0\n",
@@ -489,12 +490,17 @@ export function modelFixture(config, store, root, controls = {}, remote) {
               value = await fixture.implementation(task, text, ["executed"]);
             }
             result = value.result;
+            signal.throwIfAborted();
             if (
               task === "implementation_change" &&
               result.response?.outcome !== "needs_information"
             ) {
               const branch = `orm-work/${randomUUID()}/${run.id}`;
               git("add", ".");
+              const parent =
+                new PublicationRepository(store).target(job.id).head ??
+                request.workspace.source.sha;
+              if (parent !== starting_sha) git("reset", "--soft", parent);
               git("commit", "--allow-empty", "-m", "Fixture change");
               git("push", remote.repository, `HEAD:refs/heads/${branch}`);
               change = { branch, sha: git("rev-parse", "HEAD") };
