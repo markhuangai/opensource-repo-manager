@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { githubId, type RepositoryIdentity } from "../domain/jobs.ts";
 import type { GitHubActionsSource } from "../adapters/github/actions-source.ts";
+import { remoteDev } from "../domain/remote-turns.ts";
 import {
   StateCodec,
   StateError,
@@ -17,6 +18,18 @@ const eventSchema = z.object({
   pull_request: z.object({ number: githubId }).optional(),
   comment: z.object({ id: githubId }).optional(),
   sender: z.object({ id: githubId, login: z.string() }).optional(),
+  workflow_run: z
+    .object({
+      id: githubId,
+      workflow_id: githubId,
+      event: z.string(),
+      path: z.string(),
+      head_repository: z.object({ id: githubId }).nullable(),
+      run_attempt: githubId,
+      display_title: z.string(),
+      actor: z.object({ id: githubId }),
+    })
+    .optional(),
 });
 export type RoutingSource = Pick<
   GitHubActionsSource,
@@ -117,6 +130,36 @@ export async function routeActions(
       throw new StateError("state_invalid");
     await source.taskIssue(Number(number), signal);
     numbers = [Number(number)];
+  } else if (request.event === "workflow_run" && event.action === "completed") {
+    const run = event.workflow_run;
+    const match =
+      run &&
+      /^ORM agent #([1-9][0-9]*) ([a-f0-9-]{36})$/.exec(run.display_title);
+    if (
+      run &&
+      match &&
+      run.path === `.github/workflows/${remoteDev.dispatcher}` &&
+      run.event === "workflow_dispatch" &&
+      run.run_attempt === 1 &&
+      run.head_repository?.id === repository.id
+    ) {
+      const number = Number(match[1]);
+      if (!Number.isSafeInteger(number)) throw new StateError("state_invalid");
+      const state = await authenticatedTask(
+        source,
+        repository,
+        number,
+        request.sessionKey,
+        signal,
+      );
+      if (
+        state?.agent_turn?.id === match[2] &&
+        state.author_id === run.actor.id &&
+        state.agent_turn.workflow_id === run.workflow_id &&
+        [null, run.id].includes(state.agent_turn.run_id)
+      )
+        numbers = [number];
+    }
   } else if (request.event === "schedule") {
     numbers = await source.enrolled(signal);
     const batches = Math.max(1, Math.ceil(numbers.length / 256));

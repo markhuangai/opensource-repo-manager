@@ -200,7 +200,7 @@ describe("controller-admitted conversations", () => {
         new ConversationRepository(reopened).prepare({ ...f.request, resume })
           ?.duplicate?.outcome,
       ).toBe("completed");
-      expect(reopened.db.pragma("user_version", { simple: true })).toBe(12);
+      expect(reopened.db.pragma("user_version", { simple: true })).toBe(13);
       expect(reopened.jobs()).toEqual(jobs);
     } finally {
       reopened.close();

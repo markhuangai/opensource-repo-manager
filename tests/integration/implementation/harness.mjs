@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { createServer } from "node:http";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -31,8 +29,6 @@ import {
 } from "/publication-fixture.ts";
 import { PrMonitorService } from "/opt/orm/app/dist/services/pr-monitor/index.js";
 import { evaluateReadiness } from "/opt/orm/app/dist/services/pr-monitor/policy.js";
-import { respond as claude } from "/agent-fixtures/claude.mjs";
-import { respond as codex } from "/agent-fixtures/codex.mjs";
 import {
   sourceFiles,
   bundlesWithCanaries,
@@ -72,10 +68,6 @@ export async function runImplementationTests(sdks, suite) {
     remote,
     receipt;
   const controls = {};
-  const model = createServer((req, res) =>
-    (sdk === "claude" ? claude : codex)(req, res, fixture),
-  );
-  await new Promise((resolve) => model.listen(0, "127.0.0.1", resolve));
   const logger = {
     info: (message) => logs.push(message),
     error: (message) => logs.push(message),
@@ -139,18 +131,7 @@ export async function runImplementationTests(sdks, suite) {
       );
       config.github.repository = "owner/repo";
       config.github.token = remote.state.token;
-      config.proxy.url = `http://127.0.0.1:${model.address().port}/v1`;
-      config.proxy.key = `implementation-proxy-${randomUUID()}`;
-      config.profiles = {
-        worker:
-          sdk === "codex"
-            ? { sdk, model: "gpt-5.5", effort: "xhigh" }
-            : {
-                sdk,
-                model: "auto",
-                effort: "xhigh",
-              },
-      };
+      config.profiles = { worker: { sdk } };
       for (const role of Object.keys(config.roles)) {
         config.roles[role].profile = "worker";
       }
@@ -175,17 +156,15 @@ export async function runImplementationTests(sdks, suite) {
             baseUrl: remote.url,
             log: { debug: silent, info: silent, warn: silent, error: silent },
           });
+        fixture = modelFixture(config, store, runtimeRoot, controls, remote);
         supervisor = await Supervisor.create(store, snapshot, secrets, {
           root: runtimeRoot,
-          workers: { [sdk]: `/opt/orm/app/dist/adapters/agents/${sdk}.js` },
+          agents: fixture.agents,
           sourceUrl: () => remote.url + "/owner/repo.git",
           publicationWriter: (ready) =>
             new OctokitWriter("owner/repo", client, ready),
         });
-        for (const [method, requestIndex] of [
-          ["run", 0],
-          ["runReview", 1],
-        ]) {
+        for (const [method, requestIndex] of [["run", 0]]) {
           const run = supervisor[method].bind(supervisor);
           supervisor[method] = async function* (...args) {
             try {
@@ -239,7 +218,6 @@ export async function runImplementationTests(sdks, suite) {
           () => remote.url + "/owner/repo.git",
           implementation,
         );
-        fixture = modelFixture(config, store, runtimeRoot, controls);
         for (const number of remote.state.issues.keys())
           await intake.enrollIssue(number, AbortSignal.timeout(10000));
       };
@@ -1710,7 +1688,6 @@ export async function runImplementationTests(sdks, suite) {
         }
       }
       assert(!logs.join("\n").includes(config.github.token));
-      assert(!logs.join("\n").includes(config.proxy.key));
       await closeRuntime();
       await remote.close();
       remote = undefined;
@@ -1762,14 +1739,7 @@ export async function runImplementationTests(sdks, suite) {
       errors.push(diagnostic);
     }
   } finally {
-    for (const cleanup of [
-      () => closeRuntime(),
-      () => remote?.close(),
-      ...[model].map((server) => async () => {
-        server.closeAllConnections();
-        await new Promise((resolve) => server.close(resolve));
-      }),
-    ]) {
+    for (const cleanup of [() => closeRuntime(), () => remote?.close()]) {
       try {
         await cleanup();
       } catch (error) {

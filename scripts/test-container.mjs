@@ -22,6 +22,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { stringify as stringifyYaml } from "yaml";
 import { parseRepositoryActionsConfiguration } from "../src/config/schema.ts";
+import { remoteDev } from "../src/domain/remote-turns.ts";
 import { parseConfigurationSources } from "../src/config/sources.ts";
 import {
   selectContainerSuites,
@@ -433,14 +434,11 @@ try {
       }),
       JSON.stringify({
         ORM_GITHUB_TOKEN: canary + "-github",
-        ORM_PROXY_KEY: canary + "-proxy",
         ORM_SESSION_KEY: Buffer.alloc(32, 13).toString("base64"),
-        PROXY_URL: "https://proxy.example.invalid/v1",
       }),
     ),
   ).configuration;
   validConfig.github = { repository: "owner/repo", token: `${canary}-github` };
-  validConfig.proxy.key = `${canary}-proxy`;
   const validYaml = stringifyYaml(validConfig);
   const invalidUtf8 = Buffer.from(validYaml);
   invalidUtf8[invalidUtf8.indexOf(`${canary}-github`)] = 0xff;
@@ -474,25 +472,16 @@ try {
       code: "yaml_invalid",
     },
     {
-      name: "query-credential",
-      source: stringifyYaml({
-        ...validConfig,
-        proxy: {
-          ...validConfig.proxy,
-          url: `https://fixture.invalid/v1?client_secret=${canary}`,
-        },
-      }),
+      name: "obsolete-configuration",
+      source: stringifyYaml({ ...validConfig, version: 1 }),
       expected: 1,
       code: "schema_invalid",
     },
     {
-      name: "ordinary-query",
+      name: "obsolete-model-budget",
       source: stringifyYaml({
         ...validConfig,
-        proxy: {
-          ...validConfig.proxy,
-          url: "https://fixture.invalid/v1?api-version=1",
-        },
+        limits: { ...validConfig.limits, model_requests: 10 },
       }),
       expected: 1,
       code: "schema_invalid",
@@ -625,8 +614,6 @@ try {
     `type=bind,src=${join(testInputs, "container-suites.mjs")},dst=/container-suites.mjs,readonly`,
     "--mount",
     `type=bind,src=${join(testInputs, "tests", "fixtures", "runtime")},dst=/runtime-fixtures,readonly`,
-    "--mount",
-    `type=bind,src=${join(testInputs, "tests", "integration", "agents")},dst=/agent-fixtures,readonly`,
     "--mount",
     `type=bind,src=${join(testInputs, "tests", "integration", "bootstrap")},dst=/bootstrap-fixtures,readonly`,
     "--mount",
@@ -899,11 +886,6 @@ try {
     );
     assert.equal(runtimeProof.runtime, "passed");
     assert.equal(runtimeProof.cleanup, "passed");
-    assert.equal(runtimeProof.claude_sdk?.sdk, "0.3.296");
-    assert.equal(runtimeProof.claude_sdk?.cleanup, "passed");
-    assert.equal(runtimeProof.codex_sdk?.sdk, "0.162.1");
-    assert.equal(runtimeProof.codex_sdk?.protocol, "responses_http_sse");
-    assert.equal(runtimeProof.codex_sdk?.cleanup, "passed");
 
     console.log("Verifying reviewed GitHub publication");
     phase("publication");
@@ -1099,6 +1081,9 @@ try {
         });
       });
       actionsLaneReceipts.push(childReceipt);
+      for (const { diagnostic_events } of childReceipt.bounded_actions)
+        for (const event of diagnostic_events)
+          console.log(JSON.stringify(event));
       timings.push({
         phase: `actions-${sdk}-${group}`,
         started_at: startedAt,
@@ -1157,28 +1142,21 @@ try {
         (await readFile(skill, "utf8")) + "\nOPERATOR_SKILL_CANARY\n",
       );
       const taskConfig = globalThis.structuredClone(validConfig);
-      taskConfig.proxy.url = "http://investigation-fixture:8317/v1";
       taskConfig.profiles = {
-        worker:
-          sdk === "codex"
-            ? { sdk, model: "gpt-5.5", effort: "xhigh" }
-            : {
-                sdk,
-                model: "auto",
-                effort: "xhigh",
-              },
+        coding: { sdk },
+        review: { sdk: sdk === "codex" ? "claude" : "codex" },
       };
-      for (const role of Object.keys(taskConfig.roles)) {
-        taskConfig.roles[role].profile = "worker";
-      }
+      for (const role of Object.keys(taskConfig.roles))
+        taskConfig.roles[role].profile = ["audit", "output_review"].includes(
+          role,
+        )
+          ? "review"
+          : "coding";
       taskConfig.pr_monitor = {
         enabled: true,
-        requirements_source: "github",
+        requirements_source: "operator",
         required_checks: ["Fixture CI"],
-        automated_reviewers: [
-          { login: "chatgpt-codex-connector[bot]", signal: "codex" },
-          { login: "coderabbitai[bot]", signal: "coderabbit" },
-        ],
+        automated_reviewers: [],
         local_checks_only: false,
       };
       const configName = "actions.yml";
@@ -1204,6 +1182,43 @@ try {
             : {}),
         }),
       );
+      const provider = join(directory, "provider");
+      const providerGit = join(temporary, "provider.git");
+      await mkdir(join(provider, "src", "platform"), { recursive: true });
+      const git = (args) =>
+        execFileSync("git", args, {
+          encoding: "utf8",
+          timeout: 120_000,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      git(["init", "--bare", providerGit]);
+      git([
+        "--git-dir",
+        providerGit,
+        "fetch",
+        "--depth=1",
+        "--no-tags",
+        `https://github.com/${remoteDev.repository}.git`,
+        remoteDev.sha,
+      ]);
+      assert.equal(
+        git(["--git-dir", providerGit, "rev-parse", "FETCH_HEAD"]).trim(),
+        remoteDev.sha,
+      );
+      for (const path of [
+        "package.json",
+        "src/platform/checkpoint-policy.mjs",
+        "src/platform/continuation-policy.mjs",
+        "src/platform/project-config.mjs",
+        "src/platform/runtime-log.mjs",
+        "src/platform/artifact-io.mjs",
+        "src/platform/sources.mjs",
+      ]) {
+        await writeFile(
+          join(provider, path),
+          git(["--git-dir", providerGit, "show", `${remoteDev.sha}:${path}`]),
+        );
+      }
       const caBundle = docker([
         "run",
         "--rm",
@@ -1296,12 +1311,13 @@ try {
         `type=bind,src=${join(upstream, "key.pem")},dst=/fixture-key.pem,readonly`,
         "--mount",
         `type=bind,src=${join(upstream, "ca.pem")},dst=/fixture-ca.pem,readonly`,
+        "--env",
+        `ORM_TEST_FIXTURE_GROUP=${actionsGroup}`,
         ...mounts,
         "--entrypoint",
         "/opt/orm-runtime/bin/node",
         image,
-        "/investigation-fixtures/server.mjs",
-        ...(suite === "actions" ? ["--actions"] : []),
+        "/actions-fixtures/remote-server.mjs",
       ]);
       await waitUntil(
         () =>
@@ -1326,6 +1342,7 @@ try {
             data,
             freshData,
             directory,
+            eventDirectory: temporary,
             image,
             net,
             label,

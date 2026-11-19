@@ -58,7 +58,7 @@ describe("selected-issue intake", () => {
     const initial = f.store.job(1)!;
     f.store.db
       .prepare(
-        "UPDATE jobs SET budget_json=json_set(budget_json,'$.model_requests',17)",
+        "UPDATE jobs SET budget_json=json_set(budget_json,'$.agent_runs',17)",
       )
       .run();
     f.github.state.issues[1].state = "closed";
@@ -74,7 +74,7 @@ describe("selected-issue intake", () => {
       revision: closed.revision + 1,
       snapshot_digest: initial.snapshot_digest,
     });
-    expect(JSON.parse(f.store.job(1)!.budget_json).model_requests).toBe(17);
+    expect(JSON.parse(f.store.job(1)!.budget_json).agent_runs).toBe(17);
   });
   it("filters only recorded automation comments, preserving human replies by the same account", async () => {
     const f = await setup();

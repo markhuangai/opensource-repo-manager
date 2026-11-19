@@ -72,6 +72,8 @@ export function protectedPath(path: string) {
     value.startsWith(".github/workflows/") ||
     value === ".github/actions" ||
     value.startsWith(".github/actions/") ||
+    value === ".github/orm" ||
+    value.startsWith(".github/orm/") ||
     /(^|\/)action\.ya?ml$/.test(value) ||
     [
       "codeowners",
@@ -79,6 +81,8 @@ export function protectedPath(path: string) {
       "docs/codeowners",
       ".github/dependabot.yml",
       ".github/dependabot.yaml",
+      ".github/orm.yml",
+      ".remote-dev.yml",
       ".gitmodules",
     ].includes(value)
   );
@@ -152,6 +156,7 @@ export class PublicationGit {
     timestamp: string,
     limit: number,
     signal: AbortSignal,
+    remoteCommit?: string,
   ) {
     validateArtifactLinks(manifest.files);
     const before = new Map<string, { mode: string; sha: string }>();
@@ -259,6 +264,54 @@ export class PublicationGit {
     )
       .toString()
       .trim();
+    if (remoteCommit) {
+      if (!/^[a-f0-9]{40}$/.test(remoteCommit))
+        throw new RuntimeError("publication_candidate_changed");
+      await this.command(
+        ["fetch", "--no-tags", this.endpoint, remoteCommit],
+        signal,
+      );
+      const actual = (
+        await this.command(
+          ["rev-parse", "FETCH_HEAD", "FETCH_HEAD^{tree}"],
+          signal,
+        )
+      )
+        .toString()
+        .trim();
+      if (actual !== `${remoteCommit}\n${tree}`)
+        throw new RuntimeError("publication_candidate_changed");
+      let candidateMessage = "";
+      if (remoteCommit !== parent) {
+        if (!changes.length) throw new RuntimeError("publication_no_change");
+        const raw = (
+          await this.command(["cat-file", "commit", remoteCommit], signal)
+        ).toString();
+        const boundary = raw.indexOf("\n\n");
+        const parents = raw
+          .slice(0, boundary)
+          .split("\n")
+          .filter((line) => line.startsWith("parent "));
+        if (
+          boundary < 0 ||
+          parents.length !== 1 ||
+          parents[0] !== `parent ${parent}`
+        )
+          throw new RuntimeError("publication_candidate_changed");
+        if (this.secrets.containsCredentials(raw))
+          throw new RuntimeError("publication_secret");
+        candidateMessage = raw.slice(boundary + 2);
+      }
+      return {
+        commit: remoteCommit,
+        tree,
+        parent,
+        message: candidateMessage,
+        actor,
+        timestamp,
+        changes,
+      };
+    }
     if (!changes.length)
       return {
         commit: parent,

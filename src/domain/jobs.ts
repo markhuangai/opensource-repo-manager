@@ -48,7 +48,7 @@ export type PullContext = {
 export type IssueRefresh = { number: number; generation: number };
 export type BudgetUsage = {
   active_ms: number;
-  model_requests: number;
+  agent_runs: number;
   repair_cycles: number;
   infrastructure_retries: number;
   infrastructure_exhausted?: boolean;
@@ -56,7 +56,7 @@ export type BudgetUsage = {
 };
 export const budgetUsage = z.strictObject({
   active_ms: z.number().int().nonnegative().safe(),
-  model_requests: z.number().int().nonnegative().safe(),
+  agent_runs: z.number().int().nonnegative().safe(),
   repair_cycles: z.number().int().nonnegative().safe(),
   infrastructure_retries: z.number().int().nonnegative().safe(),
   infrastructure_exhausted: z.boolean().optional(),
@@ -64,7 +64,7 @@ export const budgetUsage = z.strictObject({
 });
 export const initialBudget: BudgetUsage = {
   active_ms: 0,
-  model_requests: 0,
+  agent_runs: 0,
   repair_cycles: 0,
   infrastructure_retries: 0,
   wait_ms: 0,

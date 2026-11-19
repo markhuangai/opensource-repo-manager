@@ -1347,7 +1347,7 @@ describe.each([
       observed: text("observed") ? JSON.parse(text("observed")) : undefined,
     };
   };
-  it("resolves within the called workflow without nesting, forwarding configuration or increasing permissions", () => {
+  it("resolves the runtime before passing it to the controller with read permissions", () => {
     expect(document.jobs.runtime).toMatchObject({
       permissions: { contents: "read" },
       "runs-on": "${{ inputs.runner }}",
@@ -1370,8 +1370,8 @@ describe.each([
       required: false,
       default: "",
     });
-    expect(Object.values(document.jobs).filter((job) => job.uses)).toHaveLength(
-      0,
+    expect(Object.values(document.jobs).filter((job) => job.uses)).toEqual(
+      name === "test-ai" ? [aiTest.jobs.agent] : [],
     );
     expect(maintenance.jobs.resolve.needs).toBe("runtime");
     expect(maintenance.jobs.resolve.outputs["runtime-image"]).toBe(
@@ -1385,9 +1385,11 @@ describe.each([
       step(maintenance.jobs.maintenance, "Execute the bounded maintenance task")
         .env.ORM_RUNTIME_IMAGE,
     ).toBe("${{ needs.resolve.outputs.runtime-image }}");
-    expect(aiTest.jobs.test.needs).toBe("runtime");
+    expect(aiTest.jobs.authorize.needs).toBe("runtime");
+    expect(aiTest.jobs.agent.needs).toBe("authorize");
     expect(
-      step(aiTest.jobs.test, "Test one AI response").env.ORM_RUNTIME_IMAGE,
+      step(aiTest.jobs.authorize, "Check the dispatch and select its profile")
+        .env.ORM_RUNTIME_IMAGE,
     ).toBe("${{ needs.runtime.outputs.runtime-image }}");
   });
   for (const [ref, workflowSha, objectType] of [
@@ -2334,7 +2336,7 @@ describe.each([
       );
     await invoke(
       aiTestScript,
-      { version: 1, outcome: "completed", cleanup: "passed" },
+      { runner: "codex", profile: "review", write: false, timeout_minutes: 2 },
       { ORM_TEST_ROLE: "audit" },
       {
         eventName: "workflow_dispatch",
@@ -2347,9 +2349,14 @@ describe.each([
   });
 });
 
-const aiTestScript = step(aiTest.jobs.test, "Test one AI response").with.script;
-const aiTestCleanup = step(aiTest.jobs.test, "Remove the AI test container")
-  .with.script;
+const aiTestScript = step(
+  aiTest.jobs.authorize,
+  "Check the dispatch and select its profile",
+).with.script;
+const aiTestCleanup = step(
+  aiTest.jobs.authorize,
+  "Remove the AI test container",
+).with.script;
 describe("manual consumer AI test", () => {
   const env = {
     ORM_RUNTIME_IMAGE: `${image}@${digest("a")}`,
@@ -2363,7 +2370,7 @@ describe("manual consumer AI test", () => {
   it("exposes configured-role selection and forwards the existing configuration sources", async () => {
     expect(Object.keys(aiTest.on)).toEqual(["workflow_call"]);
     expect(aiTest.on.workflow_call.inputs.role.default).toBe("implementation");
-    expect(aiTest.permissions).toEqual({ contents: "read" });
+    expect(aiTest.permissions).toEqual({ contents: "read", actions: "read" });
     const caller = parse(
       await readFile(
         new URL("../examples/actions/test-ai.yml", import.meta.url),
@@ -2387,10 +2394,10 @@ describe("manual consumer AI test", () => {
         getExecOutput: async () => ({
           exitCode: 0,
           stdout: JSON.stringify({
-            version: 1,
-            outcome: "completed",
-            reason: "ai_interaction_completed",
-            cleanup: "passed",
+            runner: "codex",
+            profile: "review",
+            write: false,
+            timeout_minutes: 2,
           }),
           stderr: "",
         }),
@@ -2399,7 +2406,8 @@ describe("manual consumer AI test", () => {
     expect(calls[1][1].slice(-2)).toEqual(["test-ai", "audit"]);
     expect(calls[1][1]).toContain("ORM_CONFIGURATION_SECRETS");
     expect(result.failures).toEqual([]);
-    expect(result.summaries[0].runtime_image).toBe(env.ORM_RUNTIME_IMAGE);
+    expect(result.outputs.runner).toBe("codex");
+    expect(result.outputs.write).toBe("false");
   });
   it("forwards complete stderr lines before the container exits, preserving UTF-8 and the stdout result", async () => {
     const forwarded = [];
@@ -2424,10 +2432,10 @@ describe("manual consumer AI test", () => {
           return {
             exitCode: 0,
             stdout: JSON.stringify({
-              version: 1,
-              outcome: "completed",
-              reason: "ai_interaction_completed",
-              cleanup: "passed",
+              runner: "codex",
+              profile: "review",
+              write: false,
+              timeout_minutes: 2,
             }),
             stderr: bytes.toString(),
           };
@@ -2448,24 +2456,20 @@ describe("manual consumer AI test", () => {
       ).rejects.toThrow();
     });
   it("reports failed interaction and refuses cleanup of another run's container", async () => {
-    const result = await run(aiTestScript, {
-      context,
-      env,
-      executor: {
-        exec: async () => {},
-        getExecOutput: async () => ({
-          exitCode: 1,
-          stdout: JSON.stringify({
-            version: 1,
-            outcome: "failed",
-            reason: "ai_test_timeout",
-            cleanup: "passed",
+    await expect(
+      run(aiTestScript, {
+        context,
+        env,
+        executor: {
+          exec: async () => {},
+          getExecOutput: async () => ({
+            exitCode: 1,
+            stdout: '{"outcome":"failed"}',
+            stderr: "",
           }),
-          stderr: "",
-        }),
-      },
-    });
-    expect(result.failures).toEqual(["AI test stopped: ai_test_timeout"]);
+        },
+      }),
+    ).rejects.toThrow("Agent authorization failed");
     await expect(
       run(aiTestCleanup, {
         context,
@@ -2479,5 +2483,38 @@ describe("manual consumer AI test", () => {
         },
       }),
     ).rejects.toThrow("ownership is unverified");
+  });
+});
+
+describe("consumer agent dispatch", () => {
+  it("requires authorization and restricts all native secrets to the first run attempt", async () => {
+    const agent = aiTest.jobs.agent;
+    expect(agent.uses).toBe(
+      "markhuangai/agent-remote-dev/.github/workflows/remote-dev.yml@v1.0.0",
+    );
+    expect(agent.needs).toBe("authorize");
+    expect(agent.if).toBe("github.run_attempt == '1'");
+    expect(agent.with).not.toHaveProperty("resume-run-id");
+    for (const secret of Object.values(agent.secrets)) {
+      expect(secret).toContain("github.run_attempt == '1'");
+      expect(secret).not.toMatch(
+        /ORM_CONFIGURATION|ORM_GITHUB_TOKEN|ORM_SESSION_KEY/,
+      );
+    }
+    expect(agent.secrets["github-token"]).toBe(
+      "${{ github.run_attempt == '1' && (needs.authorize.outputs.write == 'true' && secrets.ORM_AGENT_WORK_TOKEN || needs.authorize.outputs.write == 'false' && secrets.ORM_AGENT_READ_TOKEN) || '' }}",
+    );
+    const caller = parse(
+      await readFile(
+        new URL("../examples/actions/orm-agent.yml", import.meta.url),
+        "utf8",
+      ),
+    );
+    expect(Object.keys(caller.on.workflow_dispatch.inputs)).toEqual([
+      "issue",
+      "turn",
+      "plan",
+    ]);
+    expect(caller.jobs.agent.if).toBe("github.run_attempt == '1'");
   });
 });

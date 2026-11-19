@@ -8,10 +8,9 @@ export function separateSecrets(
   actionsRuntimeToken?: string,
 ) {
   const credentials = new Map<string, string>();
-  const sensitive: string[] = [config.github.token, config.proxy.key];
+  const sensitive: string[] = [config.github.token];
   const put = (name: string, value: string) => credentials.set(name, value);
   put("github.token", config.github.token);
-  put("proxy.key", config.proxy.key);
   if (actionsRuntimeToken !== undefined) {
     put("actions.runtime_token", actionsRuntimeToken);
     sensitive.push(actionsRuntimeToken);
@@ -30,7 +29,6 @@ export function separateSecrets(
   );
   const redactor = createKnownSecretChecker([
     ...sensitive,
-    config.proxy.url,
     ...config.redaction_values,
   ]);
   const secrets = Object.freeze({
@@ -50,7 +48,6 @@ export function separateSecrets(
     version: config.version,
     github: { repository: config.github.repository },
     pr_monitor: config.pr_monitor,
-    proxy: { url: config.proxy.url },
     profiles: config.profiles,
     roles: config.roles,
     limits: config.limits,

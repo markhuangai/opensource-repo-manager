@@ -26,9 +26,7 @@ import {
 } from "/opt/orm/app/dist/config/load.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
 import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
-import { digest } from "/opt/orm/app/dist/domain/agents.js";
-import { respond as codex } from "/agent-fixtures/codex.mjs";
-import { respond as claude } from "/agent-fixtures/claude.mjs";
+import { digest, workerLimits } from "/opt/orm/app/dist/domain/agents.js";
 import { bootstrapScenarios } from "/container-suites.mjs";
 
 async function listen(server) {
@@ -179,13 +177,11 @@ export async function runBootstrapTests(suite) {
   );
   const proof = [],
     errors = [],
-    requests = [],
-    histories = new Map();
+    counts = { runs: 0 };
   let currentPlan,
     currentSdk = "codex",
     rejectAudit = false,
-    supervisor,
-    fixture;
+    supervisor;
   const markPhase = (phase) => {
     const timing = {
       sdk: currentSdk,
@@ -196,18 +192,87 @@ export async function runBootstrapTests(suite) {
     appendFileSync(join(root, "timings.jsonl"), JSON.stringify(timing) + "\n");
   };
   const recordCase = (details) => proof.push({ ...details, sdk: currentSdk });
-  const modelServer = createServer((req, res) =>
-    (currentSdk === "codex" ? codex : claude)(req, res, fixture),
-  );
-  const proxy = (await listen(modelServer)) + "/v1";
-  const profiles = {
-    codex: { sdk: "codex", model: "gpt-5.5", effort: "xhigh" },
-    claude: {
-      sdk: "claude",
-      model: "auto",
-      effort: "xhigh",
+  const profiles = { codex: { sdk: "codex" }, claude: { sdk: "claude" } };
+  const agents = {
+    async execute(request, signal) {
+      signal.throwIfAborted();
+      assert.equal(request.profile.sdk, currentSdk);
+      const input = request.input;
+      if (input.task !== "bootstrap_plan")
+        assert.equal(input.task, "bootstrap_audit");
+      return {
+        id: randomUUID(),
+        run_id: ++counts.runs,
+        started_at: Date.now(),
+        starting_sha: request.workspace.source.sha,
+        elapsed_ms: 0,
+        candidate: null,
+        result:
+          input.task === "bootstrap_plan"
+            ? globalThis.structuredClone(currentPlan)
+            : {
+                approved: !rejectAudit,
+                findings: rejectAudit ? ["fixture rejection"] : [],
+                source_digest: input.source_digest,
+                plan_digest: input.plan_digest,
+              },
+      };
     },
   };
+  async function exerciseEnvironment(request, script) {
+    return supervisor.withJobLease(
+      request,
+      AbortSignal.timeout(180000),
+      (lease) =>
+        supervisor.bootstrapWorkspace(
+          lease,
+          request,
+          async (workspace, runId) => {
+            const execute = (argv, cwd, environment, operation) =>
+              supervisor.bootstrapCommand(
+                lease,
+                request,
+                workspace,
+                request.bootstrap_receipt,
+                runId,
+                argv,
+                cwd,
+                environment,
+                operation,
+              );
+            const setup = await supervisor.bootstrap.materialize(
+              request,
+              workspace,
+              runId,
+              lease.signal,
+              execute,
+            );
+            const output = await execute(
+              ["/bin/sh", "-c", script],
+              workspace.workspace,
+              setup.environment,
+              "fixture-verification",
+            );
+            assert.match(output.stdout, /BOOTSTRAP_TESTS_PASSED/);
+            return store.recordArtifact(
+              await supervisor.workspaces.freeze(
+                {
+                  run_id: runId,
+                  job_id: request.job_id,
+                  revision: request.revision,
+                  source: request.workspace.source,
+                },
+                workspace.workspace,
+                workerLimits(store.snapshot(request.snapshot_digest)).storage,
+                lease.signal,
+                undefined,
+                setup.excluded,
+              ),
+            );
+          },
+        ),
+    );
+  }
   let number = 5000;
   const seed = (snapshot, source) => {
     store.saveSnapshot(snapshot);
@@ -227,11 +292,6 @@ export async function runBootstrapTests(suite) {
       snapshot,
     );
     return store.job(number);
-  };
-  const events = async (stream) => {
-    const result = [];
-    for await (const event of stream) result.push(event);
-    return result;
   };
   const makePlan = (languages, manager) => ({
     version: 1,
@@ -291,7 +351,6 @@ export async function runBootstrapTests(suite) {
         await readFile("/config/actions.yml", "utf8"),
       );
       config.github.repository = "owner/repo";
-      config.proxy.url = proxy;
       for (const role of Object.keys(config.roles)) {
         config.profiles[role] = profiles[sdk];
         config.roles[role].profile = role;
@@ -323,25 +382,8 @@ export async function runBootstrapTests(suite) {
       supervisor = await Supervisor.create(store, snapshot, secrets, {
         root: join(root, "runtime"),
         sourceUrl: () => endpoint + "/owner/repo.git",
-        workers: { [sdk]: `/opt/orm/app/dist/adapters/agents/${sdk}.js` },
+        agents,
       });
-      fixture = {
-        config,
-        store,
-        root: join(root, "runtime"),
-        errors,
-        requests,
-        histories,
-        bootstrap(scenario, text) {
-          if (scenario === "bootstrap_plan") return currentPlan;
-          return {
-            approved: !rejectAudit,
-            source_digest: /"source_digest":"([a-f0-9]{64})"/.exec(text)[1],
-            plan_digest: /"plan_digest":"([a-f0-9]{64})"/.exec(text)[1],
-            findings: rejectAudit ? ["fixture rejection"] : [],
-          };
-        },
-      };
       const cases =
         suite === "bootstrap-node"
           ? sdk === "claude"
@@ -536,7 +578,7 @@ export async function runBootstrapTests(suite) {
           "Bootstrap executed proposed project tests",
         );
         const manager = name.startsWith("yarn") ? "yarn" : name;
-        fixture.environmentCommand = python
+        const testCommand = python
           ? "python test.py" +
             (name === "pip"
               ? ` && test "$(project-version)" = 25.0 && (cd nested && python test.py && test "$(project-version)" = 24.2) && (cd nested/deep && python probe.py) && (cd nested-other && python probe.py) && (cd "$HOME" && python -c 'import os, sys; assert sys.prefix == sys.base_prefix; assert "VIRTUAL_ENV" not in os.environ')`
@@ -553,42 +595,22 @@ export async function runBootstrapTests(suite) {
             return `python -c 'import sys; assert sys.base_prefix == "${tool.path}"'`;
           })
           .join("\n");
-        fixture.environmentCommand =
+        const environmentCommand =
           "set -eu\n" +
           (name === "npm" ? "test ! -e .yarn/cache/late.zip\n" : "") +
           probes +
           "\n" +
-          fixture.environmentCommand +
+          `(${testCommand}) || exit` +
           (name === "npm"
             ? "\nprintf SDK-generated > .yarn/cache/late.zip\n"
             : "") +
           '\ntest ! -r /config/actions.yml\ntest "$(id -u)" = 10001\nprintf "\\nBOOTSTRAP_TESTS_PASSED\\n"\n';
-        const result = await events(
-          supervisor.run(
-            {
-              ...supervisor.request(job.id, "implementation", {
-                task: "bootstrap_environment",
-              }),
-              bootstrap_receipt: receipt.id,
-            },
-            new globalThis.AbortController().signal,
-          ),
-        );
-        const terminal = result.at(-1);
-        assert.equal(
-          terminal.outcome,
-          "completed",
-          JSON.stringify({
-            name,
-            result,
-            errors: errors.map((error) => error.message),
-          }),
-        );
-        const artifact = store.artifact(
-          terminal.artifact,
-          job.id,
-          job.revision,
-        );
+        const bound = {
+          ...supervisor.request(job.id, "implementation"),
+          bootstrap_receipt: receipt.id,
+        };
+        const artifactId = await exerciseEnvironment(bound, environmentCommand);
+        const artifact = store.artifact(artifactId, job.id, job.revision);
         assert(
           artifact.files.some(
             (file) =>
@@ -627,58 +649,7 @@ export async function runBootstrapTests(suite) {
               (file) => file.path === ".yarn/cache/late.zip",
             ),
           );
-          const bound = {
-            ...supervisor.request(job.id, "implementation", {
-              task: "bootstrap_environment",
-            }),
-            bootstrap_receipt: receipt.id,
-          };
-          const sessionId = result.find(
-            (event) => event.type === "session",
-          )?.id;
-          const saved = store
-            .runs()
-            .find(
-              (run) =>
-                run.job_id === job.id &&
-                run.session_id === sessionId &&
-                run.role === "implementation",
-            );
-          assert(sessionId && saved);
-          const checkpoint = JSON.parse(
-            await readFile(
-              join(
-                root,
-                "runtime",
-                "private",
-                "sessions",
-                saved.id,
-                "checkpoint.json",
-              ),
-              "utf8",
-            ),
-          ).checkpoint;
-          assert(
-            checkpoint.workspace.files.some(
-              (file) => file.path === ".yarn/cache/tracked.txt",
-            ),
-          );
-          assert(
-            !checkpoint.workspace.files.some(
-              (file) => file.path === ".yarn/cache/late.zip",
-            ),
-          );
-          const resume = {
-            id: sessionId,
-            binding: JSON.parse(saved.binding_json).binding,
-          };
-          const resumed = await events(
-            supervisor.run(
-              { ...bound, resume },
-              new globalThis.AbortController().signal,
-            ),
-          );
-          assert.equal(resumed.at(-1).outcome, "completed");
+          await exerciseEnvironment(bound, environmentCommand);
           currentPlan.test_commands.push({
             cwd: ".",
             argv: ["/bin/true"],
@@ -692,13 +663,6 @@ export async function runBootstrapTests(suite) {
           assert.notEqual(changedPlan.plan_digest, receipt.plan_digest);
           assert.deepEqual(changedPlan.environment, receipt.environment);
           assert.deepEqual(changedPlan.manager_locks, receipt.manager_locks);
-          const planMismatch = await events(
-            supervisor.run(
-              { ...bound, bootstrap_receipt: changedPlan.id, resume },
-              new globalThis.AbortController().signal,
-            ),
-          );
-          assert.equal(planMismatch.at(-1).outcome, "failed");
           currentPlan.test_commands.pop();
           await supervisor.withBootstrapLease(
             request,
@@ -739,8 +703,8 @@ export async function runBootstrapTests(suite) {
           const changed = globalThis.structuredClone(receipt);
           changed.id = randomUUID();
           changed.manager_locks[`npm@${versions.managers.npm}`][
-            "package-lock.json"
-          ] += "\n";
+            "unexpected.json"
+          ] = "{}";
           const token = store.acquireLease(job.id, job.revision);
           store.startRuntimeLease(
             token,
@@ -748,23 +712,23 @@ export async function runBootstrapTests(suite) {
           );
           store.saveBootstrap(changed, token);
           assert(store.releaseLease(token));
-          const mismatch = await events(
-            supervisor.run(
-              { ...bound, bootstrap_receipt: changed.id, resume },
-              new globalThis.AbortController().signal,
+          await assert.rejects(
+            exerciseEnvironment(
+              { ...bound, bootstrap_receipt: changed.id },
+              environmentCommand,
             ),
+            /package_manager_lock_invalid/,
           );
-          assert.equal(mismatch.at(-1).outcome, "failed");
-          const artifactMismatch = await events(
-            supervisor.run(
+          await assert.rejects(
+            exerciseEnvironment(
               {
                 ...bound,
-                workspace: { ...bound.workspace, artifact: terminal.artifact },
+                workspace: { ...bound.workspace, artifact: artifactId },
               },
-              new globalThis.AbortController().signal,
+              environmentCommand,
             ),
+            /bootstrap_/,
           );
-          assert.equal(artifactMismatch.at(-1).outcome, "failed");
         }
         for (const uid of [10001, 10002])
           assert.equal((await userProcesses(uid)).length, 0);
@@ -1203,7 +1167,7 @@ export async function runBootstrapTests(suite) {
         supervisor = await Supervisor.create(store, snapshot, secrets, {
           root: join(root, "runtime"),
           sourceUrl: () => endpoint + "/owner/repo.git",
-          workers: { [sdk]: `/opt/orm/app/dist/adapters/agents/${sdk}.js` },
+          agents,
         });
         assert.equal(store.bootstrap(interruptedId).status, "interrupted");
         assert.equal(
@@ -1249,7 +1213,6 @@ export async function runBootstrapTests(suite) {
       () => markPhase("cleanup:start"),
       () => supervisor?.close(),
       () => store.close(),
-      () => close(modelServer),
       () => close(sourceServer),
       async () => {
         await writeFile(join(root, "complete"), "bootstrap fixture finished");

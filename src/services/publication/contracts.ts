@@ -95,7 +95,6 @@ export type ReviewRequest = {
   payload: unknown;
   evidence: unknown;
   artifact_digest?: string;
-  parent_run_id?: string;
 };
 export type ReviewReceipt = {
   id: string;

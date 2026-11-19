@@ -18,7 +18,6 @@ export const configurationSections = [
   "version",
   "github",
   "pr_monitor",
-  "proxy",
   "profiles",
   "roles",
   "limits",

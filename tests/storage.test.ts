@@ -57,7 +57,7 @@ describe("durable SQLite repositories", () => {
     const { store, path, snapshot } = await database();
     seed(store, snapshot);
     const instance = new PublicationRepository(store).instance();
-    expect(store.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(store.db.pragma("user_version", { simple: true })).toBe(13);
     const tables = store.db
       .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
       .all();
@@ -72,7 +72,7 @@ describe("durable SQLite repositories", () => {
     expect(reopened.snapshot(snapshot.digest)).toEqual(snapshot);
     expect(new PublicationRepository(reopened).instance()).toBe(instance);
   });
-  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])(
+  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])(
     "rejects pre-removal schema %i without migration or reset",
     async (version) => {
       const { store, path, snapshot } = await database();
@@ -129,7 +129,7 @@ describe("durable SQLite repositories", () => {
         private: false,
       }),
     ).toThrow("repository_changed");
-    store.db.pragma("user_version = 13");
+    store.db.pragma("user_version = 14");
     store.close();
     expect(() => new Store(path)).toThrow("schema_unsupported");
   });
@@ -150,7 +150,7 @@ describe("durable SQLite repositories", () => {
     expect(
       store.updateBudget(job.id, job.revision, token, {
         active_ms: 10,
-        model_requests: 2,
+        agent_runs: 2,
         repair_cycles: 1,
         infrastructure_retries: 1,
         wait_ms: 3,
@@ -167,11 +167,11 @@ describe("durable SQLite repositories", () => {
     const closed = store.job(1)!;
     expect(closed.status).toBe("closed");
     expect(closed.snapshot_digest).toBe(snapshot.digest);
-    expect(JSON.parse(closed.budget_json).model_requests).toBe(2);
+    expect(JSON.parse(closed.budget_json).agent_runs).toBe(2);
     expect(
       store.updateBudget(job.id, job.revision, token, {
         active_ms: 0,
-        model_requests: 0,
+        agent_runs: 0,
         repair_cycles: 0,
         infrastructure_retries: 0,
         wait_ms: 0,
@@ -182,10 +182,10 @@ describe("durable SQLite repositories", () => {
     expect(store.job(1)!.id).toBe(job.id);
     expect(store.job(1)!.revision).toBe(closed.revision + 1);
     expect(
-      store.snapshot(snapshot.digest).roles.investigation.profile.model,
-    ).toBe("fixture-model");
+      store.snapshot(snapshot.digest).roles.implementation.bundle.system,
+    ).toContain("fixture-model");
     expect(() => {
-      store.snapshot(snapshot.digest).roles.audit.profile.model = "mutated";
+      store.snapshot(snapshot.digest).roles.audit.profile.sdk = "claude";
     }).toThrow();
     expect(store.acquireLease(job.id, store.job(1)!.revision)).toBeUndefined();
     expect(store.releaseLease(token)).toBe(true);
@@ -200,7 +200,7 @@ describe("durable SQLite repositories", () => {
     expect(
       store.updateBudget(job.id, job.revision, token, {
         active_ms: 25,
-        model_requests: 4,
+        agent_runs: 4,
         repair_cycles: 1,
         infrastructure_retries: 0,
         wait_ms: 6,
@@ -233,7 +233,7 @@ describe("durable SQLite repositories", () => {
       refresh.generation,
     );
     expect(reopened.owns("issue_comment", 123)).toBe(true);
-    expect(JSON.parse(reopened.job(1)!.budget_json).model_requests).toBe(4);
+    expect(JSON.parse(reopened.job(1)!.budget_json).agent_runs).toBe(4);
     expect(
       reopened.acquireLease(secondJob.id, secondJob.revision),
     ).toBeUndefined();
@@ -254,7 +254,7 @@ describe("durable SQLite repositories", () => {
     expect(store.reserveModelRequest(token, 2)).toBe(true);
     expect(second.reserveModelRequest(token, 2)).toBe(true);
     expect(store.reserveModelRequest(token, 2)).toBe(false);
-    expect(JSON.parse(store.job(1)!.budget_json).model_requests).toBe(2);
+    expect(JSON.parse(store.job(1)!.budget_json).agent_runs).toBe(2);
     const started = (
       store.db.prepare("SELECT accounted_at FROM runtime_leases").get() as {
         accounted_at: number;

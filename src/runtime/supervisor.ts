@@ -1,34 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { lstat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { Readable } from "node:stream";
+import { lstat } from "node:fs/promises";
 import { setInterval, clearInterval } from "node:timers";
 import type { RunSnapshot } from "../config/load.ts";
 import type { SecretAccessor } from "../config/secrets.ts";
 import { roleNames, type Role } from "../config/schema.ts";
 import { immutable } from "../config/bundles.ts";
-import { createKnownSecretChecker } from "../logging/redact.ts";
 import {
   digest,
   RuntimeError,
   roleUsers,
-  workerEnvelopeSchema,
   workerLimits,
   type AgentEvent,
   type AgentRunner,
   type AgentRunRequest,
-  type WorkerRequest,
 } from "../domain/agents.ts";
 import type { SourceMetadata } from "../domain/jobs.ts";
 import type { Store } from "../repositories/store.ts";
-import { ConversationRepository } from "../repositories/conversations.ts";
-import { ModelRelay } from "../services/model-relay.ts";
 import { BootstrapService } from "../services/bootstrap/index.ts";
-import {
-  commandDirectory,
-  dependencyExclusions,
-} from "../services/bootstrap/environment.ts";
+import { commandDirectory } from "../services/bootstrap/environment.ts";
 import type {
   BootstrapCommand,
   CommandReceipt,
@@ -36,87 +25,35 @@ import type {
 import { PublicationService } from "../services/publication/index.ts";
 import type { GitHubWriter } from "../adapters/github/writer.ts";
 import { runCommand } from "../adapters/toolchains/process.ts";
+import type { CandidateCommit } from "../domain/remote-turns.ts";
 import {
   WorkspaceService,
-  gitCommand,
   type PreparedWorkspace,
 } from "../services/workspaces/index.ts";
+import type { RemoteAgents } from "./remote-agents.ts";
 import { cleanTemporary, treeBytes } from "../services/workspaces/files.ts";
 import {
   assertRuntimeIdentity,
-  cleanEnvironment,
   cleanUser,
   deletedFileBytes,
-  signalUser,
-  spawnAsRole,
-  suspendUser,
-  trustedExecutable,
   userProcesses,
 } from "./process.ts";
 
-class EventQueue {
-  private values: AgentEvent[] = [];
-  private waiter: (() => void) | undefined;
-  private ended = false;
-  private failure: unknown;
-  push(event: AgentEvent) {
-    this.values.push(event);
-    this.waiter?.();
-  }
-  end(error?: unknown) {
-    this.ended = true;
-    this.failure = error;
-    this.waiter?.();
-  }
-  async *events() {
-    for (;;) {
-      const event = this.values.shift();
-      if (event) {
-        yield event;
-        continue;
-      }
-      if (this.ended) {
-        if (this.failure) throw this.failure;
-        return;
-      }
-      await new Promise<void>((resolve) => {
-        this.waiter = resolve;
-      });
-      this.waiter = undefined;
-    }
-  }
-}
-
-type ActiveRun = {
-  id: string;
-  lease: string;
-  request: AgentRunRequest;
-  snapshot: RunSnapshot;
-  deadline: number;
-  controller: AbortController;
-  signal: AbortSignal;
-  suspended: boolean;
-  reviewing: boolean;
-  reviewTask?: Promise<void>;
-  reviewCleanupFailed?: boolean;
-};
 export type BootstrapLease = Readonly<{
   lease: string;
-  deadline: number;
   signal: AbortSignal;
   request: AgentRunRequest;
   abort: (reason: RuntimeError) => void;
 }>;
 export type SupervisorOptions = {
   root?: string;
-  workers?: Partial<Record<"claude" | "codex", string>>;
+  agents?: RemoteAgents;
   sourceUrl?: (repository: string) => string;
   publicationWriter?: (ready: () => void) => GitHubWriter;
 };
 
 export class Supervisor implements AgentRunner {
   private readonly controller = new AbortController();
-  private readonly active = new Map<string, ActiveRun>();
   private readonly tasks = new Set<Promise<void>>();
   private runtimeFailure: string | null = null;
   readonly workspaces: WorkspaceService;
@@ -124,7 +61,6 @@ export class Supervisor implements AgentRunner {
   readonly publication: PublicationService;
   private readonly bootstrapLeases = new Set<BootstrapLease>();
   private readonly bootstrapOutput = new Map<string, number>();
-  private readonly relay: ModelRelay;
   private readonly store: Store;
   private readonly snapshot: RunSnapshot;
   private readonly secrets: SecretAccessor;
@@ -144,7 +80,6 @@ export class Supervisor implements AgentRunner {
       secrets,
       options.sourceUrl,
     );
-    this.relay = new ModelRelay(store, snapshot.settings.proxy.url, secrets);
     this.bootstrap = new BootstrapService(this, store, secrets);
     this.publication = new PublicationService(this, store, secrets, {
       writer: options.publicationWriter,
@@ -159,29 +94,21 @@ export class Supervisor implements AgentRunner {
     options: SupervisorOptions = {},
   ) {
     const supervisor = new Supervisor(store, snapshot, secrets, options);
-    try {
-      await assertRuntimeIdentity();
-      await supervisor.workspaces.initialize();
-      for (const uid of [10001, 10002, 10003]) {
-        await cleanUser(uid);
-        await cleanTemporary(uid);
-      }
-      store.interruptBootstrap();
-      await supervisor.bootstrap.initialize();
-      for (const lease of store.leases()) store.accountActive(lease.token);
-      for (const run of store
-        .runs()
-        .filter((run) => run.finished_at === null)) {
-        await supervisor.workspaces.remove(run.id);
-        store.finishRun(run.id, "interrupted", null, null);
-      }
-      for (const lease of store.leases()) store.releaseLease(lease.token);
-      await supervisor.relay.start();
-      return supervisor;
-    } catch (error) {
-      await supervisor.relay.close();
-      throw error;
+    await assertRuntimeIdentity();
+    await supervisor.workspaces.initialize();
+    for (const uid of [10001, 10002, 10003]) {
+      await cleanUser(uid);
+      await cleanTemporary(uid);
     }
+    store.interruptBootstrap();
+    await supervisor.bootstrap.initialize();
+    for (const lease of store.leases()) store.accountActive(lease.token);
+    for (const run of store.runs().filter((run) => run.finished_at === null)) {
+      await supervisor.workspaces.remove(run.id);
+      store.finishRun(run.id, "interrupted", null, null);
+    }
+    for (const lease of store.leases()) store.releaseLease(lease.token);
+    return supervisor;
   }
 
   status() {
@@ -223,21 +150,7 @@ export class Supervisor implements AgentRunner {
   }
 
   outputReviewAvailable() {
-    return Boolean(
-      this.options.workers?.[this.snapshot.roles.output_review.profile.sdk],
-    );
-  }
-
-  reviewCurrent(parentId: string, jobId: number, revision: number) {
-    const parent = this.active.get(parentId);
-    return (
-      !!parent &&
-      parent.request.job_id === jobId &&
-      parent.request.revision === revision &&
-      !parent.signal.aborted &&
-      parent.deadline > Date.now() &&
-      this.store.runtimeCurrent(parent.lease)
-    );
+    return Boolean(this.options.agents);
   }
 
   run(
@@ -298,19 +211,19 @@ export class Supervisor implements AgentRunner {
     let session: BootstrapLease | undefined;
     const timer = setInterval(() => {
       try {
-        this.store.accountActive(lease);
-        if (session && Date.now() >= session.deadline)
-          controller.abort(new RuntimeError("active_budget_exhausted"));
-        else if (!this.store.runtimeCurrent(lease))
-          controller.abort(new RuntimeError("revision_stale"));
-      } catch {
-        controller.abort(new RuntimeError("monitor_failed"));
+        this.checkLease(lease);
+      } catch (error) {
+        controller.abort(
+          error instanceof RuntimeError
+            ? error
+            : new RuntimeError("monitor_failed"),
+        );
       }
     }, 100);
     const operationTask = (async () => {
       let result: T | undefined, failure: { error: unknown } | undefined;
       try {
-        const deadline = this.store.startRuntimeLease(
+        this.store.startRuntimeLease(
           lease,
           snapshot.settings.limits.active_minutes * 60_000,
         );
@@ -319,7 +232,6 @@ export class Supervisor implements AgentRunner {
         );
         session = {
           lease,
-          deadline,
           request,
           signal: AbortSignal.any([
             signal,
@@ -377,7 +289,15 @@ export class Supervisor implements AgentRunner {
 
   runJobAgent(session: BootstrapLease, request: AgentRunRequest) {
     this.validateBootstrapLease(session, request);
-    return this.execute(request, session.signal, undefined, session);
+    return this.execute(request, session.signal, session.lease);
+  }
+
+  private checkLease(lease: string) {
+    const deadline = this.store.accountActive(lease);
+    if (deadline !== undefined && Date.now() >= deadline)
+      throw new RuntimeError("active_budget_exhausted");
+    if (!this.store.runtimeCurrent(lease))
+      throw new RuntimeError("revision_stale");
   }
 
   private validateBootstrapLease(
@@ -399,12 +319,17 @@ export class Supervisor implements AgentRunner {
     request: AgentRunRequest,
     operation: (workspace: PreparedWorkspace, runId: string) => Promise<T>,
     publishedHead?: string,
+    requiredParent?: string,
   ): Promise<T> {
     this.validateBootstrapLease(session, request);
+    const candidate =
+      request.workspace.artifact &&
+      this.store.candidate(request.workspace.artifact);
     if (
       publishedHead &&
       (request.role !== "audit" ||
-        publishedHead !== this.store.durability?.publishedHead())
+        (!requiredParent &&
+          publishedHead !== this.store.durability?.publishedHead()))
     )
       throw new RuntimeError("publication_head_changed");
     const snapshot = this.store.snapshot(request.snapshot_digest),
@@ -469,9 +394,10 @@ export class Supervisor implements AgentRunner {
         snapshot.settings.github.repository,
         limits,
         signal,
-        publishedHead,
+        publishedHead ?? (candidate ? candidate.sha : undefined),
+        requiredParent,
       );
-      if (request.workspace.artifact) {
+      if (request.workspace.artifact && !candidate) {
         const artifact = this.store.artifact(
           request.workspace.artifact,
           request.job_id,
@@ -645,70 +571,6 @@ export class Supervisor implements AgentRunner {
     );
   }
 
-  async *runReview(
-    parentId: string,
-    request: AgentRunRequest,
-    signal: AbortSignal,
-  ): AsyncIterable<AgentEvent> {
-    const parent = this.active.get(parentId);
-    if (
-      !parent ||
-      !this.store.runtimeCurrent(parent.lease) ||
-      parent.reviewing ||
-      parent.suspended ||
-      ![10001, 10002].includes(roleUsers[parent.request.role].uid) ||
-      roleUsers[parent.request.role].uid === roleUsers[request.role].uid ||
-      (parent.request.role === "audit" && request.role !== "output_review") ||
-      !["audit", "output_review"].includes(request.role) ||
-      request.job_id !== parent.request.job_id ||
-      request.revision !== parent.request.revision
-    )
-      throw new RuntimeError("review_parent_invalid");
-    parent.reviewing = true;
-    parent.suspended = true;
-    const queue = new EventQueue(),
-      controller = new AbortController();
-    const task = (async () => {
-      let failure: unknown;
-      try {
-        await suspendUser(roleUsers[parent.request.role].uid);
-        for await (const event of this.execute(
-          request,
-          AbortSignal.any([signal, parent.signal, controller.signal]),
-          parent,
-        ))
-          queue.push(event);
-      } catch (error) {
-        failure = error;
-        if (error instanceof RuntimeError && error.code === "cleanup_failed") {
-          parent.reviewCleanupFailed = true;
-          parent.controller.abort(error);
-        }
-      } finally {
-        parent.reviewing = false;
-        parent.suspended = false;
-        try {
-          if (!parent.signal.aborted && !parent.reviewCleanupFailed)
-            await signalUser(roleUsers[parent.request.role].uid, "SIGCONT");
-        } catch (error) {
-          failure = error;
-          parent.reviewCleanupFailed = true;
-          this.runtimeFailure = "cleanup_failed";
-          parent.controller.abort(new RuntimeError("cleanup_failed"));
-        }
-        parent.reviewTask = undefined;
-        queue.end(failure);
-      }
-    })();
-    parent.reviewTask = task;
-    try {
-      yield* queue.events();
-    } finally {
-      controller.abort(new RuntimeError("consumer_cancelled"));
-      await task;
-    }
-  }
-
   private validate(request: AgentRunRequest) {
     const job = this.store.jobById(request.job_id);
     if (
@@ -726,8 +588,7 @@ export class Supervisor implements AgentRunner {
       digest(snapshot.roles[request.role].profile) !==
         digest(request.profile) ||
       snapshot.settings.github.repository !==
-        this.snapshot.settings.github.repository ||
-      snapshot.settings.proxy.url !== this.snapshot.settings.proxy.url
+        this.snapshot.settings.github.repository
     )
       throw new RuntimeError("snapshot_mismatch");
     if (this.secrets.containsCredentials(request))
@@ -738,617 +599,84 @@ export class Supervisor implements AgentRunner {
   private async *execute(
     request: AgentRunRequest,
     signal: AbortSignal,
-    parent?: ActiveRun,
-    held?: BootstrapLease,
+    lease?: string,
   ): AsyncIterable<AgentEvent> {
-    const snapshot = this.validate(request),
-      worker = this.options.workers?.[request.profile.sdk];
-    if (!worker) throw new RuntimeError("backend_unavailable");
-    await trustedExecutable(worker);
-    const bootstrap = fileURLToPath(new URL("./worker.js", import.meta.url));
-    await trustedExecutable(bootstrap);
-    const controller = new AbortController(),
-      combined = AbortSignal.any([
-        signal,
-        this.controller.signal,
-        controller.signal,
-        ...(parent ? [parent.signal] : []),
-      ]);
-    combined.throwIfAborted();
-    const continuation = new ConversationRepository(this.store).prepare(
-      request,
+    this.validate(request);
+    const agents = this.options.agents;
+    if (!agents) throw new RuntimeError("backend_unavailable");
+    const current = AbortSignal.any([signal, this.controller.signal]);
+    const accepted = await agents.execute(request, current);
+    current.throwIfAborted();
+    this.validate(request);
+    if (lease) this.checkLease(lease);
+    let artifact = request.workspace.artifact;
+    if (accepted.candidate) {
+      const inspection = {
+        ...request,
+        role: "audit" as const,
+        profile: this.store.snapshot(request.snapshot_digest).roles.audit
+          .profile,
+        workspace: { source: request.workspace.source },
+      };
+      artifact = await this.captureCandidate(
+        inspection,
+        accepted.candidate,
+        this.publication.repository.target(request.job_id).head ??
+          request.workspace.source.sha,
+        current,
+      );
+    }
+    this.store.registerRemoteRun(
+      accepted.id,
+      request.job_id,
+      request.revision,
+      request.role,
+      accepted,
     );
-    if (continuation?.duplicate) {
-      yield { type: "session", id: request.resume!.id };
-      yield continuation.duplicate;
-      return;
-    }
-    if (continuation)
-      request = { ...request, conversation: continuation.conversation };
-    const lease =
-      parent?.lease ??
-      held?.lease ??
-      this.store.acquireLease(request.job_id, request.revision);
-    if (!lease) throw new RuntimeError("lease_busy");
-    let deadline: number;
-    try {
-      deadline =
-        parent?.deadline ??
-        held?.deadline ??
-        this.store.startRuntimeLease(
-          lease,
-          snapshot.settings.limits.active_minutes * 60_000,
-        );
-    } catch (error) {
-      if (!parent && !held) this.store.releaseLease(lease);
-      throw error;
-    }
-    const context: ActiveRun = {
-      id: randomUUID(),
-      lease,
-      request,
-      snapshot,
-      deadline,
-      controller,
-      signal: combined,
-      suspended: false,
-      reviewing: false,
+    yield {
+      type: "terminal",
+      outcome: "completed",
+      result: accepted.result,
+      artifact,
+      run_id: accepted.id,
     };
-    this.active.set(context.id, context);
-    const queue = new EventQueue();
-    const task = this.work(
-      context,
-      worker,
-      bootstrap,
-      queue,
-      parent,
-      held,
-    ).catch((error) => queue.end(error));
-    this.tasks.add(task);
-    try {
-      yield* queue.events();
-    } finally {
-      controller.abort(new RuntimeError("consumer_cancelled"));
-      await task;
-      this.tasks.delete(task);
-      this.active.delete(context.id);
-    }
   }
 
-  private async work(
-    context: ActiveRun,
-    worker: string,
-    bootstrap: string,
-    queue: EventQueue,
-    parent?: ActiveRun,
-    held?: BootstrapLease,
+  async captureCandidate(
+    request: AgentRunRequest,
+    candidate: CandidateCommit,
+    parent: string,
+    signal: AbortSignal,
   ) {
-    const { request, snapshot, signal, lease, id } = context,
-      identity = roleUsers[request.role],
-      limits = workerLimits(snapshot);
-    let prepared: PreparedWorkspace | undefined;
-    let environment: Readonly<Record<string, string>> | undefined;
-    let excluded: ((reference: string) => boolean) | undefined;
-    let relay: ReturnType<ModelRelay["authorize"]> | undefined,
-      registered = false,
-      cleaned = false;
-    let session: string | null = null,
-      terminal: Extract<AgentEvent, { type: "terminal" }> | undefined;
-    let termination: Promise<void> | undefined,
-      watching: Promise<void> | undefined;
-    let cleanupFailure: unknown,
-      cleanupStep = "connections";
-    const revoke = () => {
-      relay?.revoke();
-    };
-    const abort = () => {
-      revoke();
-      if (registered && !termination) termination = cleanUser(identity.uid);
-      if (termination)
-        void termination.catch((error) => {
-          cleanupFailure = error;
-        });
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    const expiry =
-      context.deadline - Date.now() <= 2_147_483_647
-        ? setTimeout(
-            () =>
-              context.controller.abort(
-                new RuntimeError("active_budget_exhausted"),
-              ),
-            Math.max(1, context.deadline - Date.now()),
-          )
-        : undefined;
-    const timer = setInterval(() => {
-      if (watching) return;
-      watching = (async () => {
-        if (Date.now() >= context.deadline)
-          throw new RuntimeError("active_budget_exhausted");
-        if (!this.store.runtimeCurrent(lease))
-          throw new RuntimeError("revision_stale");
-        if (!parent) this.store.accountActive(lease);
-        if (prepared) {
-          let used = await treeBytes(prepared.root, limits.storage);
-          for (const path of ["/tmp", "/var/tmp", "/dev/shm", "/run/lock"]) {
-            try {
-              const stat = await lstat(path);
-              if (!stat.isSymbolicLink())
-                used += await treeBytes(
-                  path,
-                  limits.storage - used,
-                  identity.uid,
-                );
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-                throw error;
-            }
-          }
-          used += await deletedFileBytes(identity.uid, limits.storage - used);
-          if (used > limits.storage) throw new RuntimeError("storage_limit");
-        }
-      })()
-        .catch((error) =>
-          context.controller.abort(
-            error instanceof RuntimeError
-              ? error
-              : new RuntimeError("monitor_failed"),
-          ),
-        )
-        .finally(() => {
-          watching = undefined;
-        });
-    }, 1000);
-    try {
-      await this.store.checkpoint(signal);
-      if ((await userProcesses(identity.uid)).length)
-        throw new RuntimeError("worker_user_busy");
-      this.store.startRun({
-        id,
-        job_id: request.job_id,
-        revision: request.revision,
-        role: request.role,
-        uid: identity.uid,
-        parent_id: parent?.id ?? null,
-        lease_token: lease,
-        binding_json: "{}",
-      });
-      registered = true;
-      prepared = await this.workspaces.prepare(
-        id,
-        request.role,
-        snapshot.roles[request.role].bundle,
-        request.workspace.source,
-        snapshot.settings.github.repository,
-        limits,
-        signal,
-      );
-      signal.throwIfAborted();
-      if (request.workspace.artifact) {
-        const manifest = this.store.artifact(
-          request.workspace.artifact,
-          request.job_id,
-          request.revision,
-        );
-        if (digest(manifest.source) !== digest(request.workspace.source))
-          throw new RuntimeError("artifact_source_mismatch");
-        await this.workspaces.restore(
-          manifest,
-          prepared.workspace,
-          request.role,
-          limits.storage,
-          signal,
-        );
-      }
-      signal.throwIfAborted();
-      const binding = digest({
-        ...(request.conversation
-          ? { conversation: { version: 1, id: request.conversation.id } }
-          : {}),
-        job_id: request.job_id,
-        revision: request.revision,
-        role: request.role,
-        source: request.workspace.source,
-        input: request.input,
-        output_schema: request.output_schema,
-        artifact: request.workspace.artifact,
-        snapshot: request.snapshot_digest,
-        profile: request.profile,
-        ...(request.bootstrap_receipt
-          ? {
-              environment: digest({
-                plan: this.bootstrap.receipt(request).plan_digest,
-                tools: this.bootstrap.receipt(request).environment,
-                managers: this.bootstrap.receipt(request).manager_locks,
-              }),
-            }
-          : {}),
-      });
-      if (request.resume) {
-        const previous = this.store.sessionRun(
-          request.job_id,
-          request.revision,
-          request.role,
-          request.resume.id,
-        );
-        if (
-          ["audit", "output_review"].includes(request.role) ||
-          !previous ||
-          previous.finished_at === null ||
-          !["completed", "limited"].includes(previous.status) ||
-          previous.binding_json !== JSON.stringify({ binding }) ||
-          request.resume.binding !== binding
-        )
-          throw new RuntimeError("resume_mismatch");
-        await this.workspaces.restoreSession(
-          previous.id,
-          binding,
-          request.resume.id,
-          prepared,
-          request.role,
-          limits.storage,
-          signal,
-        );
-      }
-      this.store.bindRun(id, binding);
-      if (request.role === "implementation")
-        await gitCommand(
-          [
-            "checkout",
-            "-b",
-            this.publication.repository.target(request.job_id).branch,
-            request.workspace.source.sha,
-          ],
-          {
-            cwd: prepared.workspace,
-            env: cleanEnvironment(
-              prepared.home,
-              prepared.temporary,
-              identity.name,
-            ),
-            signal,
-            role: request.role,
-            processes: limits.processes,
-          },
-        );
-      if (request.bootstrap_receipt) {
-        let setupOutput = 0;
-        const setup = await this.bootstrap.materialize(
-          request,
-          prepared,
-          id,
-          signal,
-          (argv, cwd, env, operation) =>
-            runCommand(argv[0], argv.slice(1), {
-              cwd,
-              env,
-              role: request.role,
-              processes: limits.processes,
-              signal,
-              limit: limits.output - setupOutput,
-              operation,
-              secrets: this.secrets,
-              record: (receipt) => {
-                this.store.recordBootstrapCommand(
-                  request.bootstrap_receipt!,
-                  id,
-                  receipt,
-                );
-                if (receipt.finished_at !== null)
-                  setupOutput += receipt.output_bytes;
-              },
-            }).finally(async () => {
-              await cleanUser(identity.uid);
-              await cleanTemporary(identity.uid);
-            }),
-        );
-        environment = Object.fromEntries(
-          Object.entries(setup.environment).filter(
-            (entry): entry is [string, string] => typeof entry[1] === "string",
-          ),
-        );
-        excluded = setup.excluded;
-      }
-      relay = this.relay.authorize({
+    const artifact = await this.withJobLease(request, signal, (lease) =>
+      this.bootstrapWorkspace(
         lease,
-        context: {
-          run_id: id,
-          job_id: request.job_id,
-          revision: request.revision,
-          role: request.role,
-        },
-        profile: request.profile,
-        deadline: context.deadline,
-        requests: snapshot.settings.limits.model_requests,
-        bytes: limits.output,
-        signal,
-        current: () => this.store.runtimeCurrent(lease),
-        available: () => !context.suspended,
-      });
-      const workerRequest: WorkerRequest = {
-        ...request,
-        run_id: id,
-        workspace: prepared.workspace,
-        home: prepared.home,
-        temporary: prepared.temporary,
-        session_directory: prepared.session,
-        deadline: context.deadline,
-        prompts: {
-          ...prepared.prompts,
-          selected: snapshot.settings.roles[request.role].skills.map(
-            (reference) =>
-              join(prepared!.prompts.skills, reference, "SKILL.md"),
-          ),
-        },
-        relay: { url: relay.url, authorization: relay.authorization },
-        binding,
-        ...(environment ? { environment } : {}),
-      };
-      const outputCredentials = createKnownSecretChecker([
-          workerRequest.relay.authorization,
-        ]),
-        credentialStream = outputCredentials.createStream(),
-        input = JSON.stringify(workerRequest);
-      if (Buffer.byteLength(input) > 32 * 1024 * 1024)
-        throw new RuntimeError("request_limit");
-      const child = spawnAsRole(
-        request.role,
-        "/opt/orm-runtime/bin/node",
-        [bootstrap, worker],
-        {
-          cwd: prepared.workspace,
-          env: cleanEnvironment(
-            prepared.home,
-            prepared.temporary,
-            identity.name,
-          ),
-          processes: limits.processes,
-          protocol: true,
-        },
-      );
-      let output = 0,
-        pending = Buffer.alloc(0),
-        protocolFailure: RuntimeError | undefined;
-      const fail = (code: string) => {
-        protocolFailure ??= new RuntimeError(code);
-        context.controller.abort(protocolFailure);
-      };
-      const count = (chunk: Buffer) => {
-        output += chunk.length;
-        if (output > limits.output) fail("output_limit");
-      };
-      child.stdout!.on("data", count);
-      child.stderr!.on("data", count);
-      (child.stdio[3] as Readable).on("data", (chunk: Buffer) => {
-        count(chunk);
-        if (signal.aborted) return;
-        pending = Buffer.concat([pending, chunk]);
-        try {
-          let newline;
-          while ((newline = pending.indexOf(10)) >= 0) {
-            const line = pending.subarray(0, newline);
-            pending = pending.subarray(newline + 1);
-            if (!line.length) continue;
-            if (line.length > 1024 * 1024)
-              throw new RuntimeError("protocol_limit");
-            const wire = workerEnvelopeSchema.parse(
-              JSON.parse(new TextDecoder("utf8", { fatal: true }).decode(line)),
-            );
-            if (
-              wire.run_id !== id ||
-              wire.job_id !== request.job_id ||
-              wire.revision !== request.revision ||
-              !this.store.runtimeCurrent(lease) ||
-              terminal
-            )
-              throw new RuntimeError("protocol_invalid");
-            if (
-              this.secrets.containsCredentials(wire.event) ||
-              outputCredentials.contains(wire.event) ||
-              (wire.event.type === "progress" &&
-                credentialStream.push(wire.event.message))
-            )
-              throw new RuntimeError("secret_in_output");
-            if (wire.event.type === "terminal") terminal = wire.event;
-            else if (wire.event.type === "session") {
-              if (session && session !== wire.event.id)
-                throw new RuntimeError("protocol_invalid");
-              session = wire.event.id;
-              queue.push(wire.event);
-            } else queue.push(wire.event);
-          }
-          if (pending.length > 1024 * 1024) fail("protocol_limit");
-        } catch (error) {
-          fail(error instanceof RuntimeError ? error.code : "protocol_invalid");
-        }
-      });
-      child.stdin!.on("error", () => fail("worker_input_failed"));
-      const code = await new Promise<number | null>((resolve) => {
-        child.once("error", () => {
-          fail("worker_start_failed");
-        });
-        child.once("close", resolve);
-        child.stdin!.end(input);
-        if (signal.aborted) abort();
-      });
-      if (protocolFailure) throw protocolFailure;
-      if (pending.length || !terminal || code !== 0)
-        throw new RuntimeError("worker_failed");
-      signal.throwIfAborted();
-      if (terminal.outcome !== "completed" && terminal.outcome !== "limited")
-        throw new RuntimeError(terminal.outcome);
-      revoke();
-
-      termination ??= cleanUser(identity.uid);
-      await termination;
-      if (cleanupFailure) throw new RuntimeError("cleanup_failed");
-      if (!this.store.runtimeCurrent(lease))
-        throw new RuntimeError("revision_stale");
-      if (terminal.outcome === "completed" || session) {
-        const manifest = await this.workspaces.freeze(
-          {
-            run_id: id,
-            job_id: request.job_id,
-            revision: request.revision,
-            source: request.workspace.source,
-          },
-          prepared.workspace,
-          limits.storage,
-          signal,
-          undefined,
-          excluded ?? dependencyExclusions(prepared.source_files),
-        );
-        if (session && identity.uid === 10001) {
-          await treeBytes(prepared.root, limits.storage);
-          await this.workspaces.saveSession(
-            binding,
-            session,
-            manifest,
-            prepared.session,
-            limits.storage,
-            signal,
-            outputCredentials,
-            request.conversation,
+        request,
+        async (prepared, id) => {
+          const manifest = await this.workspaces.freeze(
+            {
+              run_id: id,
+              job_id: request.job_id,
+              revision: request.revision,
+              source: request.workspace.source,
+            },
+            prepared.workspace,
+            workerLimits(this.store.snapshot(request.snapshot_digest)).storage,
+            lease.signal,
           );
-        }
-        if (terminal.outcome === "completed") {
-          const artifact = this.store.recordArtifact(manifest);
-          await writeFile(
-            join(this.workspaces.privateRoot, "manifests", artifact),
-            JSON.stringify(manifest),
-            { mode: 0o400, flag: "wx" },
-          );
-          terminal = { ...terminal, artifact };
-        }
-      }
-    } catch (error) {
-      session = null;
-      const code = signal.aborted
-        ? signal.reason instanceof RuntimeError
-          ? signal.reason.code
-          : "cancelled"
-        : error instanceof RuntimeError
-          ? error.code
-          : "worker_failed";
-      terminal = {
-        type: "terminal",
-        outcome:
-          code === "revision_stale" || code === "stale"
-            ? "stale"
-            : code === "cancelled" || code === "consumer_cancelled"
-              ? "cancelled"
-              : [
-                    "limited",
-                    "output_limit",
-                    "storage_limit",
-                    "active_budget_exhausted",
-                  ].includes(code)
-                ? "limited"
-                : "failed",
-      };
-      if (code === "cleanup_failed") cleanupFailure = error;
-    } finally {
-      clearInterval(timer);
-      clearTimeout(expiry);
-      if (context.reviewTask) {
-        context.controller.abort(new RuntimeError("cancelled"));
-        await context.reviewTask;
-        if (context.reviewCleanupFailed)
-          cleanupFailure = new RuntimeError("cleanup_failed");
-      }
-      await watching;
-      revoke();
-      try {
-        if (registered) {
-          cleanupStep = "processes";
-          termination ??= cleanUser(identity.uid);
-          await termination;
-          cleanupStep = "temporary";
-          await cleanTemporary(identity.uid);
-          cleanupStep = "workspace";
-          await this.workspaces.remove(id);
-        }
-        cleanupStep = "receipt";
-        if (!cleanupFailure) {
-          if (
-            terminal &&
-            (terminal.outcome === "completed" ||
-              (terminal.outcome === "limited" && !signal.aborted)) &&
-            !this.store.runtimeCurrent(lease)
-          )
-            terminal = { type: "terminal", outcome: "stale" };
-          if (registered)
-            this.store.db
-              .transaction(() => {
-                this.store.finishRun(
-                  id,
-                  terminal!.outcome,
-                  !signal.aborted &&
-                    ["completed", "limited"].includes(terminal!.outcome)
-                    ? session
-                    : null,
-                  terminal?.outcome === "completed"
-                    ? (terminal.artifact ?? null)
-                    : null,
-                );
-                if (
-                  session &&
-                  request.conversation &&
-                  !signal.aborted &&
-                  ["completed", "limited"].includes(terminal!.outcome)
-                ) {
-                  if (this.secrets.containsCredentials(terminal))
-                    throw new RuntimeError("secret_in_session");
-                  new ConversationRepository(this.store).complete(
-                    request,
-                    id,
-                    terminal!,
-                  );
-                }
-              })
-              .immediate();
-          cleaned = true;
-        }
-      } catch (error) {
-        const code =
-          error instanceof RuntimeError
-            ? error.code
-            : (error as NodeJS.ErrnoException)?.code;
-        const cause =
-          typeof code === "string" &&
-          /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(code) &&
-          !this.secrets.containsCredentials(code)
-            ? new RuntimeError(code)
-            : undefined;
-        cleanupFailure = new RuntimeError(`cleanup_${cleanupStep}_failed`, {
-          cause,
-        });
-      }
-      signal.removeEventListener("abort", abort);
-      if (!parent) {
-        this.store.accountActive(lease);
-        if (cleaned && !held && !this.store.releaseLease(lease))
-          cleanupFailure = new RuntimeError("cleanup_failed");
-      }
-    }
-    if (cleanupFailure) {
-      this.runtimeFailure = "cleanup_failed";
-      throw new RuntimeError("cleanup_failed", {
-        cause:
-          cleanupFailure instanceof RuntimeError ? cleanupFailure : undefined,
-      });
-    }
-    queue.push(terminal!);
-    queue.end();
+          return this.store.recordArtifact(manifest);
+        },
+        candidate.sha,
+        parent,
+      ),
+    );
+    this.store.recordCandidate(artifact, candidate);
+    return artifact;
   }
 
   async close() {
     this.controller.abort(new RuntimeError("cancelled"));
-    try {
-      await Promise.all(this.tasks);
-    } finally {
-      await this.relay.close();
-    }
+    await Promise.all(this.tasks);
     if (this.store.runs().some((run) => run.finished_at === null))
       throw new RuntimeError("cleanup_failed");
   }

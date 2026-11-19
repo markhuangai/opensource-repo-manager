@@ -68,7 +68,6 @@ describe("protected Actions configuration", () => {
     expect(config.pr_monitor).toEqual(input.pr_monitor);
     const { secrets, settings } = separateSecrets(config);
     expect(secrets.get("github.token")).toBe(input.github.token);
-    expect(secrets.get("proxy.key")).toBe(input.proxy.key);
     expect(() => secrets.get("github.webhook_secret")).toThrow(
       "reference_invalid",
     );

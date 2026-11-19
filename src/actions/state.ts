@@ -14,6 +14,7 @@ import { commandSchema } from "../services/bootstrap/contracts.ts";
 import { artifactReferenceSchema } from "./bundle.ts";
 import { questionSchema } from "../services/clarification-contracts.ts";
 import { feedbackAssessment } from "../services/pr-monitor/contracts.ts";
+import { turnSchema } from "../domain/remote-turns.ts";
 
 const count = z.number().int().nonnegative().safe();
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -174,7 +175,7 @@ export const prContinuationSchema = z.strictObject({
 });
 export type PrContinuation = z.infer<typeof prContinuationSchema>;
 export const taskStateSchema = z.strictObject({
-  version: z.literal(1),
+  version: z.literal(2),
   repository: repositoryIdentity.strict(),
   issue: z.strictObject({ id: githubId, number: githubId }),
   task_id: z.uuid(),
@@ -198,7 +199,7 @@ export const taskStateSchema = z.strictObject({
   budget: budgetUsage,
   limits: z.strictObject({
     active_ms: count,
-    model_requests: count,
+    agent_runs: count,
     repair_cycles: count,
     infrastructure_retries: count,
     wait_ms: count,
@@ -237,6 +238,7 @@ export const taskStateSchema = z.strictObject({
   head: sha.nullable(),
   pull: ownedPull.nullable(),
   pending: durablePublicationSchema.nullable(),
+  agent_turn: turnSchema.nullable(),
   session_artifact: artifactReferenceSchema.nullable(),
   pr: prContinuationSchema.optional(),
 });
@@ -287,7 +289,7 @@ export class StateCodec {
     if (Buffer.byteLength(serialized) > stateBytes)
       throw new StateError("state_size_limit");
     const content = Buffer.from(serialized).toString("base64url");
-    const body = `${narrative}\n\n${stateMarker}v1:${content}:${this.mac(content, narrative, state.initializing).toString("base64url")} -->`;
+    const body = `${narrative}\n\n${stateMarker}v2:${content}:${this.mac(content, narrative, state.initializing).toString("base64url")} -->`;
     if (Buffer.byteLength(body) > commentBytes)
       throw new StateError("state_size_limit");
     return body;
@@ -304,8 +306,10 @@ export class StateCodec {
   ): StateComment {
     if (Buffer.byteLength(body) > commentBytes)
       throw new StateError("state_size_limit");
+    if (body.includes(`${stateMarker}v1:`))
+      throw new StateError("state_legacy_unbound");
     const match =
-      /^(.*)\n\n<!-- orm:task-state:v1:([A-Za-z0-9_-]+):([A-Za-z0-9_-]+) -->$/s.exec(
+      /^(.*)\n\n<!-- orm:task-state:v2:([A-Za-z0-9_-]+):([A-Za-z0-9_-]+) -->$/s.exec(
         body,
       );
     if (!match || match[1].includes(stateMarker))
@@ -351,6 +355,7 @@ export class StateCodec {
         state.scope !== null ||
         state.findings !== null ||
         state.session_artifact !== null ||
+        state.agent_turn !== null ||
         state.pr !== undefined ||
         Object.values(state.budget).some(Boolean)
       )

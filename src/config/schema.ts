@@ -29,47 +29,7 @@ const name = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/);
 const text = z.string().min(1).max(4096);
 const secret = z.string().min(1).max(16384);
 const relativePath = z.string().min(1).max(4096).refine(isContainedReference);
-const url = text.refine((value) => {
-  try {
-    const parsed = new URL(value);
-    return (
-      ["http:", "https:"].includes(parsed.protocol) &&
-      !parsed.username &&
-      !parsed.password &&
-      !parsed.hash
-    );
-  } catch {
-    return false;
-  }
-});
-const endpointUrl = url.refine((value) => {
-  try {
-    return new URL(value).search === "";
-  } catch {
-    return false;
-  }
-});
-const profile = z.discriminatedUnion("sdk", [
-  z.strictObject({
-    sdk: z.literal("claude"),
-    model: text,
-    effort: z.enum(["low", "medium", "high", "xhigh", "max"]),
-  }),
-  z.strictObject({
-    sdk: z.literal("codex"),
-    model: text,
-    effort: z.enum([
-      "minimal",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-      "ultra",
-      "persistent",
-    ]),
-  }),
-]);
+const profile = z.strictObject({ sdk: z.enum(["claude", "codex"]) });
 const role = z.strictObject({
   profile: name,
   prompts: z.strictObject({ system: relativePath, user: relativePath }),
@@ -95,7 +55,7 @@ export const prMonitorPolicy = z
   })
   .prefault({});
 const actionsConfigurationSchema = z.strictObject({
-  version: z.literal(1),
+  version: z.literal(2),
   github: z.strictObject({
     repository: z
       .string()
@@ -103,7 +63,6 @@ const actionsConfigurationSchema = z.strictObject({
     token: secret,
   }),
   pr_monitor: prMonitorPolicy,
-  proxy: z.strictObject({ url: endpointUrl, key: secret }),
   redaction_values: z
     .array(z.string().min(1).max(sourceContextBytes))
     .max(65536)
@@ -116,19 +75,17 @@ const actionsConfigurationSchema = z.strictObject({
     audit: role,
     output_review: role,
   }),
-  limits: z
-    .strictObject({
-      active_slots: z.literal(1).default(1),
-      active_minutes: positive.default(60),
-      model_requests: positive.default(200),
-      repair_cycles: count.default(3),
-      infrastructure_retries: count.default(2),
-      wait_hours: positive.default(24),
-      worker_processes: positive.default(128),
-      worker_output_bytes: positive.default(16 * 1024 * 1024),
-      worker_storage_bytes: positive.default(4 * 1024 * 1024 * 1024),
-    })
-    .prefault({}),
+  limits: z.strictObject({
+    active_slots: z.literal(1).default(1),
+    active_minutes: positive.default(60),
+    agent_runs: positive,
+    repair_cycles: count.default(3),
+    infrastructure_retries: count.default(2),
+    wait_hours: positive.default(24),
+    worker_processes: positive.default(128),
+    worker_output_bytes: positive.default(16 * 1024 * 1024),
+    worker_storage_bytes: positive.default(4 * 1024 * 1024 * 1024),
+  }),
 });
 
 export type ActionsConfiguration = z.infer<typeof actionsConfigurationSchema>;
@@ -350,7 +307,7 @@ export function parseRepositoryActionsConfiguration(
       diagnostic: record && { source: record.source, name: record.name },
     };
   };
-  for (const path of [["github", "token"], ["proxy", "key"], ["session_key"]])
+  for (const path of [["github", "token"], ["session_key"]])
     if (sourceForPath(resolved.records, path)?.source !== "secret")
       rejectConfiguration(
         "source_reference_invalid",

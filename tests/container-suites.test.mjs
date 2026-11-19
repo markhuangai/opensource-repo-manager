@@ -306,27 +306,30 @@ describe("Actions lane coverage and identity", () => {
             credential_exclusion: "passed",
             no_public_listener: "passed",
             unrelated_issue: "untouched",
-            native_session_artifacts: "passed",
+            artifact_transport: [
+              {
+                method: "GET",
+                path: "/repos/owner/repo/actions/artifacts/1/zip",
+              },
+            ],
           },
         ],
       })),
     );
-  it("preserves the complete original scenario inventory in five independent chains", () => {
+  it("requires the dispatched workflow scenario inventory in five independent chains", () => {
     expect(
       Object.fromEntries(
         actionsGroups.map((group) => [group, actionsScenarios[group].length]),
       ),
     ).toEqual({
-      lifecycle: 32,
-      sessions: 8,
-      "pr-recovery": 16,
-      clarification: 19,
-      "clarification-recovery": 42,
+      lifecycle: 5,
+      sessions: 2,
+      "pr-recovery": 3,
+      clarification: 2,
+      "clarification-recovery": 5,
     });
     const all = Object.values(actionsScenarios).flat();
-    expect(all.filter((id) => !id.startsWith("controller-"))).toHaveLength(97);
-    expect(all).toHaveLength(117);
-    expect(new Set(all).size).toBe(117);
+    expect(new Set(all).size).toBe(all.length);
     expect(() => verifyActionsReceipts(lanes(), identity)).not.toThrow();
   });
   it("supports a serial profiling mode and bounded parallelism", () => {
@@ -453,6 +456,14 @@ describe("Actions lane coverage and identity", () => {
       "missing resource observations",
       (rows) => {
         delete rows[0].bounded_actions[0].resource_samples;
+      },
+    ],
+    [
+      "CPU affinity without live resource observations",
+      (rows) => {
+        rows[0].bounded_actions[0].resource_samples = [
+          { cpu_set: identity.actions_cpu_set },
+        ];
       },
     ],
     [

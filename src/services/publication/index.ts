@@ -1,5 +1,12 @@
+import {
+  RemoteTurnPending,
+  remoteRetryReasons,
+} from "../../domain/remote-turns.ts";
 import { randomUUID } from "node:crypto";
-import { createApiDiagnostics } from "../../logging/api.ts";
+import {
+  createApiDiagnostics,
+  type ApiDiagnostics,
+} from "../../logging/api.ts";
 import { mkdtemp, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -11,7 +18,11 @@ import {
 import { PublicationGit } from "../../adapters/github/git.ts";
 import type { SecretAccessor } from "../../config/secrets.ts";
 import { digest, RuntimeError, workerLimits } from "../../domain/agents.ts";
-import { IntakeError, type IssueContext } from "../../domain/jobs.ts";
+import {
+  budgetUsage,
+  IntakeError,
+  type IssueContext,
+} from "../../domain/jobs.ts";
 import type { Store } from "../../repositories/store.ts";
 import { PublicationRepository } from "../../repositories/publication.ts";
 import { InvestigationRepository } from "../../repositories/investigation.ts";
@@ -21,7 +32,7 @@ import { findingIdentity } from "../pr-monitor/policy.ts";
 import { renderFindings, stageText } from "../investigation/contracts.ts";
 import type { BootstrapLease, Supervisor } from "../../runtime/supervisor.ts";
 import { rootDirectory } from "../workspaces/files.ts";
-import { ExternalOutputReview } from "./review.ts";
+import { ExternalOutputReview, outputReviewBinding } from "./review.ts";
 import { policyIdentity } from "./scanner.ts";
 import { renderQuestion } from "../clarification-contracts.ts";
 import {
@@ -71,6 +82,7 @@ export class PublicationService {
   private readonly store: Store;
   private readonly secrets: SecretAccessor;
   private readonly options: PublicationOptions;
+  private readonly diagnostics: ApiDiagnostics;
   private readinessValidator?: (
     id: string,
     signal: AbortSignal,
@@ -85,6 +97,10 @@ export class PublicationService {
     this.store = store;
     this.secrets = secrets;
     this.options = options;
+    this.diagnostics = createApiDiagnostics(secrets, {
+      repository: supervisor.repositoryName(),
+      issue_number: store.jobs()[0]?.issue_number,
+    });
     this.repository = new PublicationRepository(store);
     this.root = join(supervisor.workspaces.privateRoot, "publication");
     this.outputReview = new ExternalOutputReview(
@@ -99,10 +115,7 @@ export class PublicationService {
         supervisor.repositoryName(),
         secrets.get("github.token"),
         () => this.repository.providerReady(),
-        createApiDiagnostics(secrets, {
-          repository: supervisor.repositoryName(),
-          issue_number: store.jobs()[0]?.issue_number,
-        }),
+        this.diagnostics,
       );
   }
 
@@ -204,6 +217,21 @@ export class PublicationService {
       lease?: BootstrapLease,
     ) => {
       const job = this.repository.current(proposal.job_id, proposal.revision);
+      if (proposal.kind === "notice") {
+        const pending = this.repository.pending(job.id);
+        if (
+          pending?.status === "prepared" &&
+          pending.retry_pending &&
+          pending.failure &&
+          remoteRetryReasons.includes(pending.failure) &&
+          !pending.review_id &&
+          pending.steps.every((step) => step.state === "prepared")
+        ) {
+          pending.status = "blocked";
+          pending.retry_pending = false;
+          this.repository.save(pending);
+        }
+      }
       const source = (
         JSON.parse(job.input_json) as { source: PublicationReceipt["source"] }
       ).source;
@@ -406,14 +434,19 @@ export class PublicationService {
         await this.store.checkpoint(publicationSignal);
         return receipt;
       } catch (error) {
+        if (error instanceof RemoteTurnPending) throw error;
         const cancelled =
           publicationSignal.aborted && error === publicationSignal.reason;
         this.failed(receipt, error);
+        const retryableAgent =
+          error instanceof RuntimeError &&
+          remoteRetryReasons.includes(error.code);
         receipt.status = receipt.steps.some(
           (step) => step.state === "dispatching" || step.state === "uncertain",
         )
           ? "uncertain"
           : cancelled ||
+              retryableAgent ||
               (error instanceof IntakeError &&
                 ["github_rate_limited", "github_publication_failed"].includes(
                   error.code,
@@ -426,7 +459,7 @@ export class PublicationService {
               ? "reviewed"
               : "prepared"
             : "blocked";
-        if (cancelled) receipt.retry_pending = true;
+        if (cancelled || retryableAgent) receipt.retry_pending = true;
         this.repository.save(receipt);
         return receipt;
       } finally {
@@ -843,6 +876,9 @@ export class PublicationService {
       )
         throw new RuntimeError("publication_evidence_mismatch");
       const parent = proposal.expected_head ?? receipt.source.sha;
+      const candidate = this.store.candidate(proposal.artifact_digest);
+      if (!candidate && !proposal.recovery_of)
+        throw new RuntimeError("publication_candidate_changed");
       this.repository.providerReady();
       await git.initialize(parent, signal);
       const message = `${proposal.commit_message}\n\nORM-Publication: ${this.repository.instance()}:${job.id}:${receipt.id}\n`;
@@ -855,6 +891,7 @@ export class PublicationService {
         receipt.timestamp,
         workerLimits(this.store.snapshot(job.snapshot_digest)).storage,
         signal,
+        candidate?.sha ?? parent,
       );
       payload.pull = {
         title: proposal.title,
@@ -1053,17 +1090,16 @@ export class PublicationService {
     const payload = operation.payload as FrozenPayload;
     const receipt = this.repository.reviewed(operation.review_id);
     const run = receipt.run_id ? this.store.run(receipt.run_id) : undefined;
-    const expected = digest({
-      job_id: jobId,
-      revision: operation.revision,
-      destination: payload.destination,
-      payload,
-      evidence: payload.evidence,
-      artifact_digest: null,
-      parent_run_id: null,
-      snapshot_digest: this.store.jobById(jobId)!.snapshot_digest,
-      policy_identity: policyIdentity,
-    });
+    const expected = outputReviewBinding(
+      {
+        job_id: jobId,
+        revision: operation.revision,
+        destination: payload.destination,
+        payload,
+        evidence: payload.evidence,
+      },
+      this.store.jobById(jobId)!.snapshot_digest,
+    );
     if (
       !payload.narrative ||
       !receipt.approved ||
@@ -1154,11 +1190,55 @@ export class PublicationService {
     }
     if (receipt.proposal.kind === "change") {
       const branch = await this.writer.branch(receipt.target.branch, signal);
-      if (
-        receipt.target.branch === repository.default_branch ||
-        branch.protected
-      )
+      if (receipt.target.branch === repository.default_branch)
         throw new RuntimeError("publication_branch_protected");
+      const candidate = this.store.candidate(receipt.proposal.artifact_digest);
+      if (
+        candidate &&
+        !receipt.steps.some(
+          (step) => step.kind === "branch" && step.state === "confirmed",
+        )
+      ) {
+        const observed = (await this.writer.branch(candidate.branch, signal))
+          .head;
+        if (observed !== candidate.sha) {
+          const job = this.store.jobById(receipt.job_id)!;
+          const implementation = new ImplementationRepository(
+            this.store,
+          ).current(job);
+          const audit = implementation?.audits.find(
+            (item) => item.id === implementation.audit_id,
+          );
+          const run = audit && this.store.run(audit.run_id);
+          const budget = budgetUsage.parse(JSON.parse(job.budget_json));
+          const limits = this.store.snapshot(job.snapshot_digest).settings
+            .limits;
+          this.diagnostics.event("agent.stale_audit", {
+            issue_number: job.issue_number,
+            phase: job.phase,
+            revision: job.revision,
+            role: "audit",
+            runner: audit?.profile.sdk,
+            ...(run ? JSON.parse(run.binding_json) : {}),
+            operation_id: receipt.id,
+            expected_sha: candidate.sha,
+            observed_sha: observed,
+            work_branch: candidate.branch,
+            outcome: "rejected",
+            remaining_active_ms: Math.max(
+              0,
+              limits.active_minutes * 60_000 - budget.active_ms,
+            ),
+            remaining_agent_runs: Math.max(
+              0,
+              limits.agent_runs - budget.agent_runs,
+            ),
+            recovery:
+              "Rebuild the change from verified source, then obtain a new audit and test receipt.",
+          });
+          throw new RuntimeError("agent_candidate_moved");
+        }
+      }
       if (branch.head !== receipt.target.head)
         throw new RuntimeError("publication_head_changed");
       const base = await this.writer.branch(repository.default_branch, signal);

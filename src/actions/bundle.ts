@@ -12,8 +12,9 @@ import { Readable, Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip, createGunzip } from "node:zlib";
 import { z } from "zod";
-import { digest, sdkVersions } from "../domain/agents.ts";
+import { digest } from "../domain/agents.ts";
 import { StateError } from "../domain/durability.ts";
+import { remoteDev } from "../domain/remote-turns.ts";
 
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const positive = z.number().int().positive().safe();
@@ -61,7 +62,7 @@ export function runtimeDigest() {
     node: process.version,
     platform: process.platform,
     architecture: process.arch,
-    sdks: sdkVersions,
+    provider: remoteDev.sha,
   });
 }
 

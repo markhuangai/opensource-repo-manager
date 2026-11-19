@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -17,10 +15,9 @@ import {
 } from "/opt/orm/app/dist/config/load.js";
 import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
+import { RuntimeError } from "/opt/orm/app/dist/domain/agents.js";
 import { userProcesses } from "/opt/orm/app/dist/runtime/process.js";
 import { createPublicationFixture } from "/publication-fixture.ts";
-import { respond as claude } from "/agent-fixtures/claude.mjs";
-import { respond as codex } from "/agent-fixtures/codex.mjs";
 import { sourceFiles, bundlesWithCanaries, modelFixture } from "./protocol.mjs";
 
 async function until(check, message) {
@@ -41,14 +38,6 @@ export async function runInvestigationTests() {
   const proof = [],
     errors = [];
   let fixture, sdk, store, supervisor, intake, investigation;
-  const model = createServer((req, res) => {
-    if (fixture?.unavailable) {
-      res.writeHead(503).end("Model unavailable");
-      return;
-    }
-    return (sdk === "claude" ? claude : codex)(req, res, fixture);
-  });
-  await new Promise((resolve) => model.listen(0, "127.0.0.1", resolve));
   const logs = [],
     logger = {
       info: (message) => logs.push(message),
@@ -75,18 +64,7 @@ export async function runInvestigationTests() {
       );
       config.github.repository = "owner/repo";
       config.github.token = remote.state.token;
-      config.proxy.url = `http://127.0.0.1:${model.address().port}/v1`;
-      config.proxy.key = `investigation-proxy-${randomUUID()}`;
-      config.profiles = {
-        worker:
-          sdk === "codex"
-            ? { sdk, model: "gpt-5.5", effort: "xhigh" }
-            : {
-                sdk,
-                model: "auto",
-                effort: "xhigh",
-              },
-      };
+      config.profiles = { worker: { sdk } };
       for (const role of Object.keys(config.roles)) {
         config.roles[role].profile = "worker";
       }
@@ -109,9 +87,10 @@ export async function runInvestigationTests() {
           baseUrl: remote.url,
           log: { debug: silent, info: silent, warn: silent, error: silent },
         });
+        fixture = modelFixture(config, store, runtimeRoot, controls, remote);
         supervisor = await Supervisor.create(store, snapshot, secrets, {
           root: runtimeRoot,
-          workers: { [sdk]: `/opt/orm/app/dist/adapters/agents/${sdk}.js` },
+          agents: fixture.agents,
           sourceUrl: () => remote.url + "/owner/repo.git",
           publicationWriter: (ready) =>
             new OctokitWriter("owner/repo", client, ready),
@@ -153,7 +132,6 @@ export async function runInvestigationTests() {
           logger,
           () => remote.url + "/owner/repo.git",
         );
-        fixture = modelFixture(config, store, runtimeRoot, controls);
         for (const number of remote.state.issues.keys())
           await intake.enrollIssue(number, AbortSignal.timeout(10000));
       };
@@ -371,8 +349,8 @@ export async function runInvestigationTests() {
         assert.equal(comments.length, 1);
         assert.equal(
           JSON.parse(store.job(lateFailure.issue_number).budget_json)
-            .model_requests,
-          budget.model_requests,
+            .agent_runs,
+          budget.agent_runs,
         );
         const finalPublications = supervisor.publication.repository.operation(
           blocked.publication_id,
@@ -536,7 +514,7 @@ export async function runInvestigationTests() {
         if (saved.bootstrap_receipt)
           assert.equal(resumed.bootstrap_receipt, saved.bootstrap_receipt);
         assert(finalUsage.active_ms >= usage.active_ms);
-        assert(finalUsage.model_requests >= usage.model_requests);
+        assert(finalUsage.agent_runs >= usage.agent_runs);
         assert(
           finalUsage.infrastructure_retries >= usage.infrastructure_retries,
         );
@@ -547,7 +525,7 @@ export async function runInvestigationTests() {
         if (boundary === "active_worker") {
           assert.equal(
             finalUsage.infrastructure_retries,
-            usage.infrastructure_retries + 1,
+            usage.infrastructure_retries,
           );
           const inspecting = store.db
             .prepare(
@@ -579,11 +557,10 @@ export async function runInvestigationTests() {
         );
         assert.equal(comments.length, 1);
         assert.equal(comments[0].id, commentId);
-        const requests = finalUsage.model_requests;
+        const requests = finalUsage.agent_runs;
         await investigation.reconcile();
         assert.equal(
-          JSON.parse(store.job(recovering.issue_number).budget_json)
-            .model_requests,
+          JSON.parse(store.job(recovering.issue_number).budget_json).agent_runs,
           requests,
         );
         proof.push({ sdk, recovery_checkpoint: boundary, result: "passed" });
@@ -595,23 +572,20 @@ export async function runInvestigationTests() {
           "UPDATE jobs SET budget_json=json_set(budget_json,'$.infrastructure_retries',?) WHERE id=?",
         )
         .run(config.limits.infrastructure_retries, retryLimited.id);
-      let stoppingAtLimit;
       controls.investigate = async (_task, value) => {
         if (value.job.id === retryLimited.id)
-          stoppingAtLimit ??= investigation.stop();
+          throw new RuntimeError("agent_run_failed");
       };
       await investigation.reconcile();
-      assert(
-        stoppingAtLimit,
-        "Worker interruption at the retry limit was not reached",
-      );
-      await stoppingAtLimit;
       controls.investigate = undefined;
-      assert(record(retryLimited).agent_pending);
+      assert.equal(
+        record(retryLimited).failure,
+        "infrastructure_budget_exhausted",
+      );
       const limitedRuns = store.runs().length,
         limitedRequests = JSON.parse(
           store.job(retryLimited.issue_number).budget_json,
-        ).model_requests;
+        ).agent_runs;
       await closeRuntime();
       await start();
       await investigation.reconcile();
@@ -621,7 +595,7 @@ export async function runInvestigationTests() {
       );
       const exhaustedBudget = store.job(retryLimited.issue_number).budget_json;
       assert.equal(JSON.parse(exhaustedBudget).infrastructure_exhausted, true);
-      assert.equal(JSON.parse(exhaustedBudget).model_requests, limitedRequests);
+      assert.equal(JSON.parse(exhaustedBudget).agent_runs, limitedRequests);
       assert.equal(store.runs().length, limitedRuns);
       remote.state.issues.get(retryLimited.issue_number).body +=
         " New information after exhaustion.";
@@ -754,7 +728,7 @@ export async function runInvestigationTests() {
         assert.equal(recovered.agent_pending, blocked.agent_pending);
         assert.equal(recovered.status_operation, pending.id);
         assert.equal(store.runs().length, runs);
-        assert.equal(usage.model_requests, budget.model_requests);
+        assert.equal(usage.agent_runs, budget.agent_runs);
         assert.equal(comments.length, 1);
         assert.equal(comments[0].id, commentId);
         assert.equal(
@@ -798,9 +772,9 @@ export async function runInvestigationTests() {
       const exhausted = await add("source_only");
       store.db
         .prepare(
-          "UPDATE jobs SET budget_json=json_set(budget_json,'$.model_requests',?) WHERE id=?",
+          "UPDATE jobs SET budget_json=json_set(budget_json,'$.agent_runs',?) WHERE id=?",
         )
-        .run(config.limits.model_requests, exhausted.id);
+        .run(config.limits.agent_runs, exhausted.id);
       await investigation.reconcile();
       assert.equal(record(exhausted).stage, "blocked");
       assert(!store.runs().some((entry) => entry.job_id === exhausted.id));
@@ -963,7 +937,6 @@ export async function runInvestigationTests() {
       proof.push({ sdk, restart_after_publication_before_handoff: "passed" });
 
       assert(!logs.join("\n").includes(config.github.token));
-      assert(!logs.join("\n").includes(config.proxy.key));
       await closeRuntime();
       for (const uid of [10001, 10002, 10003])
         assert.deepEqual(await userProcesses(uid), []);
@@ -977,9 +950,5 @@ export async function runInvestigationTests() {
   } finally {
     await closeRuntime();
     await remote.close();
-    for (const server of [model]) {
-      server.closeAllConnections();
-      await new Promise((resolve) => server.close(resolve));
-    }
   }
 }

@@ -1,3 +1,7 @@
+import {
+  RemoteTurnPending,
+  remoteRetryReasons,
+} from "../../domain/remote-turns.ts";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
@@ -31,6 +35,7 @@ import {
 } from "./policy.ts";
 
 const transient = new Set([
+  ...remoteRetryReasons,
   "github_read_failed",
   "github_graphql_failed",
   "github_rate_limited",
@@ -161,6 +166,7 @@ export class PrMonitorService {
         }
         await this.observe(record, policyDigest, signal);
       } catch (error) {
+        if (error instanceof RemoteTurnPending) throw error;
         if (signal.aborted) return;
         await this.failed(record, error, signal);
       } finally {
@@ -449,7 +455,6 @@ export class PrMonitorService {
     try {
       this.assertWaitBudget(record);
       this.repository.current(record);
-      this.resumePending(record);
       let snapshot = await this.read(record, signal);
       this.assertWaitBudget(record);
       record.wait_accounted_at = null;
@@ -531,6 +536,11 @@ export class PrMonitorService {
         record.pending_agent = null;
         record.assessment_digest = digest(surfaces);
         snapshot = refreshed;
+      } else if (record.pending_agent) {
+        record.pending_agent = null;
+        const implementation = this.repository.implementation(record);
+        implementation.agent_pending = null;
+        this.implementation.repository.save(implementation);
       }
       record.stage = "queued";
       record.snapshot_digest = this.repository.evidence({
@@ -577,6 +587,7 @@ export class PrMonitorService {
       record.wait_accounted_at = Date.now();
       this.repository.save(record);
     } catch (error) {
+      if (error instanceof RemoteTurnPending) throw error;
       if (!signal.aborted) await this.failed(record, error, signal);
     } finally {
       this.active = false;
@@ -778,18 +789,6 @@ export class PrMonitorService {
     }
   }
 
-  private resumePending(record: PrMonitor) {
-    const pending = record.pending_agent;
-    if (!pending) return;
-    if (!this.store.reserveInfrastructureRetry(record.job_id))
-      throw new RuntimeError("infrastructure_budget_exhausted");
-    record.pending_agent = null;
-    const implementation = this.repository.implementation(record);
-    implementation.agent_pending = null;
-    this.implementation.repository.save(implementation);
-    this.repository.save(record);
-  }
-
   private async report(
     record: PrMonitor,
     stage: "waiting" | "blocked" | "ready",
@@ -901,9 +900,13 @@ export class PrMonitorService {
     }
     this.invalidate(record);
     this.repository.accountWait(record);
+    const pending = this.supervisor.publication.repository.pending(
+      record.job_id,
+    );
     if (
       transient.has(code) &&
-      this.store.reserveInfrastructureRetry(record.job_id)
+      ((pending?.retry_pending && pending.failure === code) ||
+        this.store.reserveInfrastructureRetry(record.job_id))
     ) {
       record.stage = "waiting";
       record.wait_accounted_at ??= Date.now();

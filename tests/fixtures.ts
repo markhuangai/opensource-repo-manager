@@ -12,17 +12,10 @@ import { githubFixtureRequest, githubFixtureState } from "./fixtures/github.ts";
 
 export function fixtureConfigurationSources() {
   return parseConfigurationSources(
-    JSON.stringify({
-      CODING_MODEL: "your-claude-model-id",
-      CODING_MODEL_EFFORT: "high",
-      REVIEW_MODEL: "your-codex-model-id",
-      REVIEW_MODEL_EFFORT: "high",
-    }),
+    "{}",
     JSON.stringify({
       ORM_GITHUB_TOKEN: "github-fixture-token",
-      ORM_PROXY_KEY: "proxy-fixture-key",
       ORM_SESSION_KEY: Buffer.alloc(32, 13).toString("base64"),
-      PROXY_URL: "https://proxy.example.invalid/v1",
     }),
   );
 }
@@ -42,7 +35,6 @@ export async function fixtureSnapshot(
   model = "fixture-model",
   config = fixtureConfiguration(),
 ) {
-  config.profiles.coding.model = model;
   const { settings, secrets } = separateSecrets(config);
   const bundles = await loadWorkflowBundles(settings, secrets, {
     prompts: fileURLToPath(
@@ -52,7 +44,17 @@ export async function fixtureSnapshot(
       new URL("../examples/workflow/skills", import.meta.url),
     ),
   });
-  return { snapshot: createRunSnapshot(settings, bundles, secrets), secrets };
+  const fixtureBundles = {
+    ...bundles,
+    implementation: {
+      ...bundles.implementation,
+      system: bundles.implementation.system + "\n" + model,
+    },
+  };
+  return {
+    snapshot: createRunSnapshot(settings, fixtureBundles, secrets),
+    secrets,
+  };
 }
 
 export async function fixtureGitHub() {

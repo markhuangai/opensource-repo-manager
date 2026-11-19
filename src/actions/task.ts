@@ -8,6 +8,7 @@ import { PrMonitorRepository } from "../repositories/pr-monitor.ts";
 import { PublicationRepository } from "../repositories/publication.ts";
 import type { Application } from "../runtime/application.ts";
 import { currentContinuation } from "../services/clarification.ts";
+import { RemoteTurnPending } from "../domain/remote-turns.ts";
 
 export type TaskRequest = Readonly<{ issue_number: number }>;
 export type TaskResult = Readonly<{
@@ -27,6 +28,7 @@ export type TaskResult = Readonly<{
     | "clarification_reply_limit"
     | "clarification_scope_changed"
     | "remote_checks"
+    | "agent_run"
     | "monitor_disabled"
     | "retry_scheduled"
     | "human_review"
@@ -231,11 +233,25 @@ export async function executeTask(
   signal: AbortSignal,
 ): Promise<TaskResult> {
   const { intake, store, investigation, monitor } = application;
+  const waitingForAgent = async (): Promise<TaskResult> => {
+    try {
+      await application.agents?.flush(signal);
+    } catch (error) {
+      if (!(error instanceof RemoteTurnPending)) throw error;
+    }
+    return {
+      version: 1,
+      ...taskIdentity(store, request),
+      outcome: "waiting",
+      reason: "agent_run",
+    };
+  };
   let context: IssueContext;
   try {
     context = await intake.enrollIssue(request.issue_number, signal);
     await store.checkpoint(signal);
   } catch (error) {
+    if (error instanceof RemoteTurnPending) return waitingForAgent();
     if (
       error instanceof IntakeError &&
       error.code === "publication_pending" &&
@@ -248,6 +264,12 @@ export async function executeTask(
         reason: "retry_scheduled",
         retry_at: error.retryAt,
       };
+    throw error;
+  }
+  try {
+    await application.agents?.cancelSuperseded(signal);
+  } catch (error) {
+    if (error instanceof RemoteTurnPending) return waitingForAgent();
     throw error;
   }
   if (context.state === "closed")
@@ -269,6 +291,7 @@ export async function executeTask(
       signal.throwIfAborted();
       await monitor.reconcile(signal);
       signal.throwIfAborted();
+      await application.agents?.cancelSuperseded(signal);
       await store.checkpoint(signal, true);
       const outcome = taskOutcome(store, request, monitor.enabled());
       if (outcome) return outcome;
@@ -281,6 +304,7 @@ export async function executeTask(
         };
     }
   } catch (error) {
+    if (error instanceof RemoteTurnPending) return waitingForAgent();
     return {
       version: 1,
       ...taskIdentity(store, request),

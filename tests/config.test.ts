@@ -19,7 +19,6 @@ function repositoryConfiguration() {
   return {
     version: config.version,
     github: { token: { from_secret: "ORM_GITHUB_TOKEN" } },
-    proxy: { url: config.proxy.url, key: { from_secret: "ORM_PROXY_KEY" } },
     session_key: { from_secret: "ORM_SESSION_KEY" },
     profiles: config.profiles,
     roles: config.roles,
@@ -39,36 +38,40 @@ describe("repository configuration sources", () => {
       sources,
     );
 
-  it("resolves the supplied example, shared variables, and referenced SDKs before validation", () => {
+  it("selects named harness profiles from trusted sources while requiring secret provenance", () => {
     const input = repositoryConfiguration();
-    Object.assign(input.proxy, { url: { from_secret: "PROXY_URL" } });
-    Object.assign(input.profiles.coding, {
-      sdk: { from_variable: "CODING_SDK" },
-      model: { from_variable: "CODING_MODEL" },
-      effort: { from_variable: "CODING_MODEL_EFFORT" },
+    Object.assign(input.roles.implementation, {
+      profile: { from_variable: "CODING_PROFILE" },
     });
-    Object.assign(input.profiles.review, {
-      model: { from_variable: "REVIEW_MODEL" },
-      effort: { from_variable: "CODING_MODEL_EFFORT" },
+    Object.assign(input.limits, {
+      agent_runs: { from_variable: "AGENT_RUNS", format: "json" },
     });
     const sources = fixtureConfigurationSources();
-    const result = parse(input, {
-      ...sources,
-      variables: { ...sources.variables, CODING_SDK: "claude" },
-    });
-    expect(result.configuration.profiles).toEqual(
-      fixtureConfiguration().profiles,
-    );
-    expect(result.configuration.proxy.url).toBe(sources.secrets.PROXY_URL);
-    expect(result.sessionKey).toBe(sources.secrets.ORM_SESSION_KEY);
+    const variables = { CODING_PROFILE: "review", AGENT_RUNS: "16" };
+    const { configuration } = parse(input, { ...sources, variables });
     expect(
-      result.sources.filter((source) => source.name === "CODING_MODEL_EFFORT"),
-    ).toHaveLength(2);
-    expect(result.sources.every((source) => source.line && source.column)).toBe(
-      true,
-    );
+      configuration.profiles[configuration.roles.implementation.profile],
+    ).toEqual({ sdk: "codex" });
+    expect(configuration.limits.agent_runs).toBe(16);
+    Object.assign(input.github, { token: { from_variable: "TOKEN" } });
+    expect(() =>
+      parse(input, {
+        ...sources,
+        variables: { ...variables, TOKEN: "fixture-unsafe-token" },
+      }),
+    ).toThrow("source_reference_invalid");
+    for (const session_key of [
+      sources.secrets.ORM_SESSION_KEY,
+      { from_variable: "KEY" },
+    ]) {
+      expect(() =>
+        parse(Object.assign(repositoryConfiguration(), { session_key }), {
+          ...sources,
+          variables: { KEY: sources.secrets.ORM_SESSION_KEY },
+        }),
+      ).toThrow("source_reference_invalid");
+    }
   });
-
   it("retains source locations through profile and cross-field policy validation", () => {
     const defaults = fixtureConfigurationSources();
     for (const [selector, expected, observed] of [
@@ -191,192 +194,6 @@ describe("repository configuration sources", () => {
     ).toThrow("source_value_invalid");
   });
 
-  it("preserves literals even when both stores contain competing values", () => {
-    const input = repositoryConfiguration();
-    const sources = fixtureConfigurationSources();
-    const result = parse(input, {
-      ...sources,
-      variables: { ...sources.variables, PROXY_URL: "https://other.invalid" },
-      secrets: { ...sources.secrets, CODING_MODEL: "other-model" },
-    });
-    expect(result.configuration.proxy.url).toBe(input.proxy.url);
-    expect(result.configuration.profiles).toEqual(input.profiles);
-  });
-
-  it("selects only the named namespace, without fallback, and accepts case-insensitive names", () => {
-    const input = repositoryConfiguration();
-    Object.assign(input.profiles.coding, {
-      model: { from_variable: "coding_model" },
-    });
-    Object.assign(input.profiles.review, {
-      model: { from_secret: "CODING_MODEL" },
-    });
-    const defaults = fixtureConfigurationSources();
-    const sources = {
-      ...defaults,
-      secrets: { ...defaults.secrets, CODING_MODEL: "private-review-model" },
-    };
-    const result = parse(input, sources).configuration;
-    expect(result.profiles.coding.model).toBe(defaults.variables.CODING_MODEL);
-    expect(result.profiles.review.model).toBe("private-review-model");
-    const variables = { ...defaults.variables };
-    delete variables.CODING_MODEL;
-    expect(() => parse(input, { ...sources, variables })).toThrow(
-      "source_missing",
-    );
-    expect(() => parse(input, defaults)).toThrow("source_missing");
-  });
-
-  it("decodes JSON false, zero, arrays, and objects without resolving references inside returned data", () => {
-    const input = repositoryConfiguration();
-    Object.assign(input.pr_monitor, {
-      enabled: { from_variable: "ENABLED", format: "json" },
-    });
-    Object.assign(input.limits, {
-      repair_cycles: { from_variable: "REPAIRS", format: "json" },
-    });
-    Object.assign(input.roles.implementation, {
-      skills: { from_variable: "SKILLS", format: "json" },
-    });
-    Object.assign(input.profiles, {
-      review: { from_variable: "PROFILE", format: "json" },
-    });
-    const sources = fixtureConfigurationSources();
-    const variables = {
-      ...sources.variables,
-      ENABLED: "false",
-      REPAIRS: "0",
-      SKILLS: JSON.stringify(["example", "implement"]),
-      PROFILE: JSON.stringify({ sdk: "codex", model: "123", effort: "high" }),
-    };
-    const result = parse(input, { ...sources, variables }).configuration;
-    expect(result.pr_monitor.enabled).toBe(false);
-    expect(result.limits.repair_cycles).toBe(0);
-    expect(result.roles.implementation.skills).toEqual([
-      "example",
-      "implement",
-    ]);
-    expect(result.profiles.review.model).toBe("123");
-    variables.PROFILE = JSON.stringify({
-      sdk: "codex",
-      model: { from_secret: "ORM_GITHUB_TOKEN" },
-      effort: "high",
-    });
-    expect(() => parse(input, { ...sources, variables })).toThrow(
-      "schema_invalid",
-    );
-  });
-
-  it("keeps unformatted external text unchanged and rejects invalid formats and domain values", () => {
-    const input = repositoryConfiguration();
-    const sources = fixtureConfigurationSources();
-    Object.assign(input.profiles.coding, { model: { from_variable: "MODEL" } });
-    expect(
-      parse(input, { ...sources, variables: { MODEL: "123" } }).configuration
-        .profiles.coding.model,
-    ).toBe("123");
-    for (const model of [
-      { from_variable: "MODEL", from_secret: "MODEL" },
-      { from_variable: "MODEL", format: "yaml" },
-      { from_variable: "MODEL", unknown: true },
-      { from_variable: 7 },
-    ]) {
-      Object.assign(input.profiles.coding, { model });
-      expect(() =>
-        parse(input, { ...sources, variables: { MODEL: "123" } }),
-      ).toThrow("Configuration rejected");
-    }
-    Object.assign(input.profiles.coding, {
-      model: "literal",
-      effort: { from_variable: "EFFORT" },
-    });
-    expect(() =>
-      parse(input, { ...sources, variables: { EFFORT: "ultra" } }),
-    ).toThrow("schema_invalid");
-    Object.assign(input.profiles.coding, { effort: "high" });
-    Object.assign(input.limits, {
-      repair_cycles: { from_variable: "COUNT", format: "json" },
-    });
-    expect(() =>
-      parse(input, { ...sources, variables: { COUNT: "not-json-canary" } }),
-    ).toThrow("source_value_invalid");
-    expect(() =>
-      parse(input, { ...sources, variables: { COUNT: '"0"' } }),
-    ).toThrow("schema_invalid");
-  });
-
-  it("requires secret provenance for every authentication field, including referenced objects", () => {
-    const defaults = fixtureConfigurationSources();
-    for (const field of ["github", "proxy", "session_key"] as const) {
-      for (const value of [
-        "committed-credential",
-        { from_variable: "TOKEN" },
-      ]) {
-        const input = repositoryConfiguration();
-        if (field === "session_key")
-          Object.assign(input, { session_key: value });
-        else
-          Object.assign(input[field], {
-            [field === "github" ? "token" : "key"]: value,
-          });
-        expect(() =>
-          parse(input, {
-            ...defaults,
-            variables: { TOKEN: defaults.secrets.ORM_GITHUB_TOKEN },
-          }),
-        ).toThrow("source_reference_invalid");
-      }
-    }
-    const input = repositoryConfiguration();
-    Object.assign(input, {
-      github: { from_secret: "GITHUB_CONFIG", format: "json" },
-    });
-    expect(
-      parse(input, {
-        ...defaults,
-        secrets: {
-          ...defaults.secrets,
-          GITHUB_CONFIG: JSON.stringify({
-            token: defaults.secrets.ORM_GITHUB_TOKEN,
-          }),
-        },
-      }).configuration.github.repository,
-    ).toBe("owner/repo");
-    Object.assign(input, {
-      github: { from_variable: "GITHUB_CONFIG", format: "json" },
-    });
-    expect(() =>
-      parse(input, {
-        ...defaults,
-        variables: {
-          GITHUB_CONFIG: JSON.stringify({
-            token: defaults.secrets.ORM_GITHUB_TOKEN,
-          }),
-        },
-      }),
-    ).toThrow("source_reference_invalid");
-  });
-
-  it("keeps private setting redaction separate from authentication scanning", () => {
-    const input = repositoryConfiguration();
-    Object.assign(input.profiles.coding, {
-      model: { from_secret: "PRIVATE_MODEL" },
-    });
-    const defaults = fixtureConfigurationSources();
-    const { configuration } = parse(input, {
-      ...defaults,
-      secrets: { ...defaults.secrets, PRIVATE_MODEL: "private-model-canary" },
-    });
-    const { settings, secrets } = separateSecrets(configuration);
-    expect(settings.profiles.coding.model).toBe("private-model-canary");
-    expect(secrets.containsCredentials(settings)).toBe(false);
-    expect(
-      secrets.redact("private-model-canary " + configuration.proxy.url),
-    ).toBe("[redacted] [redacted]");
-    expect(settings).not.toHaveProperty("redaction_values");
-    expect(secrets.containsCredentials(configuration.github.token)).toBe(true);
-  });
-
   it("rejects unsafe contexts and recursive or oversized input without echoing private content", () => {
     for (const context of [
       '{"SECRET":',
@@ -410,29 +227,14 @@ describe("repository configuration sources", () => {
 });
 
 describe("strict protected configuration contract", () => {
-  it("accepts proxy model IDs without capability declarations and rejects the retired field", () => {
-    const config = fixtureConfiguration();
-    config.profiles.coding = {
-      sdk: "claude",
-      model: "proxy/custom-model",
-      effort: "xhigh",
-    };
-    expect(
-      parseActionsConfiguration(stringify(config)).profiles.coding,
-    ).toEqual(config.profiles.coding);
-    Object.assign(config.profiles.coding, { behaves_as: "claude-opus-4-8" });
-    expect(() => parseActionsConfiguration(stringify(config))).toThrow(
-      "schema_invalid",
-    );
-  });
-  it("accepts the documented example with both SDKs and v1 defaults", () => {
+  it("accepts the documented example with both SDKs and v2 limits", () => {
     const config = fixtureConfiguration();
     expect(config.profiles.coding.sdk).toBe("claude");
     expect(config.profiles.review.sdk).toBe("codex");
     expect(config.limits).toEqual({
       active_slots: 1,
       active_minutes: 60,
-      model_requests: 200,
+      agent_runs: 200,
       repair_cycles: 3,
       infrastructure_retries: 2,
       wait_hours: 24,
@@ -441,31 +243,6 @@ describe("strict protected configuration contract", () => {
       worker_storage_bytes: 4 * 1024 ** 3,
     });
   });
-  for (const [sdk, efforts] of [
-    ["claude", ["low", "medium", "high", "xhigh", "max"]],
-    [
-      "codex",
-      [
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max",
-        "ultra",
-        "persistent",
-      ],
-    ],
-  ] as const) {
-    for (const effort of efforts)
-      it(`accepts ${sdk}/${effort} for any phase`, () => {
-        const config = fixtureConfiguration();
-        Object.assign(config.profiles.coding, { sdk, effort });
-        expect(
-          parseActionsConfiguration(stringify(config)).profiles.coding.effort,
-        ).toBe(effort);
-      });
-  }
   it("keeps configurable budgets and credentials outside the snapshot", () => {
     const config = fixtureConfiguration();
     config.limits.active_minutes = 30;
@@ -476,13 +253,13 @@ describe("strict protected configuration contract", () => {
     const { settings, secrets } = separateSecrets(config);
     expect(secrets.containsCredentials(settings)).toBe(false);
     expect(secrets.get("github.token")).toBe(config.github.token);
-    expect(secrets.redact(config.proxy.key)).toBe("[redacted]");
+    expect(secrets.redact(config.github.token)).toBe("[redacted]");
   });
   const invalid = [
     [
       "unsupported version",
       (c: ReturnType<typeof fixtureConfiguration>) =>
-        Object.assign(c, { version: 2 }),
+        Object.assign(c, { version: 1 }),
     ],
     [
       "unknown settings",
@@ -530,9 +307,9 @@ describe("strict protected configuration contract", () => {
         Object.assign(c.github, { repository: ["a/b", "c/d"] }),
     ],
     [
-      "credential-bearing proxy URL",
+      "removed inline relay settings",
       (c: ReturnType<typeof fixtureConfiguration>) =>
-        Object.assign(c.proxy, {
+        Object.assign(c, {
           url: "https://user:password@example.invalid",
         }),
     ],
