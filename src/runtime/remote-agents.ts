@@ -180,7 +180,7 @@ export class RemoteAgents {
       signal,
     );
     const workflowId = await this.api.workflow(signal);
-    const { budget, timeout } = this.allowLaunch(request);
+    const timeout = this.allowLaunch(request);
     const turn = turnSchema.parse({
       id,
       job_id: request.job_id,
@@ -200,8 +200,6 @@ export class RemoteAgents {
       run_id: null,
       elapsed_ms: null,
     });
-    budget.agent_runs++;
-    this.store.replaceBudget(request.job_id, request.revision, budget);
     await this.state.setAgentTurn(turn, signal);
     this.event(turn, "dispatch", { outcome: "authorized" });
     let idFromDispatch: number;
@@ -326,7 +324,7 @@ export class RemoteAgents {
     if (budget.agent_runs >= limits.agent_runs)
       throw new RuntimeError("agent_run_limit");
     if (timeout < 1) throw new RuntimeError("active_budget_exhausted");
-    return { budget, timeout };
+    return timeout;
   }
 
   private async run(turn: RemoteTurn, signal: AbortSignal, receiptId?: number) {
@@ -399,8 +397,6 @@ export class RemoteAgents {
       throw new RemoteTurnPending();
     }
     const elapsed = run ? await this.api.executionTime(run, signal) : 0;
-    const job = this.store.jobById(turn.job_id);
-    if (job && elapsed) this.charge(job.id, job.revision, elapsed);
     await this.state.setAgentTurn(null, signal, elapsed);
   }
 
@@ -427,7 +423,6 @@ export class RemoteAgents {
     if (turn.elapsed_ms === null) {
       const elapsed = await this.api.executionTime(run, signal);
       this.job(request.job_id, request.revision);
-      this.charge(request.job_id, request.revision, elapsed);
       turn = { ...turn, run_id: run.id, elapsed_ms: elapsed };
       await this.state.setAgentTurn(turn, signal);
     }
@@ -460,14 +455,6 @@ export class RemoteAgents {
       if (error instanceof IntakeError && retry) throw error;
       throw new RuntimeError(cause);
     }
-  }
-
-  private charge(job: number, revision: number, elapsed: number) {
-    const budget = budgetUsage.parse(
-      JSON.parse(this.store.jobById(job)!.budget_json),
-    );
-    budget.active_ms += elapsed;
-    this.store.replaceBudget(job, revision, budget);
   }
 
   private async result(

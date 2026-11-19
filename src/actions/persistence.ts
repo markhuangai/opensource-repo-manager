@@ -685,23 +685,46 @@ export class ActionsState implements TaskDurability {
     return { repository, issue, task_id, author_id, agent_turn };
   }
 
-  setAgentTurn(turn: RemoteTurn | null, signal: AbortSignal, elapsed = 0) {
+  setAgentTurn(
+    turn: RemoteTurn | null,
+    signal: AbortSignal,
+    retiredElapsed = 0,
+  ) {
     return this.serial(async () => {
       this.bindComment();
+      const previous = this.comment.state;
       const state = this.restoredResult
-        ? {
-            ...this.comment.state,
-            budget: {
-              ...this.comment.state.budget,
-              active_ms: this.comment.state.budget.active_ms + elapsed,
-            },
-          }
-        : this.repository.project(this.comment.state, this.snapshot);
+        ? previous
+        : this.repository.project(previous, this.snapshot);
+      const launches = Number(
+        turn !== null && turn.id !== previous.agent_turn?.id,
+      );
+      const elapsed =
+        !launches && previous.agent_turn?.elapsed_ms === null
+          ? (turn?.elapsed_ms ?? retiredElapsed)
+          : 0;
+      const budget = {
+        ...state.budget,
+        agent_runs: state.budget.agent_runs + launches,
+        active_ms: state.budget.active_ms + elapsed,
+      };
+      const active = state.active && {
+        ...state.active,
+        deadline: Math.max(
+          state.active.accounted_at,
+          state.active.deadline - elapsed,
+        ),
+      };
       await this.write(
-        { ...state, agent_turn: turn },
+        { ...state, budget, active, agent_turn: turn },
         this.comment.narrative,
         signal,
       );
+      const job = this.store.job(state.issue.number);
+      if (job && (launches || elapsed)) {
+        // Local lease accounting can advance while GitHub confirms the write.
+        this.store.applyAgentUsage(job.id, job.revision, launches, elapsed);
+      }
     }, signal);
   }
   question(): Question | null {

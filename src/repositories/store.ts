@@ -541,7 +541,7 @@ CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT
   }
 
   accountActive(token: string, now = Date.now()) {
-    this.db
+    return this.db
       .transaction(() => {
         const lease = this.db
           .prepare(
@@ -565,6 +565,7 @@ CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT
         this.db
           .prepare("UPDATE runtime_leases SET accounted_at=? WHERE token=?")
           .run(until, token);
+        return lease.deadline;
       })
       .immediate();
   }
@@ -742,6 +743,36 @@ CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT
         .changes !== 1
     )
       throw new RuntimeError("revision_stale");
+  }
+
+  applyAgentUsage(
+    job: number,
+    revision: number,
+    launches: number,
+    elapsed: number,
+  ) {
+    this.db
+      .transaction(() => {
+        if (
+          this.db
+            .prepare(
+              `UPDATE jobs SET budget_json=json_set(budget_json,
+              '$.agent_runs', json_extract(budget_json,'$.agent_runs')+?,
+              '$.active_ms', json_extract(budget_json,'$.active_ms')+?)
+            WHERE id=? AND revision=?`,
+            )
+            .run(launches, elapsed, job, revision).changes !== 1
+        )
+          throw new RuntimeError("revision_stale");
+        if (elapsed)
+          this.db
+            .prepare(
+              `UPDATE runtime_leases SET deadline=max(accounted_at, deadline-?)
+             WHERE token IN (SELECT token FROM coding_lease WHERE job_id=?)`,
+            )
+            .run(elapsed, job);
+      })
+      .immediate();
   }
 
   remoteResult(key: string) {

@@ -30,6 +30,7 @@ import { ImplementationRepository } from "../src/repositories/implementation.ts"
 import { IntakeService } from "../src/services/intake.ts";
 import { separateSecrets } from "../src/config/secrets.ts";
 import { digest } from "../src/domain/agents.ts";
+import { turnSchema } from "../src/domain/remote-turns.ts";
 import { fixtureConfiguration, fixtureSnapshot } from "./fixtures.ts";
 import { createPublicationFixture } from "./fixtures/publication.ts";
 
@@ -145,6 +146,32 @@ async function setup() {
     open,
     read,
   };
+}
+
+function agentTurn(
+  f: Awaited<ReturnType<typeof setup>>,
+  role: "investigation" | "audit" = "investigation",
+) {
+  const job = f.store.job(1)!;
+  return turnSchema.parse({
+    id: randomUUID(),
+    job_id: job.id,
+    revision: job.revision,
+    phase: job.phase,
+    request_digest: digest("fixture request"),
+    role,
+    profile: f.snapshot.settings.roles[role].profile,
+    runner: f.snapshot.roles[role].profile.sdk,
+    starting_sha: f.remote.source.sha,
+    work_branch: null,
+    plan_digest: digest("fixture plan"),
+    caller_sha: f.remote.source.sha,
+    workflow_id: 91,
+    timeout_minutes: 1,
+    created_at: Date.now(),
+    run_id: null,
+    elapsed_ms: null,
+  });
 }
 
 describe("authenticated Actions task authority", () => {
@@ -373,6 +400,125 @@ describe("authenticated Actions task authority", () => {
     expect(f.read().state.active).toBeNull();
     await f.open(fresh);
     expect(f.read().state.budget.active_ms).toBe(3100);
+  });
+
+  it.each([
+    ["launch", "before"],
+    ["launch", "after"],
+    ["collect", "before"],
+    ["collect", "after"],
+    ["retire", "before"],
+    ["retire", "after"],
+  ] as const)(
+    "recovers a %s budget change interrupted %s the signed write",
+    async (transition, interruption) => {
+      const f = await setup();
+      const manager = await f.open(f.store);
+      const turn = agentTurn(f);
+      const running = { ...turn, run_id: 9000 };
+      const elapsed = 1200;
+      const retiredElapsed = transition === "retire" ? elapsed : 0;
+      const next =
+        transition === "launch"
+          ? turn
+          : transition === "collect"
+            ? { ...running, elapsed_ms: elapsed }
+            : null;
+      if (transition !== "launch") {
+        await manager.setAgentTurn(turn, signal());
+        await manager.setAgentTurn(running, signal());
+      }
+      const before = f.read().state;
+      expect(before.budget.agent_runs).toBe(transition === "launch" ? 0 : 1);
+      const expected = {
+        agent_turn: next,
+        budget: {
+          ...before.budget,
+          active_ms:
+            before.budget.active_ms + (transition === "launch" ? 0 : elapsed),
+          agent_runs: 1,
+        },
+      };
+      const cancellation = new AbortController();
+      if (interruption === "before") {
+        f.remote.state.rejectBefore = "comment";
+        f.remote.state.beforeRequest = async (method) => {
+          if (method === "PATCH") cancellation.abort();
+        };
+      } else {
+        f.remote.state.dropAfter = "comment";
+        f.remote.state.afterMutation = (kind) => {
+          if (kind === "comment") cancellation.abort();
+        };
+      }
+      await expect(
+        manager.setAgentTurn(next, cancellation.signal, retiredElapsed),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      f.remote.state.beforeRequest = undefined;
+      f.remote.state.afterMutation = undefined;
+      expect(JSON.parse(f.store.job(1)!.budget_json)).toEqual(before.budget);
+
+      if (interruption === "before") {
+        await f.store.checkpoint(signal());
+        expect(f.read().state).toMatchObject({
+          budget: before.budget,
+          agent_turn: before.agent_turn,
+        });
+      } else {
+        await expect(f.store.checkpoint(signal())).rejects.toMatchObject({
+          code: "state_conflict",
+        });
+        expect(f.read().state).toMatchObject(expected);
+      }
+
+      const fresh = f.database();
+      const recovered = await f.open(fresh);
+      await recovered.setAgentTurn(next, signal(), retiredElapsed);
+      await fresh.checkpoint(signal());
+      expect(f.read().state).toMatchObject(expected);
+      expect(JSON.parse(fresh.job(1)!.budget_json)).toEqual(expected.budget);
+    },
+  );
+
+  it("shortens live and saved controller deadlines when collecting a completed audit", async () => {
+    const f = await setup();
+    const manager = await f.open(f.store);
+    const turn = { ...agentTurn(f, "audit"), run_id: 9000 };
+    await manager.setAgentTurn(turn, signal());
+    const started = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(started);
+    const lease = f.store.acquireLease(turn.job_id, turn.revision)!;
+    const originalDeadline = f.store.startRuntimeLease(lease, 60000);
+    clock.mockReturnValue(started + 1000);
+    f.remote.state.beforeRequest = async (method) => {
+      if (method !== "PATCH") return;
+      f.remote.state.beforeRequest = undefined;
+      clock.mockReturnValue(started + 2000);
+      f.store.accountActive(lease);
+    };
+    await manager.setAgentTurn({ ...turn, elapsed_ms: 50000 }, signal());
+    const deadline = originalDeadline - 50000;
+    expect(f.read().state.active).toEqual({
+      accounted_at: started + 1000,
+      deadline,
+    });
+    expect(f.read().state.budget.active_ms).toBe(51000);
+    expect(JSON.parse(f.store.job(1)!.budget_json).active_ms).toBe(52000);
+    clock.mockReturnValue(deadline - 1);
+    expect(f.store.runtimeCurrent(lease)).toBe(true);
+    clock.mockReturnValue(deadline + 1000);
+    expect(f.store.runtimeCurrent(lease)).toBe(false);
+    expect(f.store.accountActive(lease)).toBe(deadline);
+    expect(JSON.parse(f.store.job(1)!.budget_json).active_ms).toBe(60000);
+
+    const fresh = f.database();
+    await f.open(fresh);
+    expect(f.read().state.active).toBeNull();
+    expect(f.read().state.budget.active_ms).toBe(60000);
+    const recoveredLease = fresh.acquireLease(turn.job_id, turn.revision)!;
+    expect(() => fresh.startRuntimeLease(recoveredLease, 60000)).toThrow(
+      "active_budget_exhausted",
+    );
   });
 
   it("preserves spent repair cycles and their exhaustion after restoring only comment authority", async () => {

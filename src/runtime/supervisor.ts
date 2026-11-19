@@ -41,7 +41,6 @@ import {
 
 export type BootstrapLease = Readonly<{
   lease: string;
-  deadline: number;
   signal: AbortSignal;
   request: AgentRunRequest;
   abort: (reason: RuntimeError) => void;
@@ -212,19 +211,19 @@ export class Supervisor implements AgentRunner {
     let session: BootstrapLease | undefined;
     const timer = setInterval(() => {
       try {
-        this.store.accountActive(lease);
-        if (session && Date.now() >= session.deadline)
-          controller.abort(new RuntimeError("active_budget_exhausted"));
-        else if (!this.store.runtimeCurrent(lease))
-          controller.abort(new RuntimeError("revision_stale"));
-      } catch {
-        controller.abort(new RuntimeError("monitor_failed"));
+        this.checkLease(lease);
+      } catch (error) {
+        controller.abort(
+          error instanceof RuntimeError
+            ? error
+            : new RuntimeError("monitor_failed"),
+        );
       }
     }, 100);
     const operationTask = (async () => {
       let result: T | undefined, failure: { error: unknown } | undefined;
       try {
-        const deadline = this.store.startRuntimeLease(
+        this.store.startRuntimeLease(
           lease,
           snapshot.settings.limits.active_minutes * 60_000,
         );
@@ -233,7 +232,6 @@ export class Supervisor implements AgentRunner {
         );
         session = {
           lease,
-          deadline,
           request,
           signal: AbortSignal.any([
             signal,
@@ -291,7 +289,15 @@ export class Supervisor implements AgentRunner {
 
   runJobAgent(session: BootstrapLease, request: AgentRunRequest) {
     this.validateBootstrapLease(session, request);
-    return this.execute(request, session.signal);
+    return this.execute(request, session.signal, session.lease);
+  }
+
+  private checkLease(lease: string) {
+    const deadline = this.store.accountActive(lease);
+    if (deadline !== undefined && Date.now() >= deadline)
+      throw new RuntimeError("active_budget_exhausted");
+    if (!this.store.runtimeCurrent(lease))
+      throw new RuntimeError("revision_stale");
   }
 
   private validateBootstrapLease(
@@ -593,6 +599,7 @@ export class Supervisor implements AgentRunner {
   private async *execute(
     request: AgentRunRequest,
     signal: AbortSignal,
+    lease?: string,
   ): AsyncIterable<AgentEvent> {
     this.validate(request);
     const agents = this.options.agents;
@@ -601,6 +608,7 @@ export class Supervisor implements AgentRunner {
     const accepted = await agents.execute(request, current);
     current.throwIfAborted();
     this.validate(request);
+    if (lease) this.checkLease(lease);
     let artifact = request.workspace.artifact;
     if (accepted.candidate) {
       const inspection = {
