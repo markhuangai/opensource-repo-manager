@@ -1,7 +1,7 @@
 allowed-actors: [Z-M-Huang]
 skills:
   - repository: markhuangai/agent-remote-dev-skills
-    ref: 224a5be4ddf40c6cf0a50b97885cb353e8522e2e
+    ref: main
 user-level-md-url: https://raw.githubusercontent.com/Z-M-Huang/golden-CLAUDE.md/refs/heads/main/CLAUDE.md
 auto-continue: true
 max-continuations: 3
