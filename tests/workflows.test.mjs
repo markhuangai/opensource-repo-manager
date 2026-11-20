@@ -2518,3 +2518,18 @@ describe("consumer agent dispatch", () => {
     expect(caller.jobs.agent.if).toBe("github.run_attempt == '1'");
   });
 });
+
+it("forwards only the manually selected harness's model secrets", async () => {
+  const caller = await workflow("remote-dev");
+  expect(caller.jobs["remote-dev"].secrets).toEqual({
+    "codex-config":
+      "${{ inputs.runner == 'codex' && secrets.CODEX_CONFIG_TOML || '' }}",
+    "codex-api-key":
+      "${{ inputs.runner == 'codex' && secrets.CODEX_API_KEY || '' }}",
+    "claude-settings":
+      "${{ inputs.runner == 'claude' && secrets.CLAUDE_SETTINGS_JSON || '' }}",
+    "claude-api-key":
+      "${{ inputs.runner == 'claude' && secrets.ANTHROPIC_API_KEY || '' }}",
+    "github-token": "${{ secrets.REMOTE_DEV_PAT }}",
+  });
+});

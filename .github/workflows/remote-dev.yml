@@ -1,0 +1,35 @@
+name: Remote development
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Agent runner
+        type: choice
+        options: [codex, claude]
+        default: codex
+      plan:
+        description: Approved plan or additional context for a resumed run
+        type: string
+      resume-run-id:
+        description: Run ID of the conversation to resume
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  remote-dev:
+    uses: markhuangai/agent-remote-dev/.github/workflows/remote-dev.yml@v1
+    with:
+      runner: ${{ inputs.runner }}
+      plan: ${{ inputs.plan }}
+      resume-run-id: ${{ inputs.resume-run-id }}
+      runs-on: '["ubuntu-24.04"]'
+    secrets:
+      codex-config: ${{ inputs.runner == 'codex' && secrets.CODEX_CONFIG_TOML || '' }}
+      codex-api-key: ${{ inputs.runner == 'codex' && secrets.CODEX_API_KEY || '' }}
+      claude-settings: ${{ inputs.runner == 'claude' && secrets.CLAUDE_SETTINGS_JSON || '' }}
+      claude-api-key: ${{ inputs.runner == 'claude' && secrets.ANTHROPIC_API_KEY || '' }}
+      github-token: ${{ secrets.REMOTE_DEV_PAT }}
