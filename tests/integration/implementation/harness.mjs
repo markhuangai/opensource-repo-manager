@@ -18,6 +18,7 @@ import {
 } from "/opt/orm/app/dist/config/load.js";
 import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
+import { createSafeLogger } from "/opt/orm/app/dist/logging/redact.js";
 import {
   sourceProcesses,
   userProcesses,
@@ -71,6 +72,9 @@ export async function runImplementationTests(sdks, suite) {
   const logger = {
     info: (message) => logs.push(message),
     error: (message) => logs.push(message),
+    diagnostic: createSafeLogger(loaded.secrets, true, (line) =>
+      logs.push(line),
+    ).diagnostic,
   };
   const recordWorkflowFailure = () => {
     const job = store?.db.open ? store.jobs().at(-1) : undefined;

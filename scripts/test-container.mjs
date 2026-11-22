@@ -17,7 +17,7 @@ import {
 } from "node:fs/promises";
 import { cpus, freemem, totalmem, tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { stringify as stringifyYaml } from "yaml";
@@ -1113,6 +1113,7 @@ try {
         freshData = `${prefix}-fresh-data`,
         net = `${prefix}-network`,
         upstreamName = `${prefix}-upstream`,
+        upstreamImage = `${id}:provider-fixture`,
         manager = `${prefix}-manager`;
       const directory = join(fixtures, "investigations", sdk);
       await mkdir(join(directory, "config"), { recursive: true });
@@ -1205,18 +1206,46 @@ try {
         git(["--git-dir", providerGit, "rev-parse", "FETCH_HEAD"]).trim(),
         remoteDev.sha,
       );
-      for (const path of [
+      const ts = await import("typescript");
+      const paths = git([
+        "--git-dir",
+        providerGit,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        remoteDev.sha,
+        "src",
         "package.json",
-        "src/platform/checkpoint-policy.mjs",
-        "src/platform/continuation-policy.mjs",
-        "src/platform/project-config.mjs",
-        "src/platform/runtime-log.mjs",
-        "src/platform/artifact-io.mjs",
-        "src/platform/sources.mjs",
-      ]) {
+      ])
+        .trim()
+        .split("\n");
+      for (const path of paths) {
+        const content = git([
+          "--git-dir",
+          providerGit,
+          "show",
+          `${remoteDev.sha}:${path}`,
+        ]);
+        const input = join(provider, path);
+        await mkdir(dirname(input), { recursive: true });
+        await writeFile(input, content);
+        if (!path.startsWith("src/")) continue;
+        const output = join(
+          provider,
+          path.replace(/^src\//, "dist/").replace(/\.ts$/, ".js"),
+        );
+        await mkdir(dirname(output), { recursive: true });
         await writeFile(
-          join(provider, path),
-          git(["--git-dir", providerGit, "show", `${remoteDev.sha}:${path}`]),
+          output,
+          path.endsWith(".ts")
+            ? ts.transpileModule(content, {
+                fileName: path,
+                compilerOptions: {
+                  module: ts.ModuleKind.ESNext,
+                  target: ts.ScriptTarget.ESNext,
+                },
+              }).outputText
+            : content,
         );
       }
       const caBundle = docker([
@@ -1272,6 +1301,30 @@ try {
           ],
           { timeout: 300000 },
         );
+        phase(`actions-provider-image-${sdk}`);
+        const providerDockerfile = join(temporary, "provider.Dockerfile");
+        await writeFile(
+          providerDockerfile,
+          `FROM ${image}\nRUN apt-get update && apt-get install --no-install-recommends -y python3 && find /var/lib/apt/lists -type f -delete\n`,
+        );
+        register("image", upstreamImage);
+        docker(
+          [
+            "build",
+            "--builder",
+            "default",
+            "--platform",
+            platform,
+            "--label",
+            `${label}=${id}`,
+            "--tag",
+            upstreamImage,
+            "--file",
+            providerDockerfile,
+            context,
+          ],
+          { timeout: 300_000 },
+        );
         phase(`actions-fixture-startup-${sdk}`);
       }
       register("network", net);
@@ -1316,7 +1369,7 @@ try {
         ...mounts,
         "--entrypoint",
         "/opt/orm-runtime/bin/node",
-        image,
+        upstreamImage,
         "/actions-fixtures/remote-server.mjs",
       ]);
       await waitUntil(

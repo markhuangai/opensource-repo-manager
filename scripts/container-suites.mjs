@@ -23,6 +23,18 @@ export const actionsScenarios = {
     "caller-revision-changed",
     "agent-run-limit",
   ],
+  "managed-recovery": [
+    "checkpoint-acknowledgement",
+    "conflicting-assessment",
+    "resume-pushed-progress",
+    "resume-without-conversation",
+    "collect-lost-final-result",
+    "reject-moved-progress",
+    "coding-clarification",
+    "native-result-recovery",
+    "conflicting-resume",
+    "incomplete-assessment",
+  ],
 };
 export const actionsGroups = Object.keys(actionsScenarios);
 
@@ -233,6 +245,7 @@ export function selectActionsCpuSet(available) {
 export async function runActionsChains(concurrency, run) {
   assert(Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 4);
   const pending = [
+    "managed-recovery",
     "clarification-recovery",
     "pr-recovery",
     "clarification",

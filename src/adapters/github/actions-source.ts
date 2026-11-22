@@ -5,6 +5,7 @@ import { githubId, sha, type RepositoryIdentity } from "../../domain/jobs.ts";
 import { StateError } from "../../actions/state.ts";
 import { OctokitReader } from "./reader.ts";
 import { OctokitWriter } from "./writer.ts";
+import { RuntimeError } from "../../domain/agents.ts";
 
 const treeEntry = z.object({
   path: z.string(),
@@ -26,6 +27,87 @@ export class GitHubActionsSource extends OctokitWriter {
     this.reader = new OctokitReader(repository, api);
     const [owner, repo] = repository.split("/");
     this.sourceCoordinates = { owner, repo };
+  }
+
+  async workCommit(commit: string, signal: AbortSignal) {
+    const value = z
+      .object({
+        sha,
+        tree: z.object({ sha }),
+        parents: z.array(z.object({ sha })),
+      })
+      .parse(
+        (
+          await this.api.request(
+            "GET /repos/{owner}/{repo}/git/commits/{commit_sha}",
+            {
+              ...this.sourceCoordinates,
+              commit_sha: sha.parse(commit),
+              request: {
+                signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+                redirect: "error",
+              },
+            },
+          )
+        ).data,
+      );
+    if (value.sha !== commit) throw new RuntimeError("agent_progress_conflict");
+    return value;
+  }
+
+  async workDescendsFrom(base: string, head: string, signal: AbortSignal) {
+    if (base === head) return true;
+    const value = z
+      .object({
+        status: z.string(),
+        base_commit: z.object({ sha }),
+        merge_base_commit: z.object({ sha }),
+      })
+      .parse(
+        (
+          await this.api.request(
+            "GET /repos/{owner}/{repo}/compare/{basehead}",
+            {
+              ...this.sourceCoordinates,
+              basehead: `${sha.parse(base)}...${sha.parse(head)}`,
+              request: {
+                signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+                redirect: "error",
+              },
+            },
+          )
+        ).data,
+      );
+    return (
+      value.status === "ahead" &&
+      value.base_commit.sha === base &&
+      value.merge_base_commit.sha === base
+    );
+  }
+
+  async workCandidate(
+    branch: string,
+    parent: string,
+    progress: string | null,
+    signal: AbortSignal,
+  ) {
+    const { head } = await this.branch(branch, signal);
+    if (!head) return null;
+    if (!progress) throw new RuntimeError("agent_progress_conflict");
+    const [candidate, work, base] = await Promise.all([
+      this.workCommit(head, signal),
+      this.workCommit(progress, signal),
+      this.workCommit(parent, signal),
+    ]);
+    if (
+      candidate.parents.length !== 1 ||
+      candidate.parents[0].sha !== parent ||
+      candidate.tree.sha !== work.tree.sha ||
+      candidate.tree.sha === base.tree.sha ||
+      (await this.branch(branch, signal)).head !== head
+    )
+      throw new RuntimeError("agent_progress_conflict");
+    return { branch, sha: head };
   }
 
   async files(repository: RepositoryIdentity, signal: AbortSignal) {

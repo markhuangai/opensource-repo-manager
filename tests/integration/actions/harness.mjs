@@ -222,7 +222,12 @@ export async function runActionsTests({
       options,
     );
   };
-  const native = (entry, attempt = 1, override = {}) =>
+  const native = (
+    entry,
+    attempt = 1,
+    override = {},
+    expected = attempt !== 1 || Object.keys(override).length ? 1 : 0,
+  ) =>
     container(
       [
         "authorize-agent",
@@ -238,7 +243,7 @@ export async function runActionsTests({
         ORM_AGENT_PLAN: entry.plan,
         ...override,
       },
-      { expected: attempt !== 1 || Object.keys(override).length ? 1 : 0 },
+      { expected },
     );
   async function route(run) {
     const path = join(eventDirectory, `event-${run.id}.json`);
@@ -286,8 +291,10 @@ export async function runActionsTests({
         continue;
       }
       const runs = pending(issue);
-      assert.equal(runs.length, 1, JSON.stringify(proof(issue).events));
-      result = await advance(issue, runs[0], options.onTurn, options);
+      assert(runs.length <= 1, JSON.stringify(proof(issue).events));
+      result = runs.length
+        ? await advance(issue, runs[0], options.onTurn, options)
+        : await invoke(issue, options);
     }
     return result;
   }
@@ -310,7 +317,14 @@ export async function runActionsTests({
     const [pull] = evidence.pulls;
     assert.equal(evidence.pulls.length, 1);
     assert.equal(pull.draft, false);
-    const [change] = nativeEvents(issue, "implementation_change").slice(-1);
+    const [change] = evidence.events
+      .filter(
+        (item) =>
+          item.type === "complete" &&
+          item.branch &&
+          item.task === "implementation_change",
+      )
+      .slice(-1);
     const [audit] = nativeEvents(issue, "implementation_audit").slice(-1);
     assert.equal(change.head, audit.start);
     assert.equal(audit.head, pull.head);
@@ -570,6 +584,26 @@ export async function runActionsTests({
       upstream("/reply?issue=1&allowed=true");
       const status = await drain(1, undefined, { fresh: true });
       assertPublished(1, status);
+      const events = proof(1).events;
+      const queries = nativeEvents(1, "investigation_triage");
+      assert.equal(queries.length, 2);
+      assert(
+        events.some(
+          (item) =>
+            item.role === "output_review" &&
+            item.type === "complete" &&
+            item.run > queries[0].run &&
+            item.run < queries[1].run,
+        ),
+      );
+      assert(
+        events.some(
+          (item) =>
+            item.type === "native_restore" &&
+            item.parent === queries[0].run &&
+            item.run === queries[1].run,
+        ),
+      );
       return status;
     });
     await scenario("feature-remains-manual", async () => {
@@ -588,6 +622,8 @@ export async function runActionsTests({
         { issue: 7, mode: "transient", reads: 2 },
         { issue: 8, mode: "persistent", reads: 5, failure: true },
         { issue: 9, mode: "slow", reads: 2, failure: true },
+        { issue: 10, mode: "visibility", reads: 3 },
+        { issue: 11, mode: "invisible", reads: 5 },
       ]) {
         setup(issue, `registration_${mode}`);
         const status = await invoke(issue, {
@@ -613,7 +649,9 @@ export async function runActionsTests({
             .map(({ type, run_id }) => [type, run_id]),
           [
             ...Array.from({ length: reads }, () => ["registration_read", null]),
-            ...(failure ? [] : [["registration_write", runId]]),
+            ...(failure || mode === "invisible"
+              ? []
+              : [["registration_write", runId]]),
           ],
         );
         // Checkpoint I/O also fetches the controller's own run.
@@ -642,7 +680,7 @@ export async function runActionsTests({
         );
         assert.deepEqual(
           registered.map((line) => line.run_id),
-          failure ? [] : [runId],
+          failure || mode === "invisible" ? [] : [runId],
         );
         for (const record of mismatches) {
           assert.equal(record.issue_number, issue);
@@ -664,7 +702,7 @@ export async function runActionsTests({
         if (mode === "transient") {
           const [mismatch] = mismatches;
           assert.equal(mismatches.length, 1);
-          assert.equal(mismatch.level, "info");
+          assert.equal(mismatch.level, "warn");
           assert.equal(mismatch.outcome, "retrying");
           assert.equal(mismatch.verification_attempt, 1);
           assert.equal(mismatch.mismatch_field, "display_title");
@@ -705,6 +743,33 @@ export async function runActionsTests({
                 line.route === attemptRoute,
             ),
           );
+        }
+        if (mode === "visibility" || mode === "invisible") {
+          const retries = trace.filter(
+            (row) => row.event === "agent.dispatch_run_not_visible",
+          );
+          assert.equal(retries.length, mode === "visibility" ? 1 : 5);
+          assert(
+            retries.every(
+              (row) =>
+                row.level === "warn" &&
+                row.status === 404 &&
+                row.run_id === runId &&
+                row.request_id,
+            ),
+          );
+          if (mode === "invisible") {
+            assert.equal(
+              (await invoke(issue, { main: true })).reason,
+              "agent_run",
+            );
+            assert.equal(
+              proof(issue).events.filter((row) => row.type === "dispatch")
+                .length,
+              1,
+            );
+          }
+          assert.equal((await native(entry)).runner, sdk);
         }
         diagnosticEvents.push(...mismatches, ...registered);
       }
@@ -818,6 +883,290 @@ export async function runActionsTests({
       );
       assert(logs.at(-1).includes("agent_run_limit"));
       return blocked;
+    });
+  }
+  if (group === "managed-recovery") {
+    async function untilTurn(issue, status, matches) {
+      for (let step = 0; step < 36; step++) {
+        assert(
+          ["agent_run", "retry_scheduled"].includes(status.reason),
+          JSON.stringify(status),
+        );
+        const [entry] = pending(issue);
+        if (entry && matches(entry.turn)) return entry;
+        if (status.reason === "retry_scheduled")
+          await new Promise((resolve) =>
+            setTimeout(resolve, Math.max(0, status.retry_at - Date.now())),
+          );
+        status = entry ? await advance(issue, entry) : await invoke(issue);
+      }
+      assert.fail("The expected recovery turn was never scheduled");
+    }
+    await scenario("checkpoint-acknowledgement", async () => {
+      setup(1, "reproduced");
+      upstream("/fault?kind=checkpoint_visibility_delay");
+      const registered = await invoke(1);
+      assert.equal(registered.reason, "agent_run");
+      assert(
+        logs.some(
+          (log) =>
+            log.includes('"event":"checkpoint.visibility"') &&
+            log.includes('"level":"warn"'),
+        ),
+      );
+
+      setup(2, "reproduced");
+      upstream("/fault?kind=checkpoint_ack_lost");
+      const failed = await invoke(2, { expected: 1 });
+      assert.equal(failed.checkpoint_error, "session_upload_uncertain");
+      assert.match(
+        proof(2).comments[0].body,
+        /Controller checkpoint awaiting confirmation/,
+      );
+      const resumed = await invoke(2, { fresh: true });
+      assert.equal(resumed.reason, "agent_run");
+      assert.equal(
+        proof(2).events.filter((row) => row.type === "dispatch").length,
+        1,
+      );
+      assert.match(logs.at(-1), /"event":"checkpoint.reconciled"/);
+
+      setup(7, "reproduced");
+      upstream("/fault?kind=checkpoint_ack_lost");
+      await invoke(7, { expected: 1 });
+      const orphan = proof(7).artifacts.findLast((artifact) =>
+        artifact.name.endsWith(".orm"),
+      );
+      upstream(`/fault?artifact=${orphan.id}&kind=duplicate`);
+      const rejected = await invoke(7, { fresh: true, expected: 1 });
+      assert.equal(rejected.reason, "session_provenance_invalid");
+      assert.deepEqual(proof(7).events, []);
+      return resumed;
+    });
+    await scenario("conflicting-assessment", async () => {
+      setup(16, "conflicting_assessment");
+      const conflict = await untilTurn(16, await invoke(16), (turn) =>
+        Boolean(turn.assessment),
+      );
+      const waiting = await advance(16, conflict);
+      assert.equal(waiting.reason, "agent_run");
+      assert.match(
+        logs.at(-1),
+        /"event":"agent.result_rejected".*"cause":"agent_artifact_conflict"/,
+      );
+      const [review] = pending(16);
+      assert.equal(review?.turn.role, "output_review");
+      const blocked = await advance(16, review, undefined, { expected: 1 });
+      assert.equal(blocked.reason, "implementation_blocked");
+      assert.match(
+        proof(16).comments[0].body,
+        /Implementation blocked \(agent_artifact_conflict\)/,
+      );
+      assert.equal(nativeEvents(16, "implementation_audit").length, 0);
+      assert.equal(proof(16).pulls.length, 0);
+      assert.equal(
+        proof(16).events.filter((item) => item.type === "write_attempt").length,
+        1,
+      );
+      return blocked;
+    });
+    for (const [issue, mode, name] of [
+      [3, "interrupted_coding", "resume-pushed-progress"],
+      [4, "expired_coding", "resume-without-conversation"],
+      [5, "lost_final_result", "collect-lost-final-result"],
+    ])
+      await scenario(name, async () => {
+        const base = setup(issue, mode);
+        const outcome = await drain(issue);
+        assertPublished(issue, outcome);
+        const { events } = proof(issue);
+        const first = events.find((item) => item.type === "progress_only");
+        const writes = events.filter((item) => item.type === "write_attempt");
+        if (first) {
+          assert.equal(writes.length, 2);
+          assert.notEqual(first.first, first.head);
+          const [finished] = nativeEvents(issue, "implementation_change");
+          assert.equal(finished.start, first.head);
+          assert.equal(finished.progress_branch, first.branch);
+          assert.equal(finished.parent, base.sha);
+          const restores = events.filter(
+            (item) =>
+              item.type === "native_restore" && item.role === "implementation",
+          );
+          if (mode === "interrupted_coding") {
+            assert.equal(restores.length, 1);
+            assert.equal(restores[0].restored_sha, first.first);
+            assert.equal(restores[0].start, first.head);
+          } else {
+            assert.deepEqual(restores, []);
+            setup(8, "reproduced");
+            await invoke(8);
+            const [producer] = pending(8);
+            const selection = await native(producer);
+            upstream(`/complete?run=${producer.run.id}`, selection);
+            upstream(`/rerun?run=${producer.run.id}`);
+            assert.equal((await invoke(8)).reason, "agent_run");
+            const [next] = pending(8);
+            assert.notEqual(next.run.id, producer.run.id);
+            assert(!next.turn.resume);
+          }
+        } else {
+          assert.equal(writes.length, 1);
+          const [assessment] = nativeEvents(
+            issue,
+            "implementation_candidate_assessment",
+          );
+          assert.equal(assessment.assessment_of, outcome.head_sha);
+          assert.match(logs.join("\n"), /"event":"agent.collection_pending"/);
+        }
+        return outcome;
+      });
+    await scenario("reject-moved-progress", async () => {
+      setup(6, "moved_progress");
+      const entry = await untilTurn(
+        6,
+        await invoke(6),
+        (turn) => turn.previous_writer_run_id && turn.work_branch,
+      );
+      assert(entry.turn.work_branch);
+      const changed = upstream("/move-progress?issue=6");
+      assert.match(changed.head, /^[a-f0-9]{40}$/);
+      await native(entry, 1, {}, 1);
+      assert.match(logs.at(-1), /"cause":"agent_progress_conflict"/);
+      assert.equal(
+        proof(6).events.filter((item) => item.type === "write_attempt").length,
+        1,
+      );
+      assert.equal(proof(6).pulls.length, 0);
+    });
+    await scenario("coding-clarification", async () => {
+      setup(9, "coding_clarification");
+      const waiting = await drain(9);
+      assert.equal(waiting.reason, "needs_information");
+      const [first] = nativeEvents(9, "implementation_change");
+      assert.equal(first.branch, first.progress_branch);
+      assert.match(
+        proof(9).comments[0].body,
+        new RegExp(`Saved conversation.*runs/${first.run}`),
+      );
+      assert.equal(proof(9).pulls.length, 0);
+      upstream("/reply?issue=9&allowed=true");
+      const outcome = await drain(9, undefined, { fresh: true });
+      assertPublished(9, outcome);
+      const [, last] = nativeEvents(9, "implementation_change");
+      assert.equal(last.start, first.head);
+      assert.equal(last.progress_branch, first.progress_branch);
+      assert(
+        proof(9).events.some(
+          (item) =>
+            item.type === "native_restore" &&
+            item.parent === first.run &&
+            item.run === last.run,
+        ),
+      );
+      assert(
+        proof(9).events.some(
+          (item) =>
+            item.type === "complete" &&
+            item.role === "output_review" &&
+            item.run > first.run &&
+            item.run < last.run,
+        ),
+      );
+      return outcome;
+    });
+    await scenario("native-result-recovery", async () => {
+      setup(10, "no_coding_session");
+      const outcome = await drain(10);
+      assertPublished(10, outcome);
+      const progress = proof(10).events.find(
+        (item) => item.type === "progress_only",
+      );
+      const [last] = nativeEvents(10, "implementation_change");
+      assert.equal(last.start, progress.head);
+      assert(
+        !proof(10).events.some(
+          (item) =>
+            item.type === "native_restore" && item.role === "implementation",
+        ),
+      );
+      for (const [issue, mode, resumes] of [
+        [11, "failed_investigation", false],
+        [12, "interrupted_investigation", true],
+      ]) {
+        setup(issue, mode);
+        await invoke(issue);
+        const [first] = pending(issue);
+        const stopped = await advance(issue, first);
+        const retry = await untilTurn(
+          issue,
+          stopped,
+          (turn) => turn.role === "investigation",
+        );
+        assert.equal(
+          retry.turn.resume?.run_id,
+          resumes ? first.run.id : undefined,
+        );
+        assert.equal(
+          await advance(issue, retry).then((result) => result.reason),
+          "agent_run",
+        );
+        assert.equal(
+          proof(issue).events.some(
+            (item) =>
+              item.type === "native_restore" && item.parent === first.run.id,
+          ),
+          resumes,
+        );
+      }
+      return outcome;
+    });
+    await scenario("conflicting-resume", async () => {
+      setup(13, "clarification");
+      assert.equal((await drain(13)).reason, "needs_information");
+      const [prior] = nativeEvents(13, "investigation_triage");
+      const saved = proof(13).artifacts.find((artifact) =>
+        artifact.name.startsWith(`remote-dev-session-r${prior.run}-a1-`),
+      );
+      upstream(`/fault?artifact=${saved.id}&kind=changed_digest`);
+      upstream("/reply?issue=13&allowed=true");
+      const rejected = await invoke(13, { expected: 1 });
+      assert.equal(rejected.reason, "agent_resume_conflict");
+      assert.equal(pending(13).length, 0);
+      assert.match(
+        proof(13).comments[0].body,
+        /Investigation blocked \(agent_resume_conflict\)/,
+      );
+
+      setup(14, "changed_session");
+      await invoke(14);
+      const [first] = pending(14);
+      const next = await untilTurn(14, await advance(14, first), (turn) =>
+        Boolean(turn.resume),
+      );
+      const invalid = await advance(14, next, undefined, { expected: 1 });
+      assert.equal(invalid.reason, "investigation_blocked");
+      assert.match(logs.at(-1), /"cause":"agent_artifact_conflict"/);
+      assert.equal(pending(14).length, 0);
+      return invalid;
+    });
+    await scenario("incomplete-assessment", async () => {
+      setup(15, "incomplete_assessment");
+      const outcome = await drain(15);
+      assertPublished(15, outcome);
+      const [first, next] = nativeEvents(15, "implementation_change");
+      const [assessment] = nativeEvents(
+        15,
+        "implementation_candidate_assessment",
+      );
+      assert.equal(assessment.assessment_of, first.head);
+      assert.equal(first.progress_branch, next.progress_branch);
+      assert.notEqual(outcome.head_sha, first.head);
+      assert.match(
+        logs.join("\n"),
+        /"event":"agent.candidate_assessed".*"outcome":"needs_work"/,
+      );
+      return outcome;
     });
   }
   return {

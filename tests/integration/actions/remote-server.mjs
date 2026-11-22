@@ -124,6 +124,18 @@ const http = createServer(async (req, res) => {
         remote.git(["update-ref", `refs/heads/${pull.branch}`, head]);
         return send({ head });
       }
+      case "/move-progress": {
+        const row = runs.events.findLast(
+          (item) => item.issue === issue && item.type === "progress_only",
+        );
+        assert(row);
+        const changed = remote.commit(
+          { ...fixtureSource, "README.md": "Unexpected work branch change.\n" },
+          remote.head("main"),
+        ).sha;
+        remote.git(["update-ref", `refs/heads/${row.branch}`, changed]);
+        return send({ head: changed });
+      }
       case "/start":
         runs.start(Number(url.searchParams.get("run")));
         return send({});

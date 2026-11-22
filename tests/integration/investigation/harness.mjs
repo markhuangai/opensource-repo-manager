@@ -16,6 +16,7 @@ import {
 import { parseActionsConfiguration } from "/opt/orm/app/dist/config/schema.js";
 import { separateSecrets } from "/opt/orm/app/dist/config/secrets.js";
 import { RuntimeError } from "/opt/orm/app/dist/domain/agents.js";
+import { createSafeLogger } from "/opt/orm/app/dist/logging/redact.js";
 import { userProcesses } from "/opt/orm/app/dist/runtime/process.js";
 import { createPublicationFixture } from "/publication-fixture.ts";
 import { sourceFiles, bundlesWithCanaries, modelFixture } from "./protocol.mjs";
@@ -42,6 +43,9 @@ export async function runInvestigationTests() {
     logger = {
       info: (message) => logs.push(message),
       error: (message) => logs.push(message),
+      diagnostic: createSafeLogger(loaded.secrets, true, (line) =>
+        logs.push(line),
+      ).diagnostic,
     };
   const closeRuntime = async () => {
     await investigation?.stop();
@@ -299,7 +303,13 @@ export async function runInvestigationTests() {
         assert.equal(blocked.stage, "blocked", JSON.stringify(blocked));
         const comments = remote.state.comments.get(lateFailure.issue_number),
           commentId = comments[0].id;
-        assert(comments[0].body.startsWith("Investigation is blocked"));
+        assert.match(
+          comments[0].body,
+          /^Investigation paused \(github_rate_limited\)\. ORM will retry on the next maintenance event/,
+        );
+        assert(
+          comments[0].body.includes(new Date(blocked.retry_at).toISOString()),
+        );
         assert(comments[0].body.includes(blocked.result.summary));
         assert(comments[0].body.includes(source.sha));
         const budget = JSON.parse(
@@ -320,7 +330,10 @@ export async function runInvestigationTests() {
           const successor = record(lateFailure);
           assert.equal(successor.stage, "blocked");
           assert.equal(successor.previous_operation, blocked.publication_id);
-          assert(comments[0].body.startsWith("Investigation is blocked"));
+          assert.match(
+            comments[0].body,
+            /^Investigation blocked \(active_budget_exhausted\)\. Inspect /,
+          );
           assert(comments[0].body.includes(blocked.result.summary));
           assert(comments[0].body.includes(blocked.source.sha));
           assert.equal(comments[0].id, commentId);
@@ -343,7 +356,10 @@ export async function runInvestigationTests() {
           "completed",
           JSON.stringify(record(lateFailure)),
         );
-        assert(!comments[0].body.startsWith("Investigation is blocked"));
+        assert.doesNotMatch(
+          comments[0].body,
+          /^Investigation (blocked|paused)/,
+        );
         assert(comments[0].body.includes(blocked.result.summary));
         assert.equal(comments[0].id, commentId);
         assert.equal(comments.length, 1);
@@ -407,7 +423,13 @@ export async function runInvestigationTests() {
           runs = store.runs().length;
         assert.equal(failures, 1);
         assert(blocked.retry_stage);
-        assert(comments[0].body.startsWith("Investigation is blocked"));
+        assert.match(
+          comments[0].body,
+          /^Investigation paused \(github_rate_limited\)\. ORM will retry on the next maintenance event/,
+        );
+        assert(
+          comments[0].body.includes(new Date(blocked.retry_at).toISOString()),
+        );
         afterRestore = true;
         await delay(Math.max(0, blocked.retry_at - Date.now()) + 25);
         await investigation.reconcile();
@@ -422,7 +444,10 @@ export async function runInvestigationTests() {
         assert.equal(store.runs().length, runs);
         assert.equal(comments.length, 1);
         assert.equal(comments[0].id, commentId);
-        assert(comments[0].body.startsWith("Investigation is blocked"));
+        assert.match(
+          comments[0].body,
+          /^Investigation blocked \(infrastructure_budget_exhausted\)\. Inspect /,
+        );
         assert(comments[0].body.includes(blocked.result.summary));
         assert(comments[0].body.includes(blocked.source.sha));
         const effects = remote.state.mutations.length;
@@ -700,7 +725,10 @@ export async function runInvestigationTests() {
         assert.equal(pending.proposal.kind, "investigation_stage");
         assert.equal(pending.proposal.stage, "blocked");
         assert.equal(pending.status, "prepared");
-        assert(!comments[0].body.startsWith("Investigation is blocked"));
+        assert.doesNotMatch(
+          comments[0].body,
+          /^Investigation (blocked|paused)/,
+        );
         await investigation.reconcile();
         assert.equal(remote.state.mutations.length, effects);
         assert.deepEqual(
@@ -731,10 +759,16 @@ export async function runInvestigationTests() {
         assert.equal(usage.agent_runs, budget.agent_runs);
         assert.equal(comments.length, 1);
         assert.equal(comments[0].id, commentId);
-        assert.equal(
-          comments[0].body.startsWith("Investigation is blocked"),
-          recovery !== "exhausted",
-        );
+        if (recovery === "exhausted")
+          assert.doesNotMatch(
+            comments[0].body,
+            /^Investigation (blocked|paused)/,
+          );
+        else
+          assert.match(
+            comments[0].body,
+            /^Investigation blocked \(investigation_evidence_invalid\)\. Inspect /,
+          );
         assert.equal(
           publication.status,
           recovery === "exhausted" ? "prepared" : "confirmed",

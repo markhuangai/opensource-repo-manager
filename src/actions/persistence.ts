@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createApiDiagnostics } from "../logging/api.ts";
+import { createApiDiagnostics, type ApiDiagnostics } from "../logging/api.ts";
 import {
   createGitHubReader,
   type GitHubReader,
@@ -36,7 +36,7 @@ import {
 } from "./state.ts";
 import type { TaskResult } from "./task.ts";
 import type { ActionsArtifacts } from "./artifacts.ts";
-import type { RemoteTurn } from "../domain/remote-turns.ts";
+import type { AgentRecovery, RemoteTurn } from "../domain/remote-turns.ts";
 
 export interface TaskStateTransport extends GitHubWriter {
   taskIssue(
@@ -68,6 +68,7 @@ export class ActionsState implements TaskDurability {
     private readonly snapshot: RunSnapshot,
     private readonly secrets: SecretAccessor,
     private readonly transport: TaskStateTransport,
+    private readonly diagnostics: ApiDiagnostics,
     private readonly artifacts?: ActionsArtifacts,
   ) {
     this.repository = new ActionsRepository(store);
@@ -179,6 +180,7 @@ export class ActionsState implements TaskDurability {
       snapshot,
       secrets,
       transport,
+      diagnostics,
       options.artifacts,
     );
     await manager.initialize(number, reader, signal);
@@ -297,14 +299,20 @@ export class ActionsState implements TaskDurability {
     }
     if (!(await this.transport.taskIssue(number, signal)).managed)
       await this.transport.enrollManaged(number, signal);
-    if (this.comment.state.session_artifact && !this.artifacts)
+    const context = await reader.issue(number, repository, signal);
+    if (
+      (this.comment.state.session_artifact ||
+        this.comment.state.checkpoint_pending) &&
+      !this.artifacts
+    )
       throw new StateError("session_transport_unavailable");
     let missingEvidence = false;
     if (this.artifacts) {
       try {
-        this.expired =
-          (await this.artifacts.restore(this.store, this.comment, signal)) ===
-          "expired";
+        const recovered = await this.recoverCheckpoint(context, signal);
+        if (this.restoredResult) return;
+        missingEvidence = recovered === "missing";
+        this.expired = recovered === "expired";
       } catch (error) {
         if (
           !(error instanceof StateError) ||
@@ -336,7 +344,6 @@ export class ActionsState implements TaskDurability {
         throw new StateError("state_local_conflict");
       this.comment.state.pr.resume_publication = recoveredPending;
     }
-    const context = await reader.issue(number, repository, signal);
     context.comments = context.comments.filter(
       (comment) =>
         comment.id !== canonicalId &&
@@ -562,6 +569,150 @@ export class ActionsState implements TaskDurability {
     );
   }
 
+  private async recoverCheckpoint(issue: IssueContext, signal: AbortSignal) {
+    const state = this.comment.state;
+    const pending = state.checkpoint_pending;
+    if (pending) {
+      const started = performance.now();
+      const reference = await this.artifacts!.locate(pending, signal);
+      const log = {
+        operation_id: pending.checkpoint_id,
+        producer_run_id: pending.run_id,
+        producer_attempt: pending.run_attempt,
+        generation: pending.generation,
+        artifact_id: reference?.artifact_id,
+        elapsed_ms: Math.round(performance.now() - started),
+        expected_digest: pending.digest,
+        expected_size: pending.size,
+        infrastructure_retries: state.budget.infrastructure_retries,
+        retry_limit: state.limits.infrastructure_retries,
+      };
+      if (reference) {
+        const restored = await this.artifacts!.restore(
+          this.store,
+          this.comment,
+          signal,
+          issue,
+          reference,
+        );
+        if (restored === "restored") {
+          await this.write(
+            {
+              ...state,
+              session_artifact: reference,
+              checkpoint_pending: undefined,
+            },
+            this.comment.narrative,
+            signal,
+          );
+          this.diagnostics.event("checkpoint.reconciled", {
+            ...log,
+            level: "info",
+            outcome: "restored",
+          });
+          return restored;
+        }
+        throw new StateError("recovery_evidence_missing");
+      }
+      const closed =
+        issue.state === "closed"
+          ? "issue_closed"
+          : state.pull &&
+              (await this.transport.pull(state.pull.number, signal)).state ===
+                "closed"
+            ? "pull_closed"
+            : undefined;
+      if (closed) {
+        this.restoredResult = {
+          version: 1,
+          repository: state.repository.full_name,
+          issue_number: state.issue.number,
+          job_id: state.job?.id,
+          revision: state.job?.revision,
+          outcome: "closed",
+          reason: closed,
+          ...(state.pull
+            ? { pull_number: state.pull.number, head_sha: state.pull.head }
+            : {}),
+        };
+        return "none";
+      }
+      if (
+        !state.budget.infrastructure_exhausted &&
+        state.budget.infrastructure_retries <
+          state.limits.infrastructure_retries
+      ) {
+        const budget = {
+          ...state.budget,
+          infrastructure_retries: state.budget.infrastructure_retries + 1,
+        };
+        await this.write({ ...state, budget }, this.comment.narrative, signal);
+        this.restoredResult = {
+          version: 1,
+          repository: state.repository.full_name,
+          issue_number: state.issue.number,
+          job_id: state.job?.id,
+          revision: state.job?.revision,
+          outcome: "waiting",
+          reason: "checkpoint_pending",
+        };
+        this.diagnostics.event("checkpoint.reconcile", {
+          ...log,
+          level: "warn",
+          outcome: "waiting",
+          cause: "artifact_not_visible",
+          recovery:
+            "Recheck the intended upload on the next maintenance event.",
+        });
+        return "none";
+      }
+      await this.write(
+        {
+          ...state,
+          checkpoint_pending: undefined,
+        },
+        this.comment.narrative,
+        signal,
+      );
+      this.diagnostics.event("checkpoint.reconcile", {
+        ...log,
+        level: "warn",
+        outcome: "retry_budget_exhausted",
+        cause: "artifact_not_visible",
+        recovery: "Verify the last acknowledged checkpoint before continuing.",
+      });
+      if (
+        !state.session_artifact &&
+        (state.scope ||
+          state.head ||
+          state.agent_turn ||
+          state.pending?.steps.some(
+            (step) => step.kind !== "comment" || step.state !== "confirmed",
+          ))
+      )
+        return "missing";
+    }
+    const restored = await this.artifacts!.restore(
+      this.store,
+      this.comment,
+      signal,
+      issue,
+    );
+    if (restored === "replayed_investigation") {
+      if (this.comment.state.reason === "recovery_evidence_missing") {
+        this.comment.state.reason = null;
+        this.comment.state.outcome = null;
+      }
+      this.diagnostics.event("checkpoint.legacy_investigation", {
+        level: "info",
+        artifact_id: state.session_artifact?.artifact_id,
+        producer_run_id: state.session_artifact?.run_id,
+        outcome: "restored",
+      });
+    }
+    return restored;
+  }
+
   private recoveryResult(
     context: IssueContext,
     pull?: RemotePull,
@@ -680,15 +831,29 @@ export class ActionsState implements TaskDurability {
     return this.comment.state.pr?.head;
   }
   agentState() {
-    const { repository, issue, task_id, author_id, agent_turn } =
-      this.comment.state;
-    return { repository, issue, task_id, author_id, agent_turn };
+    const {
+      repository,
+      issue,
+      task_id,
+      author_id,
+      agent_turn,
+      agent_recovery,
+    } = this.comment.state;
+    return {
+      repository,
+      issue,
+      task_id,
+      author_id,
+      agent_turn,
+      agent_recovery,
+    };
   }
 
   setAgentTurn(
     turn: RemoteTurn | null,
     signal: AbortSignal,
     retiredElapsed = 0,
+    recovery?: AgentRecovery,
   ) {
     return this.serial(async () => {
       this.bindComment();
@@ -715,8 +880,23 @@ export class ActionsState implements TaskDurability {
           state.active.deadline - elapsed,
         ),
       };
+      const run = turn?.run_id ?? turn?.receipt_run_id;
+      let agentRecovery = recovery ?? state.agent_recovery;
+      if (run && turn) {
+        agentRecovery = {
+          ...(agentRecovery?.revision === turn.revision ? agentRecovery : {}),
+          revision: turn.revision,
+          last_run_id: run,
+        };
+      }
       await this.write(
-        { ...state, budget, active, agent_turn: turn },
+        {
+          ...state,
+          budget,
+          active,
+          agent_turn: turn,
+          agent_recovery: agentRecovery,
+        },
         this.comment.narrative,
         signal,
       );
@@ -815,14 +995,26 @@ export class ActionsState implements TaskDurability {
       await this.write(state, this.comment.narrative, signal);
       if (!this.restoredResult) this.repository.confirmReconstruction(state);
       if (artifacts && this.artifacts && !this.restoredResult) {
+        if (this.comment.state.checkpoint_pending)
+          throw new StateError("session_upload_uncertain");
         const reference = await this.artifacts.capture(
           this.store,
           this.comment.state,
           signal,
+          (prepared) =>
+            this.write(
+              { ...this.comment.state, checkpoint_pending: prepared },
+              this.comment.narrative,
+              signal,
+            ),
         );
         if (reference)
           await this.write(
-            { ...this.comment.state, session_artifact: reference },
+            {
+              ...this.comment.state,
+              session_artifact: reference,
+              checkpoint_pending: undefined,
+            },
             this.comment.narrative,
             signal,
           );

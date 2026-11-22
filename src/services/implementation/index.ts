@@ -1,6 +1,7 @@
 import {
   RemoteTurnPending,
   remoteRetryReasons,
+  remoteBlockingReasons,
 } from "../../domain/remote-turns.ts";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -18,7 +19,10 @@ import { feedbackAssessment } from "../pr-monitor/contracts.ts";
 import type { PrMonitorService } from "../pr-monitor/index.ts";
 import type { Supervisor } from "../../runtime/supervisor.ts";
 import type { IntakeService } from "../intake.ts";
-import type { PublicationProposal } from "../publication/contracts.ts";
+import {
+  recoveryStatus,
+  type PublicationProposal,
+} from "../publication/contracts.ts";
 import {
   artifactFiles,
   candidateChanges,
@@ -51,6 +55,7 @@ const transient = new Set([
 ]);
 const safeFailures = new Set([
   ...transient,
+  ...remoteBlockingReasons,
   "active_budget_exhausted",
   "agent_run_limit",
   "agent_dispatch_uncertain",
@@ -889,8 +894,12 @@ export class ImplementationService {
       job_id: job.id,
       revision: job.revision,
       body: [
-        implementationStageText[record.stage],
-        record.failure ? `Reason: ${record.failure}` : "",
+        record.stage === "blocked" && record.failure
+          ? recoveryStatus("Implementation", {
+              cause: record.failure,
+              retry_at: record.retry_stage ? record.retry_at : null,
+            })
+          : implementationStageText[record.stage],
         narrative ? `Reviewed investigation:\n\n${narrative}` : "",
         target.pull
           ? `Pull request: https://github.com/${this.supervisor.repositoryName()}/pull/${target.pull.number}`
@@ -975,9 +984,16 @@ export class ImplementationService {
     if (this.secrets.containsCredentials(record))
       throw new RuntimeError("secret_in_implementation_receipt");
     this.repository.save(record);
-    this.logger.error(
-      `Maintenance implementation blocked (${record.failure}).`,
-    );
+    const fields = {
+      event: "agent.implementation_stopped",
+      level: record.retry_stage ? "warn" : "error",
+      issue_number: job.issue_number,
+      revision: job.revision,
+      cause: record.failure,
+      outcome: record.retry_stage ? "retry_scheduled" : "blocked",
+      retry_at: record.retry_stage ? record.retry_at : undefined,
+    } as const;
+    this.logger.diagnostic(fields.level, fields);
     try {
       await this.report(record, signal);
     } catch (error) {

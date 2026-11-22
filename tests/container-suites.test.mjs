@@ -35,8 +35,8 @@ describe("Actions chain scheduling", () => {
       });
       expect(peak).toBe(concurrency);
       expect(started.slice(0, 2)).toEqual([
-        "codex/clarification-recovery",
-        "claude/clarification-recovery",
+        "codex/managed-recovery",
+        "claude/managed-recovery",
       ]);
       expect(started.sort()).toEqual(
         actionsGroups
@@ -316,7 +316,7 @@ describe("Actions lane coverage and identity", () => {
         ],
       })),
     );
-  it("requires the dispatched workflow scenario inventory in five independent chains", () => {
+  it("requires the dispatched workflow scenario inventory in six independent chains", () => {
     expect(
       Object.fromEntries(
         actionsGroups.map((group) => [group, actionsScenarios[group].length]),
@@ -327,6 +327,7 @@ describe("Actions lane coverage and identity", () => {
       "pr-recovery": 3,
       clarification: 2,
       "clarification-recovery": 6,
+      "managed-recovery": 10,
     });
     const all = Object.values(actionsScenarios).flat();
     expect(new Set(all).size).toBe(all.length);

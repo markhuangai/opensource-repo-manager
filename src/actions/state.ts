@@ -11,10 +11,11 @@ import {
 import { investigationResultSchema } from "../services/investigation/contracts.ts";
 import { implementationPlanSchema } from "../services/implementation/contracts.ts";
 import { commandSchema } from "../services/bootstrap/contracts.ts";
-import { artifactReferenceSchema } from "./bundle.ts";
+import { artifactReferenceSchema, preparedArtifactSchema } from "./bundle.ts";
 import { questionSchema } from "../services/clarification-contracts.ts";
 import { feedbackAssessment } from "../services/pr-monitor/contracts.ts";
-import { turnSchema } from "../domain/remote-turns.ts";
+import { agentRecoverySchema, turnSchema } from "../domain/remote-turns.ts";
+import { recoveryStatus } from "../services/publication/contracts.ts";
 
 const count = z.number().int().nonnegative().safe();
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -239,7 +240,9 @@ export const taskStateSchema = z.strictObject({
   pull: ownedPull.nullable(),
   pending: durablePublicationSchema.nullable(),
   agent_turn: turnSchema.nullable(),
+  agent_recovery: agentRecoverySchema.optional(),
   session_artifact: artifactReferenceSchema.nullable(),
+  checkpoint_pending: preparedArtifactSchema.optional(),
   pr: prContinuationSchema.optional(),
 });
 export type TaskState = z.infer<typeof taskStateSchema>;
@@ -252,6 +255,35 @@ export type StateComment = {
 export const stateMarker = "<!-- orm:task-state:";
 export const stateBytes = 32 * 1024;
 export const commentBytes = 60 * 1024;
+
+function recoveryFooter(state: TaskState) {
+  const origin = `https://github.com/${state.repository.full_name}/actions/runs/`;
+  const recovery =
+    state.agent_recovery?.revision === state.job?.revision
+      ? state.agent_recovery
+      : undefined;
+  const usable =
+    state.job?.phase === "investigation"
+      ? recovery?.investigation
+      : recovery?.coding?.session;
+  const lines = [
+    recovery?.blocked &&
+      recoveryStatus(
+        state.job?.phase === "investigation"
+          ? "Investigation"
+          : "Implementation",
+        { cause: recovery.blocked, retry_at: null },
+      ),
+    recovery?.last_run_id &&
+      `[Latest agent attempt](${origin}${recovery.last_run_id})`,
+    usable && `[Saved conversation](${origin}${usable.run_id})`,
+    state.checkpoint_pending &&
+      `[Controller checkpoint awaiting confirmation](${origin}${state.checkpoint_pending.run_id})`,
+    state.reason === "recovery_evidence_missing" &&
+      "ORM could not verify the controller checkpoint needed to resume. Inspect the checkpoint and recorded publication in the maintenance run before retrying.",
+  ].filter(Boolean);
+  return lines.length ? `\n\n${lines.join("\n\n")}` : "";
+}
 
 export class StateCodec {
   private readonly key: Buffer;
@@ -289,7 +321,8 @@ export class StateCodec {
     if (Buffer.byteLength(serialized) > stateBytes)
       throw new StateError("state_size_limit");
     const content = Buffer.from(serialized).toString("base64url");
-    const body = `${narrative}\n\n${stateMarker}v2:${content}:${this.mac(content, narrative, state.initializing).toString("base64url")} -->`;
+    const visible = narrative + recoveryFooter(state);
+    const body = `${visible}\n\n${stateMarker}v2:${content}:${this.mac(content, visible, state.initializing).toString("base64url")} -->`;
     if (Buffer.byteLength(body) > commentBytes)
       throw new StateError("state_size_limit");
     return body;
@@ -314,7 +347,7 @@ export class StateCodec {
       );
     if (!match || match[1].includes(stateMarker))
       throw new StateError("state_invalid");
-    const [, narrative, content, signature] = match;
+    const [, visible, content, signature] = match;
     const bytes = Buffer.from(content, "base64url");
     if (bytes.length > stateBytes || bytes.toString("base64url") !== content)
       throw new StateError("state_size_limit");
@@ -327,7 +360,7 @@ export class StateCodec {
       throw new StateError("state_invalid");
     }
     this.validateInitialization(state);
-    const expected = this.mac(content, narrative, state.initializing),
+    const expected = this.mac(content, visible, state.initializing),
       actual = Buffer.from(signature, "base64url");
     if (
       actual.length !== expected.length ||
@@ -339,6 +372,11 @@ export class StateCodec {
       (!state.initializing && state.comment_id !== identity.comment_id)
     )
       throw new StateError("state_invalid");
+    const footer = recoveryFooter(state);
+    const narrative =
+      footer && visible.endsWith(footer)
+        ? visible.slice(0, -footer.length)
+        : visible;
     return { state, narrative, body };
   }
 
@@ -355,7 +393,9 @@ export class StateCodec {
         state.scope !== null ||
         state.findings !== null ||
         state.session_artifact !== null ||
+        state.checkpoint_pending !== undefined ||
         state.agent_turn !== null ||
+        state.agent_recovery !== undefined ||
         state.pr !== undefined ||
         Object.values(state.budget).some(Boolean)
       )

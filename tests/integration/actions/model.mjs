@@ -108,6 +108,22 @@ export async function model({ text, mode, turn, root, git }) {
         regression: { argv: ["node", "regression.mjs"], cwd: "." },
       });
     case "implementation_change": {
+      if (
+        mode === "coding_clarification" &&
+        !text.includes("Expected result confirmed")
+      ) {
+        await writeFile(
+          join(root, "bug.mjs"),
+          "export const increment = (value) => value + 1;\n",
+        );
+        return reply({
+          outcome: "needs_information",
+          summary:
+            "Confirm how the existing add-one behavior should be checked.",
+          questions: ["What result is expected from increment(1)?"],
+          audience: "reporter_or_maintainer",
+        });
+      }
       const repair = input.feedback.length > 0;
       const defect =
         !repair && ["audit_rejection", "monitor_repair"].includes(mode);

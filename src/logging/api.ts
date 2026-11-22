@@ -283,7 +283,10 @@ export function createApiDiagnostics(
         .join("");
     }
   }
-  function emit(level: "info" | "error", record: Fields) {
+  const severity = (level: unknown) =>
+    level === "info" || level === "warn" ? level : "error";
+
+  function emit(level: "info" | "warn" | "error", record: Fields) {
     if (record.event === "api.request.started")
       active.set(String(record.request_id), record);
     if (record.event === "api.response.started") {
@@ -439,7 +442,7 @@ export function createApiDiagnostics(
           provider_request_id: protect(record.provider_request_id),
         };
       if (record.event !== "api.response.detail") {
-        emit(record.level === "error" ? "error" : "info", record);
+        emit(severity(record.level ?? "info"), record);
         return;
       }
       const key = `${record.request_id}:${record.detail_kind}`;
@@ -472,11 +475,12 @@ export function createApiDiagnostics(
       } else pending.set(key, value);
     },
     event(event: string, fields: Fields) {
-      emit("error", {
+      const level = severity(fields.level);
+      emit(level, {
         event,
-        level: "error",
         request_id: lastFailureId,
         ...fields,
+        level,
       });
     },
     start(provider: string, operation: string, fields: Fields = {}) {

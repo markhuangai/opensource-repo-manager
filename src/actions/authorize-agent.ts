@@ -90,12 +90,100 @@ export async function authorizeAgent(
           (await source.branch(turn.work_branch, signal)).head !== null)
       )
         throw new RuntimeError("agent_write_unauthorized");
+      if (turn.progress) {
+        const progress = turn.progress;
+        const coding = state.agent_recovery?.coding;
+        if (
+          turn.role !== "implementation" ||
+          !state.scope ||
+          state.agent_recovery?.revision !== turn.revision ||
+          !coding ||
+          coding.key !== progress.key ||
+          coding.branch !== progress.branch ||
+          coding.head !== progress.head ||
+          coding.base_sha !== progress.base_sha ||
+          coding.parent_sha !== progress.parent_sha ||
+          coding.writer_run_id !== turn.previous_writer_run_id ||
+          progress.parent_sha !== (state.pr?.head ?? state.job.source.sha) ||
+          !progress.branch.startsWith(`orm-work/${state.task_id}/`) ||
+          progress.branch === turn.work_branch ||
+          Boolean(turn.work_branch) === Boolean(turn.assessment) ||
+          (await source.branch(progress.branch, signal)).head !== progress.head
+        )
+          throw new RuntimeError("agent_progress_conflict");
+        if (coding.writer_run_id) {
+          const previous = await api.latest(coding.writer_run_id, signal);
+          if (
+            previous.status !== "completed" ||
+            previous.repository.id !== repository.id ||
+            previous.head_repository.id !== repository.id ||
+            previous.actor.id !== state.author_id ||
+            previous.workflow_id !== turn.workflow_id ||
+            previous.path !== `.github/workflows/${remoteDev.dispatcher}` ||
+            previous.event !== "workflow_dispatch" ||
+            !previous.display_title.startsWith(`ORM agent #${input.issue} `)
+          )
+            throw new RuntimeError("agent_progress_conflict");
+        }
+        if (turn.assessment) {
+          const candidate = turn.assessment;
+          if (
+            digest(coding.candidate) !== digest(candidate) ||
+            candidate.writer_run_id !== coding.writer_run_id ||
+            !candidate.branch.startsWith(`orm-work/${state.task_id}/`) ||
+            turn.starting_sha !== candidate.sha ||
+            (
+              await source.workCandidate(
+                candidate.branch,
+                progress.parent_sha,
+                progress.head,
+                signal,
+              )
+            )?.sha !== candidate.sha
+          )
+            throw new RuntimeError("agent_progress_conflict");
+        } else if (turn.starting_sha !== (progress.head ?? progress.base_sha)) {
+          throw new RuntimeError("agent_progress_conflict");
+        }
+      }
+      if (turn.resume) {
+        const session = turn.work_branch
+          ? state.agent_recovery?.coding?.session
+          : state.agent_recovery?.investigation;
+        if (
+          (!turn.work_branch && turn.role !== "investigation") ||
+          !session ||
+          digest(session) !== digest(turn.resume) ||
+          session.key !== turn.recovery_key ||
+          !(await api.resumeAvailable(
+            repository,
+            state.author_id,
+            input.issue,
+            turn,
+            session,
+            signal,
+          ))
+        )
+          throw new RuntimeError("agent_resume_unavailable");
+      }
+      if (
+        turn.progress &&
+        (await source.branch(turn.progress.branch, signal)).head !==
+          turn.progress.head
+      )
+        throw new RuntimeError("agent_progress_conflict");
+      const remaining = Math.floor(
+        (state.limits.active_ms - state.budget.active_ms) / 60000,
+      );
+      if (remaining < 1 || state.budget.agent_runs > state.limits.agent_runs)
+        throw new RuntimeError("agent_budget_exhausted");
       await requireAgentConfiguration(source, repository, run, signal);
       return {
         runner: turn.runner,
         profile: turn.profile,
         write: Boolean(turn.work_branch),
-        timeout_minutes: turn.timeout_minutes,
+        timeout_minutes: Math.min(turn.timeout_minutes, remaining),
+        ...(turn.resume ? { resume_run_id: turn.resume.run_id } : {}),
       };
     }
     await setTimeout(2000, undefined, { signal });

@@ -7,6 +7,7 @@ export function artifactFixture(config) {
     requests = [],
     errors = [];
   let next = 4000,
+    hideNextCheckpoint = 0,
     dropFinalize = false,
     diagnosticFault = "";
   const head = "f".repeat(40);
@@ -200,6 +201,10 @@ export function artifactFixture(config) {
             );
           item.finalized = true;
           item.digest = hash;
+          if (item.name.endsWith(".orm") && hideNextCheckpoint) {
+            item.hiddenReads = hideNextCheckpoint;
+            hideNextCheckpoint = 0;
+          }
           if (dropFinalize) {
             dropFinalize = false;
             req.socket.destroy();
@@ -261,13 +266,18 @@ export function artifactFixture(config) {
         if (attempt) res.end(JSON.stringify(run(Number(attempt[1]))));
         else if (listing) {
           const name = url.searchParams.get("name");
-          const selected = artifacts.filter(
-            (item) =>
+          const selected = artifacts.filter((item) => {
+            const matches =
               item.run === Number(listing[1]) &&
               (!name || item.name === name) &&
               item.finalized &&
-              !item.deleted,
-          );
+              !item.deleted;
+            if (matches && item.hiddenReads) {
+              item.hiddenReads--;
+              return false;
+            }
+            return matches;
+          });
           const page = Number(url.searchParams.get("page") ?? 1),
             count = Number(url.searchParams.get("per_page") ?? 100);
           res.end(
@@ -298,6 +308,14 @@ export function artifactFixture(config) {
   }
   return {
     handle,
+    available(runId) {
+      return artifacts
+        .filter(
+          (item) =>
+            item.finalized && !item.deleted && (!runId || item.run === runId),
+        )
+        .map(metadata);
+    },
     bytes(id) {
       const item = artifacts.find(
         (artifact) =>
@@ -321,6 +339,13 @@ export function artifactFixture(config) {
     },
     fault(id, kind) {
       if (
+        kind === "checkpoint_visibility_delay" ||
+        kind === "checkpoint_ack_lost"
+      ) {
+        hideNextCheckpoint = kind === "checkpoint_visibility_delay" ? 1 : 5;
+        return;
+      }
+      if (
         [
           "diagnostic_list",
           "diagnostic_metadata",
@@ -336,6 +361,14 @@ export function artifactFixture(config) {
       }
       const artifact = artifacts.find((item) => item.id === id);
       assert(artifact);
+      if (kind === "duplicate") {
+        artifacts.push({ ...artifact, id: next++ });
+        return;
+      }
+      if (kind === "changed_digest") {
+        artifact.digest = "sha256:" + "0".repeat(64);
+        return;
+      }
       if (kind === "drop_download") {
         artifact.drop_download = true;
         return;

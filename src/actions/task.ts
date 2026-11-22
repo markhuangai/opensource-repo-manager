@@ -8,7 +8,11 @@ import { PrMonitorRepository } from "../repositories/pr-monitor.ts";
 import { PublicationRepository } from "../repositories/publication.ts";
 import type { Application } from "../runtime/application.ts";
 import { currentContinuation } from "../services/clarification.ts";
-import { RemoteTurnPending } from "../domain/remote-turns.ts";
+import {
+  remoteBlockingReasons,
+  RemoteTurnPending,
+} from "../domain/remote-turns.ts";
+import { StateError } from "../domain/durability.ts";
 
 export type TaskRequest = Readonly<{ issue_number: number }>;
 export type TaskResult = Readonly<{
@@ -29,6 +33,8 @@ export type TaskResult = Readonly<{
     | "clarification_scope_changed"
     | "remote_checks"
     | "agent_run"
+    | "checkpoint_pending"
+    | (typeof remoteBlockingReasons)[number]
     | "monitor_disabled"
     | "retry_scheduled"
     | "human_review"
@@ -81,6 +87,7 @@ export type TaskResult = Readonly<{
   state_generation?: number;
   session_recovery?: "expired_or_deleted";
   checkpoint_failed?: true;
+  checkpoint_error?: string;
 }>;
 
 export function parseTaskRequest(args: string[]): TaskRequest {
@@ -237,7 +244,18 @@ export async function executeTask(
     try {
       await application.agents?.flush(signal);
     } catch (error) {
-      if (!(error instanceof RemoteTurnPending)) throw error;
+      if (!(error instanceof RemoteTurnPending)) {
+        const reason =
+          (error instanceof RuntimeError || error instanceof StateError) &&
+          remoteBlockingReasons.find((item) => item === error.code);
+        if (!reason) throw error;
+        return {
+          version: 1,
+          ...taskIdentity(store, request),
+          outcome: "blocked",
+          reason,
+        };
+      }
     }
     return {
       version: 1,
@@ -319,5 +337,9 @@ export async function executeTask(
 }
 
 export function taskExitCode(result: TaskResult) {
-  return result.outcome === "blocked" || result.outcome === "failed" ? 1 : 0;
+  return result.outcome === "blocked" ||
+    result.outcome === "failed" ||
+    result.checkpoint_failed
+    ? 1
+    : 0;
 }

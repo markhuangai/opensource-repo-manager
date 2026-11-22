@@ -386,6 +386,7 @@ jobs:
       profile: ${{ steps.prepare.outputs.profile }}
       write: ${{ steps.prepare.outputs.write }}
       timeout: ${{ steps.prepare.outputs.timeout }}
+      resume_run_id: ${{ steps.prepare.outputs.resume_run_id }}
     steps:
       - name: Check the dispatch and select its profile
         id: prepare
@@ -439,12 +440,14 @@ jobs:
             const result = JSON.parse(output.stdout.trim());
             assert(!output.exitCode && ["codex", "claude"].includes(result.runner) &&
               /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(result.profile) && typeof result.write === "boolean" &&
-              Number.isSafeInteger(result.timeout_minutes) && result.timeout_minutes >= 1 && result.timeout_minutes <= 360,
+              Number.isSafeInteger(result.timeout_minutes) && result.timeout_minutes >= 1 && result.timeout_minutes <= 360 &&
+              (result.resume_run_id === undefined || Number.isSafeInteger(result.resume_run_id) && result.resume_run_id > 0),
               "Agent authorization failed. Inspect the controller diagnostics.");
             core.setOutput("runner", result.runner);
             core.setOutput("profile", result.profile);
             core.setOutput("write", String(result.write));
             core.setOutput("timeout", result.timeout_minutes);
+            core.setOutput("resume_run_id", result.resume_run_id === undefined ? "" : String(result.resume_run_id));
       - name: Remove the AI test container
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
@@ -473,6 +476,7 @@ jobs:
       plan: ${{ inputs.issue-number != '' && inputs.plan || 'This is an ORM connectivity probe. Keep the repository unchanged. Reply with the text ORM probe completed.' }}
       runs-on: ${{ format('[{0}]', toJSON(inputs.runner)) }}
       timeout-minutes: ${{ fromJSON(needs.authorize.outputs.timeout) }}
+      resume-run-id: ${{ needs.authorize.outputs.resume_run_id }}
     secrets:
       codex-config: ${{ github.run_attempt == '1' && needs.authorize.outputs.runner == 'codex' && fromJSON(secrets.ORM_AGENT_PROFILES)[needs.authorize.outputs.profile] || '' }}
       claude-settings: ${{ github.run_attempt == '1' && needs.authorize.outputs.runner == 'claude' && fromJSON(secrets.ORM_AGENT_PROFILES)[needs.authorize.outputs.profile] || '' }}

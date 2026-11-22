@@ -504,7 +504,7 @@ jobs:
             const result = JSON.parse(output.stdout.trim());
             assert(result.version === 1 && typeof result.outcome === "string", "Missing bounded-task result.");
             await core.summary.addHeading(`Maintenance issue ${issue}`).addCodeBlock(JSON.stringify(result, null, 2), "json").write();
-            if (output.exitCode) core.setFailed(`Maintenance stopped: ${result.reason}`);
+            if (output.exitCode) core.setFailed(`Maintenance stopped: ${result.reason}${result.checkpoint_error ? ` (checkpoint: ${result.checkpoint_error})` : ""}`);
       - name: Remove the maintenance container
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9

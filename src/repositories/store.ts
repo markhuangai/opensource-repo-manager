@@ -796,6 +796,19 @@ CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT
       .run(key);
   }
 
+  lastRemoteInvestigation(job: number, revision: number, start: string) {
+    return this.db
+      .prepare(
+        `SELECT id, binding_json FROM agent_runs
+       WHERE job_id=? AND revision=? AND role='investigation' AND status='completed'
+         AND uid IS NULL AND json_extract(binding_json, '$.starting_sha')=?
+         AND json_extract(binding_json, '$.run_attempt')=1
+       ORDER BY started_at DESC, id DESC LIMIT 1`,
+      )
+      .get(job, revision, start) as
+      { id: string; binding_json: string } | undefined;
+  }
+
   registerRemoteRun(
     id: string,
     job: number,
@@ -814,6 +827,9 @@ CREATE TABLE issue_refreshes (number INTEGER PRIMARY KEY, generation INTEGER NOT
         role,
         JSON.stringify({
           run_id: result.run_id,
+          ...(result.writer_run_id
+            ? { writer_run_id: result.writer_run_id }
+            : {}),
           run_attempt: 1,
           starting_sha: result.starting_sha,
           elapsed_ms: result.elapsed_ms,

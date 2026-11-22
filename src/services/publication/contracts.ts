@@ -9,6 +9,26 @@ import {
 export const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const text = z.string().max(65536);
 const job = { job_id: githubId, revision: githubId };
+export const recoveryDisposition = z.strictObject({
+  cause: z.string().regex(/^[a-z_]{1,64}$/),
+  retry_at: z.number().int().nonnegative().max(8.64e15).nullable(),
+});
+export function recoveryStatus(
+  phase: "Investigation" | "Implementation",
+  { cause, retry_at }: z.infer<typeof recoveryDisposition>,
+) {
+  if (retry_at !== null) {
+    const after = new Date(retry_at).toISOString();
+    return `${phase} paused (${cause}). ORM will retry on the next maintenance event at or after ${after}.`;
+  }
+  const action =
+    cause === "agent_progress_conflict"
+      ? "Inspect the expected and observed work-branch commits in the maintenance log before retrying."
+      : cause === "agent_resume_conflict" || cause === "agent_artifact_conflict"
+        ? "Inspect the previous run and its artifact identity before retrying."
+        : "Inspect the failed maintenance or agent run and correct the cause before retrying.";
+  return `${phase} blocked (${cause}). ${action}`;
+}
 export const proposalSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     ...job,
@@ -28,6 +48,7 @@ export const proposalSchema = z.discriminatedUnion("kind", [
     ...job,
     kind: z.literal("investigation_stage"),
     stage: z.union([investigationStage, z.literal("completed")]),
+    recovery: recoveryDisposition.optional(),
     previous_operation: hash.nullable(),
     after_operation: hash.nullable(),
   }),

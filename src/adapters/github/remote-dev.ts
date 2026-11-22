@@ -6,9 +6,11 @@ import {
   remoteDev,
   remoteRunSchema,
   turnTitle,
+  type NativeSession,
   type RemoteRun,
   type RemoteTurn,
 } from "../../domain/remote-turns.ts";
+import { listRunArtifacts, nativeCheckpointArtifact } from "./artifacts.ts";
 
 export class DispatchRunMismatch extends RuntimeError {
   constructor(
@@ -98,6 +100,82 @@ export class RemoteDevActions {
     );
     if (run.id !== id) throw new DispatchRunMismatch("id", id, run.id);
     return run;
+  }
+
+  async latest(id: number, signal: AbortSignal) {
+    const run = remoteRunSchema.parse(
+      (
+        await this.request(
+          "GET /repos/{owner}/{repo}/actions/runs/{run_id}",
+          { run_id: id },
+          signal,
+        )
+      ).data,
+    );
+    if (run.id !== id) throw new DispatchRunMismatch("id", id, run.id);
+    return run;
+  }
+
+  async resumeAvailable(
+    repository: RepositoryIdentity,
+    actor: number,
+    issue: number,
+    turn: RemoteTurn,
+    session: NativeSession,
+    signal: AbortSignal,
+  ) {
+    let run: RemoteRun;
+    try {
+      run = await this.latest(session.run_id, signal);
+    } catch (error) {
+      if ((error as { status?: number } | null)?.status === 404) return false;
+      throw error;
+    }
+    if (
+      run.repository.id !== repository.id ||
+      run.head_repository.id !== repository.id ||
+      run.status !== "completed"
+    )
+      throw new RuntimeError("agent_resume_conflict");
+    if (run.run_attempt !== 1) return false;
+    assertTurnRun(
+      repository,
+      actor,
+      issue,
+      {
+        ...turn,
+        id: session.turn_id,
+        run_id: session.run_id,
+        receipt_run_id: undefined,
+        created_at: Date.parse(run.created_at),
+      },
+      run,
+    );
+    assertRemoteDevPin(run);
+    const rows = await listRunArtifacts(
+      async (page) =>
+        (
+          await this.request(
+            "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+            { run_id: run.id, per_page: 100, page },
+            signal,
+          )
+        ).data,
+    );
+    const latest = nativeCheckpointArtifact(run, rows);
+    if (!latest) return false;
+    const { artifact, sequence } = latest;
+    if (
+      artifact.id !== session.artifact_id ||
+      artifact.digest !== `sha256:${session.artifact_digest}` ||
+      sequence !== session.sequence ||
+      artifact.workflow_run.id !== run.id ||
+      artifact.workflow_run.repository_id !== repository.id ||
+      artifact.workflow_run.head_repository_id !== repository.id ||
+      artifact.workflow_run.head_sha !== run.head_sha
+    )
+      throw new RuntimeError("agent_resume_conflict");
+    return true;
   }
 
   async find(

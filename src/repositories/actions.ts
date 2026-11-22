@@ -68,7 +68,11 @@ export class ActionsRepository {
   }
 
   importCheckpoint(path: string, body: string) {
-    if (this.store.jobs().length || this.local())
+    const local = this.local();
+    if (
+      this.store.jobs().length ||
+      (local && local.body !== body && local.intent !== body)
+    )
       throw new StateError("state_local_conflict");
     const db = this.store.db;
     db.prepare("ATTACH DATABASE ? AS checkpoint").run(path);
