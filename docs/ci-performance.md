@@ -16,9 +16,18 @@ The successful [ARM64 Actions job](https://github.com/markhuangai/opensource-rep
 | Initial production setup |      21s |
 | Cleanup                  |      27s |
 
-The receipt identified tested merge commit `853eb63e093f9c180b775d379815f5bd0740d4d5`, image `sha256:c4ea3dd430ec2274d53f9e6356629159bf14b20969cff072b17b278d88e0d4fa`, successful cleanup and 94 scenarios for each SDK. The original run's creation-to-final-success interval across attempts and intervening time is not one attempt's execution or queue duration. The earlier full-suite baseline remains in the README.
+The receipt identified tested merge commit `853eb63e093f9c180b775d379815f5bd0740d4d5`, image `sha256:c4ea3dd430ec2274d53f9e6356629159bf14b20969cff072b17b278d88e0d4fa`, successful cleanup and 94 scenarios for each SDK. The original run's creation-to-final-success interval across attempts and intervening time is not one attempt's execution or queue duration.
 
 One historical configured AI-review run for the same PR took about 42 minutes. Container improvements alone therefore do not prove the complete target; mandatory review outcomes and their latency must remain visible.
+
+### Before the container suites were split
+
+| Repository CI run                                                                                       |    AMD64 |   ARM64 | AMD64 implementation phase |
+| ------------------------------------------------------------------------------------------------------- | -------: | ------: | -------------------------: |
+| [PR run 40071446726](https://github.com/markhuangai/opensource-repo-manager/actions/runs/40071446726)   | 105m 55s | 90m 10s |                    62m 52s |
+| [Main run 40085201361](https://github.com/markhuangai/opensource-repo-manager/actions/runs/40085201361) | 108m 10s |  90m 2s |                    64m 17s |
+
+Image build and initial setup took about one minute. On the PR, Repository CI elapsed time was 107m 34s. From the head push, CI finished after 110m 17s and the last required Codex completion signal appeared after 170m 25s. GitHub did not expose the provider's queue and execution times separately.
 
 ## Coverage and execution
 
