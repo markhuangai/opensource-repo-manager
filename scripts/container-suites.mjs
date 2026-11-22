@@ -16,6 +16,7 @@ export const actionsScenarios = {
   ],
   clarification: ["authorized-reply", "feature-remains-manual"],
   "clarification-recovery": [
+    "dispatch-registration",
     "ambiguous-dispatch",
     "cancel-superseded",
     "denied-dispatch",
