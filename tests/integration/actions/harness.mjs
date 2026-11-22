@@ -582,6 +582,133 @@ export async function runActionsTests({
     });
   }
   if (group === "clarification-recovery") {
+    await scenario("dispatch-registration", async () => {
+      for (const { issue, mode, reads, failure } of [
+        { issue: 6, mode: "immediate", reads: 1 },
+        { issue: 7, mode: "transient", reads: 2 },
+        { issue: 8, mode: "persistent", reads: 5, failure: true },
+        { issue: 9, mode: "slow", reads: 2, failure: true },
+      ]) {
+        setup(issue, `registration_${mode}`);
+        const status = await invoke(issue, {
+          main: true,
+          expected: failure ? 1 : 0,
+        });
+        assert.equal(status.reason, failure ? "runtime_failed" : "agent_run");
+        const [entry] = pending(issue);
+        const runId = entry.run.id;
+        const log = logs.at(-1);
+        const trace = log
+          .split("\n")
+          .filter((line) => line.startsWith("{"))
+          .map(JSON.parse);
+        const events = proof(issue).events;
+        assert.equal(
+          events.filter(({ type }) => type === "dispatch").length,
+          1,
+        );
+        assert.deepEqual(
+          events
+            .filter(({ type }) => type.startsWith("registration_"))
+            .map(({ type, run_id }) => [type, run_id]),
+          [
+            ...Array.from({ length: reads }, () => ["registration_read", null]),
+            ...(failure ? [] : [["registration_write", runId]]),
+          ],
+        );
+        // Checkpoint I/O also fetches the controller's own run.
+        const requests = trace.filter(
+          (line) =>
+            line.event === "api.request.started" &&
+            line.route !==
+              `/repos/owner/repo/actions/runs/${line.workflow_run_id}/attempts/${line.run_attempt}` &&
+            /\/actions\/(?:workflows\/[^/]+\/(?:dispatches|runs)|runs\/\d+(?:\/attempts\/\d+)?)$/.test(
+              line.route ?? "",
+            ),
+        );
+        const attemptRoute = `/repos/owner/repo/actions/runs/${runId}/attempts/1`;
+        assert.deepEqual(
+          requests.map(({ method, route }) => `${method} ${route}`),
+          [
+            "POST /repos/owner/repo/actions/workflows/91/dispatches",
+            ...Array.from({ length: reads }, () => `GET ${attemptRoute}`),
+          ],
+        );
+        const mismatches = trace.filter(
+          (line) => line.event === "agent.dispatch_run_mismatch",
+        );
+        const registered = trace.filter(
+          (line) => line.event === "agent.dispatch_registered",
+        );
+        assert.deepEqual(
+          registered.map((line) => line.run_id),
+          failure ? [] : [runId],
+        );
+        for (const record of mismatches) {
+          assert.equal(record.issue_number, issue);
+          assert.equal(record.operation_id, entry.turn.id);
+          assert.equal(record.run_id, runId);
+          assert.equal(record.reason, "agent_run_mismatch");
+          assert(Number.isFinite(record.elapsed_ms));
+          assert(Buffer.byteLength(JSON.stringify(record)) <= 2048);
+        }
+        if (failure) {
+          assert.equal(
+            trace.find((line) => line.event === "actions.failed").cause,
+            "agent_run_mismatch",
+          );
+          assert.equal(mismatches.at(-1).level, "error");
+          assert.equal(mismatches.at(-1).outcome, "exhausted");
+        }
+        if (mode === "immediate") assert.deepEqual(mismatches, []);
+        if (mode === "transient") {
+          const [mismatch] = mismatches;
+          assert.equal(mismatches.length, 1);
+          assert.equal(mismatch.level, "info");
+          assert.equal(mismatch.outcome, "retrying");
+          assert.equal(mismatch.verification_attempt, 1);
+          assert.equal(mismatch.mismatch_field, "display_title");
+          assert.equal(mismatch.expected_value, entry.run.display_title);
+          assert.equal(mismatch.observed_value, "ORM agent");
+          assert.equal((await native(entry)).runner, sdk);
+        }
+        if (mode === "persistent") {
+          assert.deepEqual(
+            mismatches.map((line) => line.verification_attempt),
+            [1, 2, 3, 4, 5],
+          );
+          for (const mismatch of mismatches) {
+            assert.equal(mismatch.mismatch_field, "display_title");
+            assert.equal(mismatch.expected_value, entry.run.display_title);
+            assert.match(
+              mismatch.observed_value,
+              /^\[omitted \d+ bytes, digest=[a-f0-9]{64}\]$/,
+            );
+          }
+          assert(!log.includes("PRIVATE_TITLE_BODY"));
+        }
+        if (mode === "slow") {
+          assert.deepEqual(
+            mismatches.map((line) => line.outcome),
+            ["retrying", "exhausted"],
+          );
+          for (const mismatch of mismatches) {
+            assert.equal(mismatch.verification_attempt, 1);
+            assert.equal(mismatch.mismatch_field, "id");
+            assert.equal(mismatch.expected_value, runId);
+            assert.equal(mismatch.observed_value, 9999);
+          }
+          assert(
+            trace.some(
+              (line) =>
+                line.event === "api.request.failed" &&
+                line.route === attemptRoute,
+            ),
+          );
+        }
+        diagnosticEvents.push(...mismatches, ...registered);
+      }
+    });
     await scenario("ambiguous-dispatch", async () => {
       setup(1, "dispatch_response_lost");
       const first = await invoke(1);

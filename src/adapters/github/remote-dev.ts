@@ -10,6 +10,16 @@ import {
   type RemoteTurn,
 } from "../../domain/remote-turns.ts";
 
+export class DispatchRunMismatch extends RuntimeError {
+  constructor(
+    readonly field: string,
+    readonly expected: string | number,
+    readonly observed: string | number,
+  ) {
+    super("agent_run_mismatch");
+  }
+}
+
 export class RemoteDevActions {
   private readonly coordinates;
 
@@ -86,7 +96,7 @@ export class RemoteDevActions {
         )
       ).data,
     );
-    if (run.id !== id) throw new RuntimeError("agent_run_mismatch");
+    if (run.id !== id) throw new DispatchRunMismatch("id", id, run.id);
     return run;
   }
 
@@ -202,23 +212,31 @@ export function assertDispatchRun(
   turn: RemoteTurn,
   run: RemoteRun,
 ) {
-  if (
-    (turn.run_id !== null && turn.run_id !== run.id) ||
-    run.repository.id !== repository.id ||
-    run.repository.full_name.toLowerCase() !==
-      repository.full_name.toLowerCase() ||
-    run.head_repository.id !== repository.id ||
-    run.workflow_id !== turn.workflow_id ||
-    run.path !== `.github/workflows/${remoteDev.dispatcher}` ||
-    run.event !== "workflow_dispatch" ||
-    run.display_title !== turnTitle(issue, turn.id) ||
-    run.head_branch !== repository.default_branch ||
-    run.run_attempt !== 1 ||
-    run.actor.id !== actorId ||
-    run.triggering_actor.id !== actorId ||
-    Date.parse(run.created_at) < turn.created_at - 60000
-  )
-    throw new RuntimeError("agent_run_mismatch");
+  const identity = [
+    ["id", turn.run_id ?? run.id, run.id],
+    ["repository.id", repository.id, run.repository.id],
+    ["repository.full_name", repository.full_name, run.repository.full_name],
+    ["head_repository.id", repository.id, run.head_repository.id],
+    ["workflow_id", turn.workflow_id, run.workflow_id],
+    ["path", `.github/workflows/${remoteDev.dispatcher}`, run.path],
+    ["event", "workflow_dispatch", run.event],
+    ["display_title", turnTitle(issue, turn.id), run.display_title],
+    ["head_branch", repository.default_branch, run.head_branch],
+    ["run_attempt", 1, run.run_attempt],
+    ["actor.id", actorId, run.actor.id],
+    ["triggering_actor.id", actorId, run.triggering_actor.id],
+  ] as const;
+  for (const [field, expected, observed] of identity) {
+    const matches =
+      field === "repository.full_name"
+        ? expected.toLowerCase() === observed.toLowerCase()
+        : expected === observed;
+    if (!matches) throw new DispatchRunMismatch(field, expected, observed);
+  }
+  const earliest = turn.created_at - 60_000;
+  const created = Date.parse(run.created_at);
+  if (created < earliest)
+    throw new DispatchRunMismatch("created_at", earliest, created);
 }
 
 export function assertTurnRun(

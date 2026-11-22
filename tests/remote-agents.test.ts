@@ -3,8 +3,10 @@ import { randomUUID } from "node:crypto";
 import { Octokit } from "@octokit/rest";
 import { describe, expect, it } from "vitest";
 import {
+  assertDispatchRun,
   assertRemoteDevPin,
   assertTurnRun,
+  DispatchRunMismatch,
   RemoteDevActions,
 } from "../src/adapters/github/remote-dev.ts";
 import { digest } from "../src/domain/agents.ts";
@@ -213,5 +215,85 @@ describe("published remote development workflow", () => {
         referenced_workflows: [{ ...run.referenced_workflows![0], sha: start }],
       }),
     ).toThrow("agent_provider_pin_mismatch");
+  });
+
+  it("reports the failed dispatch identity comparison", () => {
+    const pending = operation("claude");
+    const run = runFor(pending);
+    const turn = { ...pending, run_id: run.id };
+    const earliest = turn.created_at - 60_000;
+    const matching = {
+      ...run,
+      created_at: new Date(earliest).toISOString(),
+      repository: { ...repository, full_name: "Owner/Repo" },
+    };
+    expect(() =>
+      assertDispatchRun(repository, actor.id, 18, turn, matching),
+    ).not.toThrow();
+    for (const [field, expected, observed, change] of [
+      ["id", run.id, 9001, { id: 9001 }],
+      [
+        "repository.id",
+        repository.id,
+        43,
+        { repository: { ...repository, id: 43 } },
+      ],
+      [
+        "repository.full_name",
+        repository.full_name,
+        "Owner/Other",
+        { repository: { ...repository, full_name: "Owner/Other" } },
+      ],
+      [
+        "head_repository.id",
+        repository.id,
+        43,
+        { head_repository: { id: 43 } },
+      ],
+      ["workflow_id", turn.workflow_id, 92, { workflow_id: 92 }],
+      [
+        "path",
+        run.path,
+        ".github/workflows/other.yml",
+        { path: ".github/workflows/other.yml" },
+      ],
+      ["event", "workflow_dispatch", "push", { event: "push" }],
+      [
+        "display_title",
+        matching.display_title,
+        "ORM agent",
+        { display_title: "ORM agent" },
+      ],
+      [
+        "head_branch",
+        repository.default_branch,
+        "other",
+        { head_branch: "other" },
+      ],
+      ["run_attempt", 1, 2, { run_attempt: 2 }],
+      ["actor.id", actor.id, 8, { actor: { ...actor, id: 8 } }],
+      ["triggering_actor.id", actor.id, 8, { triggering_actor: { id: 8 } }],
+      [
+        "created_at",
+        earliest,
+        earliest - 1,
+        { created_at: new Date(earliest - 1).toISOString() },
+      ],
+    ] as const) {
+      const validate = () =>
+        assertDispatchRun(repository, actor.id, 18, turn, {
+          ...matching,
+          ...change,
+        });
+      expect(validate).toThrow(DispatchRunMismatch);
+      expect(validate).toThrow(
+        expect.objectContaining({
+          code: "agent_run_mismatch",
+          field,
+          expected,
+          observed,
+        }),
+      );
+    }
   });
 });

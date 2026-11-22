@@ -8,6 +8,7 @@ import type { GitHubArtifacts } from "../adapters/github/artifacts.ts";
 import {
   assertDispatchRun,
   assertRemoteDevPin,
+  DispatchRunMismatch,
   type RemoteDevActions,
 } from "../adapters/github/remote-dev.ts";
 import {
@@ -42,6 +43,36 @@ export type RemoteAgentResult = {
   candidate: CandidateCommit | null;
   result: unknown;
 };
+
+const dispatchRetryMs = 12_000;
+const dispatchRetryDelayMs = 2_000;
+const dispatchVerificationAttempts = 5;
+const dispatchValueFormats: Record<string, RegExp> = {
+  "repository.full_name": /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/,
+  path: /^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/,
+  event:
+    /^(?:workflow_dispatch|workflow_run|push|pull_request|pull_request_target|schedule)$/,
+  display_title:
+    /^ORM agent(?: #[1-9][0-9]{0,15} [a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})?$/,
+  head_branch: /^[A-Za-z0-9_./-]+$/,
+};
+
+function dispatchDiagnosticValue(
+  field: string,
+  value: string | number,
+  secrets: SecretAccessor,
+) {
+  if (typeof value === "number") return value;
+  const bytes = Buffer.byteLength(value);
+  const redacted = secrets.redact(value);
+  if (
+    bytes <= 128 &&
+    redacted === value &&
+    dispatchValueFormats[field]?.test(value)
+  )
+    return value;
+  return `[omitted ${bytes} bytes, digest=${digest(redacted)}]`;
+}
 
 export class RemoteAgents {
   private scheduled?: {
@@ -203,7 +234,7 @@ export class RemoteAgents {
     await this.state.setAgentTurn(turn, signal);
     this.event(turn, "dispatch", { outcome: "authorized" });
     let idFromDispatch: number;
-    const dispatchStarted = Date.now();
+    const dispatchStarted = performance.now();
     try {
       idFromDispatch = await this.api.dispatch(
         repository,
@@ -219,7 +250,7 @@ export class RemoteAgents {
       this.event(turn, "dispatch_failed", {
         level: "error",
         status,
-        elapsed_ms: Date.now() - dispatchStarted,
+        elapsed_ms: Math.round(performance.now() - dispatchStarted),
         request_id: apiFailureId(error),
         outcome: denied ? "denied" : "uncertain",
         recovery: denied
@@ -243,8 +274,14 @@ export class RemoteAgents {
       }
       return;
     }
-    const run = await this.run(turn, signal, idFromDispatch);
+    const run = await this.readDispatchRun(
+      turn,
+      idFromDispatch,
+      dispatchStarted,
+      signal,
+    );
     if (!run) throw new RuntimeError("agent_dispatch_uncertain");
+    signal.throwIfAborted();
     await this.bindRun(turn, run, signal);
     this.event({ ...turn, run_id: idFromDispatch }, "dispatch_registered", {
       outcome: "waiting",
@@ -342,11 +379,81 @@ export class RemoteAgents {
     return run;
   }
 
+  private async readDispatchRun(
+    turn: RemoteTurn,
+    receiptId: number,
+    started: number,
+    signal: AbortSignal,
+  ) {
+    let mismatch: DispatchRunMismatch;
+    try {
+      return await this.run(turn, signal, receiptId);
+    } catch (error) {
+      signal.throwIfAborted();
+      if (!(error instanceof DispatchRunMismatch)) throw error;
+      mismatch = error;
+    }
+
+    const deadline = started + dispatchRetryMs;
+    const timeout = AbortSignal.timeout(
+      Math.max(0, Math.ceil(deadline - performance.now())),
+    );
+    const retrySignal = AbortSignal.any([signal, timeout]);
+    let attempt = 1;
+    const report = (outcome: "retrying" | "exhausted") => {
+      this.event({ ...turn, run_id: receiptId }, "dispatch_run_mismatch", {
+        level: outcome === "retrying" ? "info" : "error",
+        request_id: undefined,
+        verification_attempt: attempt,
+        elapsed_ms: Math.round(performance.now() - started),
+        mismatch_field: mismatch.field,
+        expected_value: dispatchDiagnosticValue(
+          mismatch.field,
+          mismatch.expected,
+          this.secrets,
+        ),
+        observed_value: dispatchDiagnosticValue(
+          mismatch.field,
+          mismatch.observed,
+          this.secrets,
+        ),
+        reason: mismatch.code,
+        outcome,
+      });
+    };
+    while (
+      attempt < dispatchVerificationAttempts &&
+      performance.now() + dispatchRetryDelayMs < deadline
+    ) {
+      report("retrying");
+      try {
+        await setTimeout(dispatchRetryDelayMs, undefined, {
+          signal: retrySignal,
+        });
+        if (performance.now() >= deadline) break;
+        const run = await this.run(turn, retrySignal, receiptId);
+        retrySignal.throwIfAborted();
+        if (performance.now() >= deadline) break;
+        return run;
+      } catch (error) {
+        signal.throwIfAborted();
+        if (timeout.aborted) break;
+        if (!(error instanceof DispatchRunMismatch)) throw error;
+        mismatch = error;
+        attempt++;
+      }
+    }
+    signal.throwIfAborted();
+    report("exhausted");
+    throw mismatch;
+  }
+
   private async bindRun(turn: RemoteTurn, run: RemoteRun, signal: AbortSignal) {
     if (run.head_sha !== turn.caller_sha) {
       this.event({ ...turn, run_id: run.id }, "dispatch_failed", {
         level: "error",
         outcome: "caller_revision_changed",
+        mismatch_field: "head_sha",
         expected_sha: turn.caller_sha,
         observed_sha: run.head_sha,
         recovery:

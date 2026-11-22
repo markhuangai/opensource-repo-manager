@@ -326,7 +326,7 @@ describe("Actions lane coverage and identity", () => {
       sessions: 2,
       "pr-recovery": 3,
       clarification: 2,
-      "clarification-recovery": 5,
+      "clarification-recovery": 6,
     });
     const all = Object.values(actionsScenarios).flat();
     expect(new Set(all).size).toBe(all.length);

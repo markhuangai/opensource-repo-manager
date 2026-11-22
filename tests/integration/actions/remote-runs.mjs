@@ -61,6 +61,16 @@ export function remoteRuns(remote, artifacts, config, model) {
     };
   };
   const state = (number) => signed(number)?.decoded.state;
+  remote.state.afterMutation = (kind) => {
+    if (kind !== "comment") return;
+    for (const { number, registration } of runs.values()) {
+      if (!registration) continue;
+      const runId = state(number)?.agent_turn?.run_id ?? null;
+      if (runId === registration.bound) continue;
+      registration.bound = runId;
+      events.push({ type: "registration_write", issue: number, run_id: runId });
+    }
+  };
   async function handle(req, res) {
     const path = new URL(req.url, "https://api.github.com").pathname;
     const workflow = path.match(
@@ -141,6 +151,9 @@ export function remoteRuns(remote, artifacts, config, model) {
         mode,
         plan: body.inputs.plan,
         elapsed: 0,
+        ...(mode.startsWith("registration_") && {
+          registration: { reads: 0, bound: null },
+        }),
       });
       if (
         mode === "dispatch_response_lost" &&
@@ -175,12 +188,39 @@ export function remoteRuns(remote, artifacts, config, model) {
       entry &&
       req.method === "GET" &&
       ["", "/attempts/1"].includes(runPath[2])
-    )
+    ) {
+      if (entry.registration && runPath[2] === "/attempts/1") {
+        const read = ++entry.registration.reads;
+        events.push({
+          type: "registration_read",
+          issue: entry.number,
+          run_id: state(entry.number).agent_turn.run_id,
+        });
+        if (entry.mode === "registration_transient" && read === 1)
+          return send({ ...entry.run, display_title: "ORM agent" });
+        if (entry.mode === "registration_persistent")
+          return send({
+            ...entry.run,
+            display_title: `PRIVATE_TITLE_BODY\n${config.github.token}\r\u001b${"x".repeat(4096)}`,
+          });
+        if (entry.mode === "registration_slow") {
+          if (read === 1) return send({ ...entry.run, id: 9999 });
+          await new Promise((resolve) => {
+            const timer = setTimeout(resolve, 15_000);
+            res.once("close", () => {
+              clearTimeout(timer);
+              resolve();
+            });
+          });
+          if (res.destroyed) return true;
+        }
+      }
       return send(
         runPath[2] === "" && entry.latestAttempt
           ? { ...entry.run, run_attempt: entry.latestAttempt }
           : entry.run,
       );
+    }
     if (
       entry?.mode === "reproduced" &&
       entry.turn.role === "output_review" &&
