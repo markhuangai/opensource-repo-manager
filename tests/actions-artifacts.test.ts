@@ -348,7 +348,7 @@ describe("checkpoint artifact selection", () => {
           ),
           reference = await transport.upload(
             path,
-            f.identity,
+            { ...f.identity, ...observed },
             f.options.limit,
             signal(),
           );

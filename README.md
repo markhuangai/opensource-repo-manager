@@ -43,7 +43,7 @@ The controller charges `limits.agent_runs` once for each authorized dispatch and
 ### Diagnose a run
 
 ```sh
-gh run view RUN_ID --repo OWNER/REPO --log | rg 'agent\.|api\.request\.|configuration_|actions\.failed'
+gh run view RUN_ID --repo OWNER/REPO --log | rg 'agent\.|checkpoint|api\.request\.|configuration_|actions\.failed'
 ```
 
 For `agent.dispatch_failed`, inspect the HTTP status and correlated request ID. Verify that `orm-agent.yml` is registered on the default branch, the configured controller is allowlisted and the PAT has Actions write access. An ambiguous response is reconciled by the signed operation UUID and expected caller before any new work.
@@ -92,7 +92,11 @@ When every current-head gate and finding disposition is complete, the existing o
 
 Agent turns run in `agent-remote-dev@v1.0.0`. The controller supplies pinned phase instructions and a starting Git revision. It limits inline instructions to the provider's 65,535-byte plan contract and uses a digested Actions artifact for larger input. It validates the native result and completed checkpoint manifest against the authorized run. The supplied audit request binds the frozen scope, source and exact candidate commit.
 
-Coding and repair publish one commit to the assigned `orm-work/<task>/<turn>` branch. Its parent is the frozen source for the first change or the last verified PR head for an update. Repairs can start with the rejected tree and carry its corrections into a new commit on that parent. A fresh audit verifies the pushed SHA. The controller runs the required local checks on that commit in its credential-free workspace and advances the PR branch only after verification.
+Coding and repair push coherent progress commits to a dedicated `orm-work/<task>/<id>` branch. ORM can start a replacement agent at the last verified push and restore a compatible native conversation. Native session artifacts hold the conversation and its Git and run metadata. Work left on a runner may need to be recreated.
+
+The agent publishes one candidate commit on a separate work branch. Its tree matches the final progress push, and its sole parent is the frozen source for a first change or the last verified PR head for an update. A fresh audit and the controller's required local checks bind the exact candidate SHA before it advances the PR.
+
+The ORM issue comment links to the latest attempt and the saved conversation. It shows when another maintenance event can retry and what to inspect if verification stops. Keep the owned work refs and Actions artifacts while recovery is pending. ORM can use verified Git progress after a native session expires. The encrypted controller checkpoint preserves task state and spent budgets.
 
 Controller workspace and toolchain commands use separate unprivileged users and clean environments. UID-wide process cleanup and bounded disk, process and output checks apply to those commands. Disk usage is a monitored soft limit. Native jobs follow the upstream execution policy and use the consumer's Actions artifact access and retention settings.
 

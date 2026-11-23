@@ -1,14 +1,19 @@
 import type { Octokit } from "@octokit/rest";
 import { z } from "zod";
 import { RuntimeError } from "../../domain/agents.ts";
+import { StateError } from "../../domain/durability.ts";
 import { githubId, type RepositoryIdentity } from "../../domain/jobs.ts";
 import {
   remoteDev,
   remoteRunSchema,
   turnTitle,
+  type NativeSession,
   type RemoteRun,
   type RemoteTurn,
 } from "../../domain/remote-turns.ts";
+import { listRunArtifacts, nativeCheckpointArtifact } from "./artifacts.ts";
+import { githubReadFailure } from "./reader.ts";
+import { carryApiFailure } from "../../logging/api.ts";
 
 export class DispatchRunMismatch extends RuntimeError {
   constructor(
@@ -98,6 +103,102 @@ export class RemoteDevActions {
     );
     if (run.id !== id) throw new DispatchRunMismatch("id", id, run.id);
     return run;
+  }
+
+  async latest(id: number, signal: AbortSignal) {
+    const run = remoteRunSchema.parse(
+      (
+        await this.request(
+          "GET /repos/{owner}/{repo}/actions/runs/{run_id}",
+          { run_id: id },
+          signal,
+        )
+      ).data,
+    );
+    if (run.id !== id) throw new DispatchRunMismatch("id", id, run.id);
+    return run;
+  }
+
+  async resumeStatus(
+    repository: RepositoryIdentity,
+    actor: number,
+    issue: number,
+    turn: RemoteTurn,
+    session: NativeSession,
+    signal: AbortSignal,
+  ) {
+    const read = async <T>(request: () => Promise<T>) => {
+      try {
+        return await request();
+      } catch (error) {
+        signal.throwIfAborted();
+        if ((error as { status?: number } | null)?.status === 404)
+          return undefined;
+        if (
+          error instanceof RuntimeError ||
+          error instanceof StateError ||
+          error instanceof z.ZodError
+        )
+          throw error;
+        const failure = githubReadFailure(error);
+        if (failure.code === "github_rate_limited") throw failure;
+        throw carryApiFailure(
+          new StateError("session_transport_unavailable"),
+          error,
+        );
+      }
+    };
+    const run = await read(() => this.latest(session.run_id, signal));
+    if (!run) return "missing";
+    if (
+      run.repository.id !== repository.id ||
+      run.head_repository.id !== repository.id
+    )
+      throw new RuntimeError("agent_resume_conflict");
+    if (run.run_attempt !== 1) return "superseded";
+    if (run.status !== "completed")
+      throw new RuntimeError("agent_resume_conflict");
+    assertTurnRun(
+      repository,
+      actor,
+      issue,
+      {
+        ...turn,
+        id: session.turn_id,
+        run_id: session.run_id,
+        receipt_run_id: undefined,
+        created_at: Date.parse(run.created_at),
+      },
+      run,
+    );
+    assertRemoteDevPin(run);
+    const rows = await read(() =>
+      listRunArtifacts(
+        async (page) =>
+          (
+            await this.request(
+              "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+              { run_id: run.id, per_page: 100, page },
+              signal,
+            )
+          ).data,
+      ),
+    );
+    if (!rows) return "missing";
+    const latest = nativeCheckpointArtifact(run, rows);
+    if (!latest) return "missing";
+    const { artifact, sequence } = latest;
+    if (
+      artifact.id !== session.artifact_id ||
+      artifact.digest !== `sha256:${session.artifact_digest}` ||
+      sequence !== session.sequence ||
+      artifact.workflow_run.id !== run.id ||
+      artifact.workflow_run.repository_id !== repository.id ||
+      artifact.workflow_run.head_repository_id !== repository.id ||
+      artifact.workflow_run.head_sha !== run.head_sha
+    )
+      throw new RuntimeError("agent_resume_conflict");
+    return latest.expired ? "expired" : "available";
   }
 
   async find(

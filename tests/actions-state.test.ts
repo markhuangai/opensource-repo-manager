@@ -102,6 +102,22 @@ async function setup() {
           expires_at: Date.now() + 86400000,
         };
       },
+      async locate(prepared) {
+        try {
+          const actual = await fileDigest(archived, prepared.size, signal());
+          if (
+            actual.digest === prepared.digest &&
+            actual.size === prepared.size
+          )
+            return {
+              ...prepared,
+              artifact_id: 1,
+              expires_at: Date.now() + 86400000,
+            };
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      },
       async download(_reference, directory) {
         const path = join(directory, "checkpoint.orm");
         try {
@@ -132,6 +148,7 @@ async function setup() {
     return artifacts;
   };
   return {
+    transport,
     artifactsFor,
     deleteArtifact: () => rm(archived),
     remote,
@@ -651,6 +668,252 @@ describe("authenticated Actions task authority", () => {
     );
   });
 
+  it.each([true, false])(
+    "recovers a prepared checkpoint across runner loss (uploaded=%s)",
+    async (uploaded) => {
+      const f = await setup();
+      await f.open(f.store, await f.artifactsFor(f.store));
+      const upload = f.transport.upload;
+      f.transport.upload = async (...args) => {
+        if (uploaded) await upload(...args);
+        throw new Error("runner lost before acknowledgement");
+      };
+      await expect(f.store.checkpoint(signal(), true)).rejects.toThrow(
+        "state_unavailable",
+      );
+      const prepared = f.read().state.checkpoint_pending!;
+      expect(prepared).toMatchObject({ run_id: 100, run_attempt: 1 });
+      const fresh = f.database();
+      const recovered = await f.open(fresh, await f.artifactsFor(fresh));
+      if (uploaded) {
+        expect(recovered.result()).toBeUndefined();
+        expect(f.read().state.session_artifact).toMatchObject(prepared);
+        expect(f.read().state.checkpoint_pending).toBeUndefined();
+        expect(fresh.job(1)?.phase).toBe("investigation");
+      } else {
+        expect(recovered.result()).toMatchObject({
+          outcome: "waiting",
+          reason: "checkpoint_pending",
+        });
+        expect(f.read().state.checkpoint_pending).toEqual(prepared);
+        const retries = f.read().state.limits.infrastructure_retries;
+        for (let used = 1; used <= retries; used++) {
+          const next = f.database();
+          await f.open(next, await f.artifactsFor(next));
+        }
+        expect(f.read().state.budget.infrastructure_retries).toBe(retries);
+        expect(f.read().state.checkpoint_pending).toBeUndefined();
+      }
+    },
+  );
+
+  it("rejects a conflicting local comment before reserving a checkpoint retry", async () => {
+    const f = await setup();
+    const artifacts = await f.artifactsFor(f.store);
+    await f.open(f.store, artifacts);
+    const previous = f.read().body;
+    f.transport.upload = async () => {
+      throw new Error("runner lost before upload");
+    };
+    await expect(f.store.checkpoint(signal(), true)).rejects.toThrow(
+      "state_unavailable",
+    );
+    const pending = f.read();
+    const local = new ActionsRepository(f.store);
+    local.acknowledge(previous);
+
+    await expect(f.open(f.store, artifacts)).rejects.toThrow(
+      "state_local_conflict",
+    );
+    expect(f.read().body).toBe(pending.body);
+    expect(local.local()?.body).toBe(previous);
+  });
+
+  it.each([false, true])(
+    "preserves exhausted checkpoint recovery through restart (uncertain publication=%s)",
+    async (uncertain) => {
+      const f = await setup();
+      const manager = await f.open(f.store, await f.artifactsFor(f.store));
+      await manager.setAgentTurn(agentTurn(f), signal());
+      f.transport.upload = async () => {
+        throw new Error("runner lost before upload");
+      };
+      await expect(f.store.checkpoint(signal(), true)).rejects.toThrow(
+        "state_unavailable",
+      );
+      const { state, narrative } = f.read();
+      state.budget.infrastructure_retries = state.limits.infrastructure_retries;
+      if (uncertain) {
+        state.pending = {
+          id: digest("dispatching status"),
+          revision: state.job!.revision,
+          kind: "investigation_stage",
+          actor: f.remote.state.actor,
+          source: state.job!.source,
+          branch: state.branch,
+          status: "dispatching",
+          commit: null,
+          review_id: randomUUID(),
+          review_binding: digest("review"),
+          policy_identity: "fixture",
+          retry_at: 0,
+          retry_pending: false,
+          steps: [
+            {
+              kind: "comment",
+              state: "dispatching",
+              object_id: state.comment_id,
+              before_digest: digest(narrative),
+              after_digest: digest("unconfirmed status"),
+              body_digest: digest("unconfirmed status"),
+              thread_id: null,
+              title_digest: null,
+            },
+          ],
+        };
+      }
+      const row = f.remote.state.comments.get(1)![0];
+      row.body = f.codec.encode(state, narrative);
+      const fresh = f.database();
+      const artifacts = await f.artifactsFor(fresh);
+      if (uncertain) {
+        await expect(f.open(fresh, artifacts)).rejects.toThrow(
+          "state_write_uncertain",
+        );
+        expect(f.read().state.checkpoint_pending).toEqual(
+          state.checkpoint_pending,
+        );
+      } else {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const stopped = await f.open(fresh, artifacts);
+          expect(stopped.result()).toMatchObject({
+            outcome: "blocked",
+            reason: "recovery_evidence_missing",
+          });
+          expect(f.read().state).toMatchObject({
+            outcome: "blocked",
+            reason: "recovery_evidence_missing",
+          });
+          expect(f.read().state.checkpoint_pending).toBeUndefined();
+        }
+      }
+    },
+  );
+
+  it.each(["valid", "changed", "competing"] as const)(
+    "replays only an exact confirmed legacy investigation comment (%s)",
+    async (scenario) => {
+      const f = await setup();
+      await f.open(f.store, await f.artifactsFor(f.store));
+      const investigations = new InvestigationRepository(f.store);
+      const record = investigations.ensure(f.store.job(1)!);
+      record.triage = {
+        outcome: "investigate",
+        summary: "Accepted triage",
+        questions: [],
+        audience: "maintainer",
+      };
+      investigations.save(record);
+      if (scenario === "competing") {
+        const job = f.store.job(1)!;
+        const publications = new PublicationRepository(f.store);
+        const id = digest("older status");
+        publications.begin({
+          id,
+          job_id: job.id,
+          revision: job.revision,
+          status: "prepared",
+          failure: null,
+          retry_at: 0,
+          retry_pending: false,
+          proposal: {
+            kind: "investigation_stage",
+            job_id: job.id,
+            revision: job.revision,
+            stage: "queued",
+            previous_operation: null,
+            after_operation: null,
+          },
+          source: f.remote.source,
+          target: publications.target(job.id),
+          actor: f.remote.state.actor,
+          timestamp: new Date().toISOString(),
+          review_id: null,
+          payload: null,
+          commit: null,
+          steps: [
+            {
+              kind: "comment",
+              state: "prepared",
+              before: null,
+              after: "An older status",
+            },
+          ],
+        });
+      }
+      await f.store.checkpoint(signal(), true);
+      const saved = f.read();
+      const state = saved.state;
+      const id = digest("missing status row");
+      const narrative = `Observed status\n\n<!-- orm:${state.publication_instance}:${state.job!.id}:${id} -->`;
+      f.remote.state.comments.get(1)![0].body = f.codec.encode(
+        {
+          ...state,
+          generation: state.generation + 1,
+          budget: { ...state.budget, agent_runs: 2 },
+          pending: {
+            id,
+            revision: state.job!.revision,
+            kind: "investigation_stage",
+            actor: f.remote.state.actor,
+            source: state.job!.source,
+            branch: state.branch,
+            status: "confirmed",
+            commit: null,
+            review_id: randomUUID(),
+            review_binding: digest("review"),
+            policy_identity: "fixture",
+            retry_at: 0,
+            retry_pending: false,
+            steps: [
+              {
+                kind: "comment",
+                state: "confirmed",
+                object_id: state.comment_id,
+                before_digest: digest(saved.narrative),
+                after_digest: digest(narrative),
+                body_digest: digest(
+                  scenario === "changed" ? "A different comment" : narrative,
+                ),
+                thread_id: null,
+                title_digest: null,
+              },
+            ],
+          },
+        },
+        narrative,
+      );
+      const fresh = f.database();
+      const manager = await f.open(fresh, await f.artifactsFor(fresh));
+      if (scenario !== "valid") {
+        expect(manager.result()).toMatchObject({
+          outcome: "blocked",
+          reason: "recovery_evidence_missing",
+        });
+        expect(
+          new PublicationRepository(fresh).pending(state.job!.id),
+        ).toBeUndefined();
+      } else {
+        expect(manager.result()).toBeUndefined();
+        expect(
+          new InvestigationRepository(fresh).current(fresh.job(1)!)?.triage,
+        ).toEqual(record.triage);
+        expect(JSON.parse(fresh.job(1)!.budget_json).agent_runs).toBe(2);
+        expect(f.remote.state.comments.get(1)).toHaveLength(1);
+      }
+    },
+  );
+
   it("allows fresh recovery after confirmed artifact deletion when no PR is owned", async () => {
     const f = await setup();
     await f.open(f.store, await f.artifactsFor(f.store));
@@ -870,8 +1133,13 @@ describe("authenticated Actions task authority", () => {
     const cursors = f.read(),
       compatible = f.database(),
       compatibleArtifacts = await f.artifactsFor(compatible);
+    const context = await f.reader.issue(
+      1,
+      await f.reader.repository(signal()),
+      signal(),
+    );
     expect(
-      await compatibleArtifacts.restore(compatible, cursors, signal()),
+      await compatibleArtifacts.restore(compatible, cursors, signal(), context),
     ).toBe("restored");
     await f.open(compatible, compatibleArtifacts);
     expect(new PrMonitorRepository(compatible).get(1)!.notification_id).toBe(

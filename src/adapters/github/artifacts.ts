@@ -1,8 +1,11 @@
 import { Octokit } from "@octokit/rest";
 import { StringDecoder } from "node:string_decoder";
+import { setTimeout } from "node:timers/promises";
 import { createGitHubClient } from "./client.ts";
+import { githubReadFailure } from "./reader.ts";
 import {
   createApiDiagnostics,
+  apiFailureId,
   carryApiFailure,
   tagApiFailure,
   type ApiDiagnostics,
@@ -17,7 +20,7 @@ import type { ActionsContext } from "../../actions/context.ts";
 import {
   fileDigest,
   type ArtifactReference,
-  type BundleIdentity,
+  type PreparedArtifact,
 } from "../../actions/bundle.ts";
 import { StateError } from "../../actions/state.ts";
 import type { SecretAccessor } from "../../config/secrets.ts";
@@ -49,14 +52,62 @@ const artifactSchema = z.object({
 });
 type Artifact = z.infer<typeof artifactSchema>;
 
+export async function listRunArtifacts(
+  read: (page: number) => Promise<unknown>,
+) {
+  const rows: Artifact[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const result = z
+      .object({
+        total_count: z.number().int().nonnegative(),
+        artifacts: z.array(artifactSchema),
+      })
+      .safeParse(await read(page));
+    if (!result.success) throw new StateError("session_provenance_invalid");
+    rows.push(...result.data.artifacts);
+    if (rows.length === result.data.total_count) return rows;
+    if (!result.data.artifacts.length || rows.length > result.data.total_count)
+      break;
+  }
+  throw new StateError("session_transport_unavailable");
+}
+
+export function nativeCheckpointArtifact(run: RemoteRun, rows: Artifact[]) {
+  const prefix = `remote-dev-session-r${run.id}-a${run.run_attempt}-`;
+  const matches = rows
+    .flatMap((artifact) => {
+      const sequence = Number(artifact.name.slice(prefix.length));
+      return artifact.name === `${prefix}${sequence}` &&
+        Number.isSafeInteger(sequence) &&
+        sequence > 0
+        ? [{ artifact, sequence }]
+        : [];
+    })
+    .sort((left, right) => right.sequence - left.sequence);
+  const [latest, next] = matches;
+  if (latest && next?.sequence === latest.sequence)
+    throw new StateError("agent_artifact_conflict");
+  if (latest)
+    return {
+      ...latest,
+      expired:
+        latest.artifact.expired ||
+        Date.parse(latest.artifact.expires_at) <= Date.now(),
+    };
+}
+
 export interface ArtifactTransport {
   verify(directory: string, signal: AbortSignal): Promise<void>;
   upload(
     path: string,
-    identity: BundleIdentity,
+    prepared: PreparedArtifact,
     limit: number,
     signal: AbortSignal,
   ): Promise<ArtifactReference>;
+  locate(
+    prepared: PreparedArtifact,
+    signal: AbortSignal,
+  ): Promise<ArtifactReference | undefined>;
   download(
     reference: ArtifactReference,
     directory: string,
@@ -107,8 +158,9 @@ export class GitHubArtifacts implements ArtifactTransport {
       ).data;
     } catch (error) {
       if (signal.aborted) throw signal.reason;
+      const failure = githubReadFailure(error);
       throw carryApiFailure(
-        new StateError("session_transport_unavailable"),
+        new StateError("session_transport_unavailable", failure.retryAt),
         error,
       );
     }
@@ -151,30 +203,13 @@ export class GitHubArtifacts implements ArtifactTransport {
     name: string | undefined,
     signal: AbortSignal,
   ) {
-    const rows: Artifact[] = [];
-    for (let page = 1; page <= 10; page++) {
-      const result = z
-        .object({
-          total_count: z.number().int().nonnegative(),
-          artifacts: z.array(artifactSchema),
-        })
-        .safeParse(
-          await this.read(
-            "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
-            { run_id: run, name, per_page: 100, page },
-            signal,
-          ),
-        );
-      if (!result.success) throw new StateError("session_provenance_invalid");
-      rows.push(...result.data.artifacts);
-      if (rows.length === result.data.total_count) return rows;
-      if (
-        !result.data.artifacts.length ||
-        rows.length > result.data.total_count
-      )
-        break;
-    }
-    throw new StateError("session_transport_unavailable");
+    return listRunArtifacts((page) =>
+      this.read(
+        "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+        { run_id: run, name, per_page: 100, page },
+        signal,
+      ),
+    );
   }
 
   async uploadAgentInput(path: string, limit: number, signal: AbortSignal) {
@@ -208,24 +243,9 @@ export class GitHubArtifacts implements ArtifactTransport {
     const rows = await this.artifacts(run.id, undefined, signal);
     const resultName = `remote-dev-result-r${run.id}-a${run.run_attempt}`;
     const result = rows.filter((artifact) => artifact.name === resultName);
-    const prefix = `remote-dev-session-r${run.id}-a${run.run_attempt}-`;
-    const checkpoints = rows
-      .filter(
-        (artifact) =>
-          artifact.name.startsWith(prefix) &&
-          /^[1-9][0-9]*$/.test(artifact.name.slice(prefix.length)),
-      )
-      .sort(
-        (left, right) =>
-          Number(right.name.slice(prefix.length)) -
-          Number(left.name.slice(prefix.length)),
-      );
-    if (
-      result.length !== 1 ||
-      !checkpoints.length ||
-      checkpoints[0].name === checkpoints[1]?.name
-    )
-      throw new StateError("agent_artifact_unavailable");
+    if (result.length > 1) throw new StateError("agent_artifact_conflict");
+    const checkpoint = nativeCheckpointArtifact(run, rows);
+    if (!result.length) throw new StateError("agent_artifact_unavailable");
     return {
       result: await this.agentRecord(
         run,
@@ -235,17 +255,52 @@ export class GitHubArtifacts implements ArtifactTransport {
         2 * 1024 * 1024,
         signal,
       ),
+      session: checkpoint
+        ? await this.readNativeCheckpoint(run, checkpoint, directory, signal)
+        : undefined,
+      result_id: result[0].id,
+    };
+  }
+
+  async agentCheckpoint(
+    run: RemoteRun,
+    directory: string,
+    signal: AbortSignal,
+  ) {
+    const latest = nativeCheckpointArtifact(
+      run,
+      await this.artifacts(run.id, undefined, signal),
+    );
+    if (latest)
+      return this.readNativeCheckpoint(run, latest, directory, signal);
+  }
+
+  private async readNativeCheckpoint(
+    run: RemoteRun,
+    {
+      artifact,
+      sequence,
+      expired,
+    }: NonNullable<ReturnType<typeof nativeCheckpointArtifact>>,
+    directory: string,
+    signal: AbortSignal,
+  ) {
+    if (expired) {
+      this.provenance(artifact, run);
+      return undefined;
+    }
+    return {
       checkpoint: await this.agentRecord(
         run,
-        checkpoints[0],
+        artifact,
         directory,
         "manifest.json",
         256 * 1024 * 1024,
         signal,
       ),
-      result_id: result[0].id,
-      checkpoint_id: checkpoints[0].id,
-      sequence: Number(checkpoints[0].name.slice(prefix.length)),
+      checkpoint_id: artifact.id,
+      checkpoint_digest: artifact.digest.slice("sha256:".length),
+      sequence,
     };
   }
 
@@ -337,52 +392,156 @@ export class GitHubArtifacts implements ArtifactTransport {
 
   async upload(
     path: string,
-    identity: BundleIdentity,
+    prepared: PreparedArtifact,
     limit: number,
     signal: AbortSignal,
   ) {
     if (
-      identity.run_id !== this.context.run_id ||
-      identity.run_attempt !== this.context.run_attempt ||
-      identity.repository_id !== this.context.repository_id
+      prepared.run_id !== this.context.run_id ||
+      prepared.run_attempt !== this.context.run_attempt ||
+      prepared.repository_id !== this.context.repository_id
     )
       throw new StateError("session_provenance_invalid");
-    const expected = await fileDigest(path, limit, signal);
-    const run = await this.run(identity.run_id, identity.run_attempt, signal);
+    if (prepared.size > limit) throw new StateError("session_size_limit");
     const name = basename(path);
-    let rows = (await this.artifacts(run.id, name, signal)).filter(
-      (artifact) => artifact.name === name,
-    );
-    if (!rows.length) {
+    if (name !== `orm-session-${prepared.checkpoint_id}.orm`)
+      throw new StateError("session_provenance_invalid");
+    const started = performance.now();
+    const log = {
+      operation_id: prepared.checkpoint_id,
+      producer_run_id: prepared.run_id,
+      producer_attempt: prepared.run_attempt,
+      generation: prepared.generation,
+      expected_digest: prepared.digest,
+      expected_size: prepared.size,
+    };
+    const wait = async (delay: number) => {
       try {
-        await this.helper(
-          { operation: "upload", name, path, directory: dirname(path) },
-          limit,
-          signal,
-        );
-      } catch {
+        await setTimeout(delay, undefined, { signal });
+      } catch (error) {
         signal.throwIfAborted();
+        throw error;
       }
-      rows = (await this.artifacts(run.id, name, signal)).filter(
-        (artifact) => artifact.name === name,
-      );
+    };
+    const readWithRetry = async <T>(read: () => Promise<T>, phase: string) => {
+      try {
+        return await read();
+      } catch (error) {
+        signal.throwIfAborted();
+        if (
+          !(error instanceof StateError) ||
+          error.code !== "session_transport_unavailable"
+        )
+          throw error;
+        this.diagnostics.event("checkpoint.read_retry", {
+          ...log,
+          phase,
+          level: "warn",
+          request_id: apiFailureId(error),
+          elapsed_ms: Math.round(performance.now() - started),
+          cause: error.code,
+          retry_at: error.retryAt || undefined,
+          outcome: "retrying",
+        });
+        await wait(Math.max(350, error.retryAt - Date.now()));
+        return read();
+      }
+    };
+    const run = await readWithRetry(
+      () => this.run(prepared.run_id, prepared.run_attempt, signal),
+      "producer",
+    );
+    const find = () => this.checkpointReference(prepared, run, signal);
+    const existing = await readWithRetry(find, "preflight");
+    if (existing) return existing;
+    let uploaded: { id: number; size: number; digest: string } | undefined;
+    let uploadFailure: string | undefined;
+    try {
+      uploaded = z
+        .object({
+          id: positive,
+          size: positive,
+          digest: z.string(),
+        })
+        .parse(
+          await this.helper(
+            { operation: "upload", name, path, directory: dirname(path) },
+            limit,
+            signal,
+          ),
+        );
+    } catch (error) {
+      signal.throwIfAborted();
+      uploadFailure = apiFailureId(error);
     }
-    if (rows.length !== 1) throw new StateError("session_upload_uncertain");
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      const reference = await readWithRetry(find, "acknowledgement");
+      if (reference) {
+        if (
+          uploaded &&
+          (uploaded.id !== reference.artifact_id ||
+            uploaded.size !== reference.size ||
+            uploaded.digest !== reference.digest)
+        )
+          throw new StateError("session_provenance_invalid");
+        this.diagnostics.event("checkpoint.acknowledged", {
+          ...log,
+          level: "info",
+          request_id: uploadFailure,
+          artifact_id: reference.artifact_id,
+          attempt,
+          elapsed_ms: Math.round(performance.now() - started),
+          outcome: "completed",
+        });
+        return reference;
+      }
+      this.diagnostics.event("checkpoint.visibility", {
+        ...log,
+        level: "warn",
+        request_id: uploadFailure,
+        artifact_id: uploaded?.id,
+        attempt,
+        elapsed_ms: Math.round(performance.now() - started),
+        cause: uploadFailure
+          ? "upload_receipt_unavailable"
+          : "artifact_not_visible",
+        outcome: attempt < 5 ? "retrying" : "reconcile",
+      });
+      if (attempt < 5) await wait(350);
+    }
+    throw new StateError("session_upload_uncertain");
+  }
+
+  async locate(prepared: PreparedArtifact, signal: AbortSignal) {
+    if (prepared.repository_id !== this.context.repository_id)
+      throw new StateError("session_provenance_invalid");
+    const run = await this.run(prepared.run_id, prepared.run_attempt, signal);
+    return this.checkpointReference(prepared, run, signal);
+  }
+
+  private async checkpointReference(
+    prepared: PreparedArtifact,
+    run: z.infer<typeof runSchema>,
+    signal: AbortSignal,
+  ) {
+    const name = `orm-session-${prepared.checkpoint_id}.orm`;
+    const rows = await this.artifacts(run.id, name, signal);
+    if (!rows.length) return undefined;
+    if (rows.length !== 1 || rows[0].name !== name)
+      throw new StateError("session_provenance_invalid");
     const artifact = rows[0];
     this.provenance(artifact, run);
     const expires = Date.parse(artifact.expires_at);
     if (
-      artifact.digest !== `sha256:${expected.digest}` ||
-      artifact.size_in_bytes !== expected.size ||
-      artifact.expired ||
-      expires <= Date.now() ||
+      artifact.digest !== `sha256:${prepared.digest}` ||
+      artifact.size_in_bytes !== prepared.size ||
       expires > Date.now() + 14 * 86400000 + 60000
     )
       throw new StateError("session_provenance_invalid");
+    if (artifact.expired || expires <= Date.now()) return undefined;
     return {
-      ...identity,
+      ...prepared,
       artifact_id: artifact.id,
-      ...expected,
       expires_at: expires,
     };
   }

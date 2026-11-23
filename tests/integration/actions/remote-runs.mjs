@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import archiver from "/opt/orm/app/node_modules/archiver/index.js";
@@ -13,6 +13,9 @@ import {
   validateManifest,
 } from "/fixture/provider/src/platform/checkpoint-policy.mjs";
 import { readFileSync } from "node:fs";
+import { Diagnostics } from "/fixture/provider/dist/diagnostics.js";
+import { TaskGit } from "/fixture/provider/dist/git.js";
+import { restoreCheckpoint } from "/fixture/provider/dist/resume.js";
 
 const workflowPath = ".github/workflows/orm-agent.yml";
 const workflowId = 91;
@@ -24,9 +27,10 @@ const releasedVersions = {
   claude: released["@anthropic-ai/claude-agent-sdk"],
 };
 
-async function archive(name, value) {
+async function archive(name, value, files = []) {
   const zip = archiver("zip");
   zip.append(JSON.stringify(value), { name });
+  for (const { path, content } of files) zip.append(content, { name: path });
   void zip.finalize();
   const bytes = [];
   for await (const chunk of zip) bytes.push(chunk);
@@ -61,6 +65,15 @@ export function remoteRuns(remote, artifacts, config, model) {
     };
   };
   const state = (number) => signed(number)?.decoded.state;
+  const latestRun = ({ run, latestAttempt }) =>
+    latestAttempt
+      ? {
+          ...run,
+          run_attempt: latestAttempt,
+          status: "in_progress",
+          conclusion: null,
+        }
+      : run;
   remote.state.afterMutation = (kind) => {
     if (kind !== "comment") return;
     for (const { number, registration } of runs.values()) {
@@ -173,10 +186,8 @@ export function remoteRuns(remote, artifacts, config, model) {
       const [start, end] = query.get("created").split("..");
       const page = Number(query.get("page"));
       const workflow_runs = [...runs.values()]
-        .map(({ run, latestAttempt }) => ({
-          ...run,
-          run_attempt: latestAttempt ?? 1,
-        }))
+        .filter((entry) => !entry.deleted)
+        .map(latestRun)
         .filter((run) => run.created_at >= start && run.created_at <= end);
       return send({
         total_count: workflow_runs.length,
@@ -184,6 +195,8 @@ export function remoteRuns(remote, artifacts, config, model) {
       });
     }
     const entry = runs.get(Number(runPath?.[1]));
+    if (entry?.deleted && req.method === "GET")
+      return send({ message: "Workflow run not found" }, 404);
     if (
       entry &&
       req.method === "GET" &&
@@ -198,6 +211,12 @@ export function remoteRuns(remote, artifacts, config, model) {
         });
         if (entry.mode === "registration_transient" && read === 1)
           return send({ ...entry.run, display_title: "ORM agent" });
+        if (entry.mode === "registration_visibility" && read === 1)
+          return send({ message: "Run not yet visible" }, 404);
+        if (entry.mode === "registration_visibility" && read === 2)
+          return send({ ...entry.run, display_title: "ORM agent" });
+        if (entry.mode === "registration_invisible" && read <= 5)
+          return send({ message: "Run not yet visible" }, 404);
         if (entry.mode === "registration_persistent")
           return send({
             ...entry.run,
@@ -215,11 +234,7 @@ export function remoteRuns(remote, artifacts, config, model) {
           if (res.destroyed) return true;
         }
       }
-      return send(
-        runPath[2] === "" && entry.latestAttempt
-          ? { ...entry.run, run_attempt: entry.latestAttempt }
-          : entry.run,
-      );
+      return send(runPath[2] === "" ? latestRun(entry) : entry.run);
     }
     if (
       entry?.mode === "reproduced" &&
@@ -269,12 +284,47 @@ export function remoteRuns(remote, artifacts, config, model) {
       profile: turn.profile,
       write: Boolean(turn.work_branch),
       timeout_minutes: turn.timeout_minutes,
+      ...(turn.resume ? { resume_run_id: turn.resume.run_id } : {}),
     });
     assert.equal(state(number).agent_turn.run_id, id);
-    const root = await mkdtemp(join(tmpdir(), "orm-native-fixture-"));
+    const directory = await mkdtemp(join(tmpdir(), "orm-native-fixture-"));
+    const root = join(directory, "repo");
+    const runnerHome = join(directory, turn.runner);
+    await mkdir(root);
+    await mkdir(runnerHome);
     try {
       const api = async (path) => {
-        if (path === `/repos/owner/repo/actions/runs/${id}`) return run;
+        const url = new URL(path, "https://api.github.com");
+        const runPath =
+          /^\/repos\/owner\/repo\/actions\/runs\/(\d+)(\/artifacts)?$/.exec(
+            url.pathname,
+          );
+        if (runPath) {
+          const producer = runs.get(Number(runPath[1]));
+          assert(producer);
+          if (runPath[2]) {
+            const rows = artifacts.available(producer.run.id);
+            const page = Number(url.searchParams.get("page"));
+            const perPage = Number(url.searchParams.get("per_page"));
+            assert(Number.isSafeInteger(page) && page > 0);
+            assert.equal(perPage, 100);
+            return {
+              total_count: rows.length,
+              artifacts: rows.slice((page - 1) * perPage, page * perPage),
+            };
+          }
+          return latestRun(producer);
+        }
+        const artifactPath =
+          /^\/repos\/owner\/repo\/actions\/artifacts\/(\d+)(\/zip)?$/.exec(
+            path,
+          );
+        if (artifactPath)
+          return artifactPath[2]
+            ? artifacts.bytes(Number(artifactPath[1]))
+            : artifacts
+                .available()
+                .find((item) => item.id === Number(artifactPath[1]));
         if (path === "/repos/owner/repo") return repository;
         if (path === "/repos/owner/repo/commits/main")
           return { sha: remote.head("main") };
@@ -299,7 +349,9 @@ export function remoteRuns(remote, artifacts, config, model) {
             permission: remote.state.permissions.get(run.actor.login)
               .permission,
           };
-        throw new Error("Unexpected released execution request");
+        throw new Error(
+          `Unexpected released execution request ${url.pathname}`,
+        );
       };
       const releasedPlan = await prepareExecution({
         api,
@@ -309,25 +361,29 @@ export function remoteRuns(remote, artifacts, config, model) {
         actor: run.actor.login,
         ref: "refs/heads/main",
         plan,
-        root,
+        root: join(directory, "provider-restore"),
         runner: turn.runner,
+        resumeRunId: selection.resume_run_id
+          ? String(selection.resume_run_id)
+          : "",
       });
       assert.equal(releasedPlan.source_sha, run.head_sha);
       assert.equal(releasedPlan.settings.auto_continue, false);
+      const gitEnv = {
+        PATH: "/usr/bin:/bin",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_AUTHOR_NAME: "Native fixture",
+        GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+        GIT_COMMITTER_NAME: "Native fixture",
+        GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+      };
       const git = (...args) =>
         execFileSync("/usr/bin/git", args, {
           cwd: root,
           encoding: "utf8",
           stdio: ["ignore", "pipe", "pipe"],
-          env: {
-            PATH: "/usr/bin:/bin",
-            GIT_CONFIG_GLOBAL: "/dev/null",
-            GIT_CONFIG_NOSYSTEM: "1",
-            GIT_AUTHOR_NAME: "Native fixture",
-            GIT_AUTHOR_EMAIL: "fixture@example.invalid",
-            GIT_COMMITTER_NAME: "Native fixture",
-            GIT_COMMITTER_EMAIL: "fixture@example.invalid",
-          },
+          env: gitEnv,
         }).trim();
       const inline = plan.includes("Task data (not authorization):\n");
       const artifactId = inline
@@ -342,21 +398,163 @@ export function remoteRuns(remote, artifacts, config, model) {
       assert(text.includes(`starting commit ${turn.starting_sha}`));
       git("init");
       git("remote", "add", "origin", remote.repository);
+      const { restored } = releasedPlan;
+      if (restored) {
+        const log = new Diagnostics();
+        const taskGit = new TaskGit(root, gitEnv, log);
+        await restoreCheckpoint(
+          { runner: turn.runner, runnerHome },
+          restored.root,
+          restored.manifest,
+          taskGit,
+          log,
+        );
+        const history =
+          turn.runner === "codex"
+            ? join(
+                runnerHome,
+                "sessions",
+                `${restored.manifest.session_id}.jsonl`,
+              )
+            : join(
+                runnerHome,
+                "projects",
+                "fixture",
+                `${restored.manifest.session_id}.jsonl`,
+              );
+        assert.match(await readFile(history, "utf8"), /Prior fixture turn/);
+        assert.equal(
+          git("rev-parse", "HEAD"),
+          restored.manifest.checkpoint_sha,
+        );
+        events.push({
+          type: "native_restore",
+          issue: number,
+          run: id,
+          parent: restored.run.id,
+          restored_sha: restored.manifest.checkpoint_sha,
+          start: turn.starting_sha,
+          role: turn.role,
+        });
+      }
       git("fetch", "--no-tags", "origin", turn.starting_sha);
       git("switch", "--detach", turn.starting_sha);
-      const { task, result } = await model({
-        text,
-        mode,
-        turn,
-        root,
-        git,
-        number,
-      });
+      const { task, result } = turn.assessment
+        ? {
+            task: "implementation_candidate_assessment",
+            result:
+              mode === "incomplete_assessment"
+                ? { outcome: "incomplete" }
+                : mode === "conflicting_assessment"
+                  ? { response: { summary: "Invalid completion record" } }
+                  : {
+                      response: {
+                        summary:
+                          "The existing pushed candidate restores increment.",
+                        title: "Fix supported increment",
+                        commit_message: "Fix supported increment",
+                      },
+                    },
+          }
+        : await model({
+            text,
+            mode,
+            turn,
+            root,
+            git,
+            number,
+          });
       const shouldPush =
         turn.work_branch &&
         result.response?.outcome !== "needs_information" &&
         mode !== "missing_push";
-      if (shouldPush) {
+      const firstWriter =
+        turn.work_branch &&
+        !events.some(
+          (item) => item.issue === number && item.type === "write_attempt",
+        );
+      if (turn.work_branch)
+        events.push({ type: "write_attempt", issue: number, run: id });
+      const interrupted = Boolean(
+        shouldPush &&
+        firstWriter &&
+        [
+          "interrupted_coding",
+          "expired_coding",
+          "no_coding_session",
+          "moved_progress",
+        ].includes(mode),
+      );
+      const lostResult = Boolean(
+        shouldPush &&
+        firstWriter &&
+        [
+          "lost_final_result",
+          "incomplete_assessment",
+          "conflicting_assessment",
+        ].includes(mode),
+      );
+      const asking = Boolean(
+        turn.progress &&
+        turn.work_branch &&
+        result.response?.outcome === "needs_information",
+      );
+      const noConversation =
+        (interrupted && mode === "no_coding_session") ||
+        (mode === "failed_investigation" &&
+          task === "investigation_triage" &&
+          !events.some(
+            (item) => item.issue === number && item.type === "no_conversation",
+          ));
+      const interruptedInvestigation =
+        mode === "interrupted_investigation" &&
+        task === "investigation_triage" &&
+        !events.some(
+          (item) => item.issue === number && item.type === "interrupted",
+        );
+      const nativeOutcome = noConversation
+        ? "failed"
+        : interrupted || interruptedInvestigation
+          ? "cancelled"
+          : "completed";
+      let checkpointHead;
+      if ((shouldPush || asking) && turn.progress) {
+        const { branch, parent_sha: parent } = turn.progress;
+        assert(text.includes(`only parent ${parent}`));
+        git("switch", "-C", branch, turn.starting_sha);
+        git("add", "bug.mjs");
+        if (git("diff", "--cached", "--name-only")) {
+          git("commit", "-m", "Correct increment");
+          git("push", "origin", `HEAD:refs/heads/${branch}`);
+        }
+        checkpointHead = git("rev-parse", "HEAD");
+        git("add", ".");
+        if (git("status", "--porcelain")) {
+          git("commit", "-m", "Record regression coverage");
+          git("push", "origin", `HEAD:refs/heads/${branch}`);
+        }
+        if (interrupted) {
+          events.push({
+            type: "progress_only",
+            issue: number,
+            run: id,
+            branch,
+            first: checkpointHead,
+            head: git("rev-parse", "HEAD"),
+          });
+        } else if (shouldPush) {
+          const candidate = git(
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            parent,
+            "-m",
+            "Correct fixture behavior",
+          );
+          git("push", "origin", `${candidate}:refs/heads/${turn.work_branch}`);
+          git("switch", "-c", turn.work_branch, candidate);
+        }
+      } else if (shouldPush) {
         const current = state(number);
         const parent = current.pr?.head ?? current.job.source.sha;
         assert(text.includes(`whose only parent is ${parent}`));
@@ -374,13 +572,55 @@ export function remoteRuns(remote, artifacts, config, model) {
       }
       const revision = git("rev-parse", "HEAD");
       const response = JSON.stringify(result);
-      const session_id = randomUUID();
+      const session_id = noConversation
+        ? ""
+        : mode === "changed_session" && restored
+          ? randomUUID()
+          : (restored?.manifest.session_id ?? randomUUID());
       const runner_version = releasedVersions[turn.runner];
+      const files = [
+        {
+          path:
+            turn.runner === "codex"
+              ? `codex/sessions/${session_id}.jsonl`
+              : `claude/projects/fixture/${session_id}.jsonl`,
+          content:
+            JSON.stringify(
+              turn.runner === "codex"
+                ? {
+                    type: "session_meta",
+                    payload: { id: session_id, message: "Prior fixture turn" },
+                  }
+                : { sessionId: session_id, text: "Prior fixture turn" },
+            ) + "\n",
+        },
+      ];
+      if (
+        process.env.ORM_TEST_FIXTURE_GROUP === "sessions" &&
+        task === "investigation_triage"
+      ) {
+        const statePath =
+          turn.runner === "codex"
+            ? "codex/sessions"
+            : "claude/projects/fixture/memory";
+        const subdirectory = `${"a".repeat(232)}/${"a".repeat(232)}`;
+        for (let i = 0; i < 4500; i++)
+          files.push({
+            path: `${statePath}/${subdirectory}/${i}.${turn.runner === "codex" ? "jsonl" : "md"}`,
+            content:
+              turn.runner === "codex"
+                ? JSON.stringify({
+                    type: "session_meta",
+                    payload: { id: `fixture-${i}` },
+                  }) + "\n"
+                : "Prior fixture turn",
+          });
+      }
       const record = {
         runner: turn.runner,
         runner_version,
-        response,
-        native_outcome: "completed",
+        response: nativeOutcome === "completed" ? response : "",
+        native_outcome: nativeOutcome,
         session_id,
       };
       const manifest = {
@@ -389,48 +629,67 @@ export function remoteRuns(remote, artifacts, config, model) {
         runner: turn.runner,
         runner_version,
         session_id,
-        branch: shouldPush ? turn.work_branch : null,
-        checkpoint_sha: revision,
-        omitted_work: false,
+        branch: interrupted
+          ? turn.progress.branch
+          : shouldPush
+            ? turn.work_branch
+            : asking
+              ? turn.progress.branch
+              : null,
+        checkpoint_sha: interrupted ? checkpointHead : revision,
+        omitted_work: interrupted,
         provider_sha: remoteDev.sha,
         auto_count: 0,
         sequence: 1,
-        outcome: "completed",
-        root_run_id: String(id),
-        activation_run_id: String(id),
+        outcome: nativeOutcome,
+        root_run_id: releasedPlan.root_run_id,
+        activation_run_id: releasedPlan.activation_run_id,
         operator: run.actor.login,
         lineage: releasedPlan.lineage,
         workspace: root,
-        runner_home: join(root, turn.runner),
-        files:
-          process.env.ORM_TEST_FIXTURE_GROUP === "sessions" &&
-          task === "investigation_triage"
-            ? Array.from({ length: 4500 }, (_, i) => ({
-                path: `${turn.runner === "codex" ? "codex/sessions" : "claude/projects/fixture/memory"}/${"a".repeat(465)}/${i}.${turn.runner === "codex" ? "jsonl" : "md"}`,
-                sha256: "b".repeat(64),
-                bytes: 1,
-              }))
-            : [],
+        runner_home: runnerHome,
+        files: files.map(({ path, content }) => ({
+          path,
+          sha256: createHash("sha256").update(content).digest("hex"),
+          bytes: Buffer.byteLength(content),
+        })),
       };
-      artifacts.native(
-        run,
-        `remote-dev-result-r${id}-a1`,
-        await archive("record.json", record),
-      );
-      validateManifest(manifest, {
-        repository: repository.full_name,
-        runner: turn.runner,
-      });
-      artifacts.native(
-        run,
-        checkpointName(manifest),
-        await archive("manifest.json", manifest),
-      );
+      if (!lostResult)
+        artifacts.native(
+          run,
+          `remote-dev-result-r${id}-a1`,
+          await archive("record.json", record),
+        );
+      if (session_id) {
+        validateManifest(manifest, {
+          repository: repository.full_name,
+          runner: turn.runner,
+        });
+        artifacts.native(
+          run,
+          checkpointName(manifest),
+          await archive("manifest.json", manifest, files),
+        );
+        if (interrupted && mode === "expired_coding") {
+          const saved = artifacts
+            .available(run.id)
+            .find((artifact) => artifact.name === checkpointName(manifest));
+          artifacts.fault(saved.id, "expired");
+        }
+      }
       entry.elapsed = 1000;
       run.status = "completed";
-      run.conclusion = "success";
+      run.conclusion = noConversation
+        ? "failure"
+        : nativeOutcome === "cancelled"
+          ? "timed_out"
+          : "success";
       events.push({
-        type: "complete",
+        type: noConversation
+          ? "no_conversation"
+          : nativeOutcome === "cancelled"
+            ? "interrupted"
+            : "complete",
         issue: number,
         run: id,
         role: turn.role,
@@ -439,6 +698,8 @@ export function remoteRuns(remote, artifacts, config, model) {
         head: revision,
         parent: shouldPush ? git("rev-parse", "HEAD^") : null,
         branch: manifest.branch,
+        progress_branch: turn.progress?.branch,
+        assessment_of: turn.assessment?.sha,
         task,
       });
       if (
@@ -465,7 +726,7 @@ export function remoteRuns(remote, artifacts, config, model) {
         });
       }
     } finally {
-      await rm(root, { recursive: true });
+      await rm(directory, { recursive: true });
     }
   }
   return {
@@ -495,6 +756,18 @@ export function remoteRuns(remote, artifacts, config, model) {
       assert.equal(entry?.run.status, "completed");
       entry.latestAttempt = 2;
     },
+    deleteLegacyProducer(number, id) {
+      const entry = runs.get(id);
+      assert.equal(entry?.run.status, "completed");
+      const { row, codec, decoded } = signed(number);
+      const { state, narrative } = decoded;
+      assert.equal(state.agent_recovery.investigation.run_id, id);
+      delete state.agent_recovery;
+      row.body = codec.encode(state, narrative);
+      entry.deleted = true;
+    },
+    codingCandidate: (number) =>
+      state(number)?.agent_recovery?.coding?.candidate,
     budget(number, used) {
       const { row, codec, decoded } = signed(number);
       const { state, narrative } = decoded;

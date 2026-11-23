@@ -7,8 +7,11 @@ import type { DurablePublication } from "../actions/state.ts";
 import type { Question } from "../services/clarification-contracts.ts";
 
 export class StateError extends RuntimeError {
-  constructor(code: string) {
+  readonly retryAt: number;
+
+  constructor(code: string, retryAt = 0) {
     super(code);
+    this.retryAt = retryAt;
   }
 }
 

@@ -632,6 +632,38 @@ export async function createPublicationFixture(root: string) {
       });
       return;
     }
+    const workCommit = path.match(
+      /^\/repos\/owner\/repo\/git\/commits\/([a-f0-9]{40})$/,
+    );
+    if (workCommit) {
+      const commit = workCommit[1];
+      const [sha, ...parents] = git([
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        commit,
+      ]).split(" ");
+      send({
+        sha,
+        tree: { sha: git(["rev-parse", `${sha}^{tree}`]) },
+        parents: parents.map((sha) => ({ sha })),
+      });
+      return;
+    }
+    const comparison = path.match(
+      /^\/repos\/owner\/repo\/compare\/([a-f0-9]{40})\.\.\.([a-f0-9]{40})$/,
+    );
+    if (comparison) {
+      const [, ancestor, candidate] = comparison;
+      const mergeBase = git(["merge-base", ancestor, candidate]);
+      send({
+        status: mergeBase === ancestor ? "ahead" : "diverged",
+        base_commit: { sha: ancestor },
+        merge_base_commit: { sha: mergeBase },
+      });
+      return;
+    }
     const rules = path.match(/^\/repos\/owner\/repo\/rules\/branches\/(.+)$/);
     if (rules) {
       const page = Number(url.searchParams.get("page") ?? 1),

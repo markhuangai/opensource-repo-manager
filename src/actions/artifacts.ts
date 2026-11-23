@@ -21,7 +21,9 @@ import {
   workerLimits,
   type ArtifactManifest,
 } from "../domain/agents.ts";
-import { ActionsRepository } from "../repositories/actions.ts";
+import { ActionsRepository, issueDigest } from "../repositories/actions.ts";
+import { PublicationRepository } from "../repositories/publication.ts";
+import type { IssueContext } from "../domain/jobs.ts";
 import { Store } from "../repositories/store.ts";
 import { userProcesses } from "../runtime/process.ts";
 import {
@@ -38,6 +40,7 @@ import {
   sealBundle,
   type ArtifactReference,
   type BundleIdentity,
+  type PreparedArtifact,
 } from "./bundle.ts";
 import {
   StateCodec,
@@ -208,6 +211,7 @@ export class ActionsArtifacts {
     store: Store,
     state: TaskState,
     signal: AbortSignal,
+    prepare: (artifact: PreparedArtifact) => Promise<void>,
   ): Promise<ArtifactReference | undefined> {
     if (!state.job) return;
     await this.idle(store);
@@ -281,7 +285,7 @@ export class ActionsArtifacts {
         upload,
         `orm-session-${identity.checkpoint_id}.orm`,
       );
-      await sealBundle({
+      const content = await sealBundle({
         identity,
         files,
         destination,
@@ -289,15 +293,22 @@ export class ActionsArtifacts {
         limit: this.limit,
         signal,
       });
+      const prepared = { ...identity, ...content };
+      await prepare(prepared);
       return await this.transport.upload(
         destination,
-        identity,
+        prepared,
         this.limit,
         signal,
       );
     } finally {
       await rm(directory, { recursive: true });
     }
+  }
+
+  locate(prepared: PreparedArtifact, signal: AbortSignal) {
+    if (prepared.size > this.limit) throw new StateError("session_size_limit");
+    return this.transport.locate(prepared, signal);
   }
 
   private async install(from: string, to: string, signal: AbortSignal) {
@@ -317,9 +328,11 @@ export class ActionsArtifacts {
     store: Store,
     current: StateComment,
     signal: AbortSignal,
-  ): Promise<"none" | "restored" | "expired"> {
+    issue: IssueContext,
+    prepared?: ArtifactReference,
+  ): Promise<"none" | "restored" | "expired" | "replayed_investigation"> {
     const state = current.state,
-      reference = state.session_artifact;
+      reference = prepared ?? state.session_artifact;
     if (!reference) return "none";
     if (
       reference.repository_id !== state.repository.id ||
@@ -330,8 +343,14 @@ export class ActionsArtifacts {
       reference.runtime_digest !== runtimeDigest()
     )
       throw new StateError("session_incompatible");
-    if (new ActionsRepository(store).local()) return "none";
-    if (store.jobs().length) throw new StateError("state_local_conflict");
+    const repository = new ActionsRepository(store);
+    const local = repository.local();
+    if (local && store.jobs().length && !prepared) return "none";
+    if (
+      (local && local.body !== current.body && local.intent !== current.body) ||
+      (!local && store.jobs().length)
+    )
+      throw new StateError("state_local_conflict");
     await this.idle(store);
     const directory = await this.temporary();
     let checkpoint: Store | undefined;
@@ -402,12 +421,18 @@ export class ActionsArtifacts {
           value > (state.budget[name as keyof typeof state.budget] as number)
         )
           throw new StateError("state_conflict");
+      const missingPublication =
+        state.pending &&
+        state.pending.kind !== "question" &&
+        !checkpoint.db
+          .prepare("SELECT 1 FROM publication_operations WHERE id=?")
+          .get(state.pending.id);
+      const confirmedInvestigationStatus =
+        missingPublication &&
+        !new PublicationRepository(checkpoint).pending(state.job.id) &&
+        this.confirmedInvestigationStatus(current, archived, issue);
       if (
-        (state.pending &&
-          state.pending.kind !== "question" &&
-          !checkpoint.db
-            .prepare("SELECT 1 FROM publication_operations WHERE id=?")
-            .get(state.pending.id)) ||
+        (missingPublication && !confirmedInvestigationStatus) ||
         (state.pull && !archived.pull) ||
         (state.head && !archived.head && !state.pending)
       )
@@ -500,11 +525,64 @@ export class ActionsArtifacts {
       }
       checkpoint.close();
       checkpoint = undefined;
-      new ActionsRepository(store).importCheckpoint(database, current.body);
-      return "restored";
+      if (!store.jobs().length)
+        repository.importCheckpoint(database, current.body);
+      return confirmedInvestigationStatus
+        ? "replayed_investigation"
+        : "restored";
     } finally {
       checkpoint?.close();
       await rm(directory, { recursive: true });
     }
+  }
+
+  private confirmedInvestigationStatus(
+    current: StateComment,
+    archived: TaskState,
+    issue: IssueContext,
+  ) {
+    const state = current.state;
+    const operation = state.pending;
+    const step = operation?.steps[0];
+    return (
+      !state.checkpoint_pending &&
+      state.job?.phase === "investigation" &&
+      archived.job?.phase === "investigation" &&
+      state.job.status === "pending" &&
+      issue.state === "open" &&
+      issueDigest(issue) === state.job.issue_digest &&
+      digest(issue.source) === digest(state.job.source) &&
+      !state.pull &&
+      !state.pr &&
+      !state.head &&
+      !state.scope &&
+      !state.question &&
+      !archived.pull &&
+      !archived.pr &&
+      !archived.head &&
+      !archived.scope &&
+      !archived.question &&
+      !state.agent_turn &&
+      !archived.agent_turn?.work_branch &&
+      !archived.pending?.steps.some(
+        (item) =>
+          item.kind !== "comment" ||
+          ["dispatching", "uncertain"].includes(item.state),
+      ) &&
+      operation?.kind === "investigation_stage" &&
+      operation.status === "confirmed" &&
+      operation.commit === null &&
+      operation.actor.id === state.author_id &&
+      operation.revision === state.job.revision &&
+      digest(operation.source) === digest(state.job.source) &&
+      operation.steps.length === 1 &&
+      step?.kind === "comment" &&
+      step.state === "confirmed" &&
+      step.object_id === state.comment_id &&
+      step.body_digest === digest(current.narrative) &&
+      current.narrative.endsWith(
+        `\n\n<!-- orm:${state.publication_instance}:${state.job.id}:${operation.id} -->`,
+      )
+    );
   }
 }

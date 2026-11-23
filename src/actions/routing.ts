@@ -156,6 +156,8 @@ export async function routeActions(
         state?.agent_turn?.id === match[2] &&
         state.author_id === run.actor.id &&
         state.agent_turn.workflow_id === run.workflow_id &&
+        (!state.agent_turn.receipt_run_id ||
+          state.agent_turn.receipt_run_id === run.id) &&
         [null, run.id].includes(state.agent_turn.run_id)
       )
         numbers = [number];

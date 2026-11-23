@@ -30,6 +30,7 @@ import { ImplementationRepository } from "../../repositories/implementation.ts";
 import { PrMonitorRepository } from "../../repositories/pr-monitor.ts";
 import { findingIdentity } from "../pr-monitor/policy.ts";
 import { renderFindings, stageText } from "../investigation/contracts.ts";
+import { recoveryStatus } from "./contracts.ts";
 import type { BootstrapLease, Supervisor } from "../../runtime/supervisor.ts";
 import { rootDirectory } from "../workspaces/files.ts";
 import { ExternalOutputReview, outputReviewBinding } from "./review.ts";
@@ -747,7 +748,7 @@ export class PublicationService {
         proposal.previous_operation,
         job.id,
       );
-      payload.comment = `${this.investigationStatus(proposal.stage, payload.narrative)}${this.pullReference(receipt)}\n\n${marker}`;
+      payload.comment = `${this.investigationStatus(proposal, payload.narrative)}${this.pullReference(receipt)}\n\n${marker}`;
     } else if (
       proposal.kind === "pr_stage" ||
       proposal.kind === "pr_notification"
@@ -1031,7 +1032,7 @@ export class PublicationService {
           proposal.kind === "pr_notification"
         ? this.previousNarrative(proposal.previous_operation, receipt.job_id)
         : "";
-    const expected = `${proposal.kind === "notice" ? notices[proposal.reason] : proposal.kind === "pr_stage" || proposal.kind === "pr_notification" ? this.prStatus(receipt, narrative) : `${this.investigationStatus(proposal.stage, narrative)}${this.pullReference(receipt)}`}\n\n<!-- orm:${this.repository.instance()}:${receipt.job_id}:${receipt.id} -->`;
+    const expected = `${proposal.kind === "notice" ? notices[proposal.reason] : proposal.kind === "pr_stage" || proposal.kind === "pr_notification" ? this.prStatus(receipt, narrative) : `${this.investigationStatus(proposal, narrative)}${this.pullReference(receipt)}`}\n\n<!-- orm:${this.repository.instance()}:${receipt.job_id}:${receipt.id} -->`;
     const review = this.repository.reviewed(receipt.review_id);
     if (
       (receipt.payload as FrozenPayload).comment !== expected ||
@@ -1064,15 +1065,19 @@ export class PublicationService {
   }
 
   private investigationStatus(
-    stage: keyof typeof stageText | "completed",
+    proposal: Extract<PublicationProposal, { kind: "investigation_stage" }>,
     narrative: string,
   ) {
+    const { stage, recovery } = proposal;
     if (stage === "completed") {
       if (!narrative)
         throw new RuntimeError("investigation_summary_unreviewed");
       return narrative;
     }
-    return `${stageText[stage]}${narrative ? `\n\nPrevious reviewed findings:\n\n${narrative}` : ""}`;
+    const status = recovery
+      ? recoveryStatus("Investigation", recovery)
+      : stageText[stage];
+    return `${status}${narrative ? `\n\nPrevious reviewed findings:\n\n${narrative}` : ""}`;
   }
 
   private previousNarrative(id: string | null, jobId: number) {

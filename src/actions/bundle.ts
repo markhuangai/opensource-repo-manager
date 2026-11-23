@@ -32,6 +32,11 @@ export const bundleIdentitySchema = z.strictObject({
   run_attempt: positive,
 });
 export type BundleIdentity = z.infer<typeof bundleIdentitySchema>;
+export const preparedArtifactSchema = bundleIdentitySchema.extend({
+  digest: hash,
+  size: positive,
+});
+export type PreparedArtifact = z.infer<typeof preparedArtifactSchema>;
 export const artifactReferenceSchema = bundleIdentitySchema.extend({
   artifact_id: positive,
   digest: hash,

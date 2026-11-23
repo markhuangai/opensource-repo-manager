@@ -52,6 +52,7 @@ const revision = remote.commit({
 });
 remote.git(["update-ref", "refs/heads/main", revision.sha]);
 const runs = remoteRuns(remote, artifacts, config, model);
+let failedRead;
 
 const tls = httpsServer(
   {
@@ -60,6 +61,18 @@ const tls = httpsServer(
   },
   async (req, res) => {
     try {
+      const path = new URL(req.url, "https://api.github.com").pathname;
+      if (req.method === "GET" && failedRead?.path === path) {
+        const { status } = failedRead;
+        failedRead = undefined;
+        res.writeHead(status, {
+          "content-type": "application/json",
+          "x-github-request-id": "fixture-read",
+          ...(status === 429 ? { "retry-after": "5" } : {}),
+        });
+        res.end(JSON.stringify({ message: "Temporary read failure" }));
+        return;
+      }
       if ((await runs.handle(req, res)) || (await artifacts.handle(req, res)))
         return;
       const upstream = request(
@@ -124,6 +137,18 @@ const http = createServer(async (req, res) => {
         remote.git(["update-ref", `refs/heads/${pull.branch}`, head]);
         return send({ head });
       }
+      case "/move-progress": {
+        const row = runs.events.findLast(
+          (item) => item.issue === issue && item.type === "progress_only",
+        );
+        assert(row);
+        const changed = remote.commit(
+          { ...fixtureSource, "README.md": "Unexpected work branch change.\n" },
+          remote.head("main"),
+        ).sha;
+        remote.git(["update-ref", `refs/heads/${row.branch}`, changed]);
+        return send({ head: changed });
+      }
       case "/start":
         runs.start(Number(url.searchParams.get("run")));
         return send({});
@@ -134,6 +159,9 @@ const http = createServer(async (req, res) => {
         return send({});
       case "/rerun":
         runs.rerun(Number(url.searchParams.get("run")));
+        return send({});
+      case "/delete-legacy-producer":
+        runs.deleteLegacyProducer(issue, Number(url.searchParams.get("run")));
         return send({});
       case "/budget":
         runs.budget(issue, Number(url.searchParams.get("used")));
@@ -172,6 +200,17 @@ const http = createServer(async (req, res) => {
           url.searchParams.get("kind"),
         );
         return send({});
+      case "/fail-read": {
+        const path = url.searchParams.get("path");
+        const status = Number(url.searchParams.get("status"));
+        assert([404, 429, 502].includes(status));
+        assert.match(
+          path,
+          /^(?:git\/commits\/[a-f0-9]{40}|compare\/[a-f0-9]{40}\.\.\.[a-f0-9]{40}|actions\/runs\/9[0-9]{3}\/(?:artifacts|attempts\/1(?:\/jobs)?))$/,
+        );
+        failedRead = { path: `/repos/owner/repo/${path}`, status };
+        return send({});
+      }
       case "/lose-pull":
         remote.state.dropAfter = "pull";
         return send({});
@@ -183,6 +222,7 @@ const http = createServer(async (req, res) => {
             .filter((row) => row.branch.endsWith(`/issue-${issue}`))
             .map((row) => ({ ...row, head: remote.head(row.branch) })),
           events: runs.events.filter((row) => row.issue === issue),
+          coding_candidate: runs.codingCandidate(issue),
           work_heads: Object.fromEntries(
             remote
               .git([

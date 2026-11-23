@@ -1,12 +1,13 @@
 import {
   RemoteTurnPending,
   remoteRetryReasons,
+  remoteBlockingReasons,
 } from "../../domain/remote-turns.ts";
 import { resolveSourceEvidence } from "./evidence.ts";
 import { join } from "node:path";
 import { z } from "zod";
 import type { SecretAccessor } from "../../config/secrets.ts";
-import { RuntimeError } from "../../domain/agents.ts";
+import { digest, RuntimeError } from "../../domain/agents.ts";
 import {
   budgetUsage,
   IntakeError,
@@ -47,6 +48,7 @@ const transient = new Set([
 ]);
 const safeFailures = new Set([
   ...transient,
+  ...remoteBlockingReasons,
   "active_budget_exhausted",
   "agent_run_limit",
   "agent_dispatch_uncertain",
@@ -591,9 +593,17 @@ export class InvestigationService {
           record.status_operation,
         )
       : undefined;
+    const recovery =
+      stage === "blocked" && record.failure
+        ? {
+            cause: record.failure,
+            retry_at: record.retry_stage ? record.retry_at : null,
+          }
+        : undefined;
     const proposal: PublicationProposal =
       previous?.proposal.kind === "investigation_stage" &&
       previous.proposal.stage === stage &&
+      digest(previous.proposal.recovery ?? null) === digest(recovery ?? null) &&
       previous.proposal.previous_operation === previousOperation
         ? previous.proposal
         : {
@@ -601,6 +611,7 @@ export class InvestigationService {
             job_id: record.job_id,
             revision: record.revision,
             stage,
+            ...(recovery ? { recovery } : {}),
             previous_operation: previousOperation,
             after_operation: record.status_operation,
           };
@@ -671,7 +682,16 @@ export class InvestigationService {
       this.failure = record.failure;
     }
     this.repository.save(record);
-    this.logger.error(`Investigation blocked (${record.failure}).`);
+    const fields = {
+      event: "agent.investigation_stopped",
+      level: record.retry_stage ? "warn" : "error",
+      issue_number: job.issue_number,
+      revision: job.revision,
+      cause: record.failure,
+      outcome: record.retry_stage ? "retry_scheduled" : "blocked",
+      retry_at: record.retry_stage ? record.retry_at : undefined,
+    } as const;
+    this.logger.diagnostic(fields.level, fields);
     await this.publishBlocked(record);
   }
 

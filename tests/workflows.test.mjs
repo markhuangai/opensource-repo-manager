@@ -2494,7 +2494,9 @@ describe("consumer agent dispatch", () => {
     );
     expect(agent.needs).toBe("authorize");
     expect(agent.if).toBe("github.run_attempt == '1'");
-    expect(agent.with).not.toHaveProperty("resume-run-id");
+    expect(agent.with["resume-run-id"]).toBe(
+      "${{ needs.authorize.outputs.resume_run_id }}",
+    );
     for (const secret of Object.values(agent.secrets)) {
       expect(secret).toContain("github.run_attempt == '1'");
       expect(secret).not.toMatch(

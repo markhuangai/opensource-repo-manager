@@ -197,17 +197,22 @@ try {
     if (!application && state && store?.db.open)
       await store.checkpoint(AbortSignal.timeout(9000), true);
   } catch (error) {
-    logger.error(
-      "Final Actions checkpoint failed; only the last acknowledged artifact is recoverable.",
-    );
-    result = { ...result, checkpoint_failed: true };
-    if (error instanceof StateError)
-      result = {
-        ...result,
-        outcome: "blocked",
-        reason: error.code as TaskResult["reason"],
-      };
-    else cleanupFailed = true;
+    if (
+      error instanceof StateError ||
+      (error instanceof DOMException && error.name === "TimeoutError")
+    ) {
+      const cause =
+        error instanceof StateError ? error.code : "checkpoint_interrupted";
+      diagnostics.event("checkpoint.final_failed", {
+        cause,
+        task_outcome: result.outcome,
+        task_reason: result.reason,
+        request_id: apiFailureId(error),
+        recovery:
+          "Check the prepared upload and last acknowledged checkpoint on the next maintenance event.",
+      });
+      result = { ...result, checkpoint_failed: true, checkpoint_error: cause };
+    } else cleanupFailed = true;
   } finally {
     try {
       if (store?.db.open) store.close();
@@ -218,7 +223,7 @@ try {
     process.removeListener("SIGINT", cancel);
     process.removeListener("SIGTERM", cancel);
   }
-  if (state?.failure())
+  if (state?.failure() && state.failure()!.code !== result.checkpoint_error)
     result = {
       ...result,
       outcome: "blocked",

@@ -221,12 +221,17 @@ export function createSafeLogger(
   diagnosticSink?: (line: string) => void,
 ) {
   return Object.freeze({
-    diagnostic: (level: "info" | "error", record: Record<string, unknown>) => {
+    diagnostic: (
+      level: "info" | "warn" | "error",
+      record: Record<string, unknown>,
+    ) => {
       const line = JSON.stringify(record);
       if (Buffer.byteLength(line) > 2048)
         throw new RangeError("Diagnostic record exceeds 2 KiB.");
       if (diagnosticSink) diagnosticSink(line);
-      else (level === "error" || stderr ? console.error : console.log)(line);
+      else if (level === "error" || stderr) console.error(line);
+      else if (level === "warn") console.warn(line);
+      else console.log(line);
     },
     info: (message: string) =>
       (stderr ? console.error : console.log)(
@@ -243,5 +248,5 @@ export function createSafeLogger(
 
 export type SafeLogger = Pick<
   ReturnType<typeof createSafeLogger>,
-  "info" | "error"
+  "info" | "error" | "diagnostic"
 >;
