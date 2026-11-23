@@ -1183,6 +1183,29 @@ export async function runActionsTests({
         1,
       );
       assert.equal(proof(6).pulls.length, 0);
+      upstream("/close?issue=6");
+      assert.equal((await invoke(6, { fresh: true })).reason, "agent_run");
+      assert.equal(signedState(6).agent_turn.id, entry.turn.id);
+      const closed = await invoke(6, { fresh: true });
+      assert.equal(closed.reason, "issue_closed");
+      assert.equal(signedState(6).agent_turn, null);
+      const retired = proof(6);
+      assert.equal(retired.pulls.length, 0);
+      assert.equal(
+        retired.work_heads[entry.turn.progress.branch],
+        changed.head,
+      );
+      assert.equal(
+        retired.events.filter(
+          (event) => event.type === "cancel" && event.run === entry.run.id,
+        ).length,
+        1,
+      );
+      assert.match(
+        logs.at(-1),
+        /"event":"agent.progress_unverified".*"outcome":"superseded"/,
+      );
+      return closed;
     });
     await scenario("coding-clarification", async () => {
       setup(9, "coding_clarification");

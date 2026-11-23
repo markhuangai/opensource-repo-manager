@@ -705,7 +705,7 @@ export class RemoteAgents {
         recovery:
           "Retire the unregistered run and dispatch from the current default branch.",
       });
-      await this.retire(turn, signal, run);
+      await this.retire(turn, signal, { run });
       throw new RemoteTurnPending();
     }
     if (turn.run_id === null)
@@ -727,13 +727,19 @@ export class RemoteAgents {
         new PrMonitorRepository(this.store).get(job.id)?.pending_agent)
     )
       return;
-    await this.retire(turn, signal);
+    await this.retire(turn, signal, {
+      superseded:
+        force || job?.revision !== turn.revision || job.status !== "pending",
+    });
   }
 
   private async retire(
     turn: RemoteTurn,
     signal: AbortSignal,
-    knownRun?: RemoteRun,
+    {
+      run: knownRun,
+      superseded = false,
+    }: { run?: RemoteRun; superseded?: boolean } = {},
   ) {
     if (turn.elapsed_ms !== null) {
       await this.state.setAgentTurn(null, signal);
@@ -752,10 +758,24 @@ export class RemoteAgents {
       throw new RemoteTurnPending();
     }
     const elapsed = run ? await this.api.executionTime(run, signal) : 0;
-    const recovery =
-      run && turn.work_branch && turn.progress
-        ? await this.freezeProgress(turn, run, signal)
-        : undefined;
+    let recovery: AgentRecovery | undefined;
+    if (run && turn.work_branch && turn.progress) {
+      try {
+        recovery = await this.freezeProgress(turn, run, signal);
+      } catch (error) {
+        if (
+          !superseded ||
+          !(error instanceof RuntimeError) ||
+          error.code !== "agent_progress_conflict"
+        )
+          throw error;
+        this.event({ ...turn, run_id: run.id }, "progress_unverified", {
+          level: "warn",
+          cause: error.code,
+          outcome: "superseded",
+        });
+      }
+    }
     await this.state.setAgentTurn(null, signal, elapsed, recovery);
   }
 
