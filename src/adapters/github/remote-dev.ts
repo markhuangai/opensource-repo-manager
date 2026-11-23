@@ -118,7 +118,7 @@ export class RemoteDevActions {
     return run;
   }
 
-  async resumeAvailable(
+  async resumeStatus(
     repository: RepositoryIdentity,
     actor: number,
     issue: number,
@@ -146,13 +146,13 @@ export class RemoteDevActions {
       }
     };
     const run = await read(() => this.latest(session.run_id, signal));
-    if (!run) return false;
+    if (!run) return "missing";
     if (
       run.repository.id !== repository.id ||
       run.head_repository.id !== repository.id
     )
       throw new RuntimeError("agent_resume_conflict");
-    if (run.run_attempt !== 1) return false;
+    if (run.run_attempt !== 1) return "superseded";
     if (run.status !== "completed")
       throw new RuntimeError("agent_resume_conflict");
     assertTurnRun(
@@ -181,9 +181,9 @@ export class RemoteDevActions {
           ).data,
       ),
     );
-    if (!rows) return false;
+    if (!rows) return "missing";
     const latest = nativeCheckpointArtifact(run, rows);
-    if (!latest) return false;
+    if (!latest) return "missing";
     const { artifact, sequence } = latest;
     if (
       artifact.id !== session.artifact_id ||
@@ -195,7 +195,7 @@ export class RemoteDevActions {
       artifact.workflow_run.head_sha !== run.head_sha
     )
       throw new RuntimeError("agent_resume_conflict");
-    return true;
+    return latest.expired ? "expired" : "available";
   }
 
   async find(

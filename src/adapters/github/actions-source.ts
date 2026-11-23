@@ -29,55 +29,15 @@ export class GitHubActionsSource extends OctokitWriter {
     this.sourceCoordinates = { owner, repo };
   }
 
-  async workCommit(commit: string, signal: AbortSignal) {
-    const value = z
-      .object({
-        sha,
-        tree: z.object({ sha }),
-        parents: z.array(z.object({ sha })),
-      })
-      .parse(
-        (
-          await this.api.request(
-            "GET /repos/{owner}/{repo}/git/commits/{commit_sha}",
-            {
-              ...this.sourceCoordinates,
-              commit_sha: sha.parse(commit),
-              request: {
-                signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
-                redirect: "error",
-              },
-            },
-          )
-        ).data,
-      );
+  private async workCommit(commit: string, signal: AbortSignal) {
+    const value = await this.reader.gitCommit(commit, signal);
     if (value.sha !== commit) throw new RuntimeError("agent_progress_conflict");
     return value;
   }
 
   async workDescendsFrom(base: string, head: string, signal: AbortSignal) {
     if (base === head) return true;
-    const value = z
-      .object({
-        status: z.string(),
-        base_commit: z.object({ sha }),
-        merge_base_commit: z.object({ sha }),
-      })
-      .parse(
-        (
-          await this.api.request(
-            "GET /repos/{owner}/{repo}/compare/{basehead}",
-            {
-              ...this.sourceCoordinates,
-              basehead: `${sha.parse(base)}...${sha.parse(head)}`,
-              request: {
-                signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
-                redirect: "error",
-              },
-            },
-          )
-        ).data,
-      );
+    const value = await this.reader.compare(base, head, signal);
     return (
       value.status === "ahead" &&
       value.base_commit.sha === base &&

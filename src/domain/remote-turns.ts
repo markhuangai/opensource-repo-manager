@@ -22,6 +22,12 @@ export const remoteBlockingReasons = [
   "agent_artifact_conflict",
   "session_provenance_invalid",
 ] as const;
+export const collectionRetryCauses = [
+  "github_read_failed",
+  "github_rate_limited",
+  "github_publication_failed",
+  "session_transport_unavailable",
+] as const;
 const workRef = z.string().regex(/^orm-work\/[a-f0-9-]{36}\/[a-f0-9-]{36}$/);
 const nativeSessionSchema = z.strictObject({
   key: phaseKey,
@@ -83,6 +89,12 @@ export const turnSchema = z.strictObject({
   recovery_key: phaseKey.optional(),
   resume: nativeSessionSchema.optional(),
   collection_retries: z.number().int().nonnegative().safe().optional(),
+  collection_retry: z
+    .strictObject({
+      cause: z.enum(collectionRetryCauses),
+      retry_at: z.number().int().positive().max(8.64e15),
+    })
+    .optional(),
   plan_digest: phaseKey,
   caller_sha: sha,
   workflow_id: githubId,
@@ -157,8 +169,11 @@ export function turnTitle(issueNumber: number, turn: string) {
 }
 
 export class RemoteTurnPending extends Error {
-  constructor() {
+  readonly retryAt?: number;
+
+  constructor(retryAt?: number) {
     super("An authorized agent run is pending.");
+    this.retryAt = retryAt;
   }
 }
 

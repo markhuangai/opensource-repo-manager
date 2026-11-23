@@ -86,12 +86,13 @@ export function nativeCheckpointArtifact(run: RemoteRun, rows: Artifact[]) {
   const [latest, next] = matches;
   if (latest && next?.sequence === latest.sequence)
     throw new StateError("agent_artifact_conflict");
-  if (
-    latest &&
-    !latest.artifact.expired &&
-    Date.parse(latest.artifact.expires_at) > Date.now()
-  )
-    return latest;
+  if (latest)
+    return {
+      ...latest,
+      expired:
+        latest.artifact.expired ||
+        Date.parse(latest.artifact.expires_at) <= Date.now(),
+    };
 }
 
 export interface ArtifactTransport {
@@ -277,10 +278,15 @@ export class GitHubArtifacts implements ArtifactTransport {
     {
       artifact,
       sequence,
+      expired,
     }: NonNullable<ReturnType<typeof nativeCheckpointArtifact>>,
     directory: string,
     signal: AbortSignal,
   ) {
+    if (expired) {
+      this.provenance(artifact, run);
+      return undefined;
+    }
     return {
       checkpoint: await this.agentRecord(
         run,

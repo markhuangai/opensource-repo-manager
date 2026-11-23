@@ -277,6 +277,38 @@ export class OctokitReader implements GitHubReader {
     };
   }
 
+  async gitCommit(commit: string, signal: AbortSignal) {
+    return z
+      .object({
+        sha,
+        tree: z.object({ sha }),
+        parents: z.array(z.object({ sha })),
+      })
+      .parse(
+        await this.read(
+          "GET /repos/{owner}/{repo}/git/commits/{commit_sha}",
+          { commit_sha: sha.parse(commit) },
+          signal,
+        ),
+      );
+  }
+
+  async compare(base: string, head: string, signal: AbortSignal) {
+    return z
+      .object({
+        status: z.string(),
+        base_commit: z.object({ sha }),
+        merge_base_commit: z.object({ sha }),
+      })
+      .parse(
+        await this.read(
+          "GET /repos/{owner}/{repo}/compare/{basehead}",
+          { basehead: `${sha.parse(base)}...${sha.parse(head)}` },
+          signal,
+        ),
+      );
+  }
+
   async issue(
     number: number,
     repository: RepositoryIdentity,

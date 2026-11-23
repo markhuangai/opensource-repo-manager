@@ -266,14 +266,18 @@ function recoveryFooter(state: TaskState) {
     state.job?.phase === "investigation"
       ? recovery?.investigation
       : recovery?.coding?.session;
+  const collection =
+    state.job?.status === "pending" &&
+    state.agent_turn?.revision === state.job.revision &&
+    state.agent_turn.phase === state.job.phase
+      ? state.agent_turn.collection_retry
+      : undefined;
+  const phase =
+    state.job?.phase === "investigation" ? "Investigation" : "Implementation";
   const lines = [
     recovery?.blocked &&
-      recoveryStatus(
-        state.job?.phase === "investigation"
-          ? "Investigation"
-          : "Implementation",
-        { cause: recovery.blocked, retry_at: null },
-      ),
+      recoveryStatus(phase, { cause: recovery.blocked, retry_at: null }),
+    collection && recoveryStatus(phase, collection),
     recovery?.last_run_id &&
       `[Latest agent attempt](${origin}${recovery.last_run_id})`,
     usable && `[Saved conversation](${origin}${usable.run_id})`,

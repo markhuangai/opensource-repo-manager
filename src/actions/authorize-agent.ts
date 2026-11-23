@@ -156,14 +156,14 @@ export async function authorizeAgent(
           !session ||
           digest(session) !== digest(turn.resume) ||
           session.key !== turn.recovery_key ||
-          !(await api.resumeAvailable(
+          (await api.resumeStatus(
             repository,
             state.author_id,
             input.issue,
             turn,
             session,
             signal,
-          ))
+          )) !== "available"
         )
           throw new RuntimeError("agent_resume_unavailable");
       }

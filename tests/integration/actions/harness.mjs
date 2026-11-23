@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import { join } from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
+import { StateCodec } from "../../../src/actions/state.ts";
 
 export async function runActionsTests({
   sdk,
@@ -904,6 +905,15 @@ export async function runActionsTests({
       }
       assert.fail("The expected recovery turn was never scheduled");
     }
+    function signedState(issue) {
+      const { id, author_id, body } = proof(issue).comments[0];
+      return new StateCodec(config.session_key).decode(body, {
+        repository_id: 42,
+        issue_id: issue + 1000,
+        comment_id: id,
+        author_id,
+      }).state;
+    }
     await scenario("checkpoint-acknowledgement", async () => {
       setup(1, "reproduced");
       upstream("/fault?kind=checkpoint_visibility_delay");
@@ -994,7 +1004,89 @@ export async function runActionsTests({
     ])
       await scenario(name, async () => {
         const base = setup(issue, mode);
-        const outcome = await drain(issue);
+        let outcome;
+        if (mode === "expired_coding") {
+          outcome = await drain(issue);
+        } else {
+          const writer = await untilTurn(issue, await invoke(issue), (turn) =>
+            Boolean(
+              turn.work_branch && (mode === "lost_final_result" || turn.resume),
+            ),
+          );
+          const selection = await native(writer);
+          upstream(`/complete?run=${writer.run.id}`, selection);
+          assert.deepEqual((await route(writer.run)).issues, [issue]);
+          const [completed] = nativeEvents(issue, "implementation_change");
+          const evidence = proof(issue);
+          const gitPath = writer.turn.resume
+            ? `git/commits/${completed.head}`
+            : `compare/${base.sha}...${evidence.work_heads[writer.turn.progress.branch]}`;
+          if (writer.turn.resume) {
+            assert.equal(selection.resume_run_id, writer.turn.resume.run_id);
+            upstream(
+              `/fault?artifact=${writer.turn.resume.artifact_id}&kind=expired`,
+            );
+            const child = evidence.artifacts.find((artifact) =>
+              artifact.name.startsWith(
+                `remote-dev-session-r${writer.run.id}-a1-`,
+              ),
+            );
+            upstream(`/fault?artifact=${child.id}&kind=hide_once`);
+          }
+          const options = { fresh: true };
+          const collecting = await invoke(issue, options);
+          assert.equal(collecting.reason, "agent_run");
+          assert.deepEqual(pending(issue), []);
+          const before = signedState(issue);
+          assert.equal(before.agent_turn.id, writer.turn.id);
+          assert.equal(before.agent_turn.collection_retries, 1);
+          upstream(`/fail-git-read?path=${gitPath}`);
+          const readStartedAt = Date.now();
+          const retry = await invoke(issue, options);
+          assert.equal(retry.reason, "retry_scheduled");
+          assert.deepEqual(pending(issue), []);
+          const cause = writer.turn.resume
+            ? "github_rate_limited"
+            : "github_read_failed";
+          const after = signedState(issue);
+          assert.equal(
+            after.budget.infrastructure_retries,
+            before.budget.infrastructure_retries + 1,
+          );
+          assert.equal(after.budget.agent_runs, before.budget.agent_runs);
+          assert.deepEqual(after.agent_turn, {
+            ...before.agent_turn,
+            collection_retry: { cause, retry_at: retry.retry_at },
+          });
+          assert(
+            retry.retry_at >=
+              readStartedAt + (writer.turn.resume ? 5000 : 1000),
+          );
+          assert(
+            proof(issue).comments[0].body.includes(
+              `Implementation paused (${cause})`,
+            ),
+          );
+          const warning = logs
+            .at(-1)
+            .split("\n")
+            .filter((line) => line.startsWith("{"))
+            .map(JSON.parse)
+            .find((row) => row.event === "agent.collection_failed");
+          assert.equal(warning.level, "warn");
+          assert.equal(warning.run_id, writer.run.id);
+          assert.equal(warning.cause, cause);
+          assert.equal(warning.retry_at, retry.retry_at);
+          assert(warning.request_id);
+          diagnosticEvents.push(warning);
+          outcome = await drain(issue, retry, options);
+          assert.equal(outcome.head_sha, completed.head);
+          if (writer.turn.resume)
+            assert.deepEqual(
+              nativeEvents(issue, "implementation_candidate_assessment"),
+              [],
+            );
+        }
         assertPublished(issue, outcome);
         const { events, coding_candidate } = proof(issue);
         const first = events.find((item) => item.type === "progress_only");

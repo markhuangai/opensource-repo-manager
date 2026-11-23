@@ -21,6 +21,7 @@ import { budgetUsage, IntakeError } from "../domain/jobs.ts";
 import { StateError } from "../domain/durability.ts";
 import {
   checkpointRecordSchema,
+  collectionRetryCauses,
   remoteDev,
   remoteBlockingReasons,
   RemoteTurnPending,
@@ -348,14 +349,14 @@ export class RemoteAgents {
     const session = workBranch ? coding?.session : recovery.investigation;
     if (session && session.key === recoveryKey) {
       if (
-        await this.api.resumeAvailable(
+        (await this.api.resumeStatus(
           repository,
           author_id,
           issue.number,
           turn,
           session,
           signal,
-        )
+        )) === "available"
       ) {
         turn.resume = session;
         this.event(turn, "resume_selected", {
@@ -762,6 +763,9 @@ export class RemoteAgents {
     request: AgentRunRequest,
     signal: AbortSignal,
   ) {
+    const deferred = turn.collection_retry?.retry_at;
+    if (deferred && Date.now() < deferred)
+      throw new RemoteTurnPending(deferred);
     const run = await this.run(turn, signal);
     if (!run) {
       if (Date.now() - turn.created_at >= remoteDev.registrationMs) {
@@ -784,102 +788,140 @@ export class RemoteAgents {
       await this.state.setAgentTurn(turn, signal);
     }
     try {
-      if (run.conclusion !== "success" && !turn.progress && !turn.recovery_key)
-        throw new RuntimeError("agent_run_failed");
-      if (turn.resume) {
-        const { repository, author_id, issue } = this.state.agentState();
-        if (
-          !(await this.api.resumeAvailable(
-            repository,
-            author_id,
-            issue.number,
-            turn,
-            turn.resume,
-            signal,
-          ))
-        )
-          throw new RuntimeError("agent_resume_conflict");
-      }
-      return await this.result(turn, run, request, signal);
+      return await this.collectResult(turn, run, request, signal);
     } catch (error) {
       signal.throwIfAborted();
+      if (error instanceof RemoteTurnPending) throw error;
       const cause =
         error instanceof RuntimeError ||
         error instanceof IntakeError ||
         error instanceof StateError
           ? error.code
           : "agent_result_invalid";
-      const retry =
-        cause === "session_transport_unavailable" ||
-        (error instanceof IntakeError &&
-          ["github_read_failed", "github_rate_limited"].includes(cause));
-      const missing = cause === "agent_artifact_unavailable";
-      if (
-        missing &&
-        turn.progress &&
-        turn.work_branch &&
-        !turn.collection_retries
-      ) {
-        this.event(turn, "collection_pending", {
+      const retry = collectionRetryCauses.find((item) => item === cause);
+      if (retry) {
+        this.job(turn.job_id, turn.revision);
+        if (!this.store.reserveInfrastructureRetry(turn.job_id)) {
+          this.event(turn, "collection_failed", {
+            level: "error",
+            cause,
+            request_id: apiFailureId(error),
+            outcome: "retry_budget_exhausted",
+          });
+          throw new RuntimeError("infrastructure_budget_exhausted");
+        }
+        const retryAt = Math.max(
+          Date.now() + 1000,
+          error instanceof IntakeError ? error.retryAt : 0,
+        );
+        await this.state.setAgentTurn(
+          { ...turn, collection_retry: { cause: retry, retry_at: retryAt } },
+          signal,
+        );
+        this.event(turn, "collection_failed", {
           level: "warn",
           cause,
+          request_id: apiFailureId(error),
+          retry_at: retryAt,
+          outcome: "retry_scheduled",
+          recovery: "Collect the same terminal run after the retry deadline.",
+        });
+        throw new RemoteTurnPending(retryAt);
+      }
+      const missing = cause === "agent_artifact_unavailable";
+      const stopped =
+        missing && run.conclusion !== "success" ? "agent_run_failed" : cause;
+      this.event(turn, "result_rejected", {
+        level: missing ? "warn" : "error",
+        outcome: "rejected",
+        run_conclusion: run.conclusion ?? undefined,
+        cause: stopped,
+        request_id: apiFailureId(error),
+        recovery:
+          "Inspect the named native run, artifact and work-branch head. Retry the phase from verified source.",
+      });
+      if (this.state.agentState().agent_turn?.id === turn.id)
+        await this.state.setAgentTurn(null, signal);
+      throw new RuntimeError(stopped);
+    }
+  }
+
+  private async collectResult(
+    turn: RemoteTurn,
+    run: RemoteRun,
+    request: AgentRunRequest,
+    signal: AbortSignal,
+  ) {
+    let parentMissing = false;
+    try {
+      if (run.conclusion !== "success" && !turn.progress && !turn.recovery_key)
+        throw new RuntimeError("agent_run_failed");
+      if (turn.resume) {
+        const { repository, author_id, issue } = this.state.agentState();
+        const status = await this.api.resumeStatus(
+          repository,
+          author_id,
+          issue.number,
+          turn,
+          turn.resume,
+          signal,
+        );
+        if (status === "superseded")
+          throw new RuntimeError("agent_resume_conflict");
+        parentMissing = status === "missing";
+        if (status !== "available")
+          this.event(turn, "resume_parent_unavailable", {
+            level: parentMissing ? "warn" : "info",
+            cause: status,
+            parent_run_id: turn.resume.run_id,
+            artifact_id: turn.resume.artifact_id,
+            outcome: parentMissing ? "reconcile" : "verify_child",
+          });
+      }
+      return await this.result(turn, run, request, parentMissing, signal);
+    } catch (error) {
+      signal.throwIfAborted();
+      if (!(error instanceof RuntimeError || error instanceof StateError))
+        throw error;
+      const missing = error.code === "agent_artifact_unavailable";
+      if (!missing && error.code !== "agent_push_missing") throw error;
+      if (missing && !turn.collection_retries) {
+        this.event(turn, "collection_pending", {
+          level: "warn",
+          cause: error.code,
           outcome: "waiting",
           recovery:
-            "Collect the same terminal run again before assigning another writer.",
+            "Collect the same terminal run again on the next maintenance event.",
         });
         await this.state.setAgentTurn(
-          { ...turn, collection_retries: 1 },
+          { ...turn, collection_retries: 1, collection_retry: undefined },
           signal,
         );
         throw new RemoteTurnPending();
       }
-      const stopped =
-        missing && run.conclusion !== "success" ? "agent_run_failed" : cause;
-      this.event(turn, retry ? "collection_failed" : "result_rejected", {
-        level: retry || missing ? "warn" : "error",
-        outcome: retry ? "retryable" : "rejected",
-        run_conclusion: run.conclusion ?? undefined,
-        cause: stopped,
-        request_id: apiFailureId(error),
-        recovery: retry
-          ? "Retry collection of the authorized attempt after GitHub artifact or source access recovers."
-          : "Inspect the named native run, artifact and work-branch head. Retry the phase from verified source.",
-      });
-      if (!retry) {
-        let recovery: AgentRecovery | undefined;
-        if (missing || cause === "agent_push_missing") {
-          recovery =
-            turn.progress && turn.work_branch
-              ? await this.freezeProgress(turn, run, signal)
-              : this.state.agentState().agent_recovery;
-          if (recovery && turn.recovery_key) {
-            const directory = await mkdtemp(
-              join(this.directory, "agent-session-"),
-            );
-            try {
-              const checkpoint = await this.artifacts.agentCheckpoint(
-                run,
-                directory,
-                signal,
-              );
-              if (checkpoint)
-                await this.rememberSession(
-                  recovery,
-                  turn,
-                  run,
-                  checkpoint,
-                  signal,
-                );
-            } finally {
-              await rm(directory, { recursive: true });
-            }
-          }
+      const recovery =
+        turn.progress && turn.work_branch
+          ? await this.freezeProgress(turn, run, signal)
+          : structuredClone(this.state.agentState().agent_recovery);
+      if (recovery && parentMissing) {
+        if (turn.work_branch) delete recovery.coding?.session;
+        else delete recovery.investigation;
+      } else if (recovery && turn.recovery_key) {
+        const directory = await mkdtemp(join(this.directory, "agent-session-"));
+        try {
+          const checkpoint = await this.artifacts.agentCheckpoint(
+            run,
+            directory,
+            signal,
+          );
+          if (checkpoint)
+            await this.rememberSession(recovery, turn, run, checkpoint, signal);
+        } finally {
+          await rm(directory, { recursive: true });
         }
-        if (this.state.agentState().agent_turn?.id === turn.id)
-          await this.state.setAgentTurn(null, signal, 0, recovery);
       }
-      if (error instanceof IntakeError && retry) throw error;
-      throw new RuntimeError(stopped);
+      await this.state.setAgentTurn(null, signal, 0, recovery);
+      throw error;
     }
   }
 
@@ -1032,6 +1074,7 @@ export class RemoteAgents {
     turn: RemoteTurn,
     run: RemoteRun,
     request: AgentRunRequest,
+    parentMissing: boolean,
     signal: AbortSignal,
   ) {
     const directory = await mkdtemp(join(this.directory, "agent-result-"));
@@ -1043,6 +1086,7 @@ export class RemoteAgents {
       if (
         record.runner !== turn.runner ||
         record.runner_version !== remoteDev.runnerVersions[turn.runner] ||
+        (turn.resume && record.session_id !== turn.resume.session_id) ||
         this.secrets.containsCredentials(record.response)
       )
         throw new RuntimeError("agent_artifact_conflict");
@@ -1050,12 +1094,12 @@ export class RemoteAgents {
         assertRemoteDevPin(run);
         if (
           run.conclusion === "success" ||
-          (turn.resume && record.session_id !== turn.resume.session_id) ||
           (saved.session &&
             this.checkpoint(turn, run, saved.session).session_id !==
               record.session_id)
         )
           throw new RuntimeError("agent_artifact_conflict");
+        if (parentMissing) throw new RuntimeError("agent_artifact_unavailable");
         const recovery =
           turn.work_branch && turn.progress
             ? await this.freezeProgress(turn, run, signal)
@@ -1080,14 +1124,7 @@ export class RemoteAgents {
         });
         throw new RuntimeError("agent_run_failed");
       }
-      if (!saved.session) throw new RuntimeError("agent_artifact_conflict");
-      const checkpoint = this.checkpoint(turn, run, saved.session);
-      if (
-        record.session_id !== checkpoint.session_id ||
-        checkpoint.outcome !== "completed" ||
-        checkpoint.omitted_work ||
-        run.conclusion !== "success"
-      )
+      if (!record.session_id || run.conclusion !== "success")
         throw new RuntimeError("agent_artifact_conflict");
       let result: unknown;
       try {
@@ -1097,6 +1134,18 @@ export class RemoteAgents {
           turn.progress ? "agent_artifact_conflict" : "agent_result_invalid",
         );
       }
+      if (request.output_schema && !compile(request.output_schema)(result))
+        throw new RuntimeError(
+          turn.progress ? "agent_artifact_conflict" : "agent_result_invalid",
+        );
+      if (!saved.session) throw new RuntimeError("agent_artifact_unavailable");
+      const checkpoint = this.checkpoint(turn, run, saved.session);
+      if (
+        record.session_id !== checkpoint.session_id ||
+        checkpoint.outcome !== "completed" ||
+        checkpoint.omitted_work
+      )
+        throw new RuntimeError("agent_artifact_conflict");
       const savedRecovery = this.state.agentState().agent_recovery;
       const recovery =
         turn.work_branch && turn.progress
@@ -1139,10 +1188,6 @@ export class RemoteAgents {
         )
           throw new RuntimeError("agent_artifact_conflict");
       }
-      if (request.output_schema && !compile(request.output_schema)(result))
-        throw new RuntimeError(
-          turn.progress ? "agent_artifact_conflict" : "agent_result_invalid",
-        );
       const clarification =
         (result as { response?: { outcome?: unknown } } | null)?.response
           ?.outcome === "needs_information";
@@ -1211,12 +1256,19 @@ export class RemoteAgents {
         });
         throw new RuntimeError("agent_checkout_mismatch");
       }
+      if (parentMissing) throw new RuntimeError("agent_artifact_unavailable");
       this.job(request.job_id, request.revision);
       if (recovery && !assessment) {
         await this.rememberSession(recovery, turn, run, saved.session, signal);
         if (coding && turn.work_branch) delete coding.candidate;
-        await this.state.setAgentTurn(turn, signal, 0, recovery);
       }
+      if ((recovery && !assessment) || turn.collection_retry)
+        await this.state.setAgentTurn(
+          { ...turn, collection_retry: undefined },
+          signal,
+          0,
+          recovery,
+        );
       const accepted = {
         id: turn.id,
         run_id: run.id,

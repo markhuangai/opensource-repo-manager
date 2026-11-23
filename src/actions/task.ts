@@ -240,7 +240,17 @@ export async function executeTask(
   signal: AbortSignal,
 ): Promise<TaskResult> {
   const { intake, store, investigation, monitor } = application;
-  const waitingForAgent = async (): Promise<TaskResult> => {
+  const waitingForAgent = async ({
+    retryAt,
+  }: RemoteTurnPending): Promise<TaskResult> => {
+    if (retryAt)
+      return {
+        version: 1,
+        ...taskIdentity(store, request),
+        outcome: "waiting",
+        reason: "retry_scheduled",
+        retry_at: retryAt,
+      };
     try {
       await application.agents?.flush(signal);
     } catch (error) {
@@ -269,7 +279,7 @@ export async function executeTask(
     context = await intake.enrollIssue(request.issue_number, signal);
     await store.checkpoint(signal);
   } catch (error) {
-    if (error instanceof RemoteTurnPending) return waitingForAgent();
+    if (error instanceof RemoteTurnPending) return waitingForAgent(error);
     if (
       error instanceof IntakeError &&
       error.code === "publication_pending" &&
@@ -287,7 +297,7 @@ export async function executeTask(
   try {
     await application.agents?.cancelSuperseded(signal);
   } catch (error) {
-    if (error instanceof RemoteTurnPending) return waitingForAgent();
+    if (error instanceof RemoteTurnPending) return waitingForAgent(error);
     throw error;
   }
   if (context.state === "closed")
@@ -322,7 +332,7 @@ export async function executeTask(
         };
     }
   } catch (error) {
-    if (error instanceof RemoteTurnPending) return waitingForAgent();
+    if (error instanceof RemoteTurnPending) return waitingForAgent(error);
     return {
       version: 1,
       ...taskIdentity(store, request),

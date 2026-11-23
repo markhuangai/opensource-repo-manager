@@ -386,6 +386,10 @@ export function artifactFixture(config) {
       }
       const artifact = artifacts.find((item) => item.id === id);
       assert(artifact);
+      if (kind === "hide_once") {
+        artifact.hiddenReads = 1;
+        return;
+      }
       if (kind === "duplicate") {
         artifacts.push({ ...artifact, id: next++ });
         return;

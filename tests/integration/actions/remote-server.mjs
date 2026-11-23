@@ -52,6 +52,7 @@ const revision = remote.commit({
 });
 remote.git(["update-ref", "refs/heads/main", revision.sha]);
 const runs = remoteRuns(remote, artifacts, config, model);
+let failedGitRead;
 
 const tls = httpsServer(
   {
@@ -60,6 +61,17 @@ const tls = httpsServer(
   },
   async (req, res) => {
     try {
+      if (failedGitRead && req.url === failedGitRead.path) {
+        const { status } = failedGitRead;
+        failedGitRead = undefined;
+        res.writeHead(status, {
+          "content-type": "application/json",
+          "x-github-request-id": "fixture-git-read",
+          ...(status === 429 ? { "retry-after": "5" } : {}),
+        });
+        res.end(JSON.stringify({ message: "Temporary Git read failure" }));
+        return;
+      }
       if ((await runs.handle(req, res)) || (await artifacts.handle(req, res)))
         return;
       const upstream = request(
@@ -187,6 +199,18 @@ const http = createServer(async (req, res) => {
           url.searchParams.get("kind"),
         );
         return send({});
+      case "/fail-git-read": {
+        const path = url.searchParams.get("path");
+        assert.match(
+          path,
+          /^(?:git\/commits\/[a-f0-9]{40}|compare\/[a-f0-9]{40}\.\.\.[a-f0-9]{40})$/,
+        );
+        failedGitRead = {
+          path: `/repos/owner/repo/${path}`,
+          status: path.startsWith("git/commits/") ? 429 : 502,
+        };
+        return send({});
+      }
       case "/lose-pull":
         remote.state.dropAfter = "pull";
         return send({});
