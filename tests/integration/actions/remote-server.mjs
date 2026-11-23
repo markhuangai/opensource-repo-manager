@@ -147,6 +147,9 @@ const http = createServer(async (req, res) => {
       case "/rerun":
         runs.rerun(Number(url.searchParams.get("run")));
         return send({});
+      case "/delete-legacy-producer":
+        runs.deleteLegacyProducer(issue, Number(url.searchParams.get("run")));
+        return send({});
       case "/budget":
         runs.budget(issue, Number(url.searchParams.get("used")));
         return send({});
@@ -195,6 +198,7 @@ const http = createServer(async (req, res) => {
             .filter((row) => row.branch.endsWith(`/issue-${issue}`))
             .map((row) => ({ ...row, head: remote.head(row.branch) })),
           events: runs.events.filter((row) => row.issue === issue),
+          coding_candidate: runs.codingCandidate(issue),
           work_heads: Object.fromEntries(
             remote
               .git([

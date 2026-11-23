@@ -43,7 +43,7 @@ The controller charges `limits.agent_runs` once for each authorized dispatch and
 ### Diagnose a run
 
 ```sh
-gh run view RUN_ID --repo OWNER/REPO --log | rg 'agent\.|api\.request\.|configuration_|actions\.failed'
+gh run view RUN_ID --repo OWNER/REPO --log | rg 'agent\.|checkpoint|api\.request\.|configuration_|actions\.failed'
 ```
 
 For `agent.dispatch_failed`, inspect the HTTP status and correlated request ID. Verify that `orm-agent.yml` is registered on the default branch, the configured controller is allowlisted and the PAT has Actions write access. An ambiguous response is reconciled by the signed operation UUID and expected caller before any new work.

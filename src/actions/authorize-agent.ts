@@ -128,6 +128,7 @@ export async function authorizeAgent(
         if (turn.assessment) {
           const candidate = turn.assessment;
           if (
+            !coding.candidate ||
             digest(coding.candidate) !== digest(candidate) ||
             candidate.writer_run_id !== coding.writer_run_id ||
             !candidate.branch.startsWith(`orm-work/${state.task_id}/`) ||

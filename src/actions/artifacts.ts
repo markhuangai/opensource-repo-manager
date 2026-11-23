@@ -22,6 +22,7 @@ import {
   type ArtifactManifest,
 } from "../domain/agents.ts";
 import { ActionsRepository, issueDigest } from "../repositories/actions.ts";
+import { PublicationRepository } from "../repositories/publication.ts";
 import type { IssueContext } from "../domain/jobs.ts";
 import { Store } from "../repositories/store.ts";
 import { userProcesses } from "../runtime/process.ts";
@@ -428,6 +429,7 @@ export class ActionsArtifacts {
           .get(state.pending.id);
       const confirmedInvestigationStatus =
         missingPublication &&
+        !new PublicationRepository(checkpoint).pending(state.job.id) &&
         this.confirmedInvestigationStatus(current, archived, issue);
       if (
         (missingPublication && !confirmedInvestigationStatus) ||

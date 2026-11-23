@@ -443,7 +443,21 @@ export class RemoteAgents {
     if (!accepted) return;
     const { run_id } = JSON.parse(accepted.binding_json) as { run_id?: number };
     if (!run_id || !Number.isSafeInteger(run_id) || run_id < 1) return;
-    const run = await this.api.latest(run_id, signal);
+    let run: RemoteRun;
+    try {
+      run = await this.api.latest(run_id, signal);
+    } catch (error) {
+      signal.throwIfAborted();
+      if (!isNotVisible(error)) throw error;
+      this.event(turn, "resume_unavailable", {
+        level: "warn",
+        parent_run_id: run_id,
+        request_id: apiFailureId(error),
+        cause: "legacy_run_not_visible",
+        outcome: "fresh_session",
+      });
+      return;
+    }
     const { repository, author_id, issue } = this.state.agentState();
     if (
       run.run_attempt !== 1 ||
@@ -772,6 +786,20 @@ export class RemoteAgents {
     try {
       if (run.conclusion !== "success" && !turn.progress && !turn.recovery_key)
         throw new RuntimeError("agent_run_failed");
+      if (turn.resume) {
+        const { repository, author_id, issue } = this.state.agentState();
+        if (
+          !(await this.api.resumeAvailable(
+            repository,
+            author_id,
+            issue.number,
+            turn,
+            turn.resume,
+            signal,
+          ))
+        )
+          throw new RuntimeError("agent_resume_conflict");
+      }
       return await this.result(turn, run, request, signal);
     } catch (error) {
       signal.throwIfAborted();
@@ -1078,7 +1106,7 @@ export class RemoteAgents {
       const assessment = turn.assessment;
       if (assessment) {
         if (
-          !coding ||
+          !coding?.candidate ||
           digest(coding.candidate) !== digest(assessment) ||
           checkpoint.branch !== null ||
           checkpoint.checkpoint_sha !== assessment.sha ||
@@ -1184,9 +1212,9 @@ export class RemoteAgents {
         throw new RuntimeError("agent_checkout_mismatch");
       }
       this.job(request.job_id, request.revision);
-      if (recovery) {
+      if (recovery && !assessment) {
         await this.rememberSession(recovery, turn, run, saved.session, signal);
-        if (coding && (turn.work_branch || assessment)) delete coding.candidate;
+        if (coding && turn.work_branch) delete coding.candidate;
         await this.state.setAgentTurn(turn, signal, 0, recovery);
       }
       const accepted = {

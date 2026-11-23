@@ -707,9 +707,102 @@ describe("authenticated Actions task authority", () => {
     },
   );
 
+  it("rejects a conflicting local comment before reserving a checkpoint retry", async () => {
+    const f = await setup();
+    const artifacts = await f.artifactsFor(f.store);
+    await f.open(f.store, artifacts);
+    const previous = f.read().body;
+    f.transport.upload = async () => {
+      throw new Error("runner lost before upload");
+    };
+    await expect(f.store.checkpoint(signal(), true)).rejects.toThrow(
+      "state_unavailable",
+    );
+    const pending = f.read();
+    const local = new ActionsRepository(f.store);
+    local.acknowledge(previous);
+
+    await expect(f.open(f.store, artifacts)).rejects.toThrow(
+      "state_local_conflict",
+    );
+    expect(f.read().body).toBe(pending.body);
+    expect(local.local()?.body).toBe(previous);
+  });
+
   it.each([false, true])(
-    "replays only an exact confirmed legacy investigation comment (changed=%s)",
-    async (changed) => {
+    "preserves exhausted checkpoint recovery through restart (uncertain publication=%s)",
+    async (uncertain) => {
+      const f = await setup();
+      const manager = await f.open(f.store, await f.artifactsFor(f.store));
+      await manager.setAgentTurn(agentTurn(f), signal());
+      f.transport.upload = async () => {
+        throw new Error("runner lost before upload");
+      };
+      await expect(f.store.checkpoint(signal(), true)).rejects.toThrow(
+        "state_unavailable",
+      );
+      const { state, narrative } = f.read();
+      state.budget.infrastructure_retries = state.limits.infrastructure_retries;
+      if (uncertain) {
+        state.pending = {
+          id: digest("dispatching status"),
+          revision: state.job!.revision,
+          kind: "investigation_stage",
+          actor: f.remote.state.actor,
+          source: state.job!.source,
+          branch: state.branch,
+          status: "dispatching",
+          commit: null,
+          review_id: randomUUID(),
+          review_binding: digest("review"),
+          policy_identity: "fixture",
+          retry_at: 0,
+          retry_pending: false,
+          steps: [
+            {
+              kind: "comment",
+              state: "dispatching",
+              object_id: state.comment_id,
+              before_digest: digest(narrative),
+              after_digest: digest("unconfirmed status"),
+              body_digest: digest("unconfirmed status"),
+              thread_id: null,
+              title_digest: null,
+            },
+          ],
+        };
+      }
+      const row = f.remote.state.comments.get(1)![0];
+      row.body = f.codec.encode(state, narrative);
+      const fresh = f.database();
+      const artifacts = await f.artifactsFor(fresh);
+      if (uncertain) {
+        await expect(f.open(fresh, artifacts)).rejects.toThrow(
+          "state_write_uncertain",
+        );
+        expect(f.read().state.checkpoint_pending).toEqual(
+          state.checkpoint_pending,
+        );
+      } else {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const stopped = await f.open(fresh, artifacts);
+          expect(stopped.result()).toMatchObject({
+            outcome: "blocked",
+            reason: "recovery_evidence_missing",
+          });
+          expect(f.read().state).toMatchObject({
+            outcome: "blocked",
+            reason: "recovery_evidence_missing",
+          });
+          expect(f.read().state.checkpoint_pending).toBeUndefined();
+        }
+      }
+    },
+  );
+
+  it.each(["valid", "changed", "competing"] as const)(
+    "replays only an exact confirmed legacy investigation comment (%s)",
+    async (scenario) => {
       const f = await setup();
       await f.open(f.store, await f.artifactsFor(f.store));
       const investigations = new InvestigationRepository(f.store);
@@ -721,6 +814,43 @@ describe("authenticated Actions task authority", () => {
         audience: "maintainer",
       };
       investigations.save(record);
+      if (scenario === "competing") {
+        const job = f.store.job(1)!;
+        const publications = new PublicationRepository(f.store);
+        const id = digest("older status");
+        publications.begin({
+          id,
+          job_id: job.id,
+          revision: job.revision,
+          status: "prepared",
+          failure: null,
+          retry_at: 0,
+          retry_pending: false,
+          proposal: {
+            kind: "investigation_stage",
+            job_id: job.id,
+            revision: job.revision,
+            stage: "queued",
+            previous_operation: null,
+            after_operation: null,
+          },
+          source: f.remote.source,
+          target: publications.target(job.id),
+          actor: f.remote.state.actor,
+          timestamp: new Date().toISOString(),
+          review_id: null,
+          payload: null,
+          commit: null,
+          steps: [
+            {
+              kind: "comment",
+              state: "prepared",
+              before: null,
+              after: "An older status",
+            },
+          ],
+        });
+      }
       await f.store.checkpoint(signal(), true);
       const saved = f.read();
       const state = saved.state;
@@ -753,7 +883,7 @@ describe("authenticated Actions task authority", () => {
                 before_digest: digest(saved.narrative),
                 after_digest: digest(narrative),
                 body_digest: digest(
-                  changed ? "A different comment" : narrative,
+                  scenario === "changed" ? "A different comment" : narrative,
                 ),
                 thread_id: null,
                 title_digest: null,
@@ -765,11 +895,14 @@ describe("authenticated Actions task authority", () => {
       );
       const fresh = f.database();
       const manager = await f.open(fresh, await f.artifactsFor(fresh));
-      if (changed) {
+      if (scenario !== "valid") {
         expect(manager.result()).toMatchObject({
           outcome: "blocked",
           reason: "recovery_evidence_missing",
         });
+        expect(
+          new PublicationRepository(fresh).pending(state.job!.id),
+        ).toBeUndefined();
       } else {
         expect(manager.result()).toBeUndefined();
         expect(

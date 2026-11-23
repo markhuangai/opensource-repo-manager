@@ -10,6 +10,7 @@ export function artifactFixture(config) {
     hideNextCheckpoint = 0,
     dropFinalize = false,
     diagnosticFault = "";
+  const failedCheckpointReads = new Set();
   const head = "f".repeat(40);
   const run = (id) => ({
     id,
@@ -266,6 +267,25 @@ export function artifactFixture(config) {
         if (attempt) res.end(JSON.stringify(run(Number(attempt[1]))));
         else if (listing) {
           const name = url.searchParams.get("name");
+          if (name?.endsWith(".orm")) {
+            const phase = artifacts.some(
+              (item) =>
+                item.run === Number(listing[1]) &&
+                item.name === name &&
+                item.finalized,
+            )
+              ? "acknowledgement"
+              : "preflight";
+            if (failedCheckpointReads.delete(phase)) {
+              res.writeHead(502, {
+                "x-request-id": `checkpoint-${phase}-failure`,
+              });
+              res.end(
+                JSON.stringify({ message: "Checkpoint listing unavailable" }),
+              );
+              return true;
+            }
+          }
           const selected = artifacts.filter((item) => {
             const matches =
               item.run === Number(listing[1]) &&
@@ -338,6 +358,11 @@ export function artifactFixture(config) {
       });
     },
     fault(id, kind) {
+      if (kind === "checkpoint_lookup_unavailable") {
+        failedCheckpointReads.add("preflight");
+        failedCheckpointReads.add("acknowledgement");
+        return;
+      }
       if (
         kind === "checkpoint_visibility_delay" ||
         kind === "checkpoint_ack_lost"

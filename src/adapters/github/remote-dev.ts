@@ -1,6 +1,7 @@
 import type { Octokit } from "@octokit/rest";
 import { z } from "zod";
 import { RuntimeError } from "../../domain/agents.ts";
+import { StateError } from "../../domain/durability.ts";
 import { githubId, type RepositoryIdentity } from "../../domain/jobs.ts";
 import {
   remoteDev,
@@ -11,6 +12,7 @@ import {
   type RemoteTurn,
 } from "../../domain/remote-turns.ts";
 import { listRunArtifacts, nativeCheckpointArtifact } from "./artifacts.ts";
+import { carryApiFailure } from "../../logging/api.ts";
 
 export class DispatchRunMismatch extends RuntimeError {
   constructor(
@@ -124,20 +126,35 @@ export class RemoteDevActions {
     session: NativeSession,
     signal: AbortSignal,
   ) {
-    let run: RemoteRun;
-    try {
-      run = await this.latest(session.run_id, signal);
-    } catch (error) {
-      if ((error as { status?: number } | null)?.status === 404) return false;
-      throw error;
-    }
+    const read = async <T>(request: () => Promise<T>) => {
+      try {
+        return await request();
+      } catch (error) {
+        signal.throwIfAborted();
+        if ((error as { status?: number } | null)?.status === 404)
+          return undefined;
+        if (
+          error instanceof RuntimeError ||
+          error instanceof StateError ||
+          error instanceof z.ZodError
+        )
+          throw error;
+        throw carryApiFailure(
+          new StateError("session_transport_unavailable"),
+          error,
+        );
+      }
+    };
+    const run = await read(() => this.latest(session.run_id, signal));
+    if (!run) return false;
     if (
       run.repository.id !== repository.id ||
-      run.head_repository.id !== repository.id ||
-      run.status !== "completed"
+      run.head_repository.id !== repository.id
     )
       throw new RuntimeError("agent_resume_conflict");
     if (run.run_attempt !== 1) return false;
+    if (run.status !== "completed")
+      throw new RuntimeError("agent_resume_conflict");
     assertTurnRun(
       repository,
       actor,
@@ -152,16 +169,19 @@ export class RemoteDevActions {
       run,
     );
     assertRemoteDevPin(run);
-    const rows = await listRunArtifacts(
-      async (page) =>
-        (
-          await this.request(
-            "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
-            { run_id: run.id, per_page: 100, page },
-            signal,
-          )
-        ).data,
+    const rows = await read(() =>
+      listRunArtifacts(
+        async (page) =>
+          (
+            await this.request(
+              "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+              { run_id: run.id, per_page: 100, page },
+              signal,
+            )
+          ).data,
+      ),
     );
+    if (!rows) return false;
     const latest = nativeCheckpointArtifact(run, rows);
     if (!latest) return false;
     const { artifact, sequence } = latest;

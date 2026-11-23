@@ -306,6 +306,13 @@ export class ActionsState implements TaskDurability {
       !this.artifacts
     )
       throw new StateError("session_transport_unavailable");
+    const local = this.repository.local();
+    if (
+      local &&
+      local.body !== this.comment.body &&
+      local.intent !== this.comment.body
+    )
+      throw new StateError("state_local_conflict");
     let missingEvidence = false;
     if (this.artifacts) {
       try {
@@ -322,13 +329,6 @@ export class ActionsState implements TaskDurability {
         missingEvidence = true;
       }
     }
-    const local = this.repository.local();
-    if (
-      local &&
-      local.body !== this.comment.body &&
-      local.intent !== this.comment.body
-    )
-      throw new StateError("state_local_conflict");
     await this.reconcile(signal);
     const recoveredPending = this.comment.state.pending;
     if (
@@ -528,6 +528,7 @@ export class ActionsState implements TaskDurability {
       !this.restoredResult &&
       state.job &&
       (this.reconstructed ||
+        state.reason === "recovery_evidence_missing" ||
         context.state === "closed" ||
         pull?.state === "closed")
     )
@@ -666,14 +667,8 @@ export class ActionsState implements TaskDurability {
         });
         return "none";
       }
-      await this.write(
-        {
-          ...state,
-          checkpoint_pending: undefined,
-        },
-        this.comment.narrative,
-        signal,
-      );
+      // Persist removal with the recovery decision so an interrupted open still has proof to reconcile.
+      delete state.checkpoint_pending;
       this.diagnostics.event("checkpoint.reconcile", {
         ...log,
         level: "warn",

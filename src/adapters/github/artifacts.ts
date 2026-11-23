@@ -395,13 +395,48 @@ export class GitHubArtifacts implements ArtifactTransport {
     )
       throw new StateError("session_provenance_invalid");
     if (prepared.size > limit) throw new StateError("session_size_limit");
-    const run = await this.run(prepared.run_id, prepared.run_attempt, signal);
     const name = basename(path);
     if (name !== `orm-session-${prepared.checkpoint_id}.orm`)
       throw new StateError("session_provenance_invalid");
-    const existing = await this.checkpointReference(prepared, run, signal);
-    if (existing) return existing;
     const started = performance.now();
+    const log = {
+      operation_id: prepared.checkpoint_id,
+      producer_run_id: prepared.run_id,
+      producer_attempt: prepared.run_attempt,
+      generation: prepared.generation,
+      expected_digest: prepared.digest,
+      expected_size: prepared.size,
+    };
+    const readWithRetry = async <T>(read: () => Promise<T>, phase: string) => {
+      try {
+        return await read();
+      } catch (error) {
+        signal.throwIfAborted();
+        if (
+          !(error instanceof StateError) ||
+          error.code !== "session_transport_unavailable"
+        )
+          throw error;
+        this.diagnostics.event("checkpoint.read_retry", {
+          ...log,
+          phase,
+          level: "warn",
+          request_id: apiFailureId(error),
+          elapsed_ms: Math.round(performance.now() - started),
+          cause: error.code,
+          outcome: "retrying",
+        });
+        await setTimeout(350, undefined, { signal });
+        return read();
+      }
+    };
+    const run = await readWithRetry(
+      () => this.run(prepared.run_id, prepared.run_attempt, signal),
+      "producer",
+    );
+    const find = () => this.checkpointReference(prepared, run, signal);
+    const existing = await readWithRetry(find, "preflight");
+    if (existing) return existing;
     let uploaded: { id: number; size: number; digest: string } | undefined;
     let uploadFailure: string | undefined;
     try {
@@ -422,17 +457,8 @@ export class GitHubArtifacts implements ArtifactTransport {
       signal.throwIfAborted();
       uploadFailure = apiFailureId(error);
     }
-    const log = {
-      operation_id: prepared.checkpoint_id,
-      producer_run_id: run.id,
-      producer_attempt: run.run_attempt,
-      generation: prepared.generation,
-      expected_digest: prepared.digest,
-      expected_size: prepared.size,
-      request_id: uploadFailure,
-    };
     for (let attempt = 1; attempt <= 5; attempt++) {
-      const reference = await this.checkpointReference(prepared, run, signal);
+      const reference = await readWithRetry(find, "acknowledgement");
       if (reference) {
         if (
           uploaded &&
@@ -444,6 +470,7 @@ export class GitHubArtifacts implements ArtifactTransport {
         this.diagnostics.event("checkpoint.acknowledged", {
           ...log,
           level: "info",
+          request_id: uploadFailure,
           artifact_id: reference.artifact_id,
           attempt,
           elapsed_ms: Math.round(performance.now() - started),
@@ -454,6 +481,7 @@ export class GitHubArtifacts implements ArtifactTransport {
       this.diagnostics.event("checkpoint.visibility", {
         ...log,
         level: "warn",
+        request_id: uploadFailure,
         artifact_id: uploaded?.id,
         attempt,
         elapsed_ms: Math.round(performance.now() - started),

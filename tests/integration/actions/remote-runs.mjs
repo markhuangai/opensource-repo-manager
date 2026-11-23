@@ -65,6 +65,15 @@ export function remoteRuns(remote, artifacts, config, model) {
     };
   };
   const state = (number) => signed(number)?.decoded.state;
+  const latestRun = ({ run, latestAttempt }) =>
+    latestAttempt
+      ? {
+          ...run,
+          run_attempt: latestAttempt,
+          status: "in_progress",
+          conclusion: null,
+        }
+      : run;
   remote.state.afterMutation = (kind) => {
     if (kind !== "comment") return;
     for (const { number, registration } of runs.values()) {
@@ -177,10 +186,8 @@ export function remoteRuns(remote, artifacts, config, model) {
       const [start, end] = query.get("created").split("..");
       const page = Number(query.get("page"));
       const workflow_runs = [...runs.values()]
-        .map(({ run, latestAttempt }) => ({
-          ...run,
-          run_attempt: latestAttempt ?? 1,
-        }))
+        .filter((entry) => !entry.deleted)
+        .map(latestRun)
         .filter((run) => run.created_at >= start && run.created_at <= end);
       return send({
         total_count: workflow_runs.length,
@@ -188,6 +195,8 @@ export function remoteRuns(remote, artifacts, config, model) {
       });
     }
     const entry = runs.get(Number(runPath?.[1]));
+    if (entry?.deleted && req.method === "GET")
+      return send({ message: "Workflow run not found" }, 404);
     if (
       entry &&
       req.method === "GET" &&
@@ -225,11 +234,7 @@ export function remoteRuns(remote, artifacts, config, model) {
           if (res.destroyed) return true;
         }
       }
-      return send(
-        runPath[2] === "" && entry.latestAttempt
-          ? { ...entry.run, run_attempt: entry.latestAttempt }
-          : entry.run,
-      );
+      return send(runPath[2] === "" ? latestRun(entry) : entry.run);
     }
     if (
       entry?.mode === "reproduced" &&
@@ -308,7 +313,7 @@ export function remoteRuns(remote, artifacts, config, model) {
               artifacts: rows.slice((page - 1) * perPage, page * perPage),
             };
           }
-          return { ...producer.run, run_attempt: producer.latestAttempt ?? 1 };
+          return latestRun(producer);
         }
         const artifactPath =
           /^\/repos\/owner\/repo\/actions\/artifacts\/(\d+)(\/zip)?$/.exec(
@@ -751,6 +756,18 @@ export function remoteRuns(remote, artifacts, config, model) {
       assert.equal(entry?.run.status, "completed");
       entry.latestAttempt = 2;
     },
+    deleteLegacyProducer(number, id) {
+      const entry = runs.get(id);
+      assert.equal(entry?.run.status, "completed");
+      const { row, codec, decoded } = signed(number);
+      const { state, narrative } = decoded;
+      assert.equal(state.agent_recovery.investigation.run_id, id);
+      delete state.agent_recovery;
+      row.body = codec.encode(state, narrative);
+      entry.deleted = true;
+    },
+    codingCandidate: (number) =>
+      state(number)?.agent_recovery?.coding?.candidate,
     budget(number, used) {
       const { row, codec, decoded } = signed(number);
       const { state, narrative } = decoded;

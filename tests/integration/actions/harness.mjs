@@ -892,7 +892,9 @@ export async function runActionsTests({
           ["agent_run", "retry_scheduled"].includes(status.reason),
           JSON.stringify(status),
         );
-        const [entry] = pending(issue);
+        const runs = pending(issue);
+        assert(runs.length <= 1, JSON.stringify(proof(issue).events));
+        const [entry] = runs;
         if (entry && matches(entry.turn)) return entry;
         if (status.reason === "retry_scheduled")
           await new Promise((resolve) =>
@@ -905,8 +907,23 @@ export async function runActionsTests({
     await scenario("checkpoint-acknowledgement", async () => {
       setup(1, "reproduced");
       upstream("/fault?kind=checkpoint_visibility_delay");
+      upstream("/fault?kind=checkpoint_lookup_unavailable");
       const registered = await invoke(1);
       assert.equal(registered.reason, "agent_run");
+      const readRetries = logs
+        .at(-1)
+        .split("\n")
+        .filter((line) => line.startsWith("{"))
+        .map(JSON.parse)
+        .filter((line) => line.event === "checkpoint.read_retry");
+      assert.deepEqual(
+        readRetries.map((line) => line.phase),
+        ["preflight", "acknowledgement"],
+      );
+      assert(
+        readRetries.every((line) => line.level === "warn" && line.request_id),
+      );
+      diagnosticEvents.push(...readRetries);
       assert(
         logs.some(
           (log) =>
@@ -979,10 +996,11 @@ export async function runActionsTests({
         const base = setup(issue, mode);
         const outcome = await drain(issue);
         assertPublished(issue, outcome);
-        const { events } = proof(issue);
+        const { events, coding_candidate } = proof(issue);
         const first = events.find((item) => item.type === "progress_only");
         const writes = events.filter((item) => item.type === "write_attempt");
-        if (first) {
+        if (mode !== "lost_final_result") {
+          assert(first);
           assert.equal(writes.length, 2);
           assert.notEqual(first.first, first.head);
           const [finished] = nativeEvents(issue, "implementation_change");
@@ -1011,13 +1029,30 @@ export async function runActionsTests({
             assert(!next.turn.resume);
           }
         } else {
+          assert.equal(first, undefined);
           assert.equal(writes.length, 1);
+          const [writer] = nativeEvents(issue, "implementation_change");
           const [assessment] = nativeEvents(
             issue,
             "implementation_candidate_assessment",
           );
           assert.equal(assessment.assessment_of, outcome.head_sha);
-          assert.match(logs.join("\n"), /"event":"agent.collection_pending"/);
+          assert.equal(coding_candidate?.sha, outcome.head_sha);
+          assert.equal(coding_candidate?.writer_run_id, writer.run);
+          assert(
+            logs.some((log) =>
+              log
+                .split("\n")
+                .filter((line) => line.startsWith("{"))
+                .map(JSON.parse)
+                .some(
+                  (row) =>
+                    row.event === "agent.collection_pending" &&
+                    row.issue_number === issue &&
+                    row.run_id === writer.run,
+                ),
+            ),
+          );
         }
         return outcome;
       });
@@ -1119,6 +1154,22 @@ export async function runActionsTests({
           resumes,
         );
       }
+      setup(18, "clarification");
+      assert.equal((await drain(18)).reason, "needs_information");
+      const [legacy] = nativeEvents(18, "investigation_triage");
+      upstream(`/delete-legacy-producer?issue=18&run=${legacy.run}`);
+      upstream("/reply?issue=18&allowed=true");
+      const replacement = await untilTurn(
+        18,
+        await invoke(18, { fresh: true }),
+        (turn) => turn.role === "investigation",
+      );
+      assert.equal(replacement.turn.resume, undefined);
+      assert.match(logs.join("\n"), /"cause":"legacy_run_not_visible"/);
+      assert.equal(
+        (await advance(18, replacement, undefined, { fresh: true })).reason,
+        "agent_run",
+      );
       return outcome;
     });
     await scenario("conflicting-resume", async () => {
@@ -1148,7 +1199,24 @@ export async function runActionsTests({
       assert.equal(invalid.reason, "investigation_blocked");
       assert.match(logs.at(-1), /"cause":"agent_artifact_conflict"/);
       assert.equal(pending(14).length, 0);
-      return invalid;
+
+      setup(17, "clarification");
+      assert.equal((await drain(17)).reason, "needs_information");
+      upstream("/reply?issue=17&allowed=true");
+      const resumed = await untilTurn(17, await invoke(17), (turn) =>
+        Boolean(turn.resume),
+      );
+      const selection = await native(resumed);
+      assert.equal(selection.resume_run_id, resumed.turn.resume.run_id);
+      upstream(
+        `/fault?artifact=${resumed.turn.resume.artifact_id}&kind=changed_digest`,
+      );
+      upstream(`/complete?run=${resumed.run.id}`, selection);
+      const changed = await invoke(17, { expected: 1 });
+      assert.equal(changed.reason, "investigation_blocked");
+      assert.match(logs.at(-1), /"cause":"agent_resume_conflict"/);
+      assert.equal(pending(17).length, 0);
+      return changed;
     });
     await scenario("incomplete-assessment", async () => {
       setup(15, "incomplete_assessment");
