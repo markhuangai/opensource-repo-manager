@@ -71,6 +71,50 @@ const status = z.object({
   updated_at: z.string(),
 });
 
+export function githubReadFailure(error: unknown) {
+  const parsed = z
+    .object({
+      status: z.number().optional(),
+      response: z
+        .object({ headers: z.record(z.string(), z.unknown()) })
+        .optional(),
+    })
+    .safeParse(error);
+  const code = parsed.success ? parsed.data.status : undefined;
+  const headers = parsed.success ? parsed.data.response?.headers : undefined;
+  if (
+    code === 429 ||
+    (code === 403 &&
+      (headers?.["x-ratelimit-remaining"] === "0" ||
+        headers?.["retry-after"] !== undefined))
+  ) {
+    const after = Number(headers?.["retry-after"]);
+    const reset = Number(headers?.["x-ratelimit-reset"]) * 1000;
+    const retryAt =
+      Number.isFinite(after) && after > 0
+        ? Date.now() + after * 1000
+        : Number.isFinite(reset) && reset > Date.now()
+          ? reset
+          : Date.now() + 60_000;
+    return carryApiFailure(
+      new IntakeError("github_rate_limited", retryAt),
+      error,
+    );
+  }
+  return carryApiFailure(
+    new IntakeError(
+      code === 401
+        ? "github_authentication"
+        : code === 403
+          ? "github_access_denied"
+          : code === 404 || code === 410
+            ? "github_not_found"
+            : "github_read_failed",
+    ),
+    error,
+  );
+}
+
 export function createGitHubReader(
   repository: string,
   token: string,
@@ -115,15 +159,7 @@ export class OctokitReader implements GitHubReader {
       return result.data;
     } catch (error) {
       if (signal.aborted) throw signal.reason;
-      const parsed = z
-        .object({
-          status: z.number().optional(),
-          response: z
-            .object({ headers: z.record(z.string(), z.unknown()) })
-            .optional(),
-        })
-        .safeParse(error);
-      const code = parsed.success ? parsed.data.status : undefined;
+      const code = (error as { status?: number } | null)?.status;
       if (code === 304 && cached) return cached.data;
       if (
         code === 404 &&
@@ -140,40 +176,7 @@ export class OctokitReader implements GitHubReader {
           new IntakeError("github_branch_unprotected"),
           error,
         );
-      const headers = parsed.success
-        ? parsed.data.response?.headers
-        : undefined;
-      const remaining = headers?.["x-ratelimit-remaining"];
-      if (
-        code === 429 ||
-        (code === 403 &&
-          (remaining === "0" || headers?.["retry-after"] !== undefined))
-      ) {
-        const after = Number(headers?.["retry-after"]);
-        const reset = Number(headers?.["x-ratelimit-reset"]) * 1000;
-        const retryAt =
-          Number.isFinite(after) && after > 0
-            ? Date.now() + after * 1000
-            : Number.isFinite(reset) && reset > Date.now()
-              ? reset
-              : Date.now() + 60_000;
-        throw carryApiFailure(
-          new IntakeError("github_rate_limited", retryAt),
-          error,
-        );
-      }
-      throw carryApiFailure(
-        new IntakeError(
-          code === 401
-            ? "github_authentication"
-            : code === 403
-              ? "github_access_denied"
-              : code === 404 || code === 410
-                ? "github_not_found"
-                : "github_read_failed",
-        ),
-        error,
-      );
+      throw githubReadFailure(error);
     }
   }
 

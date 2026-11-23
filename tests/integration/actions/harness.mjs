@@ -887,6 +887,10 @@ export async function runActionsTests({
     });
   }
   if (group === "managed-recovery") {
+    const waitForRetry = (status) =>
+      new Promise((resolve) =>
+        setTimeout(resolve, Math.max(0, status.retry_at - Date.now())),
+      );
     async function untilTurn(issue, status, matches) {
       for (let step = 0; step < 36; step++) {
         assert(
@@ -897,10 +901,7 @@ export async function runActionsTests({
         assert(runs.length <= 1, JSON.stringify(proof(issue).events));
         const [entry] = runs;
         if (entry && matches(entry.turn)) return entry;
-        if (status.reason === "retry_scheduled")
-          await new Promise((resolve) =>
-            setTimeout(resolve, Math.max(0, status.retry_at - Date.now())),
-          );
+        if (status.reason === "retry_scheduled") await waitForRetry(status);
         status = entry ? await advance(issue, entry) : await invoke(issue);
       }
       assert.fail("The expected recovery turn was never scheduled");
@@ -913,6 +914,39 @@ export async function runActionsTests({
         comment_id: id,
         author_id,
       }).state;
+    }
+    function assertCollectionRetry(issue, before, retry, cause, earliest) {
+      assert.equal(retry.reason, "retry_scheduled");
+      assert.deepEqual(pending(issue), []);
+      const after = signedState(issue);
+      assert.equal(
+        after.budget.infrastructure_retries,
+        before.budget.infrastructure_retries + 1,
+      );
+      assert.equal(after.budget.agent_runs, before.budget.agent_runs);
+      assert.deepEqual(after.agent_turn, {
+        ...before.agent_turn,
+        elapsed_ms: before.agent_turn.elapsed_ms ?? after.agent_turn.elapsed_ms,
+        collection_retry: { cause, retry_at: retry.retry_at },
+      });
+      assert(retry.retry_at >= earliest);
+      assert(
+        proof(issue).comments[0].body.includes(
+          `Implementation paused (${cause})`,
+        ),
+      );
+      const warning = logs
+        .at(-1)
+        .split("\n")
+        .filter((line) => line.startsWith("{"))
+        .map(JSON.parse)
+        .find((row) => row.event === "agent.collection_failed");
+      assert.equal(warning.level, "warn");
+      assert.equal(warning.run_id, before.agent_turn.run_id);
+      assert.equal(warning.cause, cause);
+      assert.equal(warning.retry_at, retry.retry_at);
+      assert(warning.request_id);
+      diagnosticEvents.push(warning);
     }
     await scenario("checkpoint-acknowledgement", async () => {
       setup(1, "reproduced");
@@ -932,6 +966,20 @@ export async function runActionsTests({
       );
       assert(
         readRetries.every((line) => line.level === "warn" && line.request_id),
+      );
+      const requests = proof(1).requests;
+      const rateLimit = requests.findIndex(
+        (row) => row.method === "GET" && row.status === 429,
+      );
+      assert(rateLimit >= 0);
+      const throttled = requests[rateLimit];
+      const retried = requests
+        .slice(rateLimit + 1)
+        .find((row) => row.method === "GET" && row.path === throttled.path);
+      assert(retried);
+      assert(
+        Date.parse(retried.started_at) - Date.parse(throttled.started_at) >=
+          1000,
       );
       diagnosticEvents.push(...readRetries);
       assert(
@@ -1040,45 +1088,15 @@ export async function runActionsTests({
           const before = signedState(issue);
           assert.equal(before.agent_turn.id, writer.turn.id);
           assert.equal(before.agent_turn.collection_retries, 1);
-          upstream(`/fail-git-read?path=${gitPath}`);
-          const readStartedAt = Date.now();
+          upstream(
+            `/fail-read?path=${gitPath}&status=${writer.turn.resume ? 429 : 502}`,
+          );
+          const earliest = Date.now() + (writer.turn.resume ? 5000 : 1000);
           const retry = await invoke(issue, options);
-          assert.equal(retry.reason, "retry_scheduled");
-          assert.deepEqual(pending(issue), []);
           const cause = writer.turn.resume
             ? "github_rate_limited"
             : "github_read_failed";
-          const after = signedState(issue);
-          assert.equal(
-            after.budget.infrastructure_retries,
-            before.budget.infrastructure_retries + 1,
-          );
-          assert.equal(after.budget.agent_runs, before.budget.agent_runs);
-          assert.deepEqual(after.agent_turn, {
-            ...before.agent_turn,
-            collection_retry: { cause, retry_at: retry.retry_at },
-          });
-          assert(
-            retry.retry_at >=
-              readStartedAt + (writer.turn.resume ? 5000 : 1000),
-          );
-          assert(
-            proof(issue).comments[0].body.includes(
-              `Implementation paused (${cause})`,
-            ),
-          );
-          const warning = logs
-            .at(-1)
-            .split("\n")
-            .filter((line) => line.startsWith("{"))
-            .map(JSON.parse)
-            .find((row) => row.event === "agent.collection_failed");
-          assert.equal(warning.level, "warn");
-          assert.equal(warning.run_id, writer.run.id);
-          assert.equal(warning.cause, cause);
-          assert.equal(warning.retry_at, retry.retry_at);
-          assert(warning.request_id);
-          diagnosticEvents.push(warning);
+          assertCollectionRetry(issue, before, retry, cause, earliest);
           outcome = await drain(issue, retry, options);
           assert.equal(outcome.head_sha, completed.head);
           if (writer.turn.resume)
@@ -1178,7 +1196,45 @@ export async function runActionsTests({
       );
       assert.equal(proof(9).pulls.length, 0);
       upstream("/reply?issue=9&allowed=true");
-      const outcome = await drain(9, undefined, { fresh: true });
+      const options = { fresh: true };
+      const resumed = await untilTurn(9, await invoke(9, options), (turn) =>
+        Boolean(turn.resume && turn.work_branch),
+      );
+      const before = signedState(9);
+      const earliest = Date.now() + 1000;
+      const absent = await advance(
+        9,
+        resumed,
+        () => {
+          upstream(
+            `/fail-read?path=actions/runs/${resumed.run.id}/attempts/1&status=404`,
+          );
+        },
+        options,
+      );
+      assertCollectionRetry(
+        9,
+        before,
+        absent,
+        "agent_run_not_visible",
+        earliest,
+      );
+      assert.equal(signedState(9).agent_turn.elapsed_ms, null);
+      await waitForRetry(absent);
+      const beforeRateLimit = signedState(9);
+      upstream(
+        `/fail-read?path=actions/runs/${resumed.turn.resume.run_id}/artifacts&status=429`,
+      );
+      const earliestRateLimit = Date.now() + 5000;
+      const throttled = await invoke(9, options);
+      assertCollectionRetry(
+        9,
+        beforeRateLimit,
+        throttled,
+        "github_rate_limited",
+        earliestRateLimit,
+      );
+      const outcome = await drain(9, throttled, options);
       assertPublished(9, outcome);
       const [, last] = nativeEvents(9, "implementation_change");
       assert.equal(last.start, first.head);
@@ -1204,7 +1260,25 @@ export async function runActionsTests({
     });
     await scenario("native-result-recovery", async () => {
       setup(10, "no_coding_session");
-      const outcome = await drain(10);
+      const writer = await untilTurn(10, await invoke(10), (turn) =>
+        Boolean(turn.previous_writer_run_id && turn.work_branch),
+      );
+      const before = signedState(10);
+      const earliest = Date.now() + 1000;
+      const options = { fresh: true };
+      const retry = await advance(
+        10,
+        writer,
+        () => {
+          upstream(
+            `/fail-read?path=actions/runs/${writer.run.id}/attempts/1/jobs&status=502`,
+          );
+        },
+        options,
+      );
+      assertCollectionRetry(10, before, retry, "github_read_failed", earliest);
+      assert.equal(signedState(10).agent_turn.elapsed_ms, null);
+      const outcome = await drain(10, retry, options);
       assertPublished(10, outcome);
       const progress = proof(10).events.find(
         (item) => item.type === "progress_only",

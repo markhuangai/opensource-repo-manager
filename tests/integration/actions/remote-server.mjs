@@ -52,7 +52,7 @@ const revision = remote.commit({
 });
 remote.git(["update-ref", "refs/heads/main", revision.sha]);
 const runs = remoteRuns(remote, artifacts, config, model);
-let failedGitRead;
+let failedRead;
 
 const tls = httpsServer(
   {
@@ -61,15 +61,16 @@ const tls = httpsServer(
   },
   async (req, res) => {
     try {
-      if (failedGitRead && req.url === failedGitRead.path) {
-        const { status } = failedGitRead;
-        failedGitRead = undefined;
+      const path = new URL(req.url, "https://api.github.com").pathname;
+      if (req.method === "GET" && failedRead?.path === path) {
+        const { status } = failedRead;
+        failedRead = undefined;
         res.writeHead(status, {
           "content-type": "application/json",
-          "x-github-request-id": "fixture-git-read",
+          "x-github-request-id": "fixture-read",
           ...(status === 429 ? { "retry-after": "5" } : {}),
         });
-        res.end(JSON.stringify({ message: "Temporary Git read failure" }));
+        res.end(JSON.stringify({ message: "Temporary read failure" }));
         return;
       }
       if ((await runs.handle(req, res)) || (await artifacts.handle(req, res)))
@@ -199,16 +200,15 @@ const http = createServer(async (req, res) => {
           url.searchParams.get("kind"),
         );
         return send({});
-      case "/fail-git-read": {
+      case "/fail-read": {
         const path = url.searchParams.get("path");
+        const status = Number(url.searchParams.get("status"));
+        assert([404, 429, 502].includes(status));
         assert.match(
           path,
-          /^(?:git\/commits\/[a-f0-9]{40}|compare\/[a-f0-9]{40}\.\.\.[a-f0-9]{40})$/,
+          /^(?:git\/commits\/[a-f0-9]{40}|compare\/[a-f0-9]{40}\.\.\.[a-f0-9]{40}|actions\/runs\/9[0-9]{3}\/(?:artifacts|attempts\/1(?:\/jobs)?))$/,
         );
-        failedGitRead = {
-          path: `/repos/owner/repo/${path}`,
-          status: path.startsWith("git/commits/") ? 429 : 502,
-        };
+        failedRead = { path: `/repos/owner/repo/${path}`, status };
         return send({});
       }
       case "/lose-pull":

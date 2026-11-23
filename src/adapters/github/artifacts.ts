@@ -2,6 +2,7 @@ import { Octokit } from "@octokit/rest";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout } from "node:timers/promises";
 import { createGitHubClient } from "./client.ts";
+import { githubReadFailure } from "./reader.ts";
 import {
   createApiDiagnostics,
   apiFailureId,
@@ -157,8 +158,9 @@ export class GitHubArtifacts implements ArtifactTransport {
       ).data;
     } catch (error) {
       if (signal.aborted) throw signal.reason;
+      const failure = githubReadFailure(error);
       throw carryApiFailure(
-        new StateError("session_transport_unavailable"),
+        new StateError("session_transport_unavailable", failure.retryAt),
         error,
       );
     }
@@ -413,6 +415,14 @@ export class GitHubArtifacts implements ArtifactTransport {
       expected_digest: prepared.digest,
       expected_size: prepared.size,
     };
+    const wait = async (delay: number) => {
+      try {
+        await setTimeout(delay, undefined, { signal });
+      } catch (error) {
+        signal.throwIfAborted();
+        throw error;
+      }
+    };
     const readWithRetry = async <T>(read: () => Promise<T>, phase: string) => {
       try {
         return await read();
@@ -430,9 +440,10 @@ export class GitHubArtifacts implements ArtifactTransport {
           request_id: apiFailureId(error),
           elapsed_ms: Math.round(performance.now() - started),
           cause: error.code,
+          retry_at: error.retryAt || undefined,
           outcome: "retrying",
         });
-        await setTimeout(350, undefined, { signal });
+        await wait(Math.max(350, error.retryAt - Date.now()));
         return read();
       }
     };
@@ -496,7 +507,7 @@ export class GitHubArtifacts implements ArtifactTransport {
           : "artifact_not_visible",
         outcome: attempt < 5 ? "retrying" : "reconcile",
       });
-      if (attempt < 5) await setTimeout(350, undefined, { signal });
+      if (attempt < 5) await wait(350);
     }
     throw new StateError("session_upload_uncertain");
   }

@@ -23,6 +23,7 @@ export const remoteBlockingReasons = [
   "session_provenance_invalid",
 ] as const;
 export const collectionRetryCauses = [
+  "agent_run_not_visible",
   "github_read_failed",
   "github_rate_limited",
   "github_publication_failed",

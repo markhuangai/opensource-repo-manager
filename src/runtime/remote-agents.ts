@@ -5,6 +5,7 @@ import { setTimeout } from "node:timers/promises";
 import type { ActionsState } from "../actions/persistence.ts";
 import type { GitHubActionsSource } from "../adapters/github/actions-source.ts";
 import type { GitHubArtifacts } from "../adapters/github/artifacts.ts";
+import { githubReadFailure } from "../adapters/github/reader.ts";
 import {
   assertDispatchRun,
   assertRemoteDevPin,
@@ -766,38 +767,46 @@ export class RemoteAgents {
     const deferred = turn.collection_retry?.retry_at;
     if (deferred && Date.now() < deferred)
       throw new RemoteTurnPending(deferred);
-    const run = await this.run(turn, signal);
-    if (!run) {
-      if (Date.now() - turn.created_at >= remoteDev.registrationMs) {
-        this.event(turn, "dispatch_failed", {
-          level: "error",
-          outcome: "unregistered",
-          recovery:
-            "Inspect the dispatch receipt and registered workflow. A duplicate dispatch is unsafe.",
-        });
-        throw new RuntimeError("agent_dispatch_uncertain");
-      }
-      throw new RemoteTurnPending();
-    }
-    await this.bindRun(turn, run, signal);
-    if (run.status !== "completed") throw new RemoteTurnPending();
-    if (turn.elapsed_ms === null) {
-      const elapsed = await this.api.executionTime(run, signal);
-      this.job(request.job_id, request.revision);
-      turn = { ...turn, run_id: run.id, elapsed_ms: elapsed };
-      await this.state.setAgentTurn(turn, signal);
-    }
+    let collecting: RemoteRun | undefined;
     try {
+      const run = await this.run(turn, signal);
+      if (!run) {
+        if (Date.now() - turn.created_at >= remoteDev.registrationMs) {
+          this.event(turn, "dispatch_failed", {
+            level: "error",
+            outcome: "unregistered",
+            recovery:
+              "Inspect the dispatch receipt and registered workflow. A duplicate dispatch is unsafe.",
+          });
+          throw new RuntimeError("agent_dispatch_uncertain");
+        }
+        throw new RemoteTurnPending();
+      }
+      await this.bindRun(turn, run, signal);
+      if (run.status !== "completed") throw new RemoteTurnPending();
+      turn = { ...turn, run_id: run.id };
+      if (turn.elapsed_ms === null) {
+        const elapsed = await this.api.executionTime(run, signal);
+        this.job(request.job_id, request.revision);
+        turn = { ...turn, elapsed_ms: elapsed };
+        await this.state.setAgentTurn(turn, signal);
+      }
+      collecting = run;
       return await this.collectResult(turn, run, request, signal);
     } catch (error) {
       signal.throwIfAborted();
       if (error instanceof RemoteTurnPending) throw error;
+      const status = (error as { status?: number } | null)?.status;
+      const failure =
+        !collecting && typeof status === "number"
+          ? githubReadFailure(error)
+          : error;
       const cause =
-        error instanceof RuntimeError ||
-        error instanceof IntakeError ||
-        error instanceof StateError
-          ? error.code
-          : "agent_result_invalid";
+        !collecting && turn.run_id !== null && status === 404
+          ? "agent_run_not_visible"
+          : failure instanceof RuntimeError || failure instanceof IntakeError
+            ? failure.code
+            : "agent_result_invalid";
       const retry = collectionRetryCauses.find((item) => item === cause);
       if (retry) {
         this.job(turn.job_id, turn.revision);
@@ -812,7 +821,9 @@ export class RemoteAgents {
         }
         const retryAt = Math.max(
           Date.now() + 1000,
-          error instanceof IntakeError ? error.retryAt : 0,
+          failure instanceof IntakeError || failure instanceof StateError
+            ? failure.retryAt
+            : 0,
         );
         await this.state.setAgentTurn(
           { ...turn, collection_retry: { cause: retry, retry_at: retryAt } },
@@ -824,17 +835,20 @@ export class RemoteAgents {
           request_id: apiFailureId(error),
           retry_at: retryAt,
           outcome: "retry_scheduled",
-          recovery: "Collect the same terminal run after the retry deadline.",
+          recovery: "Recheck the same agent attempt after the retry deadline.",
         });
         throw new RemoteTurnPending(retryAt);
       }
+      if (!collecting) throw error;
       const missing = cause === "agent_artifact_unavailable";
       const stopped =
-        missing && run.conclusion !== "success" ? "agent_run_failed" : cause;
+        missing && collecting.conclusion !== "success"
+          ? "agent_run_failed"
+          : cause;
       this.event(turn, "result_rejected", {
         level: missing ? "warn" : "error",
         outcome: "rejected",
-        run_conclusion: run.conclusion ?? undefined,
+        run_conclusion: collecting.conclusion ?? undefined,
         cause: stopped,
         request_id: apiFailureId(error),
         recovery:
@@ -1134,7 +1148,14 @@ export class RemoteAgents {
           turn.progress ? "agent_artifact_conflict" : "agent_result_invalid",
         );
       }
-      if (request.output_schema && !compile(request.output_schema)(result))
+      const assessment = turn.assessment;
+      const incomplete =
+        assessment && digest(result) === digest({ outcome: "incomplete" });
+      if (
+        !incomplete &&
+        request.output_schema &&
+        !compile(request.output_schema)(result)
+      )
         throw new RuntimeError(
           turn.progress ? "agent_artifact_conflict" : "agent_result_invalid",
         );
@@ -1152,7 +1173,6 @@ export class RemoteAgents {
           ? await this.freezeProgress(turn, run, signal)
           : savedRecovery && structuredClone(savedRecovery);
       const coding = recovery?.coding;
-      const assessment = turn.assessment;
       if (assessment) {
         if (
           !coding?.candidate ||
@@ -1171,7 +1191,7 @@ export class RemoteAgents {
           )?.sha !== assessment.sha
         )
           throw new RuntimeError("agent_progress_conflict");
-        if (digest(result) === digest({ outcome: "incomplete" })) {
+        if (incomplete) {
           delete coding.candidate;
           await this.state.setAgentTurn(null, signal, 0, recovery);
           this.event(turn, "candidate_assessed", {

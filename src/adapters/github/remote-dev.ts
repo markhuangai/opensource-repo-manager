@@ -12,6 +12,7 @@ import {
   type RemoteTurn,
 } from "../../domain/remote-turns.ts";
 import { listRunArtifacts, nativeCheckpointArtifact } from "./artifacts.ts";
+import { githubReadFailure } from "./reader.ts";
 import { carryApiFailure } from "../../logging/api.ts";
 
 export class DispatchRunMismatch extends RuntimeError {
@@ -139,6 +140,8 @@ export class RemoteDevActions {
           error instanceof z.ZodError
         )
           throw error;
+        const failure = githubReadFailure(error);
+        if (failure.code === "github_rate_limited") throw failure;
         throw carryApiFailure(
           new StateError("session_transport_unavailable"),
           error,

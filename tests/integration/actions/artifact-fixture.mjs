@@ -10,7 +10,7 @@ export function artifactFixture(config) {
     hideNextCheckpoint = 0,
     dropFinalize = false,
     diagnosticFault = "";
-  const failedCheckpointReads = new Set();
+  const failedCheckpointReads = new Map();
   const head = "f".repeat(40);
   const run = (id) => ({
     id,
@@ -276,9 +276,12 @@ export function artifactFixture(config) {
             )
               ? "acknowledgement"
               : "preflight";
-            if (failedCheckpointReads.delete(phase)) {
-              res.writeHead(502, {
+            const failedStatus = failedCheckpointReads.get(phase);
+            if (failedStatus) {
+              failedCheckpointReads.delete(phase);
+              res.writeHead(failedStatus, {
                 "x-request-id": `checkpoint-${phase}-failure`,
+                ...(failedStatus === 429 ? { "retry-after": "1" } : {}),
               });
               res.end(
                 JSON.stringify({ message: "Checkpoint listing unavailable" }),
@@ -359,8 +362,8 @@ export function artifactFixture(config) {
     },
     fault(id, kind) {
       if (kind === "checkpoint_lookup_unavailable") {
-        failedCheckpointReads.add("preflight");
-        failedCheckpointReads.add("acknowledgement");
+        failedCheckpointReads.set("preflight", 429);
+        failedCheckpointReads.set("acknowledgement", 502);
         return;
       }
       if (
